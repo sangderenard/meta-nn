@@ -2,16 +2,17 @@ import copy
 import math
 import random
 import time
+from collections import deque
 from contextlib import nullcontext
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from wav_ml_core import RenderConfig, normalize_bit_window, render_mono_wave_to_tensor
+from wav_ml_core import COLOR_MODE_MAP, COLOR_MODES, RenderConfig, normalize_bit_window, render_mono_wave_to_tensor
 
 
 def set_seed(seed: int):
@@ -168,19 +169,79 @@ def _tensor_to_rgb_u8_image(x: torch.Tensor) -> np.ndarray:
 
 
 class _TransformerStatusOpenGLViewer:
-    def __init__(self, enabled: bool, image_hw: Tuple[int, int], scale: int = 3):
+    def __init__(
+        self,
+        enabled: bool,
+        image_hw: Tuple[int, int],
+        scale: int = 3,
+        cycle_slots: int = 0,
+    ):
         self.enabled = bool(enabled)
-        self.scale = max(1, int(scale))
         self.image_h = max(8, int(image_hw[0]))
         self.image_w = max(8, int(image_hw[1]))
-        self.window_w = max(320, (self.image_w * self.scale * 2) + (16 * self.scale))
-        self.window_h = max(200, (self.image_h * self.scale) + (8 * self.scale))
+        _ = max(1, int(scale))
+
+        self.panel_w = max(8, min(256, int(self.image_w)))
+        self.panel_h = max(8, min(256, int(self.image_h)))
+        self.num_panels = 3
+        self.top_bar_h = 56
+        self.window_w = int(self.panel_w * self.num_panels)
+        self.window_h = int(self.top_bar_h + (self.panel_h * 2))
 
         self._ready = False
         self._failed = False
         self._pygame = None
         self._gl = None
         self._textures = None
+        self._stop_requested = False
+
+        self._last_present_t = 0.0
+        self._min_present_dt = 1.0 / 30.0
+        self._pending_frame = None
+        self._top_bar_dirty = True
+        self._panel_text_dirty = True
+
+        self._caption = ""
+        self._panel_titles = ["target", "input", "output"]
+        self._panel_rows = [[], [], []]
+        self._panel_text_rgb = [
+            np.full((self.panel_h, self.panel_w, 3), 14, dtype=np.uint8),
+            np.full((self.panel_h, self.panel_w, 3), 14, dtype=np.uint8),
+            np.full((self.panel_h, self.panel_w, 3), 14, dtype=np.uint8),
+        ]
+        self._top_bar_rgb = np.full((self.top_bar_h, self.window_w, 3), 18, dtype=np.uint8)
+
+        self._cycle_selected: List[bool] = []
+        self._gate_override = False
+        self._control_boxes: List[Tuple[str, int, Tuple[int, int, int, int]]] = []
+        self.set_cycle_roster(total_cycles=int(cycle_slots))
+
+    def set_cycle_roster(self, total_cycles: int, selected: Optional[Sequence[bool]] = None):
+        n = max(0, int(total_cycles))
+        prev = list(self._cycle_selected)
+        if n <= 0:
+            self._cycle_selected = []
+        else:
+            out = [True] * n
+            for i in range(min(len(prev), n)):
+                out[i] = bool(prev[i])
+            if selected is not None:
+                for i, v in enumerate(list(selected)[:n]):
+                    out[i] = bool(v)
+            self._cycle_selected = out
+        self._top_bar_dirty = True
+
+    def selected_cycle_ids(self) -> List[int]:
+        return [int(i + 1) for i, v in enumerate(self._cycle_selected) if bool(v)]
+
+    def is_cycle_selected(self, cycle_local: int) -> bool:
+        idx = int(cycle_local) - 1
+        if idx < 0 or idx >= len(self._cycle_selected):
+            return True
+        return bool(self._cycle_selected[idx])
+
+    def gate_override_enabled(self) -> bool:
+        return bool(self._gate_override)
 
     def _init(self):
         if (not self.enabled) or self._ready or self._failed:
@@ -192,19 +253,33 @@ class _TransformerStatusOpenGLViewer:
             pygame.display.init()
             pygame.display.gl_set_attribute(pygame.GL_DOUBLEBUFFER, 1)
             pygame.display.set_mode((self.window_w, self.window_h), pygame.OPENGL | pygame.DOUBLEBUF)
-            pygame.display.set_caption("Transformer Status Viewer")
+            pygame.display.set_caption("Stage Status Viewer")
 
             GL.glViewport(0, 0, self.window_w, self.window_h)
             GL.glDisable(GL.GL_DEPTH_TEST)
             GL.glEnable(GL.GL_TEXTURE_2D)
             GL.glClearColor(0.06, 0.06, 0.08, 1.0)
 
-            tex = GL.glGenTextures(2)
+            tex = GL.glGenTextures(7)
             if isinstance(tex, int):
-                tex = [tex, int(GL.glGenTextures(1))]
-            self._textures = [int(tex[0]), int(tex[1])]
-            for tid in self._textures:
-                GL.glBindTexture(GL.GL_TEXTURE_2D, tid)
+                tex = [int(tex)]
+                while len(tex) < 7:
+                    tex.append(int(GL.glGenTextures(1)))
+            else:
+                tex = [int(t) for t in list(tex)]
+                while len(tex) < 7:
+                    tex.append(int(GL.glGenTextures(1)))
+            self._textures = {
+                "img": [int(tex[0]), int(tex[1]), int(tex[2])],
+                "text": [int(tex[3]), int(tex[4]), int(tex[5])],
+                "bar": int(tex[6]),
+            }
+            for tid in (
+                self._textures["img"]
+                + self._textures["text"]
+                + [int(self._textures["bar"])]
+            ):
+                GL.glBindTexture(GL.GL_TEXTURE_2D, int(tid))
                 GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_MIN_FILTER, GL.GL_LINEAR)
                 GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_MAG_FILTER, GL.GL_LINEAR)
                 GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_WRAP_S, GL.GL_CLAMP_TO_EDGE)
@@ -213,6 +288,8 @@ class _TransformerStatusOpenGLViewer:
             self._pygame = pygame
             self._gl = GL
             self._ready = True
+            self._top_bar_dirty = True
+            self._panel_text_dirty = True
             print(
                 f"[transformer-viz] pygame+OpenGL ready ({self.window_w}x{self.window_h})",
                 flush=True,
@@ -236,54 +313,302 @@ class _TransformerStatusOpenGLViewer:
             0,
             gl.GL_RGB,
             gl.GL_UNSIGNED_BYTE,
-            img_rgb,
+            np.ascontiguousarray(img_rgb),
         )
 
-    def _draw_texture(self, tex_id: int, x0: float, x1: float):
+    def _resize_rgb_to_panel(self, img_rgb: np.ndarray) -> np.ndarray:
+        h = int(img_rgb.shape[0])
+        w = int(img_rgb.shape[1])
+        if (h == int(self.panel_h)) and (w == int(self.panel_w)):
+            return np.ascontiguousarray(img_rgb)
+        t = torch.from_numpy(img_rgb.astype(np.float32, copy=False)).permute(2, 0, 1).unsqueeze(0)
+        t = F.interpolate(t, size=(int(self.panel_h), int(self.panel_w)), mode="nearest")
+        out = t.squeeze(0).permute(1, 2, 0).clamp(0.0, 255.0).to(torch.uint8).cpu().numpy()
+        return np.ascontiguousarray(out)
+
+    def _normalize_panel_text(
+        self,
+        panel_titles: Optional[Sequence[str]],
+        panel_rows: Optional[Sequence[Sequence[str]]],
+    ) -> Tuple[List[str], List[List[str]]]:
+        titles = []
+        rows = []
+        for i in range(3):
+            if panel_titles is not None and i < len(panel_titles):
+                titles.append(str(panel_titles[i]))
+            else:
+                titles.append(self._panel_titles[i] if i < len(self._panel_titles) else "")
+            cur_rows: List[str] = []
+            if panel_rows is not None and i < len(panel_rows):
+                src_rows = panel_rows[i]
+                if isinstance(src_rows, (list, tuple)):
+                    for r in src_rows:
+                        txt = str(r).strip()
+                        if txt:
+                            cur_rows.append(txt)
+            rows.append(cur_rows)
+        return titles, rows
+
+    def _render_panel_text(self, title: str, rows: Sequence[str]) -> np.ndarray:
+        out = np.full((self.panel_h, self.panel_w, 3), 16, dtype=np.uint8)
+        try:
+            from PIL import Image, ImageDraw, ImageFont
+
+            im = Image.fromarray(out).convert("RGB")
+            draw = ImageDraw.Draw(im)
+            font = ImageFont.load_default()
+
+            draw.rectangle([(0, 0), (self.panel_w - 1, self.panel_h - 1)], fill=(20, 24, 30))
+            draw.rectangle([(0, 0), (self.panel_w - 1, 15)], fill=(34, 42, 52))
+            draw.text((4, 2), str(title)[:48], fill=(255, 225, 70), font=font)
+            draw.line([(0, 16), (self.panel_w - 1, 16)], fill=(70, 76, 88), width=1)
+            y = 20
+            for r in list(rows)[: max(1, (self.panel_h - 20) // 11)]:
+                draw.text((4, y), str(r)[:72], fill=(230, 234, 240), font=font)
+                y += 11
+                if y >= (self.panel_h - 10):
+                    break
+            return np.asarray(im, dtype=np.uint8)
+        except Exception:
+            return out
+
+    def _render_top_bar(self) -> np.ndarray:
+        out = np.full((self.top_bar_h, self.window_w, 3), 18, dtype=np.uint8)
+        self._control_boxes = []
+        try:
+            from PIL import Image, ImageDraw, ImageFont
+
+            im = Image.fromarray(out).convert("RGB")
+            draw = ImageDraw.Draw(im)
+            font = ImageFont.load_default()
+
+            draw.rectangle([(0, 0), (self.window_w - 1, self.top_bar_h - 1)], fill=(18, 22, 28))
+            draw.line(
+                [(0, self.top_bar_h - 1), (self.window_w - 1, self.top_bar_h - 1)],
+                fill=(70, 76, 88),
+                width=1,
+            )
+            cap = str(self._caption).strip()
+            if cap:
+                draw.text((6, 4), cap[: max(16, (self.window_w // 6) - 4)], fill=(230, 234, 240), font=font)
+
+            x = 8
+            y = 24
+            for i, is_on in enumerate(self._cycle_selected):
+                token_w = 42
+                if x + token_w >= (self.window_w - 170):
+                    break
+                box = (x, y, x + 11, y + 11)
+                fill = (52, 120, 66) if bool(is_on) else (36, 40, 44)
+                draw.rectangle([box[0], box[1], box[2], box[3]], outline=(186, 194, 204), fill=fill)
+                if bool(is_on):
+                    draw.line([(box[0] + 2, box[1] + 6), (box[0] + 5, box[1] + 9)], fill=(236, 244, 248), width=1)
+                    draw.line([(box[0] + 5, box[1] + 9), (box[0] + 9, box[1] + 2)], fill=(236, 244, 248), width=1)
+                draw.text((x + 15, y - 1), f"C{i + 1}", fill=(224, 230, 236), font=font)
+                self._control_boxes.append(("cycle", int(i), box))
+                x += token_w
+
+            ox = max(x + 4, self.window_w - 166)
+            oy = y
+            o_box = (ox, oy, ox + 11, oy + 11)
+            o_fill = (126, 84, 36) if bool(self._gate_override) else (36, 40, 44)
+            draw.rectangle([o_box[0], o_box[1], o_box[2], o_box[3]], outline=(186, 194, 204), fill=o_fill)
+            if bool(self._gate_override):
+                draw.line([(o_box[0] + 2, o_box[1] + 6), (o_box[0] + 5, o_box[1] + 9)], fill=(236, 244, 248), width=1)
+                draw.line([(o_box[0] + 5, o_box[1] + 9), (o_box[0] + 9, o_box[1] + 2)], fill=(236, 244, 248), width=1)
+            draw.text((ox + 15, oy - 1), "Override gates", fill=(230, 208, 170), font=font)
+            self._control_boxes.append(("override", -1, o_box))
+
+            active = self.selected_cycle_ids()
+            active_txt = ",".join(str(i) for i in active) if len(active) > 0 else "none"
+            draw.text(
+                (6, self.top_bar_h - 14),
+                f"cycles={active_txt} gate_override={1 if self._gate_override else 0}",
+                fill=(180, 188, 198),
+                font=font,
+            )
+            return np.asarray(im, dtype=np.uint8)
+        except Exception:
+            return out
+
+    def _draw_texture_px(self, tex_id: int, x0: int, y0: int, x1: int, y1: int):
         gl = self._gl
+        xf0 = -1.0 + (2.0 * float(x0) / float(max(1, self.window_w)))
+        xf1 = -1.0 + (2.0 * float(x1) / float(max(1, self.window_w)))
+        yt = 1.0 - (2.0 * float(y0) / float(max(1, self.window_h)))
+        yb = 1.0 - (2.0 * float(y1) / float(max(1, self.window_h)))
         gl.glBindTexture(gl.GL_TEXTURE_2D, int(tex_id))
         gl.glBegin(gl.GL_QUADS)
         gl.glTexCoord2f(0.0, 1.0)
-        gl.glVertex2f(float(x0), -1.0)
+        gl.glVertex2f(float(xf0), float(yb))
         gl.glTexCoord2f(1.0, 1.0)
-        gl.glVertex2f(float(x1), -1.0)
+        gl.glVertex2f(float(xf1), float(yb))
         gl.glTexCoord2f(1.0, 0.0)
-        gl.glVertex2f(float(x1), 1.0)
+        gl.glVertex2f(float(xf1), float(yt))
         gl.glTexCoord2f(0.0, 0.0)
-        gl.glVertex2f(float(x0), 1.0)
+        gl.glVertex2f(float(xf0), float(yt))
         gl.glEnd()
 
-    def update(self, input_img: torch.Tensor, output_img: torch.Tensor, caption: str):
+    def _present(self, force: bool = False):
+        if (not self._ready) or (not self.enabled) or self._stop_requested:
+            return
+        now = time.perf_counter()
+        has_pending = isinstance(self._pending_frame, dict)
+        dirty = bool(has_pending or self._top_bar_dirty or self._panel_text_dirty)
+        if not dirty:
+            return
+        if (not force) and has_pending and (now - self._last_present_t) < self._min_present_dt:
+            return
+
+        if has_pending:
+            frame = self._pending_frame
+            self._pending_frame = None
+            imgs = frame.get("images", None)
+            if isinstance(imgs, list) and len(imgs) == 3:
+                for i, tid in enumerate(self._textures["img"]):
+                    self._upload_texture(int(tid), np.asarray(imgs[i], dtype=np.uint8))
+            self._caption = str(frame.get("caption", ""))
+            self._panel_titles = [str(x) for x in frame.get("titles", self._panel_titles)]
+            self._panel_rows = [list(r) for r in frame.get("rows", self._panel_rows)]
+            self._panel_text_dirty = True
+            self._top_bar_dirty = True
+
+        if self._panel_text_dirty:
+            for i in range(3):
+                title = self._panel_titles[i] if i < len(self._panel_titles) else ""
+                rows = self._panel_rows[i] if i < len(self._panel_rows) else []
+                self._panel_text_rgb[i] = self._render_panel_text(title=title, rows=rows)
+                self._upload_texture(int(self._textures["text"][i]), self._panel_text_rgb[i])
+            self._panel_text_dirty = False
+
+        if self._top_bar_dirty:
+            self._top_bar_rgb = self._render_top_bar()
+            self._upload_texture(int(self._textures["bar"]), self._top_bar_rgb)
+            self._top_bar_dirty = False
+
+        gl = self._gl
+        gl.glClear(gl.GL_COLOR_BUFFER_BIT)
+
+        self._draw_texture_px(
+            int(self._textures["bar"]),
+            0,
+            0,
+            self.window_w,
+            self.top_bar_h,
+        )
+        for i in range(3):
+            x0 = int(i * self.panel_w)
+            x1 = int((i + 1) * self.panel_w)
+            self._draw_texture_px(
+                int(self._textures["text"][i]),
+                x0,
+                self.top_bar_h,
+                x1,
+                self.top_bar_h + self.panel_h,
+            )
+            self._draw_texture_px(
+                int(self._textures["img"][i]),
+                x0,
+                self.top_bar_h + self.panel_h,
+                x1,
+                self.top_bar_h + (2 * self.panel_h),
+            )
+
+        gate_mode = "manual" if self._gate_override else "auto"
+        self._pygame.display.set_caption(f"Stage Status Viewer | gate={gate_mode} | {self._caption}")
+        self._pygame.display.flip()
+        self._last_present_t = now
+
+    def _handle_click(self, x: int, y: int) -> bool:
+        xi = int(x)
+        yi = int(y)
+        if yi < 0 or yi >= int(self.top_bar_h):
+            return False
+        for kind, idx, box in self._control_boxes:
+            if (xi >= int(box[0])) and (xi <= int(box[2])) and (yi >= int(box[1])) and (yi <= int(box[3])):
+                if kind == "cycle":
+                    if int(idx) >= 0 and int(idx) < len(self._cycle_selected):
+                        self._cycle_selected[int(idx)] = not bool(self._cycle_selected[int(idx)])
+                        self._top_bar_dirty = True
+                        return True
+                elif kind == "override":
+                    self._gate_override = not bool(self._gate_override)
+                    self._top_bar_dirty = True
+                    return True
+        return False
+
+    def _poll_events(self):
+        if (not self._ready) or (self._pygame is None):
+            return
+        try:
+            for event in self._pygame.event.get():
+                if event.type == self._pygame.QUIT:
+                    self._stop_requested = True
+                    self.enabled = False
+                    self.close()
+                    return
+                if event.type == self._pygame.MOUSEBUTTONDOWN and int(getattr(event, "button", 0)) == 1:
+                    pos = getattr(event, "pos", None)
+                    if isinstance(pos, (list, tuple)) and len(pos) >= 2:
+                        if self._handle_click(int(pos[0]), int(pos[1])):
+                            self._present(force=True)
+        except Exception:
+            pass
+
+    def pump(self):
         if not self.enabled:
             return
         self._init()
         if not self._ready:
             return
+        self._poll_events()
+        self._present(force=False)
 
-        pygame = self._pygame
-        for event in pygame.event.get():
-            if event.type == pygame.QUIT:
-                self.close()
-                self.enabled = False
-                return
+    def stop_requested(self) -> bool:
+        return bool(self._stop_requested)
 
-        in_rgb = _tensor_to_rgb_u8_image(input_img)
-        out_rgb = _tensor_to_rgb_u8_image(output_img)
-        self._upload_texture(self._textures[0], in_rgb)
-        self._upload_texture(self._textures[1], out_rgb)
+    def update(
+        self,
+        clean_img: torch.Tensor,
+        input_img: torch.Tensor,
+        output_img: torch.Tensor,
+        caption: str,
+        panel_titles: Optional[Sequence[str]] = None,
+        panel_rows: Optional[Sequence[Sequence[str]]] = None,
+    ):
+        if not self.enabled:
+            return
+        self._init()
+        if not self._ready:
+            return
+        self._poll_events()
+        if self._stop_requested or (not self._ready):
+            return
 
-        gl = self._gl
-        gl.glClear(gl.GL_COLOR_BUFFER_BIT)
-        self._draw_texture(self._textures[0], -1.0, -0.02)
-        self._draw_texture(self._textures[1], 0.02, 1.0)
-        pygame.display.set_caption(f"Transformer Status Viewer | {caption}")
-        pygame.display.flip()
+        clean_rgb = self._resize_rgb_to_panel(_tensor_to_rgb_u8_image(clean_img))
+        in_rgb = self._resize_rgb_to_panel(_tensor_to_rgb_u8_image(input_img))
+        out_rgb = self._resize_rgb_to_panel(_tensor_to_rgb_u8_image(output_img))
+        titles, rows = self._normalize_panel_text(panel_titles=panel_titles, panel_rows=panel_rows)
+        self._pending_frame = {
+            "images": [clean_rgb, in_rgb, out_rgb],
+            "caption": str(caption),
+            "titles": titles,
+            "rows": rows,
+        }
+        self._present(force=False)
 
     def close(self):
         if self._ready:
             try:
                 if self._gl is not None and self._textures is not None:
-                    self._gl.glDeleteTextures(self._textures)
+                    tex_ids = (
+                        list(self._textures.get("img", []))
+                        + list(self._textures.get("text", []))
+                        + [self._textures.get("bar", 0)]
+                    )
+                    tex_ids = [int(t) for t in tex_ids if int(t) > 0]
+                    if len(tex_ids) > 0:
+                        self._gl.glDeleteTextures(tex_ids)
             except Exception:
                 pass
             try:
@@ -331,6 +656,10 @@ def sinusoidal_lr_multiplier(
     idx = min(step, total_steps - 1)
     denom = max(1, total_steps - 1)
     t = float(idx) / float(denom)
+
+    # Trivial off-switch: cycles<=0 and frequency<=0 keeps a constant base LR.
+    if float(frequency) <= 0.0 and float(cycles) <= 0.0:
+        return 1.0
 
     if float(frequency) > 0.0:
         cycles_total = float(frequency) * float(denom)
@@ -420,34 +749,292 @@ class SinusoidalLRController:
         self._apply(self.step_num)
 
 
-class TinyConvClassifier(nn.Module):
-    def __init__(self, num_classes: int):
+class _ResidualContextBlock(nn.Module):
+    def __init__(self, channels: int, dropout_p: float = 0.0):
         super().__init__()
+        c = max(1, int(channels))
+        self.conv1 = nn.Conv2d(c, c, kernel_size=3, padding=1)
+        self.bn1 = nn.BatchNorm2d(c)
+        self.conv2 = nn.Conv2d(c, c, kernel_size=3, padding=1)
+        self.bn2 = nn.BatchNorm2d(c)
+        self.act = nn.GELU()
+        self.drop = nn.Dropout2d(float(max(0.0, min(0.8, dropout_p)))) if float(dropout_p) > 0.0 else nn.Identity()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        r = x
+        y = self.conv1(x)
+        y = self.bn1(y)
+        y = self.act(y)
+        y = self.conv2(y)
+        y = self.bn2(y)
+        y = self.drop(y)
+        return self.act(y + r)
+
+
+class TinyConvClassifier(nn.Module):
+    def __init__(
+        self,
+        num_classes: int,
+        base_ch: int = 64,
+        max_ch: int = 384,
+        context_blocks: int = 8,
+        context_dropout: float = 0.05,
+    ):
+        super().__init__()
+        c0 = max(16, int(base_ch))
+        c1 = min(max(32, int(max_ch)), max(c0, int(round(c0 * 2.0))))
+        c2 = min(max(48, int(max_ch)), max(c1, int(round(c0 * 3.0))))
+        c3 = min(max(64, int(max_ch)), max(c2, int(round(c0 * 4.0))))
+        n_ctx = max(0, int(context_blocks))
+        d_ctx = float(max(0.0, min(0.8, context_dropout)))
         self.features = nn.Sequential(
-            nn.Conv2d(3, 32, kernel_size=3, padding=1),
-            nn.BatchNorm2d(32),
+            nn.Conv2d(3, c0, kernel_size=3, padding=1),
+            nn.BatchNorm2d(c0),
             nn.GELU(),
             nn.MaxPool2d(2),
-            nn.Conv2d(32, 64, kernel_size=3, padding=1),
-            nn.BatchNorm2d(64),
+            nn.Conv2d(c0, c1, kernel_size=3, padding=1),
+            nn.BatchNorm2d(c1),
             nn.GELU(),
             nn.MaxPool2d(2),
-            nn.Conv2d(64, 96, kernel_size=3, padding=1),
-            nn.BatchNorm2d(96),
+            nn.Conv2d(c1, c2, kernel_size=3, padding=1),
+            nn.BatchNorm2d(c2),
             nn.GELU(),
             nn.MaxPool2d(2),
-            nn.Conv2d(96, 128, kernel_size=3, padding=1),
-            nn.BatchNorm2d(128),
+            nn.Conv2d(c2, c3, kernel_size=3, padding=1),
+            nn.BatchNorm2d(c3),
             nn.GELU(),
+            *[_ResidualContextBlock(c3, dropout_p=d_ctx) for _ in range(n_ctx)],
         )
         self.head = nn.Sequential(
             nn.AdaptiveAvgPool2d((1, 1)),
             nn.Flatten(),
-            nn.Linear(128, num_classes),
+            nn.Linear(c3, num_classes),
         )
+        # Keep a wide semantic lane before projection to task/logit space.
+        semantic_hidden = max(1024, int(c3) * 4)
+        self.semantic_expand = nn.Sequential(
+            nn.Linear(c3, semantic_hidden),
+            nn.GELU(),
+            nn.Linear(semantic_hidden, semantic_hidden),
+            nn.GELU(),
+        )
+        self.embed_proj = nn.Linear(semantic_hidden, c3)
+        self.embed_temperature = 10.0
+        self.register_buffer("label_embed_bank", torch.zeros((0, 0), dtype=torch.float32), persistent=True)
+        self.register_buffer("label_embed_enabled", torch.zeros((1,), dtype=torch.uint8), persistent=True)
+
+    def extract_features(self, x: torch.Tensor) -> torch.Tensor:
+        h = self.features(x)
+        h = self.head[0](h)
+        h = self.head[1](h)
+        return h
+
+    def set_label_embedding_bank(self, bank: torch.Tensor, temperature: float = 10.0):
+        if bank.ndim != 2:
+            raise ValueError("Label embedding bank must be shape [num_classes, embed_dim].")
+        bank = bank.detach().to(dtype=torch.float32)
+        bank = F.normalize(bank, dim=1, eps=1e-6)
+        emb_dim = int(bank.shape[1])
+        if emb_dim <= 0:
+            raise ValueError("Label embedding dimension must be > 0.")
+        if int(self.embed_proj.out_features) != emb_dim:
+            old = self.embed_proj
+            new_proj = nn.Linear(int(old.in_features), int(emb_dim))
+            new_proj = new_proj.to(device=old.weight.device, dtype=old.weight.dtype)
+            with torch.no_grad():
+                new_proj.weight.zero_()
+                d = min(int(old.out_features), int(emb_dim))
+                new_proj.weight[:d, : int(old.in_features)] = old.weight[:d, : int(old.in_features)]
+                if old.bias is not None and new_proj.bias is not None:
+                    new_proj.bias.zero_()
+                    new_proj.bias[:d] = old.bias[:d]
+            self.embed_proj = new_proj
+        self.label_embed_bank = bank
+        self.label_embed_enabled.fill_(1)
+        self.embed_temperature = max(0.1, float(temperature))
+
+    def disable_label_embedding_bank(self):
+        self.label_embed_bank = torch.zeros((0, 0), dtype=torch.float32, device=self.label_embed_bank.device)
+        self.label_embed_enabled.fill_(0)
+
+    def encode_semantic_from_features(self, feat: torch.Tensor) -> torch.Tensor:
+        if feat.ndim != 2:
+            raise ValueError(f"Expected pooled feature tensor [B,D], got shape={tuple(feat.shape)}")
+        z = self.semantic_expand(feat)
+        z = self.embed_proj(z)
+        return F.normalize(z, dim=1, eps=1e-6)
+
+    def semantic_logits_from_features(
+        self,
+        feat: torch.Tensor,
+        bank: Optional[torch.Tensor] = None,
+        temperature: Optional[float] = None,
+    ) -> torch.Tensor:
+        z = self.encode_semantic_from_features(feat)
+        if bank is None:
+            if not bool(int(self.label_embed_enabled.item())) or int(self.label_embed_bank.shape[0]) <= 0:
+                raise RuntimeError("No active label embedding bank available for semantic logits.")
+            bank_t = self.label_embed_bank.to(device=z.device, dtype=z.dtype)
+        else:
+            bank_t = bank.to(device=z.device, dtype=z.dtype)
+        if bank_t.ndim != 2:
+            raise ValueError(f"Expected semantic bank [N,D], got shape={tuple(bank_t.shape)}")
+        if int(bank_t.shape[1]) != int(z.shape[1]):
+            raise ValueError(
+                f"Semantic bank dim mismatch: bank_dim={int(bank_t.shape[1])} embed_dim={int(z.shape[1])}"
+            )
+        bank_t = F.normalize(bank_t, dim=1, eps=1e-6)
+        t = float(self.embed_temperature if temperature is None else temperature)
+        t = max(1e-4, t)
+        return (z @ bank_t.transpose(0, 1)) * t
+
+    def semantic_logits(
+        self,
+        x: torch.Tensor,
+        bank: Optional[torch.Tensor] = None,
+        temperature: Optional[float] = None,
+    ) -> torch.Tensor:
+        feat = self.extract_features(x)
+        return self.semantic_logits_from_features(feat=feat, bank=bank, temperature=temperature)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.head(self.features(x))
+        feat = self.extract_features(x)
+        if bool(int(self.label_embed_enabled.item())) and int(self.label_embed_bank.shape[0]) > 0:
+            return self.semantic_logits_from_features(feat=feat)
+        return self.head[-1](feat)
+
+
+class DeskewFilterBundle(nn.Module):
+    def __init__(self, d_model: int, max_skew: float = 0.25):
+        super().__init__()
+        self.max_skew = max(0.0, float(max_skew))
+        hidden = max(16, int(d_model) // 4)
+        self.d_model = int(d_model)
+        self.prefilter_norm = nn.LayerNorm(int(d_model))
+        self.prefilter_fc1 = nn.Linear(int(d_model), int(hidden))
+        self.prefilter_fc2 = nn.Linear(int(hidden), 2)  # [skew, confidence_logit]
+        self.prefilter_token_fc = nn.Linear(int(hidden), int(d_model))
+        self.post_residual_norm = nn.LayerNorm(int(d_model))
+        self.post_residual_fc1 = nn.Linear(int(d_model), int(hidden))
+        self.post_residual_fc2 = nn.Linear(int(hidden), 1)  # residual skew estimate
+        self.post_residual_token_fc = nn.Linear(int(hidden), int(d_model))
+        with torch.no_grad():
+            # Identity-ish startup so legacy checkpoints don't require full retrain.
+            self.prefilter_fc2.weight.zero_()
+            self.prefilter_fc2.bias.zero_()
+            self.post_residual_fc2.weight.zero_()
+            self.post_residual_fc2.bias.zero_()
+            self.prefilter_token_fc.weight.zero_()
+            self.prefilter_token_fc.bias.zero_()
+            self.post_residual_token_fc.weight.zero_()
+            self.post_residual_token_fc.bias.zero_()
+
+    def apply_prefilter(
+        self,
+        x_in: torch.Tensor,
+        pre_tokens: torch.Tensor,
+        task_inputs: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        bsz = int(x_in.shape[0])
+        if int(pre_tokens.ndim) != 3:
+            raise ValueError(f"Deskew prefilter expects [B,N,D] tokens, got {tuple(pre_tokens.shape)}")
+        z = pre_tokens.mean(dim=1)
+        z = self.prefilter_norm(z)
+        z = F.gelu(self.prefilter_fc1(z))
+        ctrl = self.prefilter_fc2(z)
+        pred_skew = torch.tanh(ctrl[:, :1]) * float(self.max_skew)
+        confidence = torch.sigmoid(ctrl[:, 1:2])
+        pre_token_mix = float(task_inputs.get("pre_token_mix", 0.08)) if isinstance(task_inputs, dict) else 0.08
+        pre_token_mix = max(0.0, min(0.50, float(pre_token_mix)))
+        token_residual = torch.tanh(self.prefilter_token_fc(z)) * (confidence * pre_token_mix)
+        applied_skew = -(pred_skew * confidence)
+        if float(self.max_skew) <= 0.0:
+            applied_skew = torch.zeros((bsz, 1), device=x_in.device, dtype=x_in.dtype)
+            x_out = x_in
+        else:
+            x_out = _apply_stride_skew_explicit_batch(x_in, applied_skew)
+        aux = {
+            "pred_skew": pred_skew,
+            "confidence": confidence,
+            "applied_skew": applied_skew,
+            "token_residual": token_residual,
+        }
+        return x_out, aux
+
+    def observe_post(
+        self,
+        enc_tokens: torch.Tensor,
+        task_inputs: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, torch.Tensor]:
+        if int(enc_tokens.ndim) != 3:
+            raise ValueError(f"Deskew post observer expects [B,N,D] tokens, got {tuple(enc_tokens.shape)}")
+        z = enc_tokens.mean(dim=1)
+        z = self.post_residual_norm(z)
+        z = F.gelu(self.post_residual_fc1(z))
+        residual_skew = torch.tanh(self.post_residual_fc2(z)) * float(self.max_skew)
+        post_token_mix = float(task_inputs.get("post_token_mix", 0.08)) if isinstance(task_inputs, dict) else 0.08
+        post_token_mix = max(0.0, min(0.50, float(post_token_mix)))
+        token_gate = torch.clamp(
+            torch.abs(residual_skew) / max(1e-4, float(self.max_skew)),
+            min=0.0,
+            max=1.0,
+        )
+        token_residual = torch.tanh(self.post_residual_token_fc(z)) * (token_gate * post_token_mix)
+        return {
+            "residual_skew": residual_skew,
+            "token_residual": token_residual,
+            "token_gate": token_gate,
+        }
+
+    def compute_losses(
+        self,
+        pre_aux: Dict[str, torch.Tensor],
+        post_aux: Dict[str, torch.Tensor],
+        task_inputs: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, torch.Tensor]:
+        task_inputs = task_inputs or {}
+        target_skew = task_inputs.get("target_skew", None)
+        token_residual_weight = max(0.0, float(task_inputs.get("token_residual_weight", 0.01)))
+        if not torch.is_tensor(target_skew):
+            z = pre_aux["pred_skew"].new_zeros(())
+            return {
+                "prefilter_loss": z,
+                "post_residual_loss": z,
+                "token_residual_loss": z,
+                "prefilter_loss_raw": z,
+                "post_residual_loss_raw": z,
+                "token_residual_loss_raw": z,
+                "skew_mae": z,
+            }
+        target_skew = target_skew.to(device=pre_aux["pred_skew"].device, dtype=torch.float32).reshape(-1, 1)
+        max_skew = float(max(float(task_inputs.get("max_skew", self.max_skew)), 1e-4))
+        w_pre = max(0.0, float(task_inputs.get("prefilter_weight", 1.0)))
+        w_post = max(0.0, float(task_inputs.get("post_weight", 1.0)))
+        pred_skew = pre_aux["pred_skew"].to(torch.float32)
+        applied_skew = pre_aux["applied_skew"].to(torch.float32)
+        residual_obs = post_aux.get("residual_skew", torch.zeros_like(pred_skew)).to(torch.float32)
+
+        pre_raw = F.smooth_l1_loss(pred_skew / max_skew, target_skew / max_skew)
+        # After applying correction, residual should be target + applied (near 0 if corrected well).
+        residual_target = target_skew + applied_skew
+        post_raw = F.smooth_l1_loss(residual_obs / max_skew, residual_target / max_skew)
+        pre_token = pre_aux.get("token_residual", None)
+        post_token = post_aux.get("token_residual", None)
+        token_raw = pre_raw.new_zeros(())
+        if torch.is_tensor(pre_token):
+            token_raw = token_raw + torch.mean(pre_token.to(torch.float32) ** 2)
+        if torch.is_tensor(post_token):
+            token_raw = token_raw + torch.mean(post_token.to(torch.float32) ** 2)
+        mae = torch.mean(torch.abs(pred_skew - target_skew))
+        return {
+            "prefilter_loss": pre_raw * w_pre,
+            "post_residual_loss": post_raw * w_post,
+            "token_residual_loss": token_raw * token_residual_weight,
+            "prefilter_loss_raw": pre_raw,
+            "post_residual_loss_raw": post_raw,
+            "token_residual_loss_raw": token_raw,
+            "skew_mae": mae,
+        }
 
 
 class WavePatchTransformer(nn.Module):
@@ -461,10 +1048,19 @@ class WavePatchTransformer(nn.Module):
         ff_mult: int = 4,
         max_delta: float = 0.2,
         dropout: float = 0.1,
+        prefilter_max_skew: float = 0.25,
+        prefilter_enabled: bool = True,
+        aux_filter_bundle_names: Optional[Sequence[str]] = None,
     ):
         super().__init__()
         if chunk_samples % patch_size != 0:
             raise ValueError("chunk_samples must be divisible by patch_size")
+        if int(d_model) <= 0:
+            raise ValueError("d_model must be > 0")
+        if int(nhead) <= 0:
+            raise ValueError("nhead must be > 0")
+        if int(d_model) % int(nhead) != 0:
+            raise ValueError(f"d_model ({int(d_model)}) must be divisible by nhead ({int(nhead)}).")
 
         self.chunk_samples = int(chunk_samples)
         self.patch_size = int(patch_size)
@@ -485,8 +1081,39 @@ class WavePatchTransformer(nn.Module):
         )
         self.encoder = nn.TransformerEncoder(layer, num_layers=num_layers)
         self.patch_out = nn.Linear(d_model, self.patch_size)
+        self.aux_filter_bundles = nn.ModuleDict()
+        bundle_names = list(aux_filter_bundle_names) if aux_filter_bundle_names is not None else ["deskew"]
+        for name in bundle_names:
+            key = str(name).strip().lower()
+            if (not key) or (key in ("none", "off", "0")):
+                continue
+            if key == "deskew":
+                if bool(prefilter_enabled):
+                    self.register_aux_filter_bundle(
+                        key,
+                        DeskewFilterBundle(
+                            d_model=int(d_model),
+                            max_skew=float(prefilter_max_skew),
+                        ),
+                    )
+                continue
+            raise ValueError(
+                f"Unknown transformer aux filter bundle '{name}'. "
+                "Add its module and register it in WavePatchTransformer.__init__."
+            )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def register_aux_filter_bundle(self, name: str, bundle: nn.Module):
+        key = str(name).strip().lower()
+        if not key:
+            raise ValueError("Aux filter bundle name must be non-empty.")
+        self.aux_filter_bundles[key] = bundle
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        return_aux: bool = False,
+        filter_inputs: Optional[Dict[str, Dict[str, Any]]] = None,
+    ):
         if x.ndim != 2:
             raise ValueError("Expected [B, T] waveform input")
         bsz, t = x.shape
@@ -496,11 +1123,817 @@ class WavePatchTransformer(nn.Module):
             else:
                 x = F.pad(x, (0, self.chunk_samples - t), value=0.0)
 
-        patches = x.view(bsz, self.num_patches, self.patch_size)
+        filter_inputs = filter_inputs if isinstance(filter_inputs, dict) else {}
+        bundle_aux: Dict[str, Dict[str, Any]] = {}
+
+        def _align_token_residual(delta: Any, ref_tokens: torch.Tensor) -> Optional[torch.Tensor]:
+            if not torch.is_tensor(delta):
+                return None
+            d = delta
+            if int(d.ndim) == 2:
+                if int(d.shape[0]) != int(ref_tokens.shape[0]) or int(d.shape[1]) != int(ref_tokens.shape[2]):
+                    return None
+                d = d.unsqueeze(1).expand(int(ref_tokens.shape[0]), int(ref_tokens.shape[1]), int(ref_tokens.shape[2]))
+            elif int(d.ndim) == 3:
+                if int(d.shape[0]) != int(ref_tokens.shape[0]) or int(d.shape[2]) != int(ref_tokens.shape[2]):
+                    return None
+                if int(d.shape[1]) == 1 and int(ref_tokens.shape[1]) > 1:
+                    d = d.expand(int(ref_tokens.shape[0]), int(ref_tokens.shape[1]), int(ref_tokens.shape[2]))
+                elif int(d.shape[1]) != int(ref_tokens.shape[1]):
+                    return None
+            else:
+                return None
+            return d.to(device=ref_tokens.device, dtype=ref_tokens.dtype)
+
+        patches_seed = x.reshape(bsz, self.num_patches, self.patch_size)
+        h_seed = self.patch_in(patches_seed) + self.pos
+        pre_token_delta = torch.zeros_like(h_seed)
+        x_in = x
+        for name, bundle in self.aux_filter_bundles.items():
+            task_in = filter_inputs.get(str(name), {})
+            x_in, pre_aux = bundle.apply_prefilter(x_in=x_in, pre_tokens=h_seed, task_inputs=task_in)
+            token_delta = _align_token_residual(pre_aux.get("token_residual", None), h_seed)
+            if torch.is_tensor(token_delta):
+                pre_token_delta = pre_token_delta + token_delta
+                pre_aux["token_residual_applied"] = token_delta
+            bundle_aux[str(name)] = {"pre": pre_aux}
+
+        patches = x_in.reshape(bsz, self.num_patches, self.patch_size)
         h = self.patch_in(patches) + self.pos
+        h = h + pre_token_delta
         h = self.encoder(h)
-        delta = torch.tanh(self.patch_out(h)).view(bsz, self.chunk_samples) * self.max_delta
-        return torch.clamp(x + delta, -1.0, 1.0)
+        h_out = h
+        for name, bundle in self.aux_filter_bundles.items():
+            task_in = filter_inputs.get(str(name), {})
+            post_aux = bundle.observe_post(enc_tokens=h_out, task_inputs=task_in)
+            token_delta = _align_token_residual(post_aux.get("token_residual", None), h_out)
+            if torch.is_tensor(token_delta):
+                h_out = h_out + token_delta
+                post_aux["token_residual_applied"] = token_delta
+            row = bundle_aux.setdefault(str(name), {})
+            row["post"] = post_aux
+            if hasattr(bundle, "compute_losses"):
+                try:
+                    row["losses"] = bundle.compute_losses(
+                        pre_aux=dict(row.get("pre", {})),
+                        post_aux=dict(post_aux),
+                        task_inputs=task_in,
+                    )
+                except Exception:
+                    row["losses"] = {}
+        delta = torch.tanh(self.patch_out(h_out)).reshape(bsz, self.chunk_samples) * self.max_delta
+        out = torch.clamp(x_in + delta, -1.0, 1.0)
+        if not bool(return_aux):
+            return out
+        aux: Dict[str, Any] = {"filter_bundles": bundle_aux}
+        # Back-compat: expose deskew fields at top-level if present.
+        deskew_row = bundle_aux.get("deskew", {})
+        pre_row = deskew_row.get("pre", {}) if isinstance(deskew_row, dict) else {}
+        post_row = deskew_row.get("post", {}) if isinstance(deskew_row, dict) else {}
+        if isinstance(pre_row, dict):
+            aux["prefilter_skew"] = pre_row.get("pred_skew", None)
+            aux["prefilter_confidence"] = pre_row.get("confidence", None)
+            aux["prefilter_applied_skew"] = pre_row.get("applied_skew", None)
+        if isinstance(post_row, dict):
+            aux["post_residual_skew"] = post_row.get("residual_skew", None)
+        return out, aux
+
+
+class ConditionalBitPlaneGenerator(nn.Module):
+    def __init__(
+        self,
+        num_classes: int,
+        image_hw: Tuple[int, int],
+        z_dim: int = 128,
+        base_ch: int = 64,
+        depth: int = 4,
+        min_ch: int = 12,
+    ):
+        super().__init__()
+        self.num_classes = int(num_classes)
+        self.z_dim = int(z_dim)
+        self.image_h = max(8, int(image_hw[0]))
+        self.image_w = max(8, int(image_hw[1]))
+        self.depth = max(2, int(depth))
+        self.min_ch = max(8, int(min_ch))
+        # Keep a high-capacity latent image seed for 256x256 synthesis.
+        self.seed_h = min(int(self.image_h), 32)
+        self.seed_w = min(int(self.image_w), 32)
+        c0 = max(32, int(base_ch))
+        channels: List[int] = []
+        c = int(c0)
+        for _ in range(self.depth):
+            channels.append(int(c))
+            c = max(int(self.min_ch), int(c // 2))
+        cond_expand = max(1024, int(self.num_classes) * 4, int(self.z_dim) * 4)
+        cond_latent = max(256, int(self.num_classes), int(self.z_dim) * 2)
+        self.cond_encoder = nn.Sequential(
+            nn.Linear(self.num_classes, cond_expand),
+            nn.GELU(),
+            nn.Linear(cond_expand, cond_latent),
+            nn.GELU(),
+        )
+        self.fc = nn.Sequential(
+            nn.Linear(self.z_dim + cond_latent, c0 * self.seed_h * self.seed_w),
+            nn.GELU(),
+        )
+        blocks = []
+        prev_c = int(channels[0])
+        for i in range(self.depth):
+            out_c = int(channels[i])
+            blocks.append(
+                nn.Sequential(
+                    nn.Conv2d(prev_c, out_c, kernel_size=3, padding=1),
+                    nn.GELU(),
+                    nn.Conv2d(out_c, out_c, kernel_size=3, padding=1),
+                    nn.GELU(),
+                )
+            )
+            prev_c = out_c
+        self.up_blocks = nn.ModuleList(blocks)
+        self.out_head = nn.Sequential(
+            nn.Conv2d(int(channels[-1]), int(channels[-1]), kernel_size=3, padding=1),
+            nn.GELU(),
+            nn.Conv2d(int(channels[-1]), 3, kernel_size=1),
+        )
+
+    def _decode_sizes(self) -> List[Tuple[int, int]]:
+        # Grow spatial map aggressively, then refine at target.
+        sizes: List[Tuple[int, int]] = []
+        cur_h = int(self.seed_h)
+        cur_w = int(self.seed_w)
+        for i in range(self.depth):
+            if i < (self.depth - 1):
+                cur_h = min(int(self.image_h), int(cur_h) * 2)
+                cur_w = min(int(self.image_w), int(cur_w) * 2)
+            else:
+                cur_h = int(self.image_h)
+                cur_w = int(self.image_w)
+            sizes.append((int(cur_h), int(cur_w)))
+        return sizes
+
+    def forward(self, z: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
+        if z.ndim != 2:
+            raise ValueError("Generator expects z shape [B, Z].")
+        if cond.ndim != 2:
+            raise ValueError("Generator expects cond shape [B, C].")
+        if int(z.shape[0]) != int(cond.shape[0]):
+            raise ValueError("Generator batch mismatch between z and cond.")
+        if int(cond.shape[1]) != int(self.num_classes):
+            raise ValueError(
+                f"Generator condition width mismatch: got={int(cond.shape[1])} expected={int(self.num_classes)}"
+            )
+        cond_latent = self.cond_encoder(cond.to(dtype=z.dtype))
+        x = torch.cat([z, cond_latent], dim=1)
+        h = self.fc(x)
+        h = h.view(int(z.shape[0]), -1, self.seed_h, self.seed_w)
+        for block, (th, tw) in zip(self.up_blocks, self._decode_sizes()):
+            if int(h.shape[2]) != int(th) or int(h.shape[3]) != int(tw):
+                h = F.interpolate(h, size=(int(th), int(tw)), mode="nearest")
+            h = block(h)
+        out = self.out_head(h)
+        if int(out.shape[2]) != int(self.image_h) or int(out.shape[3]) != int(self.image_w):
+            out = F.interpolate(out, size=(int(self.image_h), int(self.image_w)), mode="nearest")
+        return torch.sigmoid(out)
+
+
+class ConditionalBitPlaneDiscriminator(nn.Module):
+    def __init__(self, num_classes: int, base_ch: int = 48, depth: int = 3, max_ch: int = 512):
+        super().__init__()
+        self.num_classes = int(num_classes)
+        c0 = max(16, int(base_ch))
+        n = max(2, int(depth))
+        cmax = max(c0, int(max_ch))
+        layers: List[nn.Module] = []
+        in_c = 3
+        out_c = c0
+        for _ in range(n):
+            out_c = min(int(cmax), int(out_c))
+            layers.append(nn.Conv2d(in_c, out_c, kernel_size=4, stride=2, padding=1))
+            layers.append(nn.LeakyReLU(0.2, inplace=True))
+            in_c = out_c
+            out_c = min(int(cmax), int(out_c * 2))
+        layers.append(nn.AdaptiveAvgPool2d((1, 1)))
+        layers.append(nn.Flatten())
+        self.features = nn.Sequential(*layers)
+        feat_dim = int(in_c)
+        cond_expand = max(1024, int(self.num_classes) * 4, int(feat_dim) * 4)
+        self.cond_encoder = nn.Sequential(
+            nn.Linear(self.num_classes, cond_expand),
+            nn.GELU(),
+            nn.Linear(cond_expand, feat_dim),
+            nn.GELU(),
+        )
+        self.head = nn.Linear(feat_dim * 2, 1)
+
+    def forward(self, x: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
+        if x.ndim != 4:
+            raise ValueError("Discriminator expects x shape [B, 3, H, W].")
+        if cond.ndim != 2:
+            raise ValueError("Discriminator expects cond shape [B, C].")
+        if int(cond.shape[1]) != int(self.num_classes):
+            raise ValueError(
+                f"Discriminator condition width mismatch: got={int(cond.shape[1])} expected={int(self.num_classes)}"
+            )
+        feat = self.features(x)
+        cfeat = self.cond_encoder(cond.to(dtype=feat.dtype))
+        return self.head(torch.cat([feat, cfeat], dim=1)).squeeze(1)
+
+
+def _payload_condition_bank(
+    payload_targets: Sequence[Any],
+    num_classes: int,
+) -> torch.Tensor:
+    n = int(len(payload_targets))
+    c = max(1, int(num_classes))
+    if n <= 0:
+        return torch.zeros((0, c), dtype=torch.float32)
+
+    rows = np.zeros((n, c), dtype=np.float32)
+    for i in range(n):
+        x = payload_targets[i]
+        if isinstance(x, torch.Tensor):
+            arr = x.detach().cpu().numpy().astype(np.float32, copy=False).reshape(-1)
+        else:
+            arr = np.asarray(x, dtype=np.float32).reshape(-1)
+        if int(arr.size) <= 0:
+            raise RuntimeError(f"Semantic condition row {i} is empty.")
+        if int(arr.size) != int(c):
+            raise RuntimeError(
+                f"Semantic condition width mismatch at row {i}: got={int(arr.size)} expected={int(c)}"
+            )
+        rows[i, :] = arr
+    return torch.from_numpy(rows)
+
+
+def _align_probs_with_condition(probs: torch.Tensor, cond: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    if probs.ndim != 2:
+        raise ValueError(f"Expected probs [B,C], got shape={tuple(probs.shape)}")
+    if cond.ndim != 2:
+        raise ValueError(f"Expected cond [B,C], got shape={tuple(cond.shape)}")
+    if int(probs.shape[0]) != int(cond.shape[0]):
+        raise ValueError(
+            f"Batch mismatch between probs and cond: probs={tuple(probs.shape)} cond={tuple(cond.shape)}"
+        )
+    if int(probs.shape[1]) != int(cond.shape[1]):
+        raise ValueError(
+            f"Class-width mismatch between probs and cond: probs={tuple(probs.shape)} cond={tuple(cond.shape)}"
+        )
+    return probs, cond
+
+
+@torch.no_grad()
+def evaluate_conditional_generator(
+    generator: nn.Module,
+    classifier: nn.Module,
+    payload_conditions: Sequence[Any],
+    num_classes: int,
+    image_hw: Tuple[int, int],
+    z_dim: int,
+    device: torch.device,
+    steps: int = 16,
+    batch_size: int = 64,
+    amp: bool = False,
+    amp_dtype: str = "float16",
+    channels_last: bool = False,
+    fake_class_idx: int = -1,
+    discriminator: Optional[nn.Module] = None,
+    seed: int = 0,
+) -> Dict[str, float]:
+    if len(payload_conditions) <= 0:
+        return {
+            "target_prob": 0.0,
+            "mean_prob": 0.0,
+            "coverage": 0.0,
+            "fake_prob": 0.0,
+            "disc_pass_rate": 0.0,
+        }
+    cond_bank_cpu = _payload_condition_bank(payload_targets=payload_conditions, num_classes=int(num_classes))
+    if int(cond_bank_cpu.shape[0]) <= 0:
+        return {
+            "target_prob": 0.0,
+            "mean_prob": 0.0,
+            "coverage": 0.0,
+            "fake_prob": 0.0,
+            "disc_pass_rate": 0.0,
+        }
+    cond_bank = cond_bank_cpu.to(device=device, dtype=torch.float32)
+    rng = np.random.default_rng(seed)
+    use_amp = _should_use_amp(device=device, amp=amp)
+    amp_dtype_t = _resolve_amp_dtype(amp_dtype) if use_amp else torch.float16
+    generator.eval()
+    classifier.eval()
+    disc_was_training = False
+    if discriminator is not None:
+        discriminator = discriminator.to(device)
+        disc_was_training = bool(discriminator.training)
+        discriminator.eval()
+    sum_target = torch.zeros((), device=device, dtype=torch.float32)
+    sum_mean = torch.zeros((), device=device, dtype=torch.float32)
+    sum_cov = torch.zeros((), device=device, dtype=torch.float32)
+    sum_fake = torch.zeros((), device=device, dtype=torch.float32)
+    sum_disc_pass = torch.zeros((), device=device, dtype=torch.float32)
+    n = 0
+    for _ in range(max(1, int(steps))):
+        idx = rng.integers(0, len(payload_conditions), size=max(1, int(batch_size)))
+        idx_t = torch.as_tensor(idx, device=device, dtype=torch.long)
+        cond = cond_bank.index_select(0, idx_t).to(device=device, dtype=torch.float32)
+        z = torch.randn((int(cond.shape[0]), int(z_dim)), device=device)
+        with _autocast_context(device=device, use_amp=use_amp, amp_dtype_t=amp_dtype_t):
+            fake = generator(z, cond).to(torch.float32)
+            if channels_last:
+                fake = fake.contiguous(memory_format=torch.channels_last)
+            logits = classifier(fake)
+            probs = torch.sigmoid(logits).to(torch.float32)
+        probs_target, cond_target = _align_probs_with_condition(probs=probs, cond=cond)
+        target_count = torch.clamp(cond_target.sum(dim=1), min=1.0)
+        target_prob = ((probs_target * cond_target).sum(dim=1) / target_count).mean()
+        mean_prob = probs_target.mean()
+        class_mean = probs_target.mean(dim=0)
+        cov = (class_mean > 0.5).to(torch.float32).mean()
+        if int(fake_class_idx) >= 0 and int(fake_class_idx) < int(probs.shape[1]):
+            fake_prob = probs[:, int(fake_class_idx)].mean()
+        else:
+            fake_prob = torch.zeros((), device=device, dtype=torch.float32)
+        if discriminator is not None:
+            d_fake = discriminator(fake, cond).to(torch.float32)
+            disc_pass = (d_fake > 0.0).to(torch.float32).mean()
+        else:
+            disc_pass = torch.zeros((), device=device, dtype=torch.float32)
+        sum_target += target_prob
+        sum_mean += mean_prob
+        sum_cov += cov
+        sum_fake += fake_prob
+        sum_disc_pass += disc_pass
+        n += 1
+    d = float(max(1, n))
+    out = {
+        "target_prob": float((sum_target / d).item()),
+        "mean_prob": float((sum_mean / d).item()),
+        "coverage": float((sum_cov / d).item()),
+        "fake_prob": float((sum_fake / d).item()),
+        "disc_pass_rate": float((sum_disc_pass / d).item()),
+    }
+    if discriminator is not None:
+        discriminator.train(disc_was_training)
+    return out
+
+
+def train_conditional_generator_discriminator(
+    generator: nn.Module,
+    discriminator: nn.Module,
+    classifier: nn.Module,
+    payload_images: Sequence[np.ndarray],
+    payload_conditions: Sequence[Any],
+    num_classes: int,
+    image_hw: Tuple[int, int],
+    device: torch.device,
+    epochs: int = 1,
+    steps_per_epoch: int = 120,
+    batch_size: int = 64,
+    disc_steps_per_gen_step: int = 1,
+    z_dim: int = 128,
+    lr_g: float = 2e-4,
+    lr_d: float = 2e-4,
+    w_adv: float = 0.50,
+    w_cls: float = 1.50,
+    w_wave: float = 0.0,
+    wave_margin: float = 0.02,
+    wave_denoise_weight: float = 0.25,
+    wave_carrier_blend: float = 0.35,
+    wave_strength: float = 0.35,
+    wave_stride_skew_max: float = 0.18,
+    wave_degrade_mode: str = "blur_stride",
+    transformer_for_wave: Optional[nn.Module] = None,
+    wave_cfg: Optional[RenderConfig] = None,
+    wave_sample_bits: int = 16,
+    wave_chunk_samples: int = 32768,
+    wave_reference_streams: Optional[Sequence[np.ndarray]] = None,
+    log_every_steps: int = 0,
+    step_preview_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+    stop_requested: Optional[Callable[[], bool]] = None,
+    amp: bool = False,
+    amp_dtype: str = "float16",
+    channels_last: bool = False,
+    grad_accum_steps: int = 1,
+    classifier_forward_batch_cap: int = 0,
+    seed: int = 0,
+) -> Tuple[nn.Module, nn.Module, List[Dict[str, float]]]:
+    if len(payload_images) <= 0 or len(payload_conditions) <= 0:
+        raise RuntimeError("Generator/discriminator training requires non-empty payload bank.")
+    if len(payload_images) != len(payload_conditions):
+        raise RuntimeError(
+            f"Payload image/condition mismatch: images={len(payload_images)} conditions={len(payload_conditions)}"
+        )
+
+    use_amp = _should_use_amp(device=device, amp=amp)
+    amp_dtype_t = _resolve_amp_dtype(amp_dtype) if use_amp else torch.float16
+    use_scaler = bool(use_amp and amp_dtype_t == torch.float16)
+    scaler_g = _make_grad_scaler(enabled=use_scaler)
+    scaler_d = _make_grad_scaler(enabled=use_scaler)
+    generator = generator.to(device)
+    discriminator = discriminator.to(device)
+    classifier = classifier.to(device)
+    use_wave_loss = (
+        (float(w_wave) > 0.0)
+        and (transformer_for_wave is not None)
+        and (wave_cfg is not None)
+        and bool(getattr(wave_cfg, "bitmask_enable", False))
+    )
+    wave_shape_info = None
+    wave_canvas_hw = (0, 0)
+    wave_empty_fill = 0.0
+    wave_chunk_samples = max(1, int(wave_chunk_samples))
+    wave_index = None
+    ref_sampler = None
+    transformer_was_train = False
+    transformer_requires_grad: Optional[List[bool]] = None
+    if use_wave_loss:
+        transformer_for_wave = transformer_for_wave.to(device)
+        transformer_was_train = bool(transformer_for_wave.training)
+        transformer_requires_grad = [bool(p.requires_grad) for p in transformer_for_wave.parameters()]
+        transformer_for_wave.eval()
+        for p in transformer_for_wave.parameters():
+            p.requires_grad_(False)
+        wave_shape_info = _bitwindow_shape_for_wave_len(wave_len=wave_chunk_samples, cfg=wave_cfg)
+        wave_canvas_hw = (int(wave_shape_info["height"]), int(wave_shape_info["width"]))
+        wave_empty_fill = float(int(wave_cfg.empty_fill) & 0xFF) / 255.0
+        downsample = max(1, int(wave_shape_info["downsample"]))
+        base_len = int(wave_shape_info["base_len"])
+        idx = (torch.arange(base_len, device=device, dtype=torch.long) * int(downsample)).to(torch.long)
+        idx = idx[idx < int(wave_chunk_samples)]
+        if int(idx.numel()) <= 0:
+            use_wave_loss = False
+        else:
+            wave_index = idx
+            if wave_reference_streams is not None and len(wave_reference_streams) > 0:
+                ref_sampler = _build_packed_sampler(
+                    streams=wave_reference_streams,
+                    labels=None,
+                    chunk_samples=wave_chunk_samples,
+                    seed=int(seed) + 971,
+                    device=device,
+                    cache_on_device=False,
+                    pin_memory=False,
+                )
+    if channels_last:
+        classifier = classifier.to(memory_format=torch.channels_last)
+    classifier.eval()
+    for p in classifier.parameters():
+        p.requires_grad_(False)
+
+    g_opt = torch.optim.AdamW(generator.parameters(), lr=float(lr_g), betas=(0.5, 0.999), weight_decay=1e-4)
+    d_opt = torch.optim.AdamW(discriminator.parameters(), lr=float(lr_d), betas=(0.5, 0.999), weight_decay=1e-4)
+    rng = np.random.default_rng(seed)
+    disc_steps_per_gen_step = max(1, int(disc_steps_per_gen_step))
+    grad_accum_steps = max(1, int(grad_accum_steps))
+    classifier_forward_batch_cap = max(0, int(classifier_forward_batch_cap))
+
+    def _chunk_ranges(total: int, chunks: int) -> List[Tuple[int, int]]:
+        n = max(1, int(total))
+        c = max(1, min(int(chunks), n))
+        bs = int(math.ceil(float(n) / float(c)))
+        out: List[Tuple[int, int]] = []
+        for st in range(0, n, bs):
+            ed = min(n, st + bs)
+            if ed > st:
+                out.append((int(st), int(ed)))
+        return out
+
+    def _classifier_forward_chunked(x: torch.Tensor) -> torch.Tensor:
+        cap = int(classifier_forward_batch_cap)
+        if cap <= 0 or int(x.shape[0]) <= cap:
+            return classifier(x)
+        parts: List[torch.Tensor] = []
+        for st in range(0, int(x.shape[0]), cap):
+            parts.append(classifier(x[st : st + cap]))
+        return torch.cat(parts, dim=0)
+
+    bank_x = torch.from_numpy(np.stack(payload_images, axis=0).astype(np.float32))
+    bank_cond = _payload_condition_bank(payload_targets=payload_conditions, num_classes=int(num_classes))
+    if int(bank_cond.shape[0]) != int(bank_x.shape[0]):
+        raise RuntimeError(
+            f"Payload condition/image mismatch: cond={int(bank_cond.shape[0])} images={int(bank_x.shape[0])}"
+        )
+    history: List[Dict[str, float]] = []
+
+    stop_now = False
+    for epoch in range(1, max(1, int(epochs)) + 1):
+        generator.train()
+        discriminator.train()
+        run_d = 0.0
+        run_g = 0.0
+        run_tgt = 0.0
+        run_adv = 0.0
+        run_wave = 0.0
+        run_disc_fake_pass = 0.0
+        run_disc_fake_fail = 0.0
+        n_steps = max(1, int(steps_per_epoch))
+        steps_done = 0
+        for step_idx in range(1, n_steps + 1):
+            if stop_requested is not None:
+                try:
+                    if bool(stop_requested()):
+                        stop_now = True
+                        break
+                except Exception:
+                    pass
+            idx = rng.integers(0, int(bank_x.shape[0]), size=max(1, int(batch_size)))
+            real = bank_x[idx].to(device=device, non_blocking=True)
+            cond = bank_cond[idx].to(device=device, non_blocking=True, dtype=torch.float32)
+            if channels_last:
+                real = real.contiguous(memory_format=torch.channels_last)
+            d_loss_accum = 0.0
+            for d_sub in range(disc_steps_per_gen_step):
+                if d_sub == 0:
+                    real_d = real
+                    cond_d = cond
+                else:
+                    idx_d = rng.integers(0, int(bank_x.shape[0]), size=max(1, int(batch_size)))
+                    real_d = bank_x[idx_d].to(device=device, non_blocking=True)
+                    cond_d = bank_cond[idx_d].to(device=device, non_blocking=True, dtype=torch.float32)
+                    if channels_last:
+                        real_d = real_d.contiguous(memory_format=torch.channels_last)
+
+                d_opt.zero_grad(set_to_none=True)
+                d_sub_loss = 0.0
+                d_ranges = _chunk_ranges(total=int(real_d.shape[0]), chunks=grad_accum_steps)
+                for st, ed in d_ranges:
+                    real_m = real_d[st:ed]
+                    cond_m = cond_d[st:ed]
+                    z = torch.randn((int(real_m.shape[0]), int(z_dim)), device=device)
+                    with _autocast_context(device=device, use_amp=use_amp, amp_dtype_t=amp_dtype_t):
+                        fake = generator(z, cond_m)
+                        if channels_last:
+                            fake = fake.contiguous(memory_format=torch.channels_last)
+                        d_real = discriminator(real_m, cond_m)
+                        d_fake = discriminator(fake.detach(), cond_m)
+                        d_loss = 0.5 * (
+                            F.softplus(-d_real).mean()
+                            + F.softplus(d_fake).mean()
+                        )
+                    d_loss_back = d_loss / float(max(1, len(d_ranges)))
+                    if use_scaler:
+                        scaler_d.scale(d_loss_back).backward()
+                    else:
+                        d_loss_back.backward()
+                    d_sub_loss += float(d_loss.detach().item()) * (float(ed - st) / float(max(1, int(real_d.shape[0]))))
+                if use_scaler:
+                    scaler_d.step(d_opt)
+                    scaler_d.update()
+                else:
+                    d_opt.step()
+                d_loss_accum += float(d_sub_loss)
+            d_loss_step = float(d_loss_accum / float(max(1, disc_steps_per_gen_step)))
+
+            g_opt.zero_grad(set_to_none=True)
+            g_loss_step = 0.0
+            adv_loss_step = 0.0
+            target_prob_step = 0.0
+            wave_loss_step = 0.0
+            disc_fake_pass_step = 0.0
+            preview_payload = None
+            g_ranges = _chunk_ranges(total=int(real.shape[0]), chunks=grad_accum_steps)
+            for st, ed in g_ranges:
+                cond_g = cond[st:ed]
+                real_g = real[st:ed]
+                z2 = torch.randn((int(real_g.shape[0]), int(z_dim)), device=device)
+                with _autocast_context(device=device, use_amp=use_amp, amp_dtype_t=amp_dtype_t):
+                    fake2 = generator(z2, cond_g)
+                    if channels_last:
+                        fake2 = fake2.contiguous(memory_format=torch.channels_last)
+                    d_fake2 = discriminator(fake2, cond_g)
+                    adv_loss = F.softplus(-d_fake2).mean()
+                    logits = _classifier_forward_chunked(fake2)
+                    probs = torch.sigmoid(logits).to(torch.float32)
+                    probs_target, cond_target = _align_probs_with_condition(probs=probs, cond=cond_g)
+                    target_count = torch.clamp(cond_target.sum(dim=1), min=1.0)
+                    target_prob = (probs_target * cond_target).sum(dim=1) / target_count
+                    cls_loss = (1.0 - target_prob).mean()
+                    g_loss = (float(w_adv) * adv_loss) + (float(w_cls) * cls_loss)
+                    wave_loss = torch.zeros((), device=device, dtype=torch.float32)
+                    if use_wave_loss and wave_shape_info is not None and wave_index is not None:
+                        # Wave-coupled supervision is expensive at high resolutions.
+                        # Cap coupling batch size to keep memory bounded on 12GB GPUs.
+                        wave_cap = min(int(fake2.shape[0]), 8)
+                        if wave_cap < int(fake2.shape[0]):
+                            sel = torch.randperm(int(fake2.shape[0]), device=device)[: int(wave_cap)]
+                            fake2_wave = fake2.index_select(0, sel)
+                            cond_wave = cond_g.index_select(0, sel)
+                            target_count_wave = target_count.index_select(0, sel)
+                        else:
+                            fake2_wave = fake2
+                            cond_wave = cond_g
+                            target_count_wave = target_count
+
+                        fake_canvas = fake2_wave
+                        if int(fake_canvas.shape[2]) != int(wave_canvas_hw[0]) or int(fake_canvas.shape[3]) != int(wave_canvas_hw[1]):
+                            fake_canvas = F.interpolate(fake_canvas, size=wave_canvas_hw, mode="nearest")
+                        base_seq = _bitwindow_canvas_to_base_sequence_batch(
+                            canvas=fake_canvas.to(torch.float32),
+                            shape_info=wave_shape_info,
+                            empty_fill=float(wave_empty_fill),
+                        )
+                        n_use = min(int(wave_index.numel()), int(base_seq.shape[1]))
+                        if n_use > 0:
+                            bsz = int(fake2_wave.shape[0])
+                            idx_use = wave_index[:n_use]
+                            idx_valid = (idx_use >= 0) & (idx_use < int(wave_chunk_samples))
+                            if bool(torch.any(idx_valid)):
+                                idx_use = idx_use[idx_valid]
+                            else:
+                                idx_use = None
+                            n_eff = 0 if idx_use is None else min(int(idx_use.numel()), int(base_seq.shape[1]))
+                            if n_eff <= 0:
+                                idx_use = None
+                            if idx_use is not None:
+                                seq01 = torch.clamp(base_seq[:, :n_eff], 0.0, 1.0).to(dtype=fake2.dtype)
+                                payload_wave = torch.zeros((bsz, int(wave_chunk_samples)), device=device, dtype=fake2.dtype)
+                                src = ((seq01 * 2.0) - 1.0).to(dtype=fake2.dtype)
+                                payload_wave.scatter_(1, idx_use.unsqueeze(0).expand(bsz, -1), src)
+                            else:
+                                payload_wave = torch.zeros((bsz, int(wave_chunk_samples)), device=device, dtype=fake2.dtype)
+                            if ref_sampler is not None:
+                                carrier_wave, _ = ref_sampler.sample(batch_size=bsz)
+                                if carrier_wave.device != device:
+                                    carrier_wave = carrier_wave.to(device, non_blocking=True)
+                                carrier_wave = carrier_wave.to(dtype=fake2.dtype)
+                            elif wave_reference_streams is not None and len(wave_reference_streams) > 0:
+                                carrier_np = _sample_wave_batch_unlabeled(
+                                    streams=wave_reference_streams,
+                                    batch_size=bsz,
+                                    chunk_samples=int(wave_chunk_samples),
+                                    rng=rng,
+                                )
+                                carrier_wave = _to_device_wave_batch(
+                                    carrier_np,
+                                    device=device,
+                                    pin_memory=False,
+                                ).to(dtype=fake2.dtype)
+                            else:
+                                carrier_wave = torch.zeros_like(payload_wave)
+                            blend = float(max(0.0, min(1.0, float(wave_carrier_blend))))
+                            clean_wave = torch.clamp(
+                                ((1.0 - blend) * carrier_wave) + (blend * payload_wave),
+                                -1.0,
+                                1.0,
+                            )
+                            s_vec = torch.full((bsz, 1), float(max(0.0, min(1.0, float(wave_strength)))), device=device, dtype=fake2.dtype)
+                            dirty_wave = _degrade_wave_batch(
+                                x_clean=clean_wave,
+                                strength=s_vec,
+                                noise_std_min=0.0,
+                                noise_std_max=0.0,
+                                dropout_max=0.0,
+                                quant_bits_min=16,
+                                quant_bits_max=16,
+                                mode=str(wave_degrade_mode),
+                                stride_skew_max=float(max(0.0, float(wave_stride_skew_max))),
+                            )
+                            wave_out = transformer_for_wave(dirty_wave)
+                            with torch.no_grad():
+                                img_wave_before = render_mono_wave_to_tensor(
+                                    clean_wave.to(torch.float32),
+                                    cfg=wave_cfg,
+                                    image_hw=image_hw,
+                                    sample_bits=int(wave_sample_bits),
+                                )
+                            img_wave_after = render_mono_wave_to_tensor(
+                                wave_out.to(torch.float32),
+                                cfg=wave_cfg,
+                                image_hw=image_hw,
+                                sample_bits=int(wave_sample_bits),
+                            )
+                            if channels_last:
+                                img_wave_before = img_wave_before.contiguous(memory_format=torch.channels_last)
+                                img_wave_after = img_wave_after.contiguous(memory_format=torch.channels_last)
+                            with torch.no_grad():
+                                logits_wave_before = _classifier_forward_chunked(img_wave_before)
+                            logits_wave_after = _classifier_forward_chunked(img_wave_after)
+                            probs_wave_before = torch.sigmoid(logits_wave_before).to(torch.float32)
+                            probs_wave_after = torch.sigmoid(logits_wave_after).to(torch.float32)
+                            probs_wave_before_t, cond_wave_t = _align_probs_with_condition(
+                                probs=probs_wave_before,
+                                cond=cond_wave,
+                            )
+                            probs_wave_after_t, _ = _align_probs_with_condition(
+                                probs=probs_wave_after,
+                                cond=cond_wave_t,
+                            )
+                            target_count_wave_t = torch.clamp(cond_wave_t.sum(dim=1), min=1.0)
+                            target_prob_before = (probs_wave_before_t * cond_wave_t).sum(dim=1) / target_count_wave_t
+                            target_prob_after = (probs_wave_after_t * cond_wave_t).sum(dim=1) / target_count_wave_t
+                            score_gap = F.relu((target_prob_before + float(max(0.0, float(wave_margin)))) - target_prob_after).mean()
+                            denoise_term = F.l1_loss(wave_out.to(torch.float32), clean_wave.to(torch.float32))
+                            wave_loss = score_gap + (float(max(0.0, float(wave_denoise_weight))) * denoise_term)
+                            g_loss = g_loss + (float(w_wave) * wave_loss)
+                g_loss_back = g_loss / float(max(1, len(g_ranges)))
+                if use_scaler:
+                    scaler_g.scale(g_loss_back).backward()
+                else:
+                    g_loss_back.backward()
+
+                w = float(ed - st) / float(max(1, int(real.shape[0])))
+                g_loss_step += float(g_loss.detach().item()) * w
+                adv_loss_step += float(adv_loss.detach().item()) * w
+                target_prob_step += float(target_prob.detach().mean().item()) * w
+                wave_loss_step += float(wave_loss.detach().item()) * w
+                disc_fake_pass = float((d_fake2.detach().to(torch.float32) > 0.0).to(torch.float32).mean().item())
+                disc_fake_pass_step += float(disc_fake_pass) * w
+                if preview_payload is None:
+                    preview_payload = {
+                        "target_img": real_g[0].detach().to(torch.float32),
+                        "fake_img": fake2[0].detach().to(torch.float32),
+                        "probs": probs[0].detach().to(torch.float32),
+                        "target_condition": cond_g[0].detach().to(torch.float32).cpu(),
+                        "target_prob": float(target_prob[0].detach().to(torch.float32).item()),
+                    }
+            if use_scaler:
+                scaler_g.step(g_opt)
+                scaler_g.update()
+            else:
+                g_opt.step()
+
+            run_d += float(d_loss_step)
+            run_g += float(g_loss_step)
+            run_adv += float(adv_loss_step)
+            run_tgt += float(target_prob_step)
+            run_wave += float(wave_loss_step)
+            run_disc_fake_pass += float(disc_fake_pass_step)
+            run_disc_fake_fail += (1.0 - float(disc_fake_pass_step))
+            steps_done = int(step_idx)
+
+            if step_preview_callback is not None:
+                emit = False
+                if int(log_every_steps) > 0:
+                    emit = ((int(step_idx) % int(log_every_steps) == 0) or (int(step_idx) == int(n_steps)))
+                else:
+                    emit = (int(step_idx) == int(n_steps))
+                if emit and isinstance(preview_payload, dict):
+                    try:
+                        step_preview_callback(
+                            {
+                                "epoch": int(epoch),
+                                "step": int(step_idx),
+                                "steps_per_epoch": int(n_steps),
+                                "target_img": preview_payload["target_img"],
+                                "fake_img": preview_payload["fake_img"],
+                                "probs": preview_payload["probs"],
+                                "target_condition": preview_payload["target_condition"],
+                                "target_prob": float(preview_payload["target_prob"]),
+                                "g_loss": float(g_loss_step),
+                                "d_loss": float(d_loss_step),
+                                "adv_loss": float(adv_loss_step),
+                                "wave_loss": float(wave_loss_step),
+                                "target_prob_avg": float(run_tgt / float(max(1, int(step_idx)))),
+                                "g_loss_avg": float(run_g / float(max(1, int(step_idx)))),
+                                "d_loss_avg": float(run_d / float(max(1, int(step_idx)))),
+                            }
+                        )
+                    except Exception:
+                        pass
+
+            if int(log_every_steps) > 0 and ((int(step_idx) % int(log_every_steps) == 0) or (int(step_idx) == int(n_steps))):
+                _g = float(run_g / float(step_idx))
+                _d = float(run_d / float(step_idx))
+                _a = float(run_adv / float(step_idx))
+                _t = float(run_tgt / float(step_idx))
+                _w = float(run_wave / float(step_idx))
+                _dp = float(run_disc_fake_pass / float(step_idx))
+                _df = float(run_disc_fake_fail / float(step_idx))
+                print(
+                    f"[generator-train] epoch={epoch}/{max(1, int(epochs))} "
+                    f"step={step_idx}/{n_steps} g_loss={_g:.4f} d_loss={_d:.4f} "
+                    f"adv={_a:.4f} target_prob={_t:.4f} wave={_w:.4f} "
+                    f"disc_fake_pass={_dp:.4f} disc_fake_fail={_df:.4f} "
+                    f"d_steps={int(disc_steps_per_gen_step)}",
+                    flush=True,
+                )
+
+        if int(steps_done) <= 0:
+            break
+        denom = float(max(1, int(steps_done)))
+        history.append(
+            {
+                "epoch": float(epoch),
+                "d_loss": float(run_d / denom),
+                "g_loss": float(run_g / denom),
+                "g_adv_loss": float(run_adv / denom),
+                "g_target_prob": float(run_tgt / denom),
+                "g_wave_loss": float(run_wave / denom),
+                "disc_fake_pass_rate": float(run_disc_fake_pass / denom),
+                "disc_fake_fail_rate": float(run_disc_fake_fail / denom),
+                "disc_steps_per_gen_step": float(disc_steps_per_gen_step),
+            }
+        )
+        if stop_now:
+            break
+    if use_wave_loss and transformer_for_wave is not None:
+        if transformer_requires_grad is not None:
+            for p, req in zip(transformer_for_wave.parameters(), transformer_requires_grad):
+                p.requires_grad_(bool(req))
+        transformer_for_wave.train(transformer_was_train)
+    return generator, discriminator, history
 
 
 def _iterate_indices(n: int, batch_size: int, shuffle: bool, rng: np.random.Generator):
@@ -562,6 +1995,14 @@ def train_classifier(
     grad_accum_steps: int = 1,
     cache_dataset_on_device: bool = False,
     seed: int = 0,
+    log_every_steps: int = 0,
+    step_preview_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+    stop_requested: Optional[Callable[[], bool]] = None,
+    semantic_mix_noise_prob: float = 0.0,
+    semantic_mix_noise_std: float = 0.0,
+    semantic_mix_blend_min: float = 0.10,
+    semantic_mix_blend_max: float = 0.35,
+    semantic_mix_class_index: int = -1,
 ) -> Tuple[nn.Module, List[Dict[str, float]]]:
     rng = np.random.default_rng(seed)
     model = model.to(device)
@@ -572,6 +2013,22 @@ def train_classifier(
     use_scaler = bool(use_amp and amp_dtype_t == torch.float16)
     scaler = _make_grad_scaler(enabled=use_scaler)
     grad_accum_steps = max(1, int(grad_accum_steps))
+    mix_prob = max(0.0, min(1.0, float(semantic_mix_noise_prob)))
+    mix_noise_std = max(0.0, float(semantic_mix_noise_std))
+    mix_blend_lo = max(0.0, min(1.0, float(semantic_mix_blend_min)))
+    mix_blend_hi = max(mix_blend_lo, min(1.0, float(semantic_mix_blend_max)))
+    mix_class_idx = int(semantic_mix_class_index)
+    try:
+        max_label_train = int(y_train.max().item()) if int(y_train.numel()) > 0 else -1
+    except Exception:
+        max_label_train = -1
+    try:
+        max_label_val = int(y_val.max().item()) if int(y_val.numel()) > 0 else -1
+    except Exception:
+        max_label_val = -1
+    max_label = max(int(max_label_train), int(max_label_val))
+    if int(mix_class_idx) < 0 or int(mix_class_idx) > int(max_label):
+        mix_class_idx = -1
 
     x_train_buf, y_train_buf = x_train, y_train
     x_val_buf, y_val_buf = x_val, y_val
@@ -601,6 +2058,7 @@ def train_classifier(
     best_state = None
     best_val = -math.inf
 
+    stop_now = False
     for epoch in range(1, epochs + 1):
         model.train()
         total_loss = 0.0
@@ -610,6 +2068,13 @@ def train_classifier(
             _iterate_indices(int(x_train.shape[0]), batch_size=batch_size, shuffle=True, rng=rng),
             start=1,
         ):
+            if stop_requested is not None:
+                try:
+                    if bool(stop_requested()):
+                        stop_now = True
+                        break
+                except Exception:
+                    pass
             if x_train_buf.device.type == device.type:
                 idx_t = torch.as_tensor(idx, device=device, dtype=torch.long)
                 xb = x_train_buf.index_select(0, idx_t)
@@ -617,6 +2082,43 @@ def train_classifier(
             else:
                 xb = x_train_buf[idx].to(device, non_blocking=True)
                 yb = y_train_buf[idx].to(device, non_blocking=True)
+            if float(mix_prob) > 0.0 and int(xb.shape[0]) > 0:
+                mask = torch.rand((int(xb.shape[0]),), device=xb.device) < float(mix_prob)
+                if bool(mask.any().item()):
+                    mix_idx = torch.nonzero(mask, as_tuple=False).reshape(-1)
+                    xb_f = xb.to(torch.float32)
+                    src = xb_f.index_select(0, mix_idx)
+                    partner_idx = torch.randint(
+                        low=0,
+                        high=max(1, int(xb_f.shape[0])),
+                        size=(int(mix_idx.numel()),),
+                        device=xb.device,
+                        dtype=torch.long,
+                    )
+                    partner = xb_f.index_select(0, partner_idx)
+                    if float(mix_blend_hi) <= float(mix_blend_lo):
+                        alpha = torch.full(
+                            (int(mix_idx.numel()), 1, 1, 1),
+                            float(mix_blend_lo),
+                            device=xb.device,
+                            dtype=xb_f.dtype,
+                        )
+                    else:
+                        alpha = torch.empty(
+                            (int(mix_idx.numel()), 1, 1, 1),
+                            device=xb.device,
+                            dtype=xb_f.dtype,
+                        ).uniform_(float(mix_blend_lo), float(mix_blend_hi))
+                    mixed = ((1.0 - alpha) * src) + (alpha * partner)
+                    if float(mix_noise_std) > 0.0:
+                        mixed = mixed + (torch.randn_like(mixed) * float(mix_noise_std))
+                    mixed = torch.clamp(mixed, 0.0, 1.0)
+                    xb_f = xb_f.clone()
+                    xb_f.index_copy_(0, mix_idx, mixed)
+                    xb = xb_f.to(dtype=xb.dtype)
+                    if int(mix_class_idx) >= 0:
+                        yb = yb.clone()
+                        yb.index_fill_(0, mix_idx, int(mix_class_idx))
             xb = _maybe_channels_last(xb, enabled=channels_last)
             with _autocast_context(device=device, use_amp=use_amp, amp_dtype_t=amp_dtype_t):
                 logits = model(xb)
@@ -641,7 +2143,32 @@ def train_classifier(
                 opt.zero_grad(set_to_none=True)
             total_loss += float(loss.item()) * int(xb.shape[0])
             n_seen += int(xb.shape[0])
+            if step_preview_callback is not None:
+                emit = False
+                if int(log_every_steps) > 0:
+                    emit = ((int(step_idx) % int(log_every_steps) == 0) or (int(step_idx) == int(num_batches)))
+                else:
+                    emit = (int(step_idx) == int(num_batches))
+                if emit and int(xb.shape[0]) > 0:
+                    try:
+                        probs0 = torch.softmax(logits[0].detach().to(torch.float32), dim=0)
+                        step_preview_callback(
+                            {
+                                "epoch": int(epoch),
+                                "step": int(step_idx),
+                                "steps_per_epoch": int(num_batches),
+                                "img": xb[0].detach().to(torch.float32),
+                                "probs": probs0.detach().to(torch.float32),
+                                "target_class": int(yb[0].detach().item()),
+                                "batch_loss": float(loss.detach().to(torch.float32).item()),
+                                "train_loss": float(total_loss / float(max(1, n_seen))),
+                            }
+                        )
+                    except Exception:
+                        pass
 
+        if stop_now:
+            break
         train_loss = total_loss / max(1, n_seen)
         val_stats = evaluate_classifier(
             model,
@@ -680,26 +2207,52 @@ def stft_mag_l1(x_hat: torch.Tensor, x_ref: torch.Tensor, n_fft: int = 512, hop:
     return F.l1_loss(mag_hat, mag_ref)
 
 
+def _eligible_stream_indices_by_chunk_length(streams: Sequence[np.ndarray], chunk_samples: int) -> np.ndarray:
+    n_need = max(1, int(chunk_samples))
+    keep = [int(i) for i, s in enumerate(streams) if int(np.asarray(s).size) >= n_need]
+    return np.asarray(keep, dtype=np.int64)
+
+
 def _sample_wave_batch(
     streams: Sequence[np.ndarray],
-    labels: Sequence[int],
+    labels: Sequence[Any],
     batch_size: int,
     chunk_samples: int,
     rng: np.random.Generator,
 ):
     xb = np.zeros((batch_size, chunk_samples), dtype=np.float32)
-    yb = np.zeros((batch_size,), dtype=np.int64)
+    eligible = _eligible_stream_indices_by_chunk_length(streams=streams, chunk_samples=chunk_samples)
+    if int(eligible.size) <= 0:
+        raise RuntimeError(
+            f"No streams are long enough for chunk_samples={int(chunk_samples)} "
+            f"(stream_count={len(streams)})."
+        )
+    first = labels[int(eligible[0])]
+    first_arr = np.asarray(first)
+    scalar_mode = bool(np.asarray(first_arr).ndim == 0)
+    if scalar_mode:
+        yb = np.zeros((batch_size,), dtype=np.int64)
+        label_dim = 0
+    else:
+        label_dim = int(np.asarray(first_arr, dtype=np.float32).reshape(-1).size)
+        if label_dim <= 0:
+            raise RuntimeError("Wave batch labels must have non-empty semantic vectors.")
+        yb = np.zeros((batch_size, label_dim), dtype=np.float32)
     for i in range(batch_size):
-        idx = int(rng.integers(0, len(streams)))
-        yb[i] = int(labels[idx])
-        s = streams[idx]
-        if s.size == 0:
-            continue
-        if s.size >= chunk_samples:
-            start = int(rng.integers(0, s.size - chunk_samples + 1))
-            xb[i, :] = s[start : start + chunk_samples]
+        pick = int(rng.integers(0, int(eligible.size)))
+        idx = int(eligible[pick])
+        if scalar_mode:
+            yb[i] = int(labels[idx])
         else:
-            xb[i, : s.size] = s
+            arr = np.asarray(labels[idx], dtype=np.float32).reshape(-1)
+            if int(arr.size) != int(label_dim):
+                raise RuntimeError(
+                    f"Wave batch label width mismatch: got={int(arr.size)} expected={int(label_dim)}"
+                )
+            yb[i, :] = arr
+        s = streams[idx]
+        start = int(rng.integers(0, s.size - chunk_samples + 1))
+        xb[i, :] = s[start : start + chunk_samples]
     return xb, yb
 
 
@@ -707,7 +2260,7 @@ class PackedWaveBatchSampler:
     def __init__(
         self,
         streams: Sequence[np.ndarray],
-        labels: Optional[Sequence[int]],
+        labels: Optional[Sequence[Any]],
         chunk_samples: int,
         seed: int,
         device: torch.device,
@@ -718,20 +2271,46 @@ class PackedWaveBatchSampler:
             raise ValueError("PackedWaveBatchSampler requires at least one stream.")
         self.chunk_samples = max(1, int(chunk_samples))
         self.device = device if (cache_on_device and device.type == "cuda") else torch.device("cpu")
-        self.num_streams = int(len(streams))
+        eligible = _eligible_stream_indices_by_chunk_length(streams=streams, chunk_samples=self.chunk_samples)
+        if int(eligible.size) <= 0:
+            raise ValueError(
+                f"PackedWaveBatchSampler requires streams with length >= chunk_samples={self.chunk_samples}; "
+                f"got stream_count={len(streams)} eligible=0."
+            )
+        filtered_streams = [streams[int(i)] for i in eligible.tolist()]
+        filtered_labels = None
+        if labels is not None:
+            filtered_labels = [labels[int(i)] for i in eligible.tolist()]
+        self.num_streams = int(len(filtered_streams))
 
-        lengths_np = np.asarray([max(0, int(s.size)) for s in streams], dtype=np.int64)
+        lengths_np = np.asarray([max(0, int(s.size)) for s in filtered_streams], dtype=np.int64)
         max_len = int(max(1, lengths_np.max(initial=0)))
         data = torch.zeros((self.num_streams, max_len), dtype=torch.float32)
-        for i, s in enumerate(streams):
+        for i, s in enumerate(filtered_streams):
             if s.size > 0:
                 v = torch.from_numpy(np.asarray(s, dtype=np.float32, order="C"))
                 data[i, : int(v.shape[0])] = v
 
         lengths = torch.from_numpy(lengths_np)
         labels_t = None
-        if labels is not None:
-            labels_t = torch.as_tensor(labels, dtype=torch.long)
+        if filtered_labels is not None and len(filtered_labels) > 0:
+            first_arr = np.asarray(filtered_labels[0])
+            scalar_mode = bool(np.asarray(first_arr).ndim == 0)
+            if scalar_mode:
+                labels_t = torch.as_tensor([int(x) for x in filtered_labels], dtype=torch.long)
+            else:
+                label_dim = int(np.asarray(first_arr, dtype=np.float32).reshape(-1).size)
+                if label_dim <= 0:
+                    raise RuntimeError("Packed labels require non-empty semantic vectors.")
+                bank = np.zeros((len(filtered_labels), label_dim), dtype=np.float32)
+                for i, row in enumerate(filtered_labels):
+                    arr = np.asarray(row, dtype=np.float32).reshape(-1)
+                    if int(arr.size) != int(label_dim):
+                        raise RuntimeError(
+                            f"Packed label width mismatch at row {i}: got={int(arr.size)} expected={int(label_dim)}"
+                        )
+                    bank[i, :] = arr
+                labels_t = torch.from_numpy(bank)
 
         if self.device.type == "cuda":
             data = data.to(self.device, non_blocking=True)
@@ -768,11 +2347,7 @@ class PackedWaveBatchSampler:
         u = torch.rand((b,), generator=self.rng, device=self.device)
         start = torch.floor(u * (max_start.to(torch.float32) + 1.0)).to(torch.long)
         pos = start.unsqueeze(1) + self._chunk_idx.unsqueeze(0)
-        valid_len = torch.clamp(lengths, min=1)
-        pos = torch.minimum(pos, valid_len.unsqueeze(1) - 1)
         xb = torch.gather(picked, dim=1, index=pos)
-        mask = self._chunk_idx.unsqueeze(0) < lengths.unsqueeze(1)
-        xb = xb * mask.to(dtype=xb.dtype)
 
         yb = None
         if self.labels is not None:
@@ -782,7 +2357,7 @@ class PackedWaveBatchSampler:
 
 def _build_packed_sampler(
     streams: Sequence[np.ndarray],
-    labels: Optional[Sequence[int]],
+    labels: Optional[Sequence[Any]],
     chunk_samples: int,
     seed: int,
     device: torch.device,
@@ -826,74 +2401,420 @@ def _sample_wave_batch_unlabeled(
     rng: np.random.Generator,
 ):
     xb = np.zeros((batch_size, chunk_samples), dtype=np.float32)
+    eligible = _eligible_stream_indices_by_chunk_length(streams=streams, chunk_samples=chunk_samples)
+    if int(eligible.size) <= 0:
+        raise RuntimeError(
+            f"No streams are long enough for chunk_samples={int(chunk_samples)} "
+            f"(stream_count={len(streams)})."
+        )
     for i in range(batch_size):
-        idx = int(rng.integers(0, len(streams)))
+        pick = int(rng.integers(0, int(eligible.size)))
+        idx = int(eligible[pick])
         s = streams[idx]
-        if s.size == 0:
-            continue
-        if s.size >= chunk_samples:
-            start = int(rng.integers(0, s.size - chunk_samples + 1))
-            xb[i, :] = s[start : start + chunk_samples]
-        else:
-            xb[i, : s.size] = s
+        start = int(rng.integers(0, s.size - chunk_samples + 1))
+        xb[i, :] = s[start : start + chunk_samples]
     return xb
 
 
-def _degrade_wave_batch(
+def _apply_stride_skew_explicit_batch(x: torch.Tensor, skew_vec: torch.Tensor) -> torch.Tensor:
+    bsz, t = x.shape
+    if int(t) <= 1:
+        return x
+    # Coordinate math in fp16/bf16 at long sequence lengths can quantize to
+    # out-of-range indices (e.g., 32768 for a 32768-long signal). Keep index
+    # calculations in fp32 and clamp indices explicitly.
+    coord_dtype = torch.float32
+    base = torch.arange(int(t), device=x.device, dtype=coord_dtype).unsqueeze(0).expand(int(bsz), -1)
+    center = float(int(t) - 1) * 0.5
+    skew = skew_vec.to(device=x.device, dtype=coord_dtype).reshape(-1, 1)
+    if int(skew.shape[0]) == 1 and int(bsz) > 1:
+        skew = skew.expand(int(bsz), 1)
+    elif int(skew.shape[0]) != int(bsz):
+        raise ValueError(
+            f"skew tensor batch mismatch: got {int(skew.shape[0])}, expected {int(bsz)}"
+        )
+    scale = torch.clamp(1.0 + skew, 0.5, 1.5)
+    src = ((base - center) * scale) + center
+    src = torch.clamp(src, 0.0, float(int(t) - 1))
+    src0 = torch.floor(src).to(torch.long)
+    src0 = torch.clamp(src0, min=0, max=int(t) - 1)
+    src1 = torch.clamp(src0 + 1, max=int(t) - 1)
+    alpha = (src - src0.to(dtype=coord_dtype)).to(dtype=x.dtype)
+    x0 = torch.gather(x, dim=1, index=src0)
+    x1 = torch.gather(x, dim=1, index=src1)
+    return ((1.0 - alpha) * x0) + (alpha * x1)
+
+
+def _apply_stride_skew_batch(
+    x: torch.Tensor,
+    s_vec: torch.Tensor,
+    max_skew: float,
+    return_skew: bool = False,
+):
+    bsz, _ = x.shape
+    if float(max_skew) <= 0.0:
+        if bool(return_skew):
+            z = torch.zeros((int(bsz), 1), device=x.device, dtype=x.dtype)
+            return x, z
+        return x
+    s_loc = s_vec.to(device=x.device, dtype=torch.float32)
+    skew = ((torch.rand((int(bsz), 1), device=x.device, dtype=torch.float32) * 2.0) - 1.0) * (
+        float(max_skew) * s_loc
+    )
+    out = _apply_stride_skew_explicit_batch(x=x, skew_vec=skew)
+    if bool(return_skew):
+        return out, skew.to(dtype=x.dtype)
+    return out
+
+
+def _bitwindow_shape_for_wave_len(wave_len: int, cfg: RenderConfig):
+    downsample = max(1, int(cfg.downsample))
+    width = max(1, int(cfg.width))
+    base_len = max(1, (max(1, int(wave_len)) + downsample - 1) // downsample)
+    if int(cfg.max_points) > 0:
+        base_len = min(base_len, int(cfg.max_points))
+    _, mapping = COLOR_MODE_MAP.get(cfg.color_mode, COLOR_MODE_MAP[COLOR_MODES[0][0]])
+    special = bool(mapping.get("__special__") == "single_source_rgb_stride")
+    max_len = (base_len + 2) // 3 if special else base_len
+    total = int(math.ceil(float(max_len) / float(width)) * width)
+    height = max(1, total // width)
+    return {
+        "downsample": int(downsample),
+        "width": int(width),
+        "base_len": int(base_len),
+        "max_len": int(max_len),
+        "total": int(total),
+        "height": int(height),
+        "mapping": mapping,
+        "special": special,
+    }
+
+
+def _bitwindow_canvas_to_base_sequence_batch(canvas: torch.Tensor, shape_info: Dict, empty_fill: float) -> torch.Tensor:
+    mapping = shape_info["mapping"]
+    special = bool(shape_info["special"])
+    base_len = int(shape_info["base_len"])
+    max_len = int(shape_info["max_len"])
+    bsz = int(canvas.shape[0])
+    flat_ch = canvas.reshape(bsz, int(canvas.shape[1]), -1)
+
+    if not special:
+        streams = []
+        if mapping.get("R") is not None:
+            streams.append(flat_ch[:, 0, :])
+        if mapping.get("G") is not None:
+            streams.append(flat_ch[:, 1, :])
+        if mapping.get("B") is not None:
+            streams.append(flat_ch[:, 2, :])
+        if len(streams) <= 0:
+            flat = torch.full(
+                (bsz, int(shape_info["total"])),
+                float(empty_fill),
+                device=canvas.device,
+                dtype=canvas.dtype,
+            )
+        elif len(streams) == 1:
+            flat = streams[0]
+        else:
+            flat = torch.stack(streams, dim=0).mean(dim=0)
+        if int(flat.shape[1]) < int(max_len):
+            pad_n = int(max_len) - int(flat.shape[1])
+            flat = F.pad(flat, (0, int(pad_n)), value=float(empty_fill))
+        return flat[:, : int(base_len)]
+
+    r = flat_ch[:, 0, :]
+    g = flat_ch[:, 1, :]
+    b = flat_ch[:, 2, :]
+    if int(r.shape[1]) < int(max_len):
+        r = F.pad(r, (0, int(max_len - int(r.shape[1]))), value=float(empty_fill))
+    if int(g.shape[1]) < int(max_len):
+        g = F.pad(g, (0, int(max_len - int(g.shape[1]))), value=float(empty_fill))
+    if int(b.shape[1]) < int(max_len):
+        b = F.pad(b, (0, int(max_len - int(b.shape[1]))), value=float(empty_fill))
+    idx = torch.arange(int(base_len), device=canvas.device, dtype=torch.long)
+    src_idx = torch.div(idx, 3, rounding_mode="floor")
+    mod = torch.remainder(idx, 3)
+    gather_idx = src_idx.unsqueeze(0).expand(bsz, -1)
+    rv = torch.gather(r, dim=1, index=gather_idx)
+    gv = torch.gather(g, dim=1, index=gather_idx)
+    bv = torch.gather(b, dim=1, index=gather_idx)
+    return torch.where(mod.unsqueeze(0) == 0, rv, torch.where(mod.unsqueeze(0) == 1, gv, bv))
+
+
+def _degrade_bitwindow_image_plane(canvas: torch.Tensor, s_vec: torch.Tensor, stride_skew_max: float) -> torch.Tensor:
+    x = canvas
+    bsz = int(x.shape[0])
+    # Image-plane skew (horizontal shear by row) only.
+    if float(stride_skew_max) > 0.0:
+        shear = ((torch.rand((bsz, 1), device=x.device, dtype=x.dtype) * 2.0) - 1.0) * (
+            float(stride_skew_max) * s_vec
+        )
+        theta = torch.zeros((bsz, 2, 3), device=x.device, dtype=x.dtype)
+        theta[:, 0, 0] = 1.0
+        theta[:, 0, 1] = shear.squeeze(1)
+        theta[:, 1, 1] = 1.0
+        grid = F.affine_grid(theta, size=x.shape, align_corners=False)
+        x = F.grid_sample(x, grid, mode="bilinear", padding_mode="zeros", align_corners=False)
+
+    # Image-plane blur.
+    blur_k_choices = (1, 3, 5, 7)
+    blur_rank = torch.round(3.0 * s_vec.squeeze(1).to(torch.float32)).to(torch.long)
+    blur_idx = torch.clamp(blur_rank, min=0, max=len(blur_k_choices) - 1)
+    blur_bank = []
+    for k in blur_k_choices:
+        if int(k) <= 1:
+            blur_bank.append(x)
+        else:
+            blur_bank.append(F.avg_pool2d(x, kernel_size=int(k), stride=1, padding=(int(k) // 2)))
+    blur_stack = torch.stack(blur_bank, dim=1)
+    pick = torch.arange(bsz, device=x.device, dtype=torch.long)
+    x_blur = blur_stack[pick, blur_idx, :, :, :]
+    blur_mix = 0.05 + (0.80 * s_vec.view(bsz, 1, 1, 1))
+    x = ((1.0 - blur_mix) * x) + (blur_mix * x_blur)
+    return torch.clamp(x, 0.0, 1.0)
+
+
+def _degrade_wave_batch_target_bits(
     x_clean: torch.Tensor,
-    strength: float,
+    strength,
     noise_std_min: float,
     noise_std_max: float,
     dropout_max: float,
     quant_bits_min: int,
     quant_bits_max: int,
+    cfg: RenderConfig,
+    sample_bits: int,
+    bit_low: int,
+    bit_high: int,
+    mode: str = "full",
+    stride_skew_max: float = 0.0,
+    return_meta: bool = False,
 ):
-    s = float(max(0.0, min(1.0, strength)))
+    mode_key = str(mode).strip().lower()
+    if mode_key not in ("full", "blur_stride"):
+        mode_key = "full"
+
+    if torch.is_tensor(strength):
+        s_vec = strength.detach().to(device=x_clean.device, dtype=torch.float32).reshape(-1, 1)
+        if int(s_vec.shape[0]) == 1 and int(x_clean.shape[0]) > 1:
+            s_vec = s_vec.expand(int(x_clean.shape[0]), 1)
+        elif int(s_vec.shape[0]) != int(x_clean.shape[0]):
+            raise ValueError(
+                f"strength tensor batch mismatch: got {int(s_vec.shape[0])}, expected {int(x_clean.shape[0])}"
+            )
+    else:
+        s_scalar = float(max(0.0, min(1.0, float(strength))))
+        s_vec = torch.full((int(x_clean.shape[0]), 1), s_scalar, device=x_clean.device, dtype=torch.float32)
+    s_vec = torch.clamp(s_vec, 0.0, 1.0).to(dtype=x_clean.dtype)
+
+    lo, hi, depth = normalize_bit_window(int(bit_low), int(bit_high), int(sample_bits))
+    full_mask = (1 << int(sample_bits)) - 1
+    window_mask = (1 << int(depth)) - 1
+    q_min = -(1 << (int(sample_bits) - 1))
+    q_max = (1 << (int(sample_bits) - 1)) - 1
+    q_scale = float(1 << (int(sample_bits) - 1))
+
+    x = torch.clamp(x_clean, -1.0, 1.0)
+    q_signed = torch.round(x * q_scale)
+    q_signed = torch.clamp(q_signed, float(q_min), float(q_max)).to(torch.int64)
+    unsigned = torch.bitwise_and(q_signed, full_mask)
+    window = torch.bitwise_and(torch.bitwise_right_shift(unsigned, int(lo)), int(window_mask)).to(torch.float32)
+    if int(depth) == 1:
+        window01 = window
+    else:
+        window01 = window / float(window_mask)
+
+    # Apply degradation directly in target-bit sequence domain so stride skew is
+    # temporal (real resampling skew), not image-plane affine shear.
+    window_wave = torch.clamp((window01 * 2.0) - 1.0, -1.0, 1.0).to(dtype=x_clean.dtype)
+    degraded_pack = _degrade_wave_batch(
+        x_clean=window_wave,
+        strength=s_vec,
+        noise_std_min=float(noise_std_min),
+        noise_std_max=float(noise_std_max),
+        dropout_max=float(dropout_max),
+        quant_bits_min=int(quant_bits_min),
+        quant_bits_max=int(quant_bits_max),
+        mode=str(mode_key),
+        stride_skew_max=float(stride_skew_max),
+        return_meta=bool(return_meta),
+    )
+    if isinstance(degraded_pack, tuple):
+        degraded_wave, degrade_meta = degraded_pack
+    else:
+        degraded_wave, degrade_meta = degraded_pack, None
+    degraded01 = torch.clamp((degraded_wave.to(torch.float32) * 0.5) + 0.5, 0.0, 1.0)
+
+    downsample = max(1, int(cfg.downsample))
+    base_len = max(1, (max(1, int(x_clean.shape[1])) + downsample - 1) // downsample)
+    if int(cfg.max_points) > 0:
+        base_len = min(base_len, int(cfg.max_points))
+    n_use = min(int(base_len), int(degraded01.shape[1]))
+    if n_use <= 0:
+        if bool(return_meta):
+            z = torch.zeros((int(x_clean.shape[0]), 1), device=x_clean.device, dtype=x_clean.dtype)
+            return x_clean, {"skew_applied": z}
+        return x_clean
+    idx = (torch.arange(n_use, device=x_clean.device, dtype=torch.long) * int(downsample)).to(torch.long)
+    idx = idx[idx < int(x_clean.shape[1])]
+    n_use = int(idx.shape[0])
+    if n_use <= 0:
+        if bool(return_meta):
+            z = torch.zeros((int(x_clean.shape[0]), 1), device=x_clean.device, dtype=x_clean.dtype)
+            return x_clean, {"skew_applied": z}
+        return x_clean
+    desired01 = torch.clamp(degraded01[:, :n_use], 0.0, 1.0)
+
+    if int(depth) == 1:
+        desired = (desired01 >= 0.5).to(torch.int64)
+    else:
+        desired = torch.round(desired01 * float(window_mask)).to(torch.int64)
+        desired = torch.clamp(desired, min=0, max=int(window_mask))
+    desired_full = torch.bitwise_left_shift(desired, int(lo))
+
+    unsigned_sel = torch.gather(unsigned, dim=1, index=idx.unsqueeze(0).expand(int(x_clean.shape[0]), -1))
+    clear_mask = torch.tensor(
+        int(full_mask ^ (int(window_mask) << int(lo))),
+        device=x_clean.device,
+        dtype=torch.int64,
+    )
+    unsigned_new = torch.bitwise_and(unsigned_sel, clear_mask)
+    unsigned_new = torch.bitwise_or(unsigned_new, desired_full)
+    unsigned_out = unsigned.clone()
+    unsigned_out.scatter_(1, idx.unsqueeze(0).expand(int(x_clean.shape[0]), -1), unsigned_new)
+    sign_cut = 1 << (int(sample_bits) - 1)
+    signed_out = torch.where(unsigned_out >= sign_cut, unsigned_out - (1 << int(sample_bits)), unsigned_out)
+    out = torch.clamp(signed_out.to(dtype=x_clean.dtype) / q_scale, -1.0, 1.0)
+    if not bool(return_meta):
+        return out
+    skew_applied = None
+    if isinstance(degrade_meta, dict):
+        skew_applied = degrade_meta.get("skew_applied", None)
+    if not torch.is_tensor(skew_applied):
+        skew_applied = torch.zeros((int(x_clean.shape[0]), 1), device=x_clean.device, dtype=x_clean.dtype)
+    else:
+        skew_applied = skew_applied.to(device=x_clean.device, dtype=x_clean.dtype).reshape(int(x_clean.shape[0]), 1)
+    return out, {"skew_applied": skew_applied}
+
+
+def _degrade_wave_batch(
+    x_clean: torch.Tensor,
+    strength,
+    noise_std_min: float,
+    noise_std_max: float,
+    dropout_max: float,
+    quant_bits_min: int,
+    quant_bits_max: int,
+    mode: str = "full",
+    stride_skew_max: float = 0.0,
+    return_meta: bool = False,
+):
     x = x_clean
     bsz, t = x.shape
+    if torch.is_tensor(strength):
+        s_vec = strength.detach().to(device=x.device, dtype=torch.float32).reshape(-1, 1)
+        if int(s_vec.shape[0]) == 1 and int(bsz) > 1:
+            s_vec = s_vec.expand(int(bsz), 1)
+        elif int(s_vec.shape[0]) != int(bsz):
+            raise ValueError(
+                f"strength tensor batch mismatch: got {int(s_vec.shape[0])}, expected {int(bsz)}"
+            )
+    else:
+        s_scalar = float(max(0.0, min(1.0, float(strength))))
+        s_vec = torch.full((int(bsz), 1), s_scalar, device=x.device, dtype=torch.float32)
+    s_vec = torch.clamp(s_vec, 0.0, 1.0).to(dtype=x.dtype)
+    mode_key = str(mode).strip().lower()
+    if mode_key not in ("full", "blur_stride"):
+        mode_key = "full"
+    skew_applied = torch.zeros((int(bsz), 1), device=x.device, dtype=x.dtype)
+
+    if mode_key == "blur_stride":
+        x, skew_applied = _apply_stride_skew_batch(
+            x=x,
+            s_vec=s_vec,
+            max_skew=float(stride_skew_max),
+            return_skew=True,
+        )
+        blur_k_choices = (3, 5, 7, 9, 11)
+        blur_rank = torch.round(1.0 + (4.0 * s_vec.squeeze(1).to(torch.float32))).to(torch.long)
+        blur_idx = torch.clamp(blur_rank, min=1, max=len(blur_k_choices)) - 1
+        x_b = x.unsqueeze(1)
+        blur_bank = []
+        for k in blur_k_choices:
+            blur_bank.append(F.avg_pool1d(x_b, kernel_size=int(k), stride=1, padding=(int(k) // 2)).squeeze(1))
+        blur_stack = torch.stack(blur_bank, dim=1)
+        pick = torch.arange(bsz, device=x.device, dtype=torch.long)
+        x_blur = blur_stack[pick, blur_idx, :]
+        blur_mix = 0.10 + (0.70 * s_vec)
+        x = ((1.0 - blur_mix) * x) + (blur_mix * x_blur)
+        out = torch.clamp(x, -1.0, 1.0)
+        if bool(return_meta):
+            return out, {"skew_applied": skew_applied}
+        return out
 
     # Broadband additive noise.
-    noise_std = float(noise_std_min) + (float(noise_std_max) - float(noise_std_min)) * s
-    if noise_std > 0.0:
-        x = x + (torch.randn_like(x) * float(noise_std))
+    noise_std = float(noise_std_min) + ((float(noise_std_max) - float(noise_std_min)) * s_vec)
+    x = x + (torch.randn_like(x) * noise_std)
 
     # Random gain jitter and partial dropout emulate capture/channel variation.
-    gain_sigma = 0.03 + (0.20 * s)
+    gain_sigma = 0.03 + (0.20 * s_vec)
     gain = torch.exp(torch.randn((bsz, 1), device=x.device, dtype=x.dtype) * gain_sigma)
     x = x * gain
-    drop_p = max(0.0, min(0.95, float(dropout_max) * s))
-    if drop_p > 0.0:
-        keep = (torch.rand((bsz, t), device=x.device) > drop_p).to(x.dtype)
-        x = x * keep
+    drop_p = torch.clamp(float(dropout_max) * s_vec, 0.0, 0.95)
+    keep = (torch.rand((bsz, t), device=x.device, dtype=x.dtype) > drop_p).to(x.dtype)
+    x = x * keep
 
-    # Short contiguous occlusion band.
-    seg_len = int(max(1, round((0.005 + (0.045 * s)) * float(t))))
-    if seg_len < t:
-        starts = torch.randint(0, max(1, t - seg_len + 1), (bsz,), device=x.device)
-        idx = torch.arange(t, device=x.device).unsqueeze(0)
+    # Short contiguous occlusion band with per-sample lengths.
+    seg_len = torch.round((0.005 + (0.045 * s_vec.squeeze(1))) * float(t)).to(torch.long)
+    seg_len = torch.clamp(seg_len, min=1, max=max(1, int(t)))
+    if int(t) > 1:
+        max_start = torch.clamp(int(t) - seg_len + 1, min=1)
+        starts = torch.floor(
+            torch.rand((bsz,), device=x.device, dtype=x.dtype) * max_start.to(dtype=x.dtype)
+        ).to(torch.long)
+        idx = torch.arange(t, device=x.device, dtype=torch.long).unsqueeze(0)
         seg_keep = ((idx < starts.unsqueeze(1)) | (idx >= (starts + seg_len).unsqueeze(1))).to(x.dtype)
         x = x * seg_keep
 
-    # Mild low-pass blur.
-    blur_k = int(1 + (2 * int(round(1 + (4.0 * s)))))
-    blur_k = max(3, min(15, blur_k | 1))
-    x_blur = F.avg_pool1d(x.unsqueeze(1), kernel_size=blur_k, stride=1, padding=(blur_k // 2)).squeeze(1)
-    blur_mix = 0.10 + (0.70 * s)
+    # Mild low-pass blur, vectorized with per-sample kernel picks.
+    blur_k_choices = (3, 5, 7, 9, 11)
+    blur_rank = torch.round(1.0 + (4.0 * s_vec.squeeze(1).to(torch.float32))).to(torch.long)
+    blur_idx = torch.clamp(blur_rank, min=1, max=len(blur_k_choices)) - 1
+    x_b = x.unsqueeze(1)
+    blur_bank = []
+    for k in blur_k_choices:
+        blur_bank.append(F.avg_pool1d(x_b, kernel_size=int(k), stride=1, padding=(int(k) // 2)).squeeze(1))
+    blur_stack = torch.stack(blur_bank, dim=1)
+    pick = torch.arange(bsz, device=x.device, dtype=torch.long)
+    x_blur = blur_stack[pick, blur_idx, :]
+    blur_mix = 0.10 + (0.70 * s_vec)
     x = ((1.0 - blur_mix) * x) + (blur_mix * x_blur)
 
-    # Bit-depth reduction.
+    # Bit-depth reduction with per-sample quantization.
     qb_lo = max(2, int(quant_bits_min))
     qb_hi = max(qb_lo, int(quant_bits_max))
-    q_bits_f = float(qb_hi) + (float(qb_lo - qb_hi) * s)
-    q_bits = max(2, int(round(q_bits_f)))
-    levels = float((1 << q_bits) - 1)
+    q_bits_f = float(qb_hi) + (float(qb_lo - qb_hi) * s_vec.to(torch.float32))
+    q_bits = torch.clamp(torch.round(q_bits_f), min=2.0)
+    levels = torch.exp2(q_bits) - 1.0
+    levels = levels.to(dtype=x.dtype)
     x01 = torch.clamp((x * 0.5) + 0.5, 0.0, 1.0)
     xq = torch.round(x01 * levels) / levels
     xq = (xq * 2.0) - 1.0
-    q_mix = 0.10 + (0.75 * s)
+    q_mix = 0.10 + (0.75 * s_vec)
     x = ((1.0 - q_mix) * x) + (q_mix * xq)
 
-    return torch.clamp(x, -1.0, 1.0)
+    if float(stride_skew_max) > 0.0:
+        x, skew_applied = _apply_stride_skew_batch(
+            x=x,
+            s_vec=s_vec,
+            max_skew=float(stride_skew_max),
+            return_skew=True,
+        )
+
+    out = torch.clamp(x, -1.0, 1.0)
+    if bool(return_meta):
+        return out, {"skew_applied": skew_applied}
+    return out
 
 
 def _build_eval_cache_labeled(
@@ -1225,7 +3146,7 @@ def train_transformer_feature_metric(
     classifier: nn.Module,
     train_streams: Sequence[np.ndarray],
     val_streams: Sequence[np.ndarray],
-    train_target_labels: Optional[Sequence[int]],
+    train_target_labels: Optional[Sequence[Any]],
     cfg: RenderConfig,
     sample_bits: int,
     image_hw: Tuple[int, int],
@@ -1258,6 +3179,21 @@ def train_transformer_feature_metric(
     degrade_dropout_max: float = 0.25,
     degrade_quant_bits_min: int = 3,
     degrade_quant_bits_max: int = 10,
+    degrade_vectorized_window: int = 4,
+    degrade_mode: str = "full",
+    degrade_stride_skew_max: float = 0.0,
+    degrade_domain: str = "waveform",
+    deskew_prefilter_weight: float = 0.20,
+    deskew_residual_weight: float = 0.10,
+    deskew_pre_token_mix: float = 0.08,
+    deskew_post_token_mix: float = 0.08,
+    deskew_token_residual_weight: float = 0.01,
+    score_rank_weight: float = 0.40,
+    score_rank_margin: float = 0.02,
+    score_spurious_weight: float = 0.35,
+    score_spurious_threshold: float = 0.35,
+    score_spurious_temp: float = 0.20,
+    score_spurious_margin: float = 0.00,
     entropy_penalty_weight: float = 0.60,
     high_bit_penalty_weight: float = 0.50,
     low_bit_penalty_weight: float = 0.08,
@@ -1266,6 +3202,9 @@ def train_transformer_feature_metric(
     score_target_margin: float = 0.0,
     seed: int = 0,
     log_every_steps: int = 0,
+    step_preview_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+    stop_requested: Optional[Callable[[], bool]] = None,
+    aux_filter_input_builder: Optional[Callable[[Dict[str, Any]], Dict[str, Dict[str, Any]]]] = None,
     cache_eval_batches: bool = True,
     visualize_status: bool = False,
     visualize_scale: int = 3,
@@ -1304,23 +3243,100 @@ def train_transformer_feature_metric(
     best_state = None
     best_gain = -math.inf
     log_every_steps = max(0, int(log_every_steps))
-    status_viewer = _TransformerStatusOpenGLViewer(
-        enabled=bool(visualize_status),
-        image_hw=image_hw,
-        scale=max(1, int(visualize_scale)),
-    )
+    if bool(visualize_status):
+        print(
+            "[transformer-viz] standalone transformer preview removed; "
+            "using shared stage preview callbacks only",
+            flush=True,
+        )
+    deskew_prefilter_weight = max(0.0, float(deskew_prefilter_weight))
+    deskew_residual_weight = max(0.0, float(deskew_residual_weight))
+    deskew_pre_token_mix = max(0.0, min(0.50, float(deskew_pre_token_mix)))
+    deskew_post_token_mix = max(0.0, min(0.50, float(deskew_post_token_mix)))
+    deskew_token_residual_weight = max(0.0, float(deskew_token_residual_weight))
+    score_rank_weight = max(0.0, float(score_rank_weight))
+    score_rank_margin = max(0.0, float(score_rank_margin))
+    score_spurious_weight = max(0.0, float(score_spurious_weight))
+    score_spurious_threshold = max(0.0, min(1.0, float(score_spurious_threshold)))
+    score_spurious_temp = max(1e-4, float(score_spurious_temp))
+    score_spurious_margin = max(0.0, float(score_spurious_margin))
     entropy_penalty_weight = max(0.0, float(entropy_penalty_weight))
     high_bit_penalty_weight = max(0.0, float(high_bit_penalty_weight))
     low_bit_penalty_weight = max(0.0, float(low_bit_penalty_weight))
     wave_l1_weight = max(0.0, float(wave_l1_weight))
     score_target_weight = max(0.0, float(score_target_weight))
     score_target_margin = max(0.0, float(score_target_margin))
+    degrade_vectorized_window = max(1, int(degrade_vectorized_window))
+    degrade_mode = str(degrade_mode).strip().lower()
+    if degrade_mode not in ("full", "blur_stride"):
+        degrade_mode = "full"
+    degrade_stride_skew_max = max(0.0, float(degrade_stride_skew_max))
+    degrade_domain = str(degrade_domain).strip().lower()
+    if degrade_domain not in ("waveform", "bitwindow"):
+        degrade_domain = "waveform"
+    if degrade_domain == "bitwindow" and (not bool(cfg.bitmask_enable)):
+        print(
+            "[transformer-feature-config] degrade_domain=bitwindow requested but cfg.bitmask_enable=0; "
+            "falling back to waveform",
+            flush=True,
+        )
+        degrade_domain = "waveform"
+    aux_bundle_module = transformer
+    if (not hasattr(aux_bundle_module, "aux_filter_bundles")) and hasattr(transformer, "module"):
+        aux_bundle_module = getattr(transformer, "module")
+    has_deskew_bundle = bool(
+        hasattr(aux_bundle_module, "aux_filter_bundles")
+        and isinstance(getattr(aux_bundle_module, "aux_filter_bundles"), nn.ModuleDict)
+        and ("deskew" in getattr(aux_bundle_module, "aux_filter_bundles"))
+    )
+    deskew_aux_active = bool(
+        bool(degrade_inputs)
+        and (str(degrade_mode) == "blur_stride")
+        and (float(degrade_stride_skew_max) > 0.0)
+        and bool(has_deskew_bundle)
+    )
+    if not bool(deskew_aux_active):
+        if (
+            ((float(deskew_prefilter_weight) > 0.0) or (float(deskew_residual_weight) > 0.0))
+            and (not bool(has_deskew_bundle))
+        ):
+            print(
+                "[transformer-feature-config] deskew loss weights requested but deskew bundle is not active; "
+                "deskew aux losses disabled.",
+                flush=True,
+            )
+        deskew_prefilter_weight = 0.0
+        deskew_residual_weight = 0.0
+        deskew_pre_token_mix = 0.0
+        deskew_post_token_mix = 0.0
+        deskew_token_residual_weight = 0.0
     target_labels = None
     target_supervision = False
     if train_target_labels is not None:
         if len(train_target_labels) == len(train_streams):
-            target_labels = [int(x) for x in train_target_labels]
-            target_supervision = True
+            target_dim = 0
+            for row in train_target_labels:
+                if row is None:
+                    continue
+                arr = np.asarray(row, dtype=np.float32).reshape(-1)
+                if int(arr.size) > 0:
+                    target_dim = int(arr.size)
+                    break
+            if int(target_dim) > 0:
+                target_rows: List[np.ndarray] = []
+                for i, row in enumerate(train_target_labels):
+                    if row is None:
+                        target_rows.append(np.zeros((int(target_dim),), dtype=np.float32))
+                        continue
+                    arr = np.asarray(row, dtype=np.float32).reshape(-1)
+                    if int(arr.size) != int(target_dim):
+                        raise RuntimeError(
+                            f"Transformer target label width mismatch at stream {i}: "
+                            f"got={int(arr.size)} expected={int(target_dim)}"
+                        )
+                    target_rows.append(arr.astype(np.float32, copy=False))
+                target_labels = target_rows
+                target_supervision = True
         else:
             print(
                 "[transformer-feature-config] target supervision disabled: "
@@ -1361,12 +3377,27 @@ def train_transformer_feature_metric(
         f"loss_w_entropy={entropy_penalty_weight:.3f} loss_w_hi={high_bit_penalty_weight:.3f} "
         f"loss_w_wave={wave_l1_weight:.3f} loss_w_lo={low_bit_penalty_weight:.3f} "
         f"target_supervision={1 if target_supervision else 0} "
-        f"target_streams={int(sum(1 for x in (target_labels or []) if int(x) > 0))} "
+        f"target_streams={int(sum(1 for x in (target_labels or []) if float(np.asarray(x, dtype=np.float32).sum()) > 0.0))} "
         f"score_topk={int(score_topk)} score_threshold={float(score_threshold):.4f} "
-        f"score_w_topk={float(score_w_topk):.3f} score_w_cov={float(score_w_cov):.3f} score_w_mean={float(score_w_mean):.3f}",
+        f"score_w_topk={float(score_w_topk):.3f} score_w_cov={float(score_w_cov):.3f} score_w_mean={float(score_w_mean):.3f} "
+        f"signal_rank_w={score_rank_weight:.3f} signal_rank_margin={score_rank_margin:.3f} "
+        f"signal_spurious_w={score_spurious_weight:.3f} signal_spurious_thr={score_spurious_threshold:.3f} "
+        f"signal_spurious_temp={score_spurious_temp:.3f} signal_spurious_margin={score_spurious_margin:.3f} "
+        f"degrade_domain={degrade_domain} degrade_vec_window={int(degrade_vectorized_window)} "
+        f"degrade_mode={degrade_mode} degrade_stride_skew_max={degrade_stride_skew_max:.3f} "
+        f"deskew_aux=({deskew_prefilter_weight:.3f},{deskew_residual_weight:.3f}) "
+        f"deskew_token_mix=({deskew_pre_token_mix:.3f},{deskew_post_token_mix:.3f}) "
+        f"deskew_token_l2={deskew_token_residual_weight:.4f}",
         flush=True,
     )
+    if bool(degrade_inputs) and (degrade_domain == "bitwindow") and (degrade_mode == "blur_stride"):
+        print(
+            "[transformer-feature-config] bitwindow sequence-domain degradation active: "
+            "target bit-window sequence is transformed (true stride-skew + blur), non-target bits are preserved.",
+            flush=True,
+        )
 
+    stop_now = False
     for epoch in range(1, epochs + 1):
         transformer.train()
         running_loss = torch.zeros((), dtype=torch.float32, device=device)
@@ -1377,67 +3408,294 @@ def train_transformer_feature_metric(
         running_score_target = torch.zeros((), dtype=torch.float32, device=device)
         running_score_after = torch.zeros((), dtype=torch.float32, device=device)
         running_score_gap = torch.zeros((), dtype=torch.float32, device=device)
+        running_score_rank_gap = torch.zeros((), dtype=torch.float32, device=device)
+        running_score_spurious_gap = torch.zeros((), dtype=torch.float32, device=device)
+        running_signal_gap = torch.zeros((), dtype=torch.float32, device=device)
+        running_aux_bundle_loss = torch.zeros((), dtype=torch.float32, device=device)
+        running_prefilter_loss = torch.zeros((), dtype=torch.float32, device=device)
+        running_post_residual_loss = torch.zeros((), dtype=torch.float32, device=device)
+        running_skew_mae = torch.zeros((), dtype=torch.float32, device=device)
+        running_deskew_target_abs = torch.zeros((), dtype=torch.float32, device=device)
+        running_deskew_pred_abs = torch.zeros((), dtype=torch.float32, device=device)
+        running_deskew_applied_abs = torch.zeros((), dtype=torch.float32, device=device)
+        running_deskew_remaining_abs = torch.zeros((), dtype=torch.float32, device=device)
+        running_deskew_post_abs = torch.zeros((), dtype=torch.float32, device=device)
+        running_deskew_conf = torch.zeros((), dtype=torch.float32, device=device)
         running_degrade = 0.0
+        last_xclean_preview = None
         last_xb_preview = None
         last_xh_preview = None
+        last_target_condition_preview = None
+        last_deskew_preview = None
         t_sample = 0.0
         t_forward = 0.0
         t_backward = 0.0
         epoch_t0 = time.perf_counter()
         opt.zero_grad(set_to_none=True)
         total_train_steps = max(1, int(epochs) * int(num_steps))
+        epoch_step_offset = (epoch - 1) * num_steps
 
-        for step_idx in range(num_steps):
-            step_t0 = time.perf_counter()
+        def _sample_clean_targets(total_batch: int):
+            total_batch = max(1, int(total_batch))
             if train_sampler is not None:
-                x_clean, y_target = train_sampler.sample(batch_size=batch_size)
-                if x_clean.device != device:
-                    x_clean = x_clean.to(device, non_blocking=True)
-                if y_target is not None and y_target.device != device:
-                    y_target = y_target.to(device, non_blocking=True)
+                x_local, y_local = train_sampler.sample(batch_size=total_batch)
+                if x_local.device != device:
+                    x_local = x_local.to(device, non_blocking=True)
+                if y_local is not None and y_local.device != device:
+                    y_local = y_local.to(device, non_blocking=True)
+                return x_local, y_local
+            if target_labels is not None:
+                xb_np, yb_np = _sample_wave_batch(
+                    streams=train_streams,
+                    labels=target_labels,
+                    batch_size=total_batch,
+                    chunk_samples=chunk_samples,
+                    rng=rng,
+                )
+                y_local = torch.from_numpy(yb_np).to(device, non_blocking=True)
             else:
-                if target_labels is not None:
-                    xb_np, yb_np = _sample_wave_batch(
-                        streams=train_streams,
-                        labels=target_labels,
-                        batch_size=batch_size,
-                        chunk_samples=chunk_samples,
-                        rng=rng,
-                    )
-                    y_target = torch.from_numpy(yb_np).to(device, non_blocking=True)
-                else:
-                    xb_np = _sample_wave_batch_unlabeled(
-                        streams=train_streams,
-                        batch_size=batch_size,
-                        chunk_samples=chunk_samples,
-                        rng=rng,
-                    )
-                    y_target = None
-                x_clean = _to_device_wave_batch(xb_np, device=device, pin_memory=pin_memory)
-            global_step = ((epoch - 1) * num_steps) + step_idx
-            progress = float(global_step) / float(max(1, total_train_steps - 1))
-            degrade_strength = float(degrade_min_strength) + (
+                xb_np = _sample_wave_batch_unlabeled(
+                    streams=train_streams,
+                    batch_size=total_batch,
+                    chunk_samples=chunk_samples,
+                    rng=rng,
+                )
+                y_local = None
+            x_local = _to_device_wave_batch(xb_np, device=device, pin_memory=pin_memory)
+            return x_local, y_local
+
+        def _prepare_vectorized_block(step_start: int, n_steps_block: int):
+            n_steps_block = max(0, int(n_steps_block))
+            if n_steps_block <= 0:
+                return []
+            total_batch = int(n_steps_block) * int(batch_size)
+            x_clean_block, y_target_block = _sample_clean_targets(total_batch=total_batch)
+            global_steps = torch.arange(
+                int(epoch_step_offset + step_start),
+                int(epoch_step_offset + step_start + n_steps_block),
+                device=device,
+                dtype=torch.float32,
+            )
+            progress = global_steps / float(max(1, total_train_steps - 1))
+            strengths = float(degrade_min_strength) + (
                 float(degrade_max_strength) - float(degrade_min_strength)
             ) * progress
+            strengths = torch.clamp(strengths, 0.0, 1.0)
+            strengths_batch = strengths.repeat_interleave(int(batch_size))
+            degrade_meta_block: Dict[str, Any] = {}
             if bool(degrade_inputs):
-                xb = _degrade_wave_batch(
-                    x_clean=x_clean,
-                    strength=degrade_strength,
-                    noise_std_min=float(degrade_noise_std_min),
-                    noise_std_max=float(degrade_noise_std_max),
-                    dropout_max=float(degrade_dropout_max),
-                    quant_bits_min=int(degrade_quant_bits_min),
-                    quant_bits_max=int(degrade_quant_bits_max),
-                )
+                if str(degrade_domain) == "bitwindow":
+                    degrade_pack = _degrade_wave_batch_target_bits(
+                        x_clean=x_clean_block,
+                        strength=strengths_batch,
+                        noise_std_min=float(degrade_noise_std_min),
+                        noise_std_max=float(degrade_noise_std_max),
+                        dropout_max=float(degrade_dropout_max),
+                        quant_bits_min=int(degrade_quant_bits_min),
+                        quant_bits_max=int(degrade_quant_bits_max),
+                        cfg=cfg,
+                        sample_bits=int(sample_bits),
+                        bit_low=int(cfg.bitmask_low),
+                        bit_high=int(cfg.bitmask_high),
+                        mode=str(degrade_mode),
+                        stride_skew_max=float(degrade_stride_skew_max),
+                        return_meta=True,
+                    )
+                else:
+                    degrade_pack = _degrade_wave_batch(
+                        x_clean=x_clean_block,
+                        strength=strengths_batch,
+                        noise_std_min=float(degrade_noise_std_min),
+                        noise_std_max=float(degrade_noise_std_max),
+                        dropout_max=float(degrade_dropout_max),
+                        quant_bits_min=int(degrade_quant_bits_min),
+                        quant_bits_max=int(degrade_quant_bits_max),
+                        mode=str(degrade_mode),
+                        stride_skew_max=float(degrade_stride_skew_max),
+                        return_meta=True,
+                    )
+                if isinstance(degrade_pack, tuple):
+                    xb_block, degrade_meta_block = degrade_pack
+                else:
+                    xb_block = degrade_pack
             else:
-                xb = x_clean
+                xb_block = x_clean_block
+            out = []
+            for j in range(n_steps_block):
+                a = int(j) * int(batch_size)
+                b = a + int(batch_size)
+                y_j = None if y_target_block is None else y_target_block[a:b]
+                meta_j: Dict[str, Any] = {}
+                skew_block = degrade_meta_block.get("skew_applied", None)
+                if torch.is_tensor(skew_block):
+                    meta_j["skew_applied"] = skew_block[a:b].detach()
+                out.append((x_clean_block[a:b], xb_block[a:b], y_j, float(strengths[j].item()), meta_j))
+            return out
+
+        prep_queue = deque()
+        first_take = min(int(num_steps), int(degrade_vectorized_window))
+        for item in _prepare_vectorized_block(step_start=0, n_steps_block=first_take):
+            prep_queue.append(item)
+        next_step_to_prepare = int(first_take)
+
+        for step_idx in range(num_steps):
+            if stop_requested is not None:
+                try:
+                    if bool(stop_requested()):
+                        stop_now = True
+                        break
+                except Exception:
+                    pass
+            step_t0 = time.perf_counter()
+            if len(prep_queue) <= 0:
+                for item in _prepare_vectorized_block(step_start=step_idx, n_steps_block=1):
+                    prep_queue.append(item)
+            x_clean, xb, y_target, degrade_strength, degrade_meta = prep_queue.popleft()
+            if len(prep_queue) <= 0 and next_step_to_prepare < int(num_steps):
+                take = min(int(degrade_vectorized_window), int(num_steps) - int(next_step_to_prepare))
+                for item in _prepare_vectorized_block(step_start=next_step_to_prepare, n_steps_block=take):
+                    prep_queue.append(item)
+                next_step_to_prepare += int(take)
             step_t1 = time.perf_counter()
 
+            filter_inputs_step: Dict[str, Dict[str, Any]] = {}
+            target_skew_step = None
+            if bool(deskew_aux_active):
+                target_skew = None
+                if isinstance(degrade_meta, dict):
+                    target_skew = degrade_meta.get("skew_applied", None)
+                if torch.is_tensor(target_skew):
+                    target_skew = target_skew.to(device=xb.device, dtype=torch.float32).reshape(-1, 1)
+                else:
+                    target_skew = torch.zeros((int(xb.shape[0]), 1), dtype=torch.float32, device=xb.device)
+                target_skew_step = target_skew
+                filter_inputs_step["deskew"] = {
+                    "target_skew": target_skew,
+                    "max_skew": float(degrade_stride_skew_max),
+                    "prefilter_weight": float(deskew_prefilter_weight),
+                    "post_weight": float(deskew_residual_weight),
+                    "pre_token_mix": float(deskew_pre_token_mix),
+                    "post_token_mix": float(deskew_post_token_mix),
+                    "token_residual_weight": float(deskew_token_residual_weight),
+                    "degrade_strength": torch.full(
+                        (int(xb.shape[0]), 1),
+                        float(degrade_strength),
+                        dtype=torch.float32,
+                        device=xb.device,
+                    ),
+                }
+            if aux_filter_input_builder is not None:
+                extra_inputs = None
+                try:
+                    extra_inputs = aux_filter_input_builder(
+                        {
+                            "epoch": int(epoch),
+                            "step": int(step_idx + 1),
+                            "steps_per_epoch": int(num_steps),
+                            "x_clean": x_clean,
+                            "x_in": xb,
+                            "target_condition": y_target,
+                            "degrade_strength": float(degrade_strength),
+                            "degrade_meta": degrade_meta,
+                            "deskew_aux_active": bool(deskew_aux_active),
+                        }
+                    )
+                except Exception:
+                    extra_inputs = None
+                if isinstance(extra_inputs, dict):
+                    for bundle_name, task_in in extra_inputs.items():
+                        if not isinstance(task_in, dict):
+                            continue
+                        key = str(bundle_name).strip().lower()
+                        row = filter_inputs_step.setdefault(key, {})
+                        row.update(task_in)
+
+            transformer_aux: Dict[str, Any] = {}
             with _autocast_context(device=device, use_amp=use_amp, amp_dtype_t=amp_dtype_t):
-                xh = transformer(xb)
+                try:
+                    xh_out = transformer(xb, return_aux=True, filter_inputs=filter_inputs_step)
+                except TypeError as e:
+                    err_msg = str(e)
+                    if ("return_aux" not in err_msg) and ("filter_inputs" not in err_msg):
+                        raise
+                    xh_out = transformer(xb)
+            if isinstance(xh_out, tuple):
+                xh = xh_out[0]
+                if len(xh_out) >= 2 and isinstance(xh_out[1], dict):
+                    transformer_aux = dict(xh_out[1])
+            else:
+                xh = xh_out
             xh_f = xh.float()
             x_clean_f = x_clean.float()
             denoise_l1 = F.l1_loss(xh_f, x_clean_f)
+            aux_bundle_loss = torch.zeros((), dtype=torch.float32, device=device)
+            prefilter_loss = torch.zeros((), dtype=torch.float32, device=device)
+            post_residual_loss = torch.zeros((), dtype=torch.float32, device=device)
+            skew_mae = torch.zeros((), dtype=torch.float32, device=device)
+            deskew_target_abs = torch.zeros((), dtype=torch.float32, device=device)
+            deskew_pred_abs = torch.zeros((), dtype=torch.float32, device=device)
+            deskew_applied_abs = torch.zeros((), dtype=torch.float32, device=device)
+            deskew_remaining_abs = torch.zeros((), dtype=torch.float32, device=device)
+            deskew_post_abs = torch.zeros((), dtype=torch.float32, device=device)
+            deskew_conf = torch.zeros((), dtype=torch.float32, device=device)
+            deskew_pred_skew_t = None
+            deskew_applied_skew_t = None
+            deskew_confidence_t = None
+            deskew_post_residual_t = None
+            if isinstance(transformer_aux, dict):
+                bundle_rows = transformer_aux.get("filter_bundles", {})
+                if isinstance(bundle_rows, dict):
+                    for bundle_name, bundle_row in bundle_rows.items():
+                        if not isinstance(bundle_row, dict):
+                            continue
+                        losses = bundle_row.get("losses", {})
+                        if not isinstance(losses, dict):
+                            continue
+                        for loss_name, loss_value in losses.items():
+                            if not torch.is_tensor(loss_value):
+                                continue
+                            v = loss_value.to(device=device, dtype=torch.float32)
+                            if str(loss_name).endswith("_loss") and (not str(loss_name).endswith("_loss_raw")):
+                                aux_bundle_loss = aux_bundle_loss + v
+                        if str(bundle_name).strip().lower() == "deskew":
+                            v = losses.get("prefilter_loss", None)
+                            if torch.is_tensor(v):
+                                prefilter_loss = v.to(device=device, dtype=torch.float32)
+                            v = losses.get("post_residual_loss", None)
+                            if torch.is_tensor(v):
+                                post_residual_loss = v.to(device=device, dtype=torch.float32)
+                            v = losses.get("skew_mae", None)
+                            if torch.is_tensor(v):
+                                skew_mae = v.to(device=device, dtype=torch.float32)
+                            pre_row = bundle_row.get("pre", {})
+                            if isinstance(pre_row, dict):
+                                v = pre_row.get("pred_skew", None)
+                                if torch.is_tensor(v):
+                                    deskew_pred_skew_t = v.to(device=device, dtype=torch.float32).reshape(-1, 1)
+                                v = pre_row.get("applied_skew", None)
+                                if torch.is_tensor(v):
+                                    deskew_applied_skew_t = v.to(device=device, dtype=torch.float32).reshape(-1, 1)
+                                v = pre_row.get("confidence", None)
+                                if torch.is_tensor(v):
+                                    deskew_confidence_t = v.to(device=device, dtype=torch.float32).reshape(-1, 1)
+                            post_row = bundle_row.get("post", {})
+                            if isinstance(post_row, dict):
+                                v = post_row.get("residual_skew", None)
+                                if torch.is_tensor(v):
+                                    deskew_post_residual_t = v.to(device=device, dtype=torch.float32).reshape(-1, 1)
+            if torch.is_tensor(target_skew_step):
+                deskew_target_abs = torch.mean(torch.abs(target_skew_step.to(device=device, dtype=torch.float32)))
+            if torch.is_tensor(deskew_pred_skew_t):
+                deskew_pred_abs = torch.mean(torch.abs(deskew_pred_skew_t))
+            if torch.is_tensor(deskew_applied_skew_t):
+                deskew_applied_abs = torch.mean(torch.abs(deskew_applied_skew_t))
+                if torch.is_tensor(target_skew_step):
+                    tgt = target_skew_step.to(device=device, dtype=torch.float32).reshape(-1, 1)
+                    deskew_remaining_abs = torch.mean(torch.abs(tgt + deskew_applied_skew_t))
+            if torch.is_tensor(deskew_post_residual_t):
+                deskew_post_abs = torch.mean(torch.abs(deskew_post_residual_t))
+            if torch.is_tensor(deskew_confidence_t):
+                deskew_conf = torch.mean(torch.clamp(deskew_confidence_t, 0.0, 1.0))
 
             xh_hi, _, _, _ = _wave_bit_window_ste(
                 xh_f, sample_bits=int(sample_bits), bit_low=high_window[0], bit_high=high_window[1]
@@ -1469,26 +3727,75 @@ def train_transformer_feature_metric(
                 )
                 img_after = _maybe_channels_last(img_after, enabled=channels_last)
                 logits_after = classifier(img_after)
+            target_cond = None
             if y_target is not None:
-                valid_mask = y_target > 0
+                if int(y_target.ndim) == 1:
+                    raise RuntimeError(
+                        "Transformer target supervision now requires semantic condition vectors [B,C], "
+                        f"but got scalar labels with shape={tuple(y_target.shape)}"
+                    )
+                if int(y_target.ndim) != 2:
+                    raise RuntimeError(f"Unexpected transformer target shape: {tuple(y_target.shape)}")
+                target_cond = torch.clamp(y_target.to(torch.float32), 0.0, 1.0)
+                valid_mask = target_cond.sum(dim=1) > 0.0
             else:
                 valid_mask = None
 
             if valid_mask is not None and bool(torch.any(valid_mask)):
                 logits_before_v = logits_before[valid_mask]
                 logits_after_v = logits_after[valid_mask]
-                mask_bits = y_target[valid_mask].to(torch.long).unsqueeze(1)
-                n_classes = int(logits_after_v.shape[1])
-                class_bits = (1 << torch.arange(n_classes, device=device, dtype=torch.long)).unsqueeze(0)
-                target_mask = (torch.bitwise_and(mask_bits, class_bits) != 0).to(torch.float32)
-                target_count = torch.clamp(target_mask.sum(), min=1.0)
+                target_vec = target_cond[valid_mask]
+                if int(target_vec.shape[1]) != int(logits_after_v.shape[1]):
+                    raise RuntimeError(
+                        "Transformer target/logit width mismatch: "
+                        f"target={tuple(target_vec.shape)} logits={tuple(logits_after_v.shape)}"
+                    )
+                target_count = torch.clamp(target_vec.sum(dim=1), min=1.0)
                 probs_before_all = torch.sigmoid(logits_before_v).to(torch.float32)
                 probs_after_all = torch.sigmoid(logits_after_v).to(torch.float32)
-                score_target = (probs_before_all * target_mask).sum() / target_count
-                score_after = (probs_after_all * target_mask).sum() / target_count
+                score_target = ((probs_before_all * target_vec).sum(dim=1) / target_count).mean()
+                score_after = ((probs_after_all * target_vec).sum(dim=1) / target_count).mean()
                 score_gap = (
-                    F.relu((probs_before_all + score_target_margin) - probs_after_all) * target_mask
-                ).sum() / target_count
+                    (F.relu((probs_before_all + score_target_margin) - probs_after_all) * target_vec).sum(dim=1)
+                    / target_count
+                ).mean()
+                non_target_vec = torch.clamp(1.0 - target_vec, 0.0, 1.0)
+                non_target_count = non_target_vec.sum(dim=1)
+                has_non_target = non_target_count > 0.0
+                if bool(torch.any(has_non_target)):
+                    non_target_den = torch.clamp(non_target_count, min=1.0)
+                    target_score_before = (probs_before_all * target_vec).sum(dim=1) / target_count
+                    target_score_after = (probs_after_all * target_vec).sum(dim=1) / target_count
+
+                    nt_before_masked = probs_before_all.masked_fill(non_target_vec <= 0.0, -1e9)
+                    nt_after_masked = probs_after_all.masked_fill(non_target_vec <= 0.0, -1e9)
+                    nt_max_before = nt_before_masked.max(dim=1).values
+                    nt_max_after = nt_after_masked.max(dim=1).values
+                    rank_violation_before = F.relu(nt_max_before + float(score_rank_margin) - target_score_before)
+                    rank_violation_after = F.relu(nt_max_after + float(score_rank_margin) - target_score_after)
+                    rank_improve_ref = F.relu(rank_violation_before - float(score_target_margin))
+                    rank_gap_vec = F.relu(rank_violation_after - rank_improve_ref)
+
+                    spurious_prob_before = (probs_before_all * non_target_vec).sum(dim=1) / non_target_den
+                    spurious_prob_after = (probs_after_all * non_target_vec).sum(dim=1) / non_target_den
+                    soft_hits_before = (
+                        torch.sigmoid((probs_before_all - float(score_spurious_threshold)) / float(score_spurious_temp))
+                        * non_target_vec
+                    ).sum(dim=1) / non_target_den
+                    soft_hits_after = (
+                        torch.sigmoid((probs_after_all - float(score_spurious_threshold)) / float(score_spurious_temp))
+                        * non_target_vec
+                    ).sum(dim=1) / non_target_den
+                    spurious_before = 0.5 * (spurious_prob_before + soft_hits_before)
+                    spurious_after = 0.5 * (spurious_prob_after + soft_hits_after)
+                    spurious_improve_ref = torch.clamp(spurious_before - float(score_spurious_margin), min=0.0)
+                    spurious_gap_vec = F.relu(spurious_after - spurious_improve_ref)
+
+                    score_rank_gap = rank_gap_vec[has_non_target].mean()
+                    score_spurious_gap = spurious_gap_vec[has_non_target].mean()
+                else:
+                    score_rank_gap = score_gap.new_zeros(())
+                    score_spurious_gap = score_gap.new_zeros(())
             else:
                 score_target = multilabel_feature_score(
                     logits_before,
@@ -1507,18 +3814,70 @@ def train_transformer_feature_metric(
                     w_mean=score_w_mean,
                 )["score"].to(torch.float32)
                 score_gap = F.relu((score_target + score_target_margin) - score_after)
+                score_rank_gap = score_gap.new_zeros(())
+                score_spurious_gap = score_gap.new_zeros(())
+
+            signal_gap = score_gap + (float(score_rank_weight) * score_rank_gap) + (
+                float(score_spurious_weight) * score_spurious_gap
+            )
 
             loss = (
-                (score_target_weight * score_gap)
+                (score_target_weight * signal_gap)
                 + (wave_l1_weight * denoise_l1)
                 + (entropy_penalty_weight * entropy_pen)
                 + (high_bit_penalty_weight * hi_bit_l1)
                 + (low_bit_penalty_weight * lo_bit_l1)
+                + aux_bundle_loss
             )
-            if status_viewer.enabled and int(xb.shape[0]) > 0:
+            if (step_preview_callback is not None) and int(xb.shape[0]) > 0:
                 preview_idx = int(rng.integers(0, int(xb.shape[0])))
+                if y_target is not None:
+                    # Select a batch row that has at least one supervised target bit.
+                    if int(y_target.ndim) == 2:
+                        target_rows = torch.nonzero((y_target > 0).any(dim=1), as_tuple=False).squeeze(1)
+                    else:
+                        target_rows = torch.nonzero(y_target > 0, as_tuple=False).reshape(-1)
+                    if int(target_rows.numel()) > 0:
+                        pick = int(rng.integers(0, int(target_rows.numel())))
+                        pick = max(0, min(int(target_rows.numel()) - 1, pick))
+                        preview_idx = int(target_rows[pick].item())
+                preview_idx = max(0, min(int(xb.shape[0]) - 1, int(preview_idx)))
+                last_xclean_preview = x_clean[preview_idx : preview_idx + 1].detach()
                 last_xb_preview = xb[preview_idx : preview_idx + 1].detach()
                 last_xh_preview = xh[preview_idx : preview_idx + 1].detach()
+                if target_cond is not None and int(preview_idx) < int(target_cond.shape[0]):
+                    last_target_condition_preview = target_cond[preview_idx].detach().to(torch.float32)
+                else:
+                    last_target_condition_preview = None
+                last_deskew_preview = None
+                try:
+                    if torch.is_tensor(target_skew_step) and int(preview_idx) < int(target_skew_step.shape[0]):
+                        target_v = float(target_skew_step[preview_idx].detach().to(torch.float32).item())
+                    else:
+                        target_v = 0.0
+                    pred_v = float(
+                        deskew_pred_skew_t[preview_idx].detach().to(torch.float32).item()
+                    ) if torch.is_tensor(deskew_pred_skew_t) and int(preview_idx) < int(deskew_pred_skew_t.shape[0]) else 0.0
+                    applied_v = float(
+                        deskew_applied_skew_t[preview_idx].detach().to(torch.float32).item()
+                    ) if torch.is_tensor(deskew_applied_skew_t) and int(preview_idx) < int(deskew_applied_skew_t.shape[0]) else 0.0
+                    conf_v = float(
+                        torch.clamp(deskew_confidence_t[preview_idx].detach().to(torch.float32), 0.0, 1.0).item()
+                    ) if torch.is_tensor(deskew_confidence_t) and int(preview_idx) < int(deskew_confidence_t.shape[0]) else 0.0
+                    post_v = float(
+                        deskew_post_residual_t[preview_idx].detach().to(torch.float32).item()
+                    ) if torch.is_tensor(deskew_post_residual_t) and int(preview_idx) < int(deskew_post_residual_t.shape[0]) else 0.0
+                    remain_v = float(target_v + applied_v)
+                    last_deskew_preview = {
+                        "target_skew": float(target_v),
+                        "pred_skew": float(pred_v),
+                        "applied_skew": float(applied_v),
+                        "remaining_skew": float(remain_v),
+                        "post_residual_skew": float(post_v),
+                        "confidence": float(conf_v),
+                    }
+                except Exception:
+                    last_deskew_preview = None
             step_t2 = time.perf_counter()
             loss_to_backprop = loss / float(grad_accum_steps)
             if use_scaler:
@@ -1548,6 +3907,19 @@ def train_transformer_feature_metric(
             running_score_target = running_score_target + score_target.detach().to(torch.float32)
             running_score_after = running_score_after + score_after.detach().to(torch.float32)
             running_score_gap = running_score_gap + score_gap.detach().to(torch.float32)
+            running_score_rank_gap = running_score_rank_gap + score_rank_gap.detach().to(torch.float32)
+            running_score_spurious_gap = running_score_spurious_gap + score_spurious_gap.detach().to(torch.float32)
+            running_signal_gap = running_signal_gap + signal_gap.detach().to(torch.float32)
+            running_aux_bundle_loss = running_aux_bundle_loss + aux_bundle_loss.detach().to(torch.float32)
+            running_prefilter_loss = running_prefilter_loss + prefilter_loss.detach().to(torch.float32)
+            running_post_residual_loss = running_post_residual_loss + post_residual_loss.detach().to(torch.float32)
+            running_skew_mae = running_skew_mae + skew_mae.detach().to(torch.float32)
+            running_deskew_target_abs = running_deskew_target_abs + deskew_target_abs.detach().to(torch.float32)
+            running_deskew_pred_abs = running_deskew_pred_abs + deskew_pred_abs.detach().to(torch.float32)
+            running_deskew_applied_abs = running_deskew_applied_abs + deskew_applied_abs.detach().to(torch.float32)
+            running_deskew_remaining_abs = running_deskew_remaining_abs + deskew_remaining_abs.detach().to(torch.float32)
+            running_deskew_post_abs = running_deskew_post_abs + deskew_post_abs.detach().to(torch.float32)
+            running_deskew_conf = running_deskew_conf + deskew_conf.detach().to(torch.float32)
             running_degrade += float(degrade_strength)
             t_sample += step_t1 - step_t0
             t_forward += step_t2 - step_t1
@@ -1564,28 +3936,69 @@ def train_transformer_feature_metric(
                 avg_score_tgt = float((running_score_target / float(steps_done)).item())
                 avg_score_after = float((running_score_after / float(steps_done)).item())
                 avg_score_gap = float((running_score_gap / float(steps_done)).item())
+                avg_rank_gap = float((running_score_rank_gap / float(steps_done)).item())
+                avg_spurious_gap = float((running_score_spurious_gap / float(steps_done)).item())
+                avg_signal_gap = float((running_signal_gap / float(steps_done)).item())
+                avg_aux_bundle = float((running_aux_bundle_loss / float(steps_done)).item())
+                avg_prefilter = float((running_prefilter_loss / float(steps_done)).item())
+                avg_post_residual = float((running_post_residual_loss / float(steps_done)).item())
+                avg_skew_mae = float((running_skew_mae / float(steps_done)).item())
+                avg_deskew_target_abs = float((running_deskew_target_abs / float(steps_done)).item())
+                avg_deskew_pred_abs = float((running_deskew_pred_abs / float(steps_done)).item())
+                avg_deskew_applied_abs = float((running_deskew_applied_abs / float(steps_done)).item())
+                avg_deskew_remaining_abs = float((running_deskew_remaining_abs / float(steps_done)).item())
+                avg_deskew_post_abs = float((running_deskew_post_abs / float(steps_done)).item())
+                avg_deskew_conf = float((running_deskew_conf / float(steps_done)).item())
                 avg_deg = float(running_degrade / float(steps_done))
-                if status_viewer.enabled and (last_xb_preview is not None) and (last_xh_preview is not None):
-                    with torch.no_grad():
-                        img_in = render_mono_wave_to_tensor(
-                            last_xb_preview, cfg=cfg, image_hw=image_hw, sample_bits=sample_bits
+                if (
+                    (step_preview_callback is not None)
+                    and (last_xclean_preview is not None)
+                    and (last_xb_preview is not None)
+                    and (last_xh_preview is not None)
+                ):
+                    try:
+                        step_preview_callback(
+                            {
+                                "epoch": int(epoch),
+                                "step": int(steps_done),
+                                "steps_per_epoch": int(num_steps),
+                                "x_clean": last_xclean_preview.detach().to(torch.float32),
+                                "x_in": last_xb_preview.detach().to(torch.float32),
+                                "x_out": last_xh_preview.detach().to(torch.float32),
+                                "target_condition": (
+                                    last_target_condition_preview.detach().to(torch.float32)
+                                    if last_target_condition_preview is not None
+                                    else None
+                                ),
+                                "score_after": float(avg_score_after),
+                                "score_gap": float(avg_score_gap),
+                                "loss": float(avg_loss),
+                                "denoise_l1": float(avg_denoise),
+                                "high_bits_l1": float(avg_hi_bits),
+                                "low_bits_l1": float(avg_lo_bits),
+                                "entropy_excess": float(avg_ent),
+                                "score_target": float(avg_score_tgt),
+                                "degrade_strength": float(avg_deg),
+                                "deskew_target_abs": float(avg_deskew_target_abs),
+                                "deskew_pred_abs": float(avg_deskew_pred_abs),
+                                "deskew_applied_abs": float(avg_deskew_applied_abs),
+                                "deskew_remaining_abs": float(avg_deskew_remaining_abs),
+                                "deskew_post_abs": float(avg_deskew_post_abs),
+                                "deskew_confidence_mean": float(avg_deskew_conf),
+                                "deskew_preview": dict(last_deskew_preview) if isinstance(last_deskew_preview, dict) else None,
+                            }
                         )
-                        img_out = render_mono_wave_to_tensor(
-                            last_xh_preview, cfg=cfg, image_hw=image_hw, sample_bits=sample_bits
-                        )
-                    status_viewer.update(
-                        input_img=img_in[0],
-                        output_img=img_out[0],
-                        caption=(
-                            f"epoch {epoch}/{epochs} step {steps_done}/{num_steps} "
-                            f"loss {avg_loss:.4f} hi {avg_hi_bits:.4f} lo {avg_lo_bits:.4f}"
-                        ),
-                    )
+                    except Exception:
+                        pass
                 print(
                     f"[transformer-train] epoch={epoch}/{epochs} step={steps_done}/{num_steps} "
                     f"loss={avg_loss:.4f} denoise_l1={avg_denoise:.4f} "
                     f"hi_bits={avg_hi_bits:.4f} lo_bits={avg_lo_bits:.4f} entropy_excess={avg_ent:.4f} "
-                    f"score_target={avg_score_tgt:.4f} score_after={avg_score_after:.4f} score_gap={avg_score_gap:.4f} "
+                    f"score_target={avg_score_tgt:.4f} score_after={avg_score_after:.4f} "
+                    f"score_gap={avg_score_gap:.4f} rank_gap={avg_rank_gap:.4f} spurious_gap={avg_spurious_gap:.4f} signal_gap={avg_signal_gap:.4f} "
+                    f"aux={avg_aux_bundle:.4f} deskew_pre={avg_prefilter:.4f} deskew_post={avg_post_residual:.4f} deskew_mae={avg_skew_mae:.4f} "
+                    f"deskew_abs(tgt/pred/app/rem/post)=({avg_deskew_target_abs:.4f}/{avg_deskew_pred_abs:.4f}/{avg_deskew_applied_abs:.4f}/{avg_deskew_remaining_abs:.4f}/{avg_deskew_post_abs:.4f}) "
+                    f"deskew_conf={avg_deskew_conf:.3f} "
                     f"degrade={avg_deg:.3f} "
                     f"samp_per_sec={(steps_done * int(batch_size)) / elapsed:.1f} "
                     f"sample_ms={(1000.0 * t_sample) / steps_done:.2f} "
@@ -1594,6 +4007,8 @@ def train_transformer_feature_metric(
                     flush=True,
                 )
 
+        if stop_now:
+            break
         s = 1.0 / max(1, num_steps)
         row_train = {
             "loss": float((running_loss * s).item()),
@@ -1604,6 +4019,19 @@ def train_transformer_feature_metric(
             "score_target": float((running_score_target * s).item()),
             "score_after": float((running_score_after * s).item()),
             "score_gap": float((running_score_gap * s).item()),
+            "score_rank_gap": float((running_score_rank_gap * s).item()),
+            "score_spurious_gap": float((running_score_spurious_gap * s).item()),
+            "signal_gap": float((running_signal_gap * s).item()),
+            "aux_bundle_loss": float((running_aux_bundle_loss * s).item()),
+            "deskew_prefilter_loss": float((running_prefilter_loss * s).item()),
+            "deskew_post_residual_loss": float((running_post_residual_loss * s).item()),
+            "deskew_skew_mae": float((running_skew_mae * s).item()),
+            "deskew_target_abs": float((running_deskew_target_abs * s).item()),
+            "deskew_pred_abs": float((running_deskew_pred_abs * s).item()),
+            "deskew_applied_abs": float((running_deskew_applied_abs * s).item()),
+            "deskew_remaining_abs": float((running_deskew_remaining_abs * s).item()),
+            "deskew_post_abs": float((running_deskew_post_abs * s).item()),
+            "deskew_confidence": float((running_deskew_conf * s).item()),
             "degrade_strength": float(running_degrade * s),
         }
 
@@ -1644,6 +4072,19 @@ def train_transformer_feature_metric(
             "train_score_target": row_train["score_target"],
             "train_score_after": row_train["score_after"],
             "train_score_gap": row_train["score_gap"],
+            "train_score_rank_gap": row_train["score_rank_gap"],
+            "train_score_spurious_gap": row_train["score_spurious_gap"],
+            "train_signal_gap": row_train["signal_gap"],
+            "train_aux_bundle_loss": row_train["aux_bundle_loss"],
+            "train_deskew_prefilter_loss": row_train["deskew_prefilter_loss"],
+            "train_deskew_post_residual_loss": row_train["deskew_post_residual_loss"],
+            "train_deskew_skew_mae": row_train["deskew_skew_mae"],
+            "train_deskew_target_abs": row_train["deskew_target_abs"],
+            "train_deskew_pred_abs": row_train["deskew_pred_abs"],
+            "train_deskew_applied_abs": row_train["deskew_applied_abs"],
+            "train_deskew_remaining_abs": row_train["deskew_remaining_abs"],
+            "train_deskew_post_abs": row_train["deskew_post_abs"],
+            "train_deskew_confidence": row_train["deskew_confidence"],
             "val_score_before": float(eval_stats["score_before"]),
             "val_score_after": float(eval_stats["score_after"]),
             "val_score_gain": gain,
@@ -1659,7 +4100,13 @@ def train_transformer_feature_metric(
             f"hi_bits={row_train['high_bits_l1']:.4f} lo_bits={row_train['low_bits_l1']:.4f} "
             f"entropy_excess={row_train['entropy_excess']:.4f} "
             f"score_target={row_train['score_target']:.4f} score_after={row_train['score_after']:.4f} "
-            f"score_gap={row_train['score_gap']:.4f} "
+            f"score_gap={row_train['score_gap']:.4f} rank_gap={row_train['score_rank_gap']:.4f} "
+            f"spurious_gap={row_train['score_spurious_gap']:.4f} signal_gap={row_train['signal_gap']:.4f} "
+            f"aux={row_train['aux_bundle_loss']:.4f} deskew_pre={row_train['deskew_prefilter_loss']:.4f} "
+            f"deskew_post={row_train['deskew_post_residual_loss']:.4f} deskew_mae={row_train['deskew_skew_mae']:.4f} "
+            f"deskew_abs(tgt/pred/app/rem/post)=({row_train['deskew_target_abs']:.4f}/{row_train['deskew_pred_abs']:.4f}/"
+            f"{row_train['deskew_applied_abs']:.4f}/{row_train['deskew_remaining_abs']:.4f}/{row_train['deskew_post_abs']:.4f}) "
+            f"deskew_conf={row_train['deskew_confidence']:.3f} "
             f"degrade={row_train['degrade_strength']:.3f} "
             f"val_gain={gain:.4f} "
             f"epoch_sec={epoch_sec:.2f} eval_sec={eval_sec:.2f} "
@@ -1668,28 +4115,11 @@ def train_transformer_feature_metric(
             f"backward_pct={(100.0 * t_backward / max(1e-6, epoch_sec)):.1f}",
             flush=True,
         )
-        if status_viewer.enabled and (last_xb_preview is not None) and (last_xh_preview is not None):
-            with torch.no_grad():
-                img_in = render_mono_wave_to_tensor(
-                    last_xb_preview, cfg=cfg, image_hw=image_hw, sample_bits=sample_bits
-                )
-                img_out = render_mono_wave_to_tensor(
-                    last_xh_preview, cfg=cfg, image_hw=image_hw, sample_bits=sample_bits
-                )
-            status_viewer.update(
-                input_img=img_in[0],
-                output_img=img_out[0],
-                caption=(
-                    f"epoch {epoch}/{epochs} val_gain {gain:.4f} "
-                    f"hi {row_train['high_bits_l1']:.4f} lo {row_train['low_bits_l1']:.4f}"
-                ),
-            )
 
         if gain > best_gain:
             best_gain = gain
             best_state = copy.deepcopy(transformer.state_dict())
 
-    status_viewer.close()
     if best_state is not None:
         transformer.load_state_dict(best_state)
     for p, req in zip(classifier.parameters(), classifier_requires_grad):

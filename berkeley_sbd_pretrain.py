@@ -39,26 +39,33 @@ except ModuleNotFoundError:
 
 
 VOC20_CLASSES = [
-    "aeroplane",
-    "bicycle",
-    "bird",
-    "boat",
-    "bottle",
-    "bus",
-    "car",
-    "cat",
-    "chair",
-    "cow",
-    "diningtable",
-    "dog",
-    "horse",
-    "motorbike",
-    "person",
-    "pottedplant",
-    "sheep",
-    "sofa",
-    "train",
-    "tvmonitor",
+    "black",
+    "white",
+    "gray",
+    "grey",
+    "red",
+    "green",
+    "blue",
+    "yellow",
+    "cyan",
+    "magenta",
+    "brown",
+    "noise",
+    "white noise",
+    "pink noise",
+    "brown noise",
+    "red noise",
+    "blue noise",
+    "violet noise",
+    "gray noise",
+    "uniform white noise",
+    "gaussian white noise",
+    "front",
+    "back",
+    "left",
+    "right",
+    "top",
+    "bottom",
 ]
 
 
@@ -192,18 +199,36 @@ class SBDMultiLabelDataset(Dataset):
 
 
 def _labels_from_segmentation_masks(ds: SBDataset, cache_path: Path):
+    target_dim = max(1, int(len(VOC20_CLASSES)))
+
+    def _adapt_shape(arr: np.ndarray) -> np.ndarray:
+        x = np.asarray(arr, dtype=np.float32)
+        if int(x.ndim) != 2:
+            raise RuntimeError(f"Invalid cached label shape: {tuple(x.shape)}")
+        n = int(x.shape[0])
+        if int(x.shape[1]) == int(target_dim):
+            return x.astype(np.float32, copy=False)
+        if int(x.shape[1]) > int(target_dim):
+            return x[:, : int(target_dim)].astype(np.float32, copy=False)
+        pad = np.zeros((int(n), int(target_dim - int(x.shape[1]))), dtype=np.float32)
+        return np.concatenate([x.astype(np.float32, copy=False), pad], axis=1).astype(np.float32, copy=False)
+
     if cache_path.exists():
         blob = np.load(cache_path, allow_pickle=False)
-        labels = blob["labels"].astype(np.float32, copy=False)
+        labels = _adapt_shape(blob["labels"])
+        try:
+            np.savez_compressed(cache_path, labels=labels.astype(np.float32, copy=False))
+        except Exception:
+            pass
         return labels
 
     _log(f"Building label cache: {cache_path}")
     n = len(ds)
-    labels = np.zeros((n, 20), dtype=np.float32)
+    labels = np.zeros((n, int(target_dim)), dtype=np.float32)
     for i, mpath in enumerate(ds.masks):
         seg = np.array(ds._get_segmentation_target(mpath), dtype=np.int32)
         ids = np.unique(seg)
-        ids = ids[(ids >= 1) & (ids <= 20)]
+        ids = ids[(ids >= 1) & (ids <= min(20, int(target_dim)))]
         if ids.size > 0:
             labels[i, ids - 1] = 1.0
         if (i + 1) % 500 == 0 or (i + 1) == n:
@@ -318,7 +343,7 @@ def evaluate(
         yb = yb.to(device, non_blocking=True)
         with _autocast_context(device=device, enabled=amp_enabled, amp_dtype_t=amp_dtype_t):
             logits = model(xb)
-            loss = F.binary_cross_entropy_with_logits(logits, yb)
+            loss = F.mse_loss(torch.sigmoid(logits), yb)
         total_loss += float(loss.item()) * int(xb.shape[0])
         n += int(xb.shape[0])
         logits_all.append(logits.detach().cpu())
@@ -581,7 +606,7 @@ def main():
             yb = yb.to(device, non_blocking=True)
             with _autocast_context(device=device, enabled=amp_enabled, amp_dtype_t=amp_dtype_t):
                 logits = model(xb)
-                loss = F.binary_cross_entropy_with_logits(logits, yb)
+                loss = F.mse_loss(torch.sigmoid(logits), yb)
             loss_to_backprop = loss / float(grad_accum_steps)
             if use_scaler:
                 scaler.scale(loss_to_backprop).backward()
