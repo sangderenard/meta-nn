@@ -8,6 +8,23 @@ set "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True"
 set "HF_HUB_OFFLINE=1"
 set "TRANSFORMERS_OFFLINE=1"
 set "HF_HOME=%USERPROFILE%\.cache\huggingface"
+set "HARD_WIPE_CACHE=0"
+set "SOFT_RESET_LABELS=0"
+
+REM CLI toggle:
+REM   run_iterative_wav_pipeline.bat --hard-wipe-cache
+for %%A in (%*) do (
+  if /I "%%~A"=="--hard-wipe-cache" set "HARD_WIPE_CACHE=1"
+  if /I "%%~A"=="--hard-wipe-caches" set "HARD_WIPE_CACHE=1"
+  if /I "%%~A"=="--soft-reset-labels" set "SOFT_RESET_LABELS=1"
+  if /I "%%~A"=="--soft-reset-label-cache" set "SOFT_RESET_LABELS=1"
+)
+if "%HARD_WIPE_CACHE%"=="1" (
+  echo [launcher] hard cache wipe requested for next pipeline run.
+)
+if "%SOFT_RESET_LABELS%"=="1" (
+  echo [launcher] soft label reset requested for next pipeline run.
+)
 
 REM Force classifier init from scratch for this iterative launcher (no Berkeley pretrain checkpoint).
 
@@ -114,6 +131,9 @@ set "TRANS_LOSS_WAVE_W=1.00"
 set "TRANS_LOSS_LO_W=0.08"
 set "TRANS_LOSS_SCORE_TARGET_W=2.00"
 set "TRANS_SCORE_MARGIN=0.02"
+set "TARGET_LABEL_KNOCKOUT_PROB=0.00"
+set "TARGET_LABEL_KNOCKOUT_MAX_DROP_FRAC=0.50"
+set "TARGET_LABEL_KNOCKOUT_MIN_KEEP=1"
 set "LR_SINE_CYCLES=0"
 set "LR_SINE_FREQUENCY=0.0"
 set "LR_SINE_TAIL_FRACTION=0.0"
@@ -151,6 +171,7 @@ set "SEMANTIC_VOCAB_EXTRA_JSON="
 set "SEMANTIC_VOCAB_EXTRA_SLOTS=48"
 set "SEMANTIC_VOCAB_CHURN_ENABLED=1"
 set "SEMANTIC_VOCAB_CHURN_REPLACE_PER_CYCLE=2"
+set "SEMANTIC_VOCAB_CHURN_SWEEP_CYCLES=3"
 set "SEMANTIC_VOCAB_REGURGITATED_CHURN_ENABLED=1"
 set "SEMANTIC_VOCAB_REGURGITATED_CHURN_PROB=0.35"
 set "SEMANTIC_VOCAB_REGURGITATED_CHURN_LIFETIME=3"
@@ -232,6 +253,7 @@ if "%SEMANTIC_VOCAB_CHURN_ENABLED%"=="1" (
   set "SEMANTIC_VOCAB_ARG=%SEMANTIC_VOCAB_ARG% --no-semantic-vocab-churn-enabled"
 )
 if not "%SEMANTIC_VOCAB_CHURN_REPLACE_PER_CYCLE%"=="" set "SEMANTIC_VOCAB_ARG=%SEMANTIC_VOCAB_ARG% --semantic-vocab-churn-replace-per-cycle %SEMANTIC_VOCAB_CHURN_REPLACE_PER_CYCLE%"
+if not "%SEMANTIC_VOCAB_CHURN_SWEEP_CYCLES%"=="" set "SEMANTIC_VOCAB_ARG=%SEMANTIC_VOCAB_ARG% --semantic-vocab-churn-sweep-cycles %SEMANTIC_VOCAB_CHURN_SWEEP_CYCLES%"
 if "%SEMANTIC_VOCAB_REGURGITATED_CHURN_ENABLED%"=="1" (
   set "SEMANTIC_VOCAB_ARG=%SEMANTIC_VOCAB_ARG% --semantic-vocab-regurgitated-churn-enabled"
 ) else (
@@ -336,7 +358,16 @@ echo.
 echo [launcher] run !RUN_INDEX! seed=!RUN_SEED! endless=%ENDLESS_MODE%
 echo [launcher] gate_gestation_loss_target=!GATE_GESTATION_LOSS_TARGET!
 echo [launcher] gate_berkeley_loss_target=!GATE_BERKELEY_LOSS_TARGET!
-call :run_pipeline !RUN_SEED!
+set "RUN_EXTRA_ARG="
+if "%HARD_WIPE_CACHE%"=="1" (
+  set "RUN_EXTRA_ARG=!RUN_EXTRA_ARG! --hard-wipe-caches"
+  set "HARD_WIPE_CACHE=0"
+)
+if "%SOFT_RESET_LABELS%"=="1" (
+  set "RUN_EXTRA_ARG=!RUN_EXTRA_ARG! --soft-reset-labels"
+  set "SOFT_RESET_LABELS=0"
+)
+call :run_pipeline !RUN_SEED! "!RUN_EXTRA_ARG!"
 set "RUN_RC=!ERRORLEVEL!"
 if "!RUN_RC!"=="%GUI_STOP_EXIT_CODE%" (
   echo.
@@ -371,6 +402,7 @@ exit /b 0
 
 :run_pipeline
 set "RUN_SEED=%~1"
+set "RUN_EXTRA_ARG=%~2"
 %PYTHON% %SCRIPT% ^
   --objective-mode berkeley_multilabel ^
   --output-dir "%OUTPUT_DIR%" %RESUME_ARG% ^
@@ -557,6 +589,9 @@ set "RUN_SEED=%~1"
   --transformer-loss-low-bit-weight %TRANS_LOSS_LO_W% ^
   --transformer-loss-score-target-weight %TRANS_LOSS_SCORE_TARGET_W% ^
   --transformer-loss-score-target-margin %TRANS_SCORE_MARGIN% ^
+  --target-label-knockout-prob %TARGET_LABEL_KNOCKOUT_PROB% ^
+  --target-label-knockout-max-drop-frac %TARGET_LABEL_KNOCKOUT_MAX_DROP_FRAC% ^
+  --target-label-knockout-min-keep %TARGET_LABEL_KNOCKOUT_MIN_KEEP% ^
   --latent-berkeley-imprint-mix-targets ^
   --latent-berkeley-imprint-steps %LATENT_IMPRINT_STEPS% ^
   --latent-berkeley-imprint-lr %LATENT_IMPRINT_LR% ^
@@ -577,7 +612,8 @@ set "RUN_SEED=%~1"
   %GD_VOCAB_ARG% ^
   %WAVE_ZERO_SHOT_ARG% ^
   %LABEL_QUERY_ARG% ^
-  %WAV_ARG%
+  %WAV_ARG% ^
+  %RUN_EXTRA_ARG%
 exit /b %ERRORLEVEL%
 
 :all_done

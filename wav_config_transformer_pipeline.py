@@ -5,6 +5,7 @@ import json
 import math
 import os
 import re
+import shutil
 import sys
 import time
 import wave
@@ -118,6 +119,119 @@ def _torch_load_cpu(path: str):
     except Exception:
         # Fallback for checkpoints that require legacy unpickling behavior.
         return torch.load(path, map_location="cpu", weights_only=False)
+
+
+def _hard_wipe_pipeline_caches(output_dir: Path, berkeley_data_root: str) -> Dict[str, Any]:
+    out_dir = Path(output_dir)
+    berkeley_root = Path(str(berkeley_data_root).strip() or "toys_to_survive_development/data/berkeley_sbd")
+    targets: List[Path] = [
+        out_dir / "accepted_wave_library",
+        out_dir / "latent_wave_pool",
+        out_dir / "training_supervision",
+    ]
+    berkeley_cache_root = berkeley_root / "cache"
+    if berkeley_cache_root.exists():
+        for payload_dir in sorted(berkeley_cache_root.glob("payload_bank_rgb*")):
+            targets.append(Path(payload_dir))
+
+    def _remove_path_retry(path: Path, retries: int = 6) -> Tuple[bool, str]:
+        last_err = ""
+        for attempt in range(max(1, int(retries))):
+            try:
+                if not path.exists():
+                    return False, ""
+                if path.is_dir():
+                    shutil.rmtree(path)
+                else:
+                    path.unlink()
+                return True, ""
+            except FileNotFoundError:
+                return False, ""
+            except PermissionError as e:
+                last_err = f"{type(e).__name__}: {e}"
+                gc.collect()
+                time.sleep(0.15 * float(attempt + 1))
+            except Exception as e:
+                last_err = f"{type(e).__name__}: {e}"
+                break
+        return False, str(last_err)
+
+    info: Dict[str, Any] = {
+        "requested": [str(p) for p in targets],
+        "removed": [],
+        "missing": [],
+        "errors": [],
+    }
+    for p in targets:
+        if not p.exists():
+            info["missing"].append(str(p))
+            continue
+        ok, err = _remove_path_retry(p)
+        if bool(ok):
+            info["removed"].append(str(p))
+        else:
+            info["errors"].append(f"{str(p)} ({str(err)})")
+    return info
+
+
+def _soft_reset_label_caches(output_dir: Path, berkeley_data_root: str) -> Dict[str, Any]:
+    _ = Path(output_dir)
+    berkeley_root = Path(str(berkeley_data_root).strip() or "toys_to_survive_development/data/berkeley_sbd")
+    targets: List[Path] = []
+    berkeley_cache_root = berkeley_root / "cache"
+    if berkeley_cache_root.exists():
+        for payload_dir in sorted(berkeley_cache_root.glob("payload_bank_rgb*")):
+            pd = Path(payload_dir)
+            targets.extend(
+                [
+                    pd / "labels.npy",
+                    pd / "labels.tmp.npy",
+                    pd / "terms.json",
+                    pd / "sources.json",
+                    pd / "manifest.json",
+                    pd / "source_catalog.json",
+                    pd / "semantic_gate_labels",
+                ]
+            )
+
+    def _remove_path_retry(path: Path, retries: int = 6) -> Tuple[bool, str]:
+        last_err = ""
+        for attempt in range(max(1, int(retries))):
+            try:
+                if not path.exists():
+                    return False, ""
+                if path.is_dir():
+                    shutil.rmtree(path)
+                else:
+                    path.unlink()
+                return True, ""
+            except FileNotFoundError:
+                return False, ""
+            except PermissionError as e:
+                last_err = f"{type(e).__name__}: {e}"
+                gc.collect()
+                time.sleep(0.15 * float(attempt + 1))
+            except Exception as e:
+                last_err = f"{type(e).__name__}: {e}"
+                break
+        return False, str(last_err)
+
+    info: Dict[str, Any] = {
+        "requested": [str(p) for p in targets],
+        "removed": [],
+        "missing": [],
+        "errors": [],
+    }
+    for p in targets:
+        if not p.exists():
+            info["missing"].append(str(p))
+            continue
+        ok, err = _remove_path_retry(p)
+        if bool(ok):
+            info["removed"].append(str(p))
+        else:
+            info["errors"].append(f"{str(p)} ({str(err)})")
+    return info
 
 
 def _normalize_l2_rows_np(x: np.ndarray) -> np.ndarray:
@@ -455,6 +569,162 @@ def _semantic_term_index_map(class_names: Sequence[str]) -> Dict[str, int]:
     return out
 
 
+def _semantic_damage_tags(term: str) -> List[str]:
+    key = re.sub(r"\s+", " ", str(term)).strip().lower()
+    if not key:
+        return []
+    lut: Dict[str, List[str]] = {
+        "noise damage": ["noise damage", "noise", "mixed noise and signal", "signal"],
+        "blur damage": ["blur damage", "signal"],
+        "dropout damage": ["dropout damage", "signal"],
+        "quantization damage": ["quantization damage", "signal"],
+        "stride skew damage": ["stride skew damage", "signal"],
+    }
+    if key in lut:
+        return _normalize_vocab_terms(lut[key])
+    if key.endswith("damage"):
+        return _normalize_vocab_terms([key, "signal"])
+    return []
+
+
+def _semantic_noise_family_terms() -> List[str]:
+    return [
+        "noise",
+        "white noise",
+        "pink noise",
+        "brown noise",
+        "red noise",
+        "blue noise",
+        "violet noise",
+        "gray noise",
+        "gaussian white noise",
+        "uniform white noise",
+    ]
+
+
+def _semantic_noise_profile_key_from_term(term: str) -> str:
+    key = re.sub(r"\s+", " ", str(term)).strip().lower()
+    lut = {
+        "noise": "uniform_white_noise",
+        "white noise": "gaussian_white_noise",
+        "uniform white noise": "uniform_white_noise",
+        "gaussian white noise": "gaussian_white_noise",
+        "pink noise": "pink_noise",
+        "brown noise": "brown_noise",
+        "red noise": "red_noise",
+        "blue noise": "blue_noise",
+        "violet noise": "violet_noise",
+        "gray noise": "gray_noise",
+        "grey noise": "gray_noise",
+    }
+    return str(lut.get(key, "")).strip().lower()
+
+
+def _semantic_noise_profile_terms(profile_key: str) -> List[str]:
+    key = re.sub(r"\s+", "_", str(profile_key)).strip().lower()
+    lut: Dict[str, List[str]] = {
+        "uniform_white_noise": ["noise", "white noise"],
+        "gaussian_white_noise": ["noise", "white noise"],
+        "pink_noise": ["noise", "pink noise"],
+        "brown_noise": ["noise", "brown noise"],
+        "red_noise": ["noise", "red noise"],
+        "blue_noise": ["noise", "blue noise"],
+        "violet_noise": ["noise", "violet noise"],
+        "gray_noise": ["noise", "gray noise"],
+    }
+    if key not in lut:
+        return ["noise"]
+    return _normalize_vocab_terms(lut[key])
+
+
+def _semantic_expand_inferred_tags(terms: Sequence[str]) -> List[str]:
+    base = _normalize_vocab_terms([str(x) for x in list(terms)])
+    out: List[str] = list(base)
+    for term in base:
+        key = re.sub(r"\s+", " ", str(term)).strip().lower()
+        if not key:
+            continue
+        if key in ("mixed noise and signal", "mix"):
+            out.extend(["mixed noise and signal", "noise", "signal"])
+        if key == "noise":
+            out.extend(["noise", "white noise"])
+        if key.endswith("noise") and key != "noise":
+            out.extend([key, "noise"])
+        if key.endswith("damage"):
+            out.extend(_semantic_damage_tags(key))
+    return _normalize_vocab_terms(out)
+
+
+def _semantic_noise_terms_from_spectrum_sample(sample: Any) -> List[str]:
+    arr = np.asarray(sample, dtype=np.float32)
+    if int(arr.size) <= 0:
+        return ["noise"]
+    if int(arr.ndim) == 3:
+        if int(arr.shape[0]) in (1, 3, 4):
+            gray = np.mean(np.asarray(arr[:3, ...], dtype=np.float32), axis=0)
+        elif int(arr.shape[2]) in (1, 3, 4):
+            gray = np.mean(np.asarray(arr[..., :3], dtype=np.float32), axis=2)
+        else:
+            gray = np.asarray(arr, dtype=np.float32).reshape(-1)
+    else:
+        gray = np.asarray(arr, dtype=np.float32)
+    beta = 0.0
+    try:
+        if int(np.asarray(gray).ndim) == 2:
+            g = np.asarray(gray, dtype=np.float64)
+            g = g - float(np.mean(g))
+            h, w = int(g.shape[0]), int(g.shape[1])
+            if h >= 8 and w >= 8:
+                p = np.abs(np.fft.fft2(g)).astype(np.float64) ** 2
+                fy = np.fft.fftfreq(h).astype(np.float64)[:, None]
+                fx = np.fft.fftfreq(w).astype(np.float64)[None, :]
+                r = np.sqrt((fx * fx) + (fy * fy)).reshape(-1)
+                pow_flat = p.reshape(-1)
+                mask = (r > 1e-6) & np.isfinite(pow_flat) & (pow_flat > 1e-20)
+                if int(np.count_nonzero(mask)) >= 32:
+                    x = np.log(r[mask])
+                    y = np.log(pow_flat[mask])
+                    slope = float(np.polyfit(x, y, 1)[0])
+                    beta = -slope
+                else:
+                    v = g.reshape(-1)
+                    v = v - float(np.mean(v))
+                    spec = np.abs(np.fft.rfft(v)).astype(np.float64) ** 2
+                    fr = np.fft.rfftfreq(int(v.size)).astype(np.float64)
+                    mask1 = (fr > 1e-6) & np.isfinite(spec) & (spec > 1e-20)
+                    if int(np.count_nonzero(mask1)) >= 16:
+                        slope = float(np.polyfit(np.log(fr[mask1]), np.log(spec[mask1]), 1)[0])
+                        beta = -slope
+        else:
+            v = np.asarray(gray, dtype=np.float64).reshape(-1)
+            v = v - float(np.mean(v))
+            spec = np.abs(np.fft.rfft(v)).astype(np.float64) ** 2
+            fr = np.fft.rfftfreq(int(v.size)).astype(np.float64)
+            mask = (fr > 1e-6) & np.isfinite(spec) & (spec > 1e-20)
+            if int(np.count_nonzero(mask)) >= 16:
+                slope = float(np.polyfit(np.log(fr[mask]), np.log(spec[mask]), 1)[0])
+                beta = -slope
+    except Exception:
+        beta = 0.0
+    noise_beta_lut = {
+        "violet noise": -2.0,
+        "blue noise": -1.0,
+        "white noise": 0.0,
+        "gray noise": 0.5,
+        "pink noise": 1.0,
+        "red noise": 1.8,
+        "brown noise": 2.0,
+    }
+    best_term = "white noise"
+    best_dist = float("inf")
+    for name, target_beta in noise_beta_lut.items():
+        d = abs(float(beta) - float(target_beta))
+        if d < best_dist:
+            best_dist = d
+            best_term = str(name)
+    return _normalize_vocab_terms(["noise", str(best_term)])
+
+
 def _semantic_tags_for_symbol_term(term: str) -> List[str]:
     key = re.sub(r"\s+", " ", str(term)).strip().lower()
     if not key:
@@ -480,11 +750,16 @@ def _semantic_tags_for_symbol_term(term: str) -> List[str]:
     elif key in ("none",):
         out.extend(["none"])
     elif key in ("noise",):
-        out.extend(["noise"])
+        out.extend(_semantic_noise_profile_terms("uniform_white_noise"))
     elif key.endswith("noise"):
-        out.extend([key, "noise"])
+        profile_key = _semantic_noise_profile_key_from_term(key)
+        if profile_key:
+            out.extend(_semantic_noise_profile_terms(profile_key))
+        else:
+            out.extend([key, "noise"])
     elif key in ("mixed noise and signal", "mix"):
-        out.extend(["mixed noise and signal", "signal", "noise"])
+        out.extend(["mixed noise and signal", "signal"])
+        out.extend(_semantic_noise_profile_terms("uniform_white_noise"))
     elif key in ("white", "black", "signal"):
         out.extend(["signal"])
     elif key == "spectrographic output":
@@ -500,15 +775,15 @@ def _semantic_tags_for_symbol_term(term: str) -> List[str]:
     elif key in ("mnist dataset", "emnist dataset", "kmnist dataset"):
         out.extend([key, "signal"])
     elif key == "regurgitated content":
-        out.extend(["regurgitated content", "mixed noise and signal", "signal"])
+        out.extend(["regurgitated content", "signal"])
     elif key == "gan image":
         out.extend(["gan image", "signal"])
     elif key.endswith("damage"):
-        out.extend([key, "signal"])
+        out.extend(_semantic_damage_tags(key))
     else:
         out.extend(["signal"])
     out.append(key)
-    return _normalize_vocab_terms(out)
+    return _semantic_expand_inferred_tags(out)
 
 
 def _merge_symbol_term_pools(
@@ -704,6 +979,24 @@ def _semantic_terms_with_tonal_tags(
     return _normalize_vocab_terms(list(base) + list(tones))
 
 
+def _semantic_enrich_generated_terms_with_noise_spectrum(
+    term_key: str,
+    terms: Sequence[str],
+    image: Any,
+) -> List[str]:
+    key = re.sub(r"\s+", " ", str(term_key)).strip().lower()
+    out = _normalize_vocab_terms([str(x) for x in list(terms)])
+    noise_related = bool(
+        key == "noise"
+        or key.endswith("noise")
+        or key in ("mix", "mixed noise and signal", "noise damage")
+    )
+    if not noise_related:
+        return out
+    out.extend(_semantic_noise_terms_from_spectrum_sample(image))
+    return _normalize_vocab_terms(out)
+
+
 def _semantic_active_target_stats(
     rows: Sequence[Any],
     threshold: float = 0.5,
@@ -734,6 +1027,147 @@ def _semantic_active_target_stats(
     out["p50"] = float(np.percentile(c_np, 50))
     out["max"] = int(c_np.max())
     return out
+
+
+def _label_knockout_row_np(
+    row: Any,
+    rng: np.random.Generator,
+    prob: float,
+    min_keep: int,
+    max_drop_frac: float,
+    threshold: float = 0.5,
+) -> Tuple[np.ndarray, int]:
+    arr = np.asarray(row, dtype=np.float32).reshape(-1).copy()
+    p = float(max(0.0, min(1.0, float(prob))))
+    keep_min = max(0, int(min_keep))
+    frac = float(max(0.0, min(1.0, float(max_drop_frac))))
+    if int(arr.size) <= 0 or p <= 0.0:
+        return arr, 0
+    if float(rng.random()) >= p:
+        return arr, 0
+    active = np.where(np.asarray(arr, dtype=np.float32) >= float(threshold))[0].astype(np.int64)
+    n_active = int(active.size)
+    if int(n_active) <= int(keep_min):
+        return arr, 0
+    max_drop_by_frac = int(math.floor(float(n_active) * float(frac)))
+    max_drop = int(n_active - int(keep_min))
+    if int(max_drop_by_frac) > 0:
+        max_drop = min(int(max_drop), int(max_drop_by_frac))
+    max_drop = max(1, int(max_drop))
+    drop_n = int(rng.integers(1, int(max_drop) + 1))
+    pick = rng.choice(active, size=int(drop_n), replace=False).astype(np.int64)
+    arr[pick] = 0.0
+    return arr.astype(np.float32, copy=False), int(drop_n)
+
+
+def _label_knockout_rows_np(
+    rows: Sequence[Any],
+    prob: float,
+    seed: int,
+    min_keep: int,
+    max_drop_frac: float,
+    threshold: float = 0.5,
+) -> Tuple[List[np.ndarray], Dict[str, Any]]:
+    rng = np.random.default_rng(max(0, int(seed)))
+    out_rows: List[np.ndarray] = []
+    rows_total = int(len(rows))
+    rows_applied = 0
+    labels_dropped = 0
+    p = float(max(0.0, min(1.0, float(prob))))
+    for row in rows:
+        out_row, dropped = _label_knockout_row_np(
+            row=row,
+            rng=rng,
+            prob=float(p),
+            min_keep=int(min_keep),
+            max_drop_frac=float(max_drop_frac),
+            threshold=float(threshold),
+        )
+        out_rows.append(np.asarray(out_row, dtype=np.float32).reshape(-1))
+        if int(dropped) > 0:
+            rows_applied += 1
+            labels_dropped += int(dropped)
+    info = {
+        "enabled": bool(float(p) > 0.0),
+        "prob": float(p),
+        "rows_total": int(rows_total),
+        "rows_applied": int(rows_applied),
+        "labels_dropped": int(labels_dropped),
+        "min_keep": int(max(0, int(min_keep))),
+        "max_drop_frac": float(max(0.0, min(1.0, float(max_drop_frac)))),
+    }
+    return out_rows, info
+
+
+def _label_knockout_optional_rows_np(
+    rows: Sequence[Any],
+    prob: float,
+    seed: int,
+    min_keep: int,
+    max_drop_frac: float,
+    threshold: float = 0.5,
+) -> Tuple[List[Any], Dict[str, Any]]:
+    real_rows = [np.asarray(r, dtype=np.float32).reshape(-1) for r in rows if r is not None]
+    knocked_rows, info = _label_knockout_rows_np(
+        rows=real_rows,
+        prob=float(prob),
+        seed=int(seed),
+        min_keep=int(min_keep),
+        max_drop_frac=float(max_drop_frac),
+        threshold=float(threshold),
+    )
+    out: List[Any] = []
+    real_idx = 0
+    for r in rows:
+        if r is None:
+            out.append(None)
+            continue
+        out.append(np.asarray(knocked_rows[int(real_idx)], dtype=np.float32).reshape(-1))
+        real_idx += 1
+    info = dict(info)
+    info["rows_with_targets"] = int(len(real_rows))
+    return out, info
+
+
+def _label_knockout_tensor_batch(
+    yb: torch.Tensor,
+    rng: np.random.Generator,
+    prob: float,
+    min_keep: int,
+    max_drop_frac: float,
+    threshold: float = 0.5,
+) -> Tuple[torch.Tensor, int, int]:
+    if (not torch.is_tensor(yb)) or int(getattr(yb, "ndim", 0)) != 2 or int(yb.shape[0]) <= 0:
+        return yb, 0, 0
+    p = float(max(0.0, min(1.0, float(prob))))
+    if float(p) <= 0.0:
+        return yb, 0, 0
+    keep_min = max(0, int(min_keep))
+    frac = float(max(0.0, min(1.0, float(max_drop_frac))))
+    out = yb.to(dtype=torch.float32).clone()
+    rows_applied = 0
+    labels_dropped = 0
+    for bi in range(int(out.shape[0])):
+        if float(rng.random()) >= float(p):
+            continue
+        row = out[int(bi)]
+        active = torch.nonzero(row >= float(threshold), as_tuple=False).reshape(-1)
+        n_active = int(active.numel())
+        if int(n_active) <= int(keep_min):
+            continue
+        max_drop_by_frac = int(math.floor(float(n_active) * float(frac)))
+        max_drop = int(n_active - int(keep_min))
+        if int(max_drop_by_frac) > 0:
+            max_drop = min(int(max_drop), int(max_drop_by_frac))
+        max_drop = max(1, int(max_drop))
+        drop_n = int(rng.integers(1, int(max_drop) + 1))
+        pos = rng.choice(np.arange(int(n_active), dtype=np.int64), size=int(drop_n), replace=False).astype(np.int64)
+        pos_t = torch.from_numpy(pos).to(device=active.device, dtype=torch.long)
+        drop_idx = active.index_select(0, pos_t)
+        row[drop_idx] = 0.0
+        rows_applied += 1
+        labels_dropped += int(drop_n)
+    return out.to(dtype=yb.dtype), int(rows_applied), int(labels_dropped)
 
 
 def _build_auto_symbol_term_pool(
@@ -1286,10 +1720,7 @@ def _build_internal_bootstrap_symbol_pool(
             return _box_blur(src, k=int(5 + (2 * (int(sample_idx) % 3))))
         if key == "noise damage":
             sig = _signal_pattern(phase=phase)
-            noi = rng.random((size, size), dtype=np.float32)
-            if int(sample_idx) % 2 == 0:
-                return np.clip(sig + (0.20 * rng.standard_normal((size, size), dtype=np.float32)), 0.0, 1.0)
-            return _mix_signal_with_noise_pcm(sig=sig, noi=noi, noise_bits=int(rng.integers(2, 5)))
+            return np.clip(sig + (0.20 * rng.standard_normal((size, size), dtype=np.float32)), 0.0, 1.0)
         if key == "dropout damage":
             src = _signal_pattern(phase=phase)
             keep_p = 0.20 + (0.15 * float((int(sample_idx) % 3) / 2.0))
@@ -1421,7 +1852,17 @@ def _build_reference_flashcard_payload_rows(
         g = 0.5 + (0.5 * np.sin((2.0 * math.pi * ((fx * x01) + (fy * y01))) + phase))
         return np.clip(g, 0.0, 1.0).astype(np.float32, copy=False)
 
-    def _noise_pattern() -> np.ndarray:
+    def _sample_white_noise_profile_key() -> str:
+        return "gaussian_white_noise" if float(rng.random()) < 0.5 else "uniform_white_noise"
+
+    def _noise_pattern(profile_key: str) -> np.ndarray:
+        key = re.sub(r"\s+", "_", str(profile_key)).strip().lower()
+        if key == "gaussian_white_noise":
+            arr = rng.standard_normal((size, size), dtype=np.float32)
+            lo = float(np.min(arr))
+            hi = float(np.max(arr))
+            den = max(1e-8, float(hi - lo))
+            return np.clip((arr - lo) / den, 0.0, 1.0).astype(np.float32, copy=False)
         return np.clip(rng.random((size, size), dtype=np.float32), 0.0, 1.0).astype(np.float32, copy=False)
 
     def _mix_signal_with_noise_pcm(sig: np.ndarray, noi: np.ndarray, noise_bits: int) -> np.ndarray:
@@ -1489,8 +1930,12 @@ def _build_reference_flashcard_payload_rows(
         idx = int(rng.integers(0, len(signal_rows)))
         return _image_any_to_rgb_chw01(signal_rows[idx], image_size=int(size))
 
-    def _pick_object() -> Tuple[np.ndarray, Optional[np.ndarray]]:
+    def _pick_object(require_supervised: bool = False) -> Tuple[np.ndarray, Optional[np.ndarray]]:
         if len(object_seed_rows) <= 0:
+            if bool(require_supervised):
+                raise RuntimeError(
+                    "Reference flashcard row requires Berkeley-supervised seed content, but payload object rows are empty."
+                )
             return _pick_signal(), None
         idx = int(rng.integers(0, len(object_seed_rows)))
         img, sv = object_seed_rows[idx]
@@ -1526,6 +1971,35 @@ def _build_reference_flashcard_payload_rows(
         vec = np.asarray(condition_vector_builder(terms, base_supervised), dtype=np.float32).reshape(-1)
         if int(vec.size) != int(c):
             raise RuntimeError(f"flashcard condition builder width mismatch: got={int(vec.size)} expected={int(c)}")
+        terms_lc = {
+            re.sub(r"\s+", " ", str(t)).strip().lower()
+            for t in terms
+            if re.sub(r"\s+", " ", str(t)).strip()
+        }
+        requires_berkeley_supervision = bool(
+            ("berkeley sbd dataset" in terms_lc) or ("object" in terms_lc) or (key in damage_terms)
+        )
+        if bool(requires_berkeley_supervision):
+            if base_supervised is None:
+                raise RuntimeError(
+                    "Berkeley/object flashcard row emitted without supervised label vector. "
+                    f"term={str(term)!r}"
+                )
+            sup_arr = np.asarray(base_supervised, dtype=np.float32).reshape(-1)
+            sup_take = min(int(sup_arr.size), int(vec.size))
+            if int(sup_take) <= 0:
+                raise RuntimeError(
+                    "Berkeley/object flashcard row has empty supervised label vector. "
+                    f"term={str(term)!r}"
+                )
+            sup_clip = np.clip(np.asarray(sup_arr[: int(sup_take)], dtype=np.float32), 0.0, 1.0)
+            vec_clip = np.clip(np.asarray(vec[: int(sup_take)], dtype=np.float32), 0.0, 1.0)
+            missing = (sup_clip >= 0.5) & (vec_clip < 0.5)
+            if bool(np.any(missing)):
+                raise RuntimeError(
+                    "Berkeley/object flashcard row dropped original supervised labels during conditioning. "
+                    f"term={str(term)!r}"
+                )
         cards_img.append(img_rgb)
         cards_cond.append(np.asarray(vec, dtype=np.float32).reshape(-1))
         term_counts[key] = int(term_counts.get(key, 0)) + 1
@@ -1538,14 +2012,23 @@ def _build_reference_flashcard_payload_rows(
                 _emit(term_key, _to_rgb(np.full((size, size), 0.50, dtype=np.float32)), None, ["none"])
                 continue
             if term_key == "noise":
-                _emit(term_key, _to_rgb(_noise_pattern()), None, ["noise"])
+                noise_profile = _sample_white_noise_profile_key()
+                noise_img = _noise_pattern(noise_profile)
+                _emit(
+                    term_key,
+                    _to_rgb(noise_img),
+                    None,
+                    list(_semantic_noise_terms_from_spectrum_sample(noise_img)),
+                )
                 continue
             if term_key == "signal":
                 _emit(term_key, _pick_signal(), None, ["signal"])
                 continue
             if term_key == "mixed noise and signal":
+                noise_profile = _sample_white_noise_profile_key()
                 sig = _pick_signal()
-                noi = _to_rgb(_noise_pattern())
+                noise_img = _noise_pattern(noise_profile)
+                noi = _to_rgb(noise_img)
                 if int(rng.integers(0, 2)) == 0:
                     a = float(rng.uniform(0.35, 0.65))
                     mixed = np.clip((a * sig) + ((1.0 - a) * noi), 0.0, 1.0)
@@ -1555,7 +2038,12 @@ def _build_reference_flashcard_payload_rows(
                         noi=noi,
                         noise_bits=int(rng.integers(2, 6)),
                     )
-                _emit(term_key, mixed, None, ["signal", "noise", "mixed noise and signal"])
+                _emit(
+                    term_key,
+                    mixed,
+                    None,
+                    ["signal", "mixed noise and signal"] + list(_semantic_noise_terms_from_spectrum_sample(noise_img)),
+                )
                 continue
             if term_key == "white":
                 _emit(term_key, _to_rgb(np.ones((size, size), dtype=np.float32)), None, ["white", "signal"])
@@ -1564,12 +2052,12 @@ def _build_reference_flashcard_payload_rows(
                 _emit(term_key, _to_rgb(np.zeros((size, size), dtype=np.float32)), None, ["black", "signal"])
                 continue
             if term_key == "object":
-                obj_img, obj_sup = _pick_object()
+                obj_img, obj_sup = _pick_object(require_supervised=True)
                 _emit(term_key, obj_img, obj_sup, ["object", "berkeley sbd dataset", "signal"])
                 continue
             if term_key in ("mnist dataset", "emnist dataset", "kmnist dataset", "berkeley sbd dataset"):
                 if term_key == "berkeley sbd dataset":
-                    obj_img, obj_sup = _pick_object()
+                    obj_img, obj_sup = _pick_object(require_supervised=True)
                     _emit(term_key, obj_img, obj_sup, [term_key, "object", "signal"])
                 else:
                     ds_img = _pick_dataset_row(term_key)
@@ -1592,13 +2080,24 @@ def _build_reference_flashcard_payload_rows(
                     term_key,
                     _to_rgb(np.clip((0.55 * sig0) + (0.45 * sig1), 0.0, 1.0)),
                     None,
-                    ["regurgitated content", "mixed noise and signal", "signal"],
+                    ["regurgitated content", "signal"],
                 )
                 continue
             if term_key in damage_terms:
-                obj_img, obj_sup = _pick_object()
-                dmg = _apply_damage(obj_img, term_key)
-                _emit(term_key, dmg, obj_sup, [term_key, "object", "berkeley sbd dataset", "signal"])
+                obj_img, obj_sup = _pick_object(require_supervised=True)
+                dmg_extra_terms = list(_semantic_damage_tags(term_key))
+                if term_key == "noise damage":
+                    noise_delta = (rng.standard_normal(obj_img.shape).astype(np.float32) * 0.16).astype(np.float32, copy=False)
+                    dmg = np.clip(np.asarray(obj_img, dtype=np.float32) + noise_delta, 0.0, 1.0).astype(np.float32, copy=False)
+                    dmg_extra_terms.extend(_semantic_noise_terms_from_spectrum_sample(noise_delta))
+                else:
+                    dmg = _apply_damage(obj_img, term_key)
+                _emit(
+                    term_key,
+                    dmg,
+                    obj_sup,
+                    list(dmg_extra_terms) + ["object", "berkeley sbd dataset"],
+                )
                 continue
             _emit(term_key, _pick_signal(), None, [term_key, "signal"])
 
@@ -1629,35 +2128,60 @@ def _rotate_active_extra_terms(
     replace_count: int,
     seed: int,
     locked_prefix_count: int = 0,
+    churn_cursor: int = 0,
+    sweep_cycles: int = 0,
 ) -> Tuple[List[str], Dict[str, Any]]:
     active = [str(x) for x in active_terms]
     pool = _normalize_vocab_terms(pool_terms)
     k_replace = max(0, int(replace_count))
     locked = max(0, min(int(len(active)), int(locked_prefix_count)))
+    sweep_n = max(0, int(sweep_cycles))
+    cursor_in = max(0, int(churn_cursor))
     info: Dict[str, Any] = {
         "changed": False,
         "replaced": 0,
         "pool_terms": int(len(pool)),
         "active_terms": int(len(active)),
         "locked_prefix": int(locked),
+        "replace_base": int(k_replace),
+        "replace_auto": 0,
+        "candidate_terms": 0,
+        "sweep_cycles": int(sweep_n),
+        "cursor_in": int(cursor_in),
+        "cursor_out": int(cursor_in),
     }
     unlocked = int(len(active) - int(locked))
     if len(active) <= 0 or len(pool) <= len(active) or k_replace <= 0 or int(unlocked) <= 0:
         return active, info
-    rng = np.random.default_rng(int(seed))
-    replace_n = min(int(k_replace), int(unlocked))
-    replace_space = np.arange(int(locked), len(active), dtype=np.int64)
-    replace_idx = rng.choice(replace_space, size=replace_n, replace=False).astype(np.int64).tolist()
+    _ = int(seed)  # Kept for API compatibility; churn rotation is deterministic.
     active_lc = {str(x).strip().lower() for x in active}
     candidates = [t for t in pool if str(t).strip().lower() not in active_lc]
+    info["candidate_terms"] = int(len(candidates))
     if len(candidates) <= 0:
         return active, info
-    rng.shuffle(candidates)
+    replace_n = min(int(k_replace), int(unlocked))
+    if int(sweep_n) > 0:
+        auto_n = int(math.ceil(float(len(candidates)) / float(max(1, int(sweep_n)))))
+        info["replace_auto"] = int(auto_n)
+        replace_n = max(int(replace_n), int(auto_n))
+    replace_n = min(int(replace_n), int(unlocked), int(len(candidates)))
+    if int(replace_n) <= 0:
+        return active, info
+    replace_space = [int(i) for i in range(int(locked), int(len(active)))]
+    if len(replace_space) <= 0:
+        return active, info
+    slot_start = int(cursor_in) % int(len(replace_space))
+    replace_idx = [int(replace_space[(slot_start + i) % int(len(replace_space))]) for i in range(int(replace_n))]
+    picked_terms: List[str] = []
+    ordered = sorted([str(t) for t in candidates], key=lambda s: s.lower())
+    start = int(cursor_in) % int(len(ordered))
+    picked_terms = [str(ordered[(start + i) % int(len(ordered))]) for i in range(int(replace_n))]
+    info["cursor_out"] = int((start + int(replace_n)) % int(len(ordered)))
     changed = 0
     for pos, idx in enumerate(replace_idx):
-        if pos >= len(candidates):
+        if pos >= len(picked_terms):
             break
-        new_t = str(candidates[pos]).strip()
+        new_t = str(picked_terms[pos]).strip()
         if not new_t:
             continue
         if str(active[int(idx)]).strip().lower() == new_t.lower():
@@ -3245,6 +3769,186 @@ def _build_berkeley_gate_val_loader(
     return loader, int(sample_count)
 
 
+def _schedule_payload_gate_rows_by_active_terms(
+    payload_terms_rows: Sequence[Sequence[str]],
+    payload_global_picks: Sequence[int],
+    payload_labels_mm: np.ndarray,
+    supervised_class_names: Sequence[str],
+    active_terms_lc: Sequence[str],
+    active_vocab_lc: Sequence[str],
+    require_all_supervised_active: bool = True,
+    allow_unmapped_rows: bool = True,
+) -> Tuple[List[int], List[int], List[List[str]], Dict[str, Any]]:
+    n_rows = min(int(len(payload_terms_rows)), int(len(payload_global_picks)))
+    active_order = list(
+        dict.fromkeys(
+            [
+                re.sub(r"\s+", " ", str(t)).strip().lower()
+                for t in active_terms_lc
+                if re.sub(r"\s+", " ", str(t)).strip()
+            ]
+        )
+    )
+    active_set = set(active_order)
+    active_vocab_set = {
+        re.sub(r"\s+", " ", str(t)).strip().lower()
+        for t in active_vocab_lc
+        if re.sub(r"\s+", " ", str(t)).strip()
+    }
+    sup_name_lc = [
+        re.sub(r"\s+", " ", str(x)).strip().lower()
+        for x in supervised_class_names
+        if re.sub(r"\s+", " ", str(x)).strip()
+    ]
+    order_lut = {str(t): int(i) for i, t in enumerate(active_order)}
+    buckets: Dict[str, List[Tuple[int, int, List[str], List[str], int]]] = {}
+    fallback_rows: List[Tuple[int, int, List[str], List[str], int]] = []
+    skipped_no_active = 0
+    skipped_inactive_supervised = 0
+    selected_sup_positive_counts: List[int] = []
+    selected_berkeley_rows = 0
+
+    for ri in range(int(n_rows)):
+        src_idx = int(payload_global_picks[int(ri)])
+        if not (0 <= int(src_idx) < int(payload_labels_mm.shape[0])):
+            raise RuntimeError(
+                "Stage-2 payload gate supervised-label index out of bounds while scheduling rows: "
+                f"row={int(ri)} pick={int(src_idx)} labels_rows={int(payload_labels_mm.shape[0])}"
+            )
+        raw_terms = payload_terms_rows[int(ri)]
+        terms = _normalize_vocab_terms([str(x) for x in list(raw_terms)]) if isinstance(raw_terms, (list, tuple)) else []
+        if len(terms) <= 0:
+            raise RuntimeError(
+                "Stage-2 payload gate encountered empty original terms row during scheduling; "
+                f"row={int(ri)} global_pick={int(src_idx)}"
+            )
+        row_lc = {
+            re.sub(r"\s+", " ", str(x)).strip().lower()
+            for x in terms
+            if re.sub(r"\s+", " ", str(x)).strip()
+        }
+        base_sup = np.asarray(payload_labels_mm[int(src_idx)], dtype=np.float32).reshape(-1)
+        sup_take = min(int(len(sup_name_lc)), int(base_sup.size))
+        sup_pos_idx = (
+            np.where(np.asarray(base_sup[: int(sup_take)], dtype=np.float32) >= 0.5)[0].astype(np.int64).tolist()
+            if int(sup_take) > 0
+            else []
+        )
+        sup_terms_lc = []
+        for sp in sup_pos_idx:
+            if 0 <= int(sp) < int(len(sup_name_lc)):
+                nm = str(sup_name_lc[int(sp)])
+                if nm:
+                    sup_terms_lc.append(nm)
+        sup_terms_lc = list(dict.fromkeys(sup_terms_lc))
+        missing_sup_vocab = [str(t) for t in sup_terms_lc if str(t) not in active_vocab_set]
+        if len(missing_sup_vocab) > 0:
+            raise RuntimeError(
+                "Stage-2 payload gate row contains supervised Berkeley labels not present in active vocabulary. "
+                f"row={int(ri)} pick={int(src_idx)} missing={','.join(missing_sup_vocab[:8])}"
+            )
+        row_is_berkeley = bool("berkeley sbd dataset" in row_lc)
+        if bool(row_is_berkeley):
+            if int(len(sup_terms_lc)) <= 0:
+                raise RuntimeError(
+                    "Stage-2 payload gate cannot pass Berkeley rows without supervised labels. "
+                    f"row={int(ri)} pick={int(src_idx)}"
+                )
+            if bool(require_all_supervised_active) and any(str(t) not in active_set for t in sup_terms_lc):
+                skipped_inactive_supervised += 1
+                if not bool(allow_unmapped_rows):
+                    continue
+            selected_berkeley_rows += 1
+            selected_sup_positive_counts.append(int(len(sup_terms_lc)))
+        row_active_terms = [
+            str(t)
+            for t in active_order
+            if (str(t) in row_lc) or (str(t) in set(sup_terms_lc))
+        ]
+        if int(len(row_active_terms)) <= 0:
+            skipped_no_active += 1
+            if not bool(allow_unmapped_rows):
+                continue
+            anchor = ""
+        else:
+            anchor = str(row_active_terms[0])
+        row_payload = (
+            int(ri),
+            int(src_idx),
+            list(terms),
+            list(row_active_terms),
+            int(len(sup_terms_lc)),
+        )
+        if anchor in active_set and int(len(anchor)) > 0:
+            buckets.setdefault(str(anchor), []).append(row_payload)
+        else:
+            fallback_rows.append(row_payload)
+
+    for key in list(buckets.keys()):
+        rows = list(buckets.get(str(key), []))
+        rows.sort(
+            key=lambda row: (
+                int(order_lut.get(str(row[3][0]) if len(row[3]) > 0 else str(key), 10**9)),
+                -int(len(row[3])),
+                -int(row[4]),
+                int(row[0]),
+            )
+        )
+        buckets[str(key)] = rows
+    fallback_rows.sort(key=lambda row: (-int(len(row[3])), -int(row[4]), int(row[0])))
+
+    ordered_rows: List[Tuple[int, int, List[str], List[str], int]] = []
+    used_local: set = set()
+    progress = True
+    while bool(progress):
+        progress = False
+        for term in active_order:
+            q = buckets.get(str(term), [])
+            while int(len(q)) > 0 and int(q[0][0]) in used_local:
+                q.pop(0)
+            if int(len(q)) <= 0:
+                continue
+            row = q.pop(0)
+            if int(row[0]) in used_local:
+                continue
+            used_local.add(int(row[0]))
+            ordered_rows.append(row)
+            progress = True
+        if not bool(progress):
+            break
+    leftovers: List[Tuple[int, int, List[str], List[str], int]] = []
+    for rows in buckets.values():
+        leftovers.extend([row for row in rows if int(row[0]) not in used_local])
+    leftovers.extend([row for row in fallback_rows if int(row[0]) not in used_local])
+    leftovers.sort(
+        key=lambda row: (
+            int(order_lut.get(str(row[3][0]) if len(row[3]) > 0 else "", 10**9)),
+            -int(len(row[3])),
+            -int(row[4]),
+            int(row[0]),
+        )
+    )
+    ordered_rows.extend(leftovers)
+
+    out_local_rows = [int(r[0]) for r in ordered_rows]
+    out_global_picks = [int(r[1]) for r in ordered_rows]
+    out_terms = [list(r[2]) for r in ordered_rows]
+    info = {
+        "rows_total": int(n_rows),
+        "rows_selected": int(len(out_local_rows)),
+        "rows_skipped_no_active": int(skipped_no_active),
+        "rows_skipped_inactive_supervised": int(skipped_inactive_supervised),
+        "active_terms": int(len(active_order)),
+        "buckets": int(len([k for k, v in buckets.items() if int(len(v)) > 0])),
+        "berkeley_rows_selected": int(selected_berkeley_rows),
+        "berkeley_sup_min": int(np.min(selected_sup_positive_counts)) if int(len(selected_sup_positive_counts)) > 0 else 0,
+        "berkeley_sup_mean": float(np.mean(selected_sup_positive_counts)) if int(len(selected_sup_positive_counts)) > 0 else 0.0,
+        "berkeley_sup_max": int(np.max(selected_sup_positive_counts)) if int(len(selected_sup_positive_counts)) > 0 else 0,
+        "mode": "deterministic_round_robin_by_active_terms",
+    }
+    return out_local_rows, out_global_picks, out_terms, info
+
+
 def _schedule_semantic_gate_indices(
     targets: Sequence[np.ndarray],
     class_names: Sequence[str],
@@ -3298,53 +4002,158 @@ def _schedule_semantic_gate_indices(
         active_indices.append(int(idx))
     active_indices = list(dict.fromkeys(active_indices))
 
-    rng = np.random.default_rng(int(seed))
+    _ = int(seed)  # Kept for API compatibility; scheduling is deterministic and staged.
     threshold = float(max(0.0, min(1.0, float(activation_threshold))))
-    buckets: Dict[int, List[int]] = {}
     active_hits: Dict[str, int] = {}
+    single_term_buckets: Dict[int, List[Tuple[float, int]]] = {int(idx): [] for idx in active_indices}
+    signature_buckets: Dict[Tuple[int, ...], List[Tuple[float, int]]] = {}
+    fallback_rows: List[Tuple[float, int]] = []
+    rows_with_active_support = 0
     for idx in active_indices:
-        vals = np.asarray(y[:, int(idx)], dtype=np.float32).reshape(-1)
-        picks = np.where(vals >= float(threshold))[0].astype(np.int64)
-        if int(picks.size) <= 0:
-            top_take = min(int(n), max(6, int(max(1, n) // 12)))
-            if int(top_take) > 0:
-                cand = np.argsort(vals)[::-1][: int(top_take)].astype(np.int64)
-                cand = cand[vals[cand] > 1e-6]
-                picks = cand.astype(np.int64, copy=False)
-        picks_l = picks.tolist()
-        rng.shuffle(picks_l)
-        buckets[int(idx)] = [int(i) for i in picks_l]
         name = str(class_names[int(idx)]) if int(idx) < int(len(class_names)) else f"class_{int(idx)}"
-        active_hits[name] = int(len(picks_l))
+        active_hits[str(name)] = 0
+    for ri in range(int(n)):
+        row = np.asarray(y[int(ri)], dtype=np.float32).reshape(-1)
+        support: List[int] = []
+        for idx in active_indices:
+            if float(row[int(idx)]) >= float(threshold):
+                support.append(int(idx))
+        if len(support) <= 0 and len(active_indices) > 0:
+            vals = np.asarray(row[np.asarray(active_indices, dtype=np.int64)], dtype=np.float32).reshape(-1)
+            if int(vals.size) > 0:
+                top_local = int(np.argmax(vals))
+                top_score = float(vals[int(top_local)])
+                if float(top_score) > 1e-6:
+                    support = [int(active_indices[int(top_local)])]
+        if len(support) <= 0:
+            fb_score = 0.0
+            if len(active_indices) > 0:
+                vals = np.asarray(row[np.asarray(active_indices, dtype=np.int64)], dtype=np.float32).reshape(-1)
+                if int(vals.size) > 0:
+                    fb_score = float(np.max(vals))
+            fallback_rows.append((float(fb_score), int(ri)))
+            continue
+        rows_with_active_support += 1
+        sig = tuple(sorted({int(x) for x in support}))
+        sig_score = float(np.mean([float(row[int(ix)]) for ix in sig])) if len(sig) > 0 else 0.0
+        signature_buckets.setdefault(sig, []).append((float(sig_score), int(ri)))
+        for idx in sig:
+            name = str(class_names[int(idx)]) if int(idx) < int(len(class_names)) else f"class_{int(idx)}"
+            active_hits[str(name)] = int(active_hits.get(str(name), 0)) + 1
+        if len(sig) == 1:
+            s_idx = int(sig[0])
+            single_term_buckets.setdefault(int(s_idx), []).append((float(row[int(s_idx)]), int(ri)))
+
+    for idx in list(single_term_buckets.keys()):
+        rows = list(single_term_buckets.get(int(idx), []))
+        rows.sort(key=lambda x: (-float(x[0]), int(x[1])))
+        single_term_buckets[int(idx)] = rows
+    for sig in list(signature_buckets.keys()):
+        rows = list(signature_buckets.get(sig, []))
+        rows.sort(key=lambda x: (-float(x[0]), int(x[1])))
+        signature_buckets[sig] = rows
+    fallback_rows.sort(key=lambda x: (-float(x[0]), int(x[1])))
 
     ordered: List[int] = []
     used: set = set()
-    if len(buckets) > 0:
-        while True:
+    stage_counts = {
+        "single_term": 0,
+        "multi_term": 0,
+        "fallback": 0,
+        "remaining": 0,
+    }
+
+    def _at_limit() -> bool:
+        return bool(int(max_samples) > 0 and int(len(ordered)) >= int(max_samples))
+
+    def _append_row(row_idx: int, stage_key: str) -> bool:
+        r = int(row_idx)
+        if r in used:
+            return False
+        ordered.append(int(r))
+        used.add(int(r))
+        stage_counts[str(stage_key)] = int(stage_counts.get(str(stage_key), 0)) + 1
+        return True
+
+    # Stage A: single-term groups (strict per-term round-robin).
+    if len(active_indices) > 0:
+        while not _at_limit():
             progressed = False
             for idx in active_indices:
-                row_bucket = buckets.get(int(idx), [])
-                while len(row_bucket) > 0 and int(row_bucket[0]) in used:
-                    row_bucket.pop(0)
-                if len(row_bucket) <= 0:
+                bucket = single_term_buckets.get(int(idx), [])
+                while len(bucket) > 0 and int(bucket[0][1]) in used:
+                    bucket.pop(0)
+                if len(bucket) <= 0:
                     continue
-                pick = int(row_bucket.pop(0))
-                if pick in used:
-                    continue
-                ordered.append(int(pick))
-                used.add(int(pick))
-                progressed = True
-                if int(max_samples) > 0 and int(len(ordered)) >= int(max_samples):
+                _, pick = bucket.pop(0)
+                if _append_row(int(pick), stage_key="single_term"):
+                    progressed = True
+                if _at_limit():
                     break
-            if (not progressed) or (int(max_samples) > 0 and int(len(ordered)) >= int(max_samples)):
+            if not progressed:
                 break
 
-    remaining = [int(i) for i in range(int(n)) if int(i) not in used]
-    rng.shuffle(remaining)
-    ordered.extend(remaining)
+    # Stage B: multi-term signature groups (size-ascending, round-robin by signature).
+    if not _at_limit():
+        sig_groups = [sig for sig in signature_buckets.keys() if int(len(sig)) >= 2]
+        size_values = sorted({int(len(sig)) for sig in sig_groups})
+        for gsz in size_values:
+            sigs = [sig for sig in sig_groups if int(len(sig)) == int(gsz)]
+            sigs = sorted(
+                sigs,
+                key=lambda sig: tuple(
+                    [
+                        (
+                            str(class_names[int(ix)]).strip().lower()
+                            if int(ix) < int(len(class_names))
+                            else f"class_{int(ix)}"
+                        )
+                        for ix in sig
+                    ]
+                ),
+            )
+            while not _at_limit():
+                progressed = False
+                for sig in sigs:
+                    bucket = signature_buckets.get(sig, [])
+                    while len(bucket) > 0 and int(bucket[0][1]) in used:
+                        bucket.pop(0)
+                    if len(bucket) <= 0:
+                        continue
+                    _, pick = bucket.pop(0)
+                    if _append_row(int(pick), stage_key="multi_term"):
+                        progressed = True
+                    if _at_limit():
+                        break
+                if not progressed:
+                    break
+            if _at_limit():
+                break
+
+    # Stage C: fallback rows with weakest active support first promoted by score.
+    if not _at_limit():
+        for _, pick in fallback_rows:
+            _append_row(int(pick), stage_key="fallback")
+            if _at_limit():
+                break
+
+    # Stage D: deterministic remainder for full-deck stability.
+    if not _at_limit():
+        remaining = [int(i) for i in range(int(n)) if int(i) not in used]
+        remaining = sorted(remaining)
+        for pick in remaining:
+            _append_row(int(pick), stage_key="remaining")
+            if _at_limit():
+                break
+
     if int(max_samples) > 0:
         ordered = ordered[: int(max_samples)]
 
+    missing_terms: List[str] = []
+    for idx in active_indices:
+        name = str(class_names[int(idx)]) if int(idx) < int(len(class_names)) else f"class_{int(idx)}"
+        if int(active_hits.get(str(name), 0)) <= 0:
+            missing_terms.append(str(name))
     info = {
         "rows": int(n),
         "target_dim_expected": int(expected_dim),
@@ -3352,10 +4161,19 @@ def _schedule_semantic_gate_indices(
         "target_dim_max": int(max(row_sizes)) if len(row_sizes) > 0 else 0,
         "active_terms": int(len(active_indices)),
         "active_term_hits": {str(k): int(v) for k, v in active_hits.items()},
-        "bucketed_rows": int(len(used)),
+        "missing_active_terms": list(missing_terms),
+        "bucketed_rows": int(rows_with_active_support),
         "selected_rows": int(len(ordered)),
         "max_samples": int(max_samples),
         "threshold": float(threshold),
+        "scheduler_mode": "deterministic_group_staged_v2",
+        "stage_counts": {
+            "single_term": int(stage_counts.get("single_term", 0)),
+            "multi_term": int(stage_counts.get("multi_term", 0)),
+            "fallback": int(stage_counts.get("fallback", 0)),
+            "remaining": int(stage_counts.get("remaining", 0)),
+        },
+        "signature_groups": int(len(signature_buckets)),
     }
     return [int(i) for i in ordered], info
 
@@ -3625,7 +4443,11 @@ def _build_gate_loader_from_dataset(
     return loader, int(picks.size)
 
 
-def _augment_bootstrap_chw01(img: np.ndarray, seed: int) -> np.ndarray:
+def _augment_bootstrap_chw01(
+    img: np.ndarray,
+    seed: int,
+    return_terms: bool = False,
+) -> Any:
     arr = np.asarray(img, dtype=np.float32)
     if int(arr.ndim) == 3 and int(arr.shape[0]) == 3:
         x = np.asarray(arr, dtype=np.float32, order="C")
@@ -3638,6 +4460,8 @@ def _augment_bootstrap_chw01(img: np.ndarray, seed: int) -> np.ndarray:
     x = np.clip(x, 0.0, 1.0).astype(np.float32, copy=False)
     c, h, w = int(x.shape[0]), int(x.shape[1]), int(x.shape[2])
     rng = np.random.default_rng(int(seed))
+
+    applied_terms: List[str] = []
 
     # Spatial permutations.
     shift_x = int(rng.integers(-max(1, w // 14), max(1, w // 14) + 1))
@@ -3657,16 +4481,20 @@ def _augment_bootstrap_chw01(img: np.ndarray, seed: int) -> np.ndarray:
         t = torch.from_numpy(np.asarray(x, dtype=np.float32)[None, ...])
         t = F.avg_pool2d(t, kernel_size=int(k), stride=1, padding=int(k // 2))
         x = np.asarray(t[0].cpu().numpy(), dtype=np.float32)
+        applied_terms.extend(_semantic_damage_tags("blur damage"))
     if float(rng.random()) < 0.45:
         odd_shift = int(rng.integers(1, 8))
         x[:, 1::2, :] = np.roll(x[:, 1::2, :], shift=odd_shift, axis=2)
+        applied_terms.extend(_semantic_damage_tags("stride skew damage"))
     if float(rng.random()) < 0.35:
         keep = float(rng.uniform(0.76, 0.96))
         mask = (rng.random((h, w), dtype=np.float32) < keep).astype(np.float32, copy=False)
         x = x * mask[None, :, :]
+        applied_terms.extend(_semantic_damage_tags("dropout damage"))
     if float(rng.random()) < 0.40:
         lv = int(rng.choice(np.asarray([4, 6, 8, 12], dtype=np.int32)))
         x = np.round(x * float(lv - 1)) / float(lv - 1)
+        applied_terms.extend(_semantic_damage_tags("quantization damage"))
 
     # Signal/noise tangling blend.
     yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
@@ -3677,6 +4505,7 @@ def _augment_bootstrap_chw01(img: np.ndarray, seed: int) -> np.ndarray:
     ph = float(rng.uniform(0.0, 2.0 * math.pi))
     sig = 0.5 + (0.5 * np.sin((2.0 * math.pi * ((fx * x01) + (fy * y01))) + ph))
     noi = rng.random((h, w), dtype=np.float32)
+    noise_tags = _semantic_noise_terms_from_spectrum_sample(noi)
     if float(rng.random()) < 0.5:
         mix_a = float(rng.uniform(0.18, 0.62))
         mix = np.clip((mix_a * sig) + ((1.0 - mix_a) * noi), 0.0, 1.0).astype(np.float32, copy=False)
@@ -3689,11 +4518,19 @@ def _augment_bootstrap_chw01(img: np.ndarray, seed: int) -> np.ndarray:
         mix = np.clip(((s_u16 & keep_mask) | payload).astype(np.float32) / 65535.0, 0.0, 1.0).astype(np.float32, copy=False)
     blend = float(rng.uniform(0.08, 0.28))
     x = np.clip(((1.0 - blend) * x) + (blend * mix[None, :, :]), 0.0, 1.0)
+    applied_terms.extend(["mixed noise and signal", "noise", "signal"])
+    applied_terms.extend(list(noise_tags))
 
     if float(rng.random()) < 0.65:
         std = float(rng.uniform(0.01, 0.08))
-        x = np.clip(x + (std * rng.standard_normal((c, h, w), dtype=np.float32)), 0.0, 1.0)
-    return np.asarray(x, dtype=np.float32)
+        noise_delta = (std * rng.standard_normal((c, h, w), dtype=np.float32)).astype(np.float32, copy=False)
+        x = np.clip(x + noise_delta, 0.0, 1.0)
+        applied_terms.extend(_semantic_damage_tags("noise damage"))
+        applied_terms.extend(_semantic_noise_terms_from_spectrum_sample(noise_delta))
+    x_out = np.asarray(x, dtype=np.float32)
+    if bool(return_terms):
+        return x_out, _normalize_vocab_terms(applied_terms)
+    return x_out
 
 
 class _BootstrapExpandedDataset(Dataset):
@@ -3705,6 +4542,8 @@ class _BootstrapExpandedDataset(Dataset):
         seed: int,
         augment: bool,
         expected_target_dim: int = 0,
+        semantic_term_to_idx: Optional[Dict[str, int]] = None,
+        augment_apply_terms: bool = True,
     ):
         n = min(int(len(images)), int(len(targets)))
         if n <= 0:
@@ -3724,6 +4563,12 @@ class _BootstrapExpandedDataset(Dataset):
                 "BootstrapExpandedDataset target width mismatch: "
                 f"got={int(self.target_dim)} expected={int(expected_target_dim)}"
             )
+        self.semantic_term_to_idx = {
+            re.sub(r"\s+", " ", str(k)).strip().lower(): int(v)
+            for k, v in (semantic_term_to_idx.items() if isinstance(semantic_term_to_idx, dict) else [])
+            if str(k).strip()
+        }
+        self.augment_apply_terms = bool(augment_apply_terms)
 
     def __len__(self) -> int:
         return int(self.total_rows)
@@ -3738,10 +4583,22 @@ class _BootstrapExpandedDataset(Dataset):
         off = int(idx % max(1, int(self.base_rows)))
         base_idx = int((off + (cycle * 17) + int(self.seed % max(1, int(self.base_rows)))) % int(self.base_rows))
         img = np.asarray(self.images[int(base_idx)], dtype=np.float32)
-        tgt = np.asarray(self.targets[int(base_idx)], dtype=np.float32)
+        tgt = np.asarray(self.targets[int(base_idx)], dtype=np.float32).copy()
         if bool(self.augment) and int(self.total_rows) > int(self.base_rows):
             aug_seed = int((int(self.seed) * 2654435761 + int(idx) * 1103515245 + int(base_idx) * 122949829) % (2**32 - 1))
-            img = _augment_bootstrap_chw01(img=img, seed=int(aug_seed))
+            img, aug_terms = _augment_bootstrap_chw01(
+                img=img,
+                seed=int(aug_seed),
+                return_terms=True,
+            )
+            if bool(self.augment_apply_terms) and int(len(self.semantic_term_to_idx)) > 0 and isinstance(aug_terms, list):
+                for term in aug_terms:
+                    tk = re.sub(r"\s+", " ", str(term)).strip().lower()
+                    if not tk:
+                        continue
+                    ti = int(self.semantic_term_to_idx.get(tk, -1))
+                    if 0 <= int(ti) < int(tgt.size):
+                        tgt[int(ti)] = 1.0
         return (
             torch.from_numpy(np.asarray(img, dtype=np.float32)),
             torch.from_numpy(np.asarray(tgt, dtype=np.float32)),
@@ -3913,6 +4770,10 @@ def _run_berkeley_refresh_epochs(
     cache_y: Optional[torch.Tensor] = None,
     cache_batch_size: int = 0,
     active_classes: int = 0,
+    target_label_knockout_prob: float = 0.0,
+    target_label_knockout_min_keep: int = 1,
+    target_label_knockout_max_drop_frac: float = 0.5,
+    target_label_knockout_seed: int = 0,
     step_preview_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
     stop_requested: Optional[Callable[[], bool]] = None,
 ):
@@ -3941,6 +4802,11 @@ def _run_berkeley_refresh_epochs(
     )
     cache_batch_size = max(1, int(cache_batch_size)) if use_cache else 0
     refresh_source = "cache" if use_cache else "loader"
+    knockout_prob = float(max(0.0, min(1.0, float(target_label_knockout_prob))))
+    knockout_enabled = bool(knockout_prob > 0.0)
+    knockout_rng = np.random.default_rng(max(0, int(target_label_knockout_seed)))
+    knockout_rows_applied = 0
+    knockout_labels_dropped = 0
     opt = torch.optim.AdamW(classifier.parameters(), lr=float(lr), weight_decay=float(weight_decay))
     min_steps = max(0, int(min_steps))
     if use_cache:
@@ -4011,6 +4877,17 @@ def _run_berkeley_refresh_epochs(
                 xb = xb.to(device, non_blocking=True)
             if yb.device != device:
                 yb = yb.to(device, non_blocking=True)
+            if bool(knockout_enabled):
+                yb, rows_drop, labels_drop = _label_knockout_tensor_batch(
+                    yb=yb,
+                    rng=knockout_rng,
+                    prob=float(knockout_prob),
+                    min_keep=int(target_label_knockout_min_keep),
+                    max_drop_frac=float(target_label_knockout_max_drop_frac),
+                    threshold=0.5,
+                )
+                knockout_rows_applied += int(rows_drop)
+                knockout_labels_dropped += int(labels_drop)
             if channels_last:
                 xb = xb.contiguous(memory_format=torch.channels_last)
             with _autocast_context(device=device, enabled=amp_enabled, amp_dtype_t=amp_dtype_t):
@@ -4087,6 +4964,8 @@ def _run_berkeley_refresh_epochs(
                     "stopped_early": False,
                     "elapsed_sec": float(time.time() - t_start),
                     "source": refresh_source,
+                    "target_knockout_rows_applied": int(knockout_rows_applied),
+                    "target_knockout_labels_dropped": int(knockout_labels_dropped),
                 }
         if stop_now:
             break
@@ -4100,6 +4979,8 @@ def _run_berkeley_refresh_epochs(
         "stopped_early": bool(stop_now),
         "elapsed_sec": float(time.time() - t_start),
         "source": refresh_source,
+        "target_knockout_rows_applied": int(knockout_rows_applied),
+        "target_knockout_labels_dropped": int(knockout_labels_dropped),
     }
 
 
@@ -4485,7 +5366,9 @@ def _sample_stream_chunks_with_labels(
         j = int(eligible[int(rng.integers(0, len(eligible)))])
         s = streams[j]
         yb[i] = int(labels[j])
-        picked.append(metas[j])
+        meta_row = dict(metas[j]) if isinstance(metas[j], dict) else {}
+        meta_row["_stream_index"] = int(j)
+        picked.append(meta_row)
         start = int(rng.integers(0, int(s.size) - int(chunk_samples) + 1))
         xb[i, :] = np.asarray(s[start : start + int(chunk_samples)], dtype=np.float32)
     return xb, yb, picked
@@ -4553,6 +5436,97 @@ def _synthesize_structured_wave(target_samples: int, framerate: int, rng: np.ran
     if peak > 1e-6:
         y = y / peak
     return y.astype(np.float32, copy=False)
+
+
+def _latent_noise_profile_keys() -> List[str]:
+    return [
+        "uniform_white_noise",
+        "gaussian_white_noise",
+        "pink_noise",
+        "brown_noise",
+        "red_noise",
+        "blue_noise",
+        "violet_noise",
+        "gray_noise",
+    ]
+
+
+def _sample_latent_noise_profile_key(rng: np.random.Generator) -> str:
+    keys = _latent_noise_profile_keys()
+    if len(keys) <= 0:
+        return "gaussian_white_noise"
+    weights = np.asarray([0.20, 0.20, 0.15, 0.12, 0.10, 0.09, 0.07, 0.07], dtype=np.float64)
+    if int(weights.size) != int(len(keys)):
+        return str(keys[int(rng.integers(0, len(keys)))])
+    weights = weights / max(1e-12, float(np.sum(weights)))
+    pick = int(rng.choice(np.arange(len(keys), dtype=np.int64), p=weights))
+    return str(keys[int(pick)])
+
+
+def _latent_noise_profile_spec(profile_key: str) -> Tuple[float, str]:
+    key = re.sub(r"\s+", "_", str(profile_key)).strip().lower()
+    lut: Dict[str, Tuple[float, str]] = {
+        "uniform_white_noise": (0.0, "uniform"),
+        "gaussian_white_noise": (0.0, "gaussian"),
+        "pink_noise": (1.0, "gaussian"),
+        "brown_noise": (2.0, "gaussian"),
+        "red_noise": (1.8, "gaussian"),
+        "blue_noise": (-1.0, "gaussian"),
+        "violet_noise": (-2.0, "gaussian"),
+        "gray_noise": (0.5, "gaussian"),
+    }
+    return tuple(lut.get(key, (0.0, "gaussian")))
+
+
+def _synthesize_profiled_noise_wave(
+    target_samples: int,
+    framerate: int,
+    profile_key: str,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    n = max(256, int(target_samples))
+    sr = max(1000, int(framerate))
+    beta, dist = _latent_noise_profile_spec(profile_key)
+    if str(dist).strip().lower() == "uniform":
+        base = rng.uniform(-1.0, 1.0, size=(n,)).astype(np.float32, copy=False)
+    else:
+        base = rng.standard_normal((n,)).astype(np.float32, copy=False)
+    if abs(float(beta)) > 1e-6:
+        spec = np.fft.rfft(base).astype(np.complex64, copy=False)
+        freqs = np.fft.rfftfreq(int(n), d=(1.0 / float(sr))).astype(np.float32, copy=False)
+        denom = np.maximum(freqs, 1.0).astype(np.float32, copy=False)
+        shape = np.power(denom, -0.5 * float(beta)).astype(np.float32, copy=False)
+        shape[0] = 0.0
+        shaped = spec * shape.astype(np.complex64, copy=False)
+        base = np.fft.irfft(shaped, n=int(n)).astype(np.float32, copy=False)
+    base = base - float(np.mean(base))
+    std = float(np.std(base)) if int(base.size) > 0 else 0.0
+    if std > 1e-8:
+        base = base / std
+    return np.asarray(base, dtype=np.float32)
+
+
+def _latent_noise_profile_key_from_path(path: str) -> str:
+    name = Path(str(path)).name.lower()
+    m = re.search(r"latent_\d+_([a-z0-9_]+)\.wav$", name)
+    if m is None:
+        return ""
+    key = re.sub(r"\s+", "_", str(m.group(1))).strip().lower()
+    if key in set(_latent_noise_profile_keys()):
+        return str(key)
+    return ""
+
+
+def _latent_stream_semantic_terms_from_path(path: str) -> List[str]:
+    p = str(path)
+    kind = _latent_pool_stream_kind(p)
+    profile_key = _latent_noise_profile_key_from_path(p)
+    noise_terms = _semantic_noise_profile_terms(profile_key if profile_key else "gaussian_white_noise")
+    if kind == "noise":
+        return _normalize_vocab_terms(list(noise_terms))
+    if kind == "mix":
+        return _normalize_vocab_terms(["mixed noise and signal", "signal"] + list(noise_terms))
+    return []
 
 
 def _resolve_library_member_path(path_text: str, library_dir: Path) -> Optional[Path]:
@@ -4641,8 +5615,17 @@ def _bootstrap_latent_wav_pool(
     rows = []
     mixed_count = 0
     structured_count = 0
+    noise_profile_counts: Dict[str, int] = {}
     for i in range(max(1, int(count))):
-        noise = (rng.standard_normal(sample_count).astype(np.float32) * float(noise_std))
+        noise_profile = _sample_latent_noise_profile_key(rng)
+        noise_raw = _synthesize_profiled_noise_wave(
+            target_samples=int(sample_count),
+            framerate=int(framerate),
+            profile_key=str(noise_profile),
+            rng=rng,
+        )
+        noise = np.asarray(noise_raw, dtype=np.float32) * float(noise_std)
+        noise_terms = _semantic_noise_terms_from_spectrum_sample(noise_raw)
         y = noise.copy()
         src = ""
         used_mix = False
@@ -4675,9 +5658,26 @@ def _bootstrap_latent_wav_pool(
 
         y = np.clip(y, -1.0, 1.0)
         target_dir = mix_dir if used_mix else noise_dir
-        out_path = target_dir / f"latent_{i:05d}.wav"
+        prof_slug = re.sub(r"[^a-z0-9_]+", "_", str(noise_profile).strip().lower()).strip("_")
+        if not prof_slug:
+            prof_slug = "gaussian_white_noise"
+        out_path = target_dir / f"latent_{i:05d}_{prof_slug}.wav"
         _save_mono_wav(out_path, y, framerate=framerate)
-        rows.append({"file": str(out_path), "mixed": bool(used_mix), "source": src})
+        rows.append(
+            {
+                "file": str(out_path),
+                "mixed": bool(used_mix),
+                "source": src,
+                "noise_profile": str(prof_slug),
+                "noise_terms": list(noise_terms),
+            }
+        )
+        noise_profile_counts[str(prof_slug)] = int(noise_profile_counts.get(str(prof_slug), 0)) + 1
+
+    index_path = pool_dir / "index.jsonl"
+    with index_path.open("w", encoding="utf-8") as f:
+        for row in rows:
+            f.write(json.dumps(row, ensure_ascii=True) + "\n")
 
     manifest = pool_dir / "manifest.json"
     manifest.write_text(
@@ -4699,6 +5699,8 @@ def _bootstrap_latent_wav_pool(
                 "structured_gain": float(structured_gain),
                 "structured_noise_gain": float(structured_noise_gain),
                 "structured_count": int(structured_count),
+                "noise_profiles": {str(k): int(v) for k, v in sorted(noise_profile_counts.items(), key=lambda kv: str(kv[0]))},
+                "index": str(index_path),
             },
             indent=2,
         ),
@@ -4712,6 +5714,8 @@ def _bootstrap_latent_wav_pool(
         "reinject_candidates": len(reinject_paths),
         "mixed_count": int(mixed_count),
         "structured_count": int(structured_count),
+        "index": str(index_path),
+        "noise_profiles": {str(k): int(v) for k, v in sorted(noise_profile_counts.items(), key=lambda kv: str(kv[0]))},
     }
 
 
@@ -4744,6 +5748,7 @@ def _build_wave_classifier_dataset_from_transformer(
     pin_memory: bool = False,
     semantic_class_names: Optional[Sequence[str]] = None,
     semantic_label_bank: Optional[np.ndarray] = None,
+    stream_target_labels: Optional[Sequence[Any]] = None,
 ):
     rng = np.random.default_rng(rng_seed)
     x_all = []
@@ -4830,30 +5835,53 @@ def _build_wave_classifier_dataset_from_transformer(
                         source_terms = picked[i].get("semantic_terms", [])
                         if isinstance(source_terms, list):
                             sem_terms.extend([str(x) for x in source_terms])
+                        stream_idx = int(picked[i].get("_stream_index", -1))
+                        if (
+                            stream_target_labels is not None
+                            and semantic_class_names is not None
+                            and 0 <= int(stream_idx) < int(len(stream_target_labels))
+                        ):
+                            src_target = stream_target_labels[int(stream_idx)]
+                            if src_target is not None:
+                                src_arr = np.asarray(src_target, dtype=np.float32).reshape(-1)
+                                src_take = min(int(src_arr.size), int(len(semantic_class_names)))
+                                if int(src_take) > 0:
+                                    src_pos = np.where(np.asarray(src_arr[: int(src_take)], dtype=np.float32) >= 0.5)[0]
+                                    for ti in src_pos.tolist():
+                                        if 0 <= int(ti) < int(len(semantic_class_names)):
+                                            sem_terms.append(str(semantic_class_names[int(ti)]))
                         src_label_idx = int(yb_np[i])
                         if semantic_class_names is not None and 0 <= src_label_idx < len(semantic_class_names):
                             sem_terms.append(str(semantic_class_names[src_label_idx]))
                         if semantic_class_names is not None and int(probs.shape[1]) > 0:
-                            k_sem = max(1, min(6, int(probs.shape[1]), int(len(semantic_class_names))))
-                            top_vals, top_idx = torch.topk(probs[i], k=k_sem, dim=0)
-                            for score_t, idx_t in zip(top_vals.tolist(), top_idx.tolist()):
-                                score = float(score_t)
-                                if score < 0.20:
-                                    continue
-                                idx = int(idx_t)
-                                if 0 <= idx < len(semantic_class_names):
-                                    sem_terms.append(str(semantic_class_names[idx]))
+                            p_row = probs[i].detach().to(torch.float32).cpu().numpy().reshape(-1)
+                            p_take = min(int(p_row.size), int(len(semantic_class_names)))
+                            if int(p_take) > 0:
+                                p_clip = np.asarray(p_row[: int(p_take)], dtype=np.float32)
+                                pred_pos = np.where(p_clip >= 0.20)[0].astype(np.int64).tolist()
+                                if int(len(pred_pos)) <= 0:
+                                    pred_pos = [int(np.argmax(p_clip))]
+                                for pi in pred_pos:
+                                    if 0 <= int(pi) < int(len(semantic_class_names)):
+                                        sem_terms.append(str(semantic_class_names[int(pi)]))
                         sem_terms.extend(
                             [
-                            "regurgitated content",
-                            "signal",
-                            "wave native output",
-                            f"wave origin {wave_origin_bucket.replace('_', ' ')}",
+                                "regurgitated content",
+                                "wave native output",
+                                f"wave origin {wave_origin_bucket.replace('_', ' ')}",
                             ]
                         )
-                        if wave_origin_bucket in {"latent_mix", "accepted_loopback", "structured_seed"}:
-                            sem_terms.append("mixed noise and signal")
-                        sem_terms = _normalize_vocab_terms(sem_terms)
+                        generated_noise_terms = _semantic_noise_terms_from_spectrum_sample(
+                            xh[i].detach().cpu().numpy().reshape(-1)
+                        )
+                        if wave_origin_bucket == "latent_noise":
+                            sem_terms.extend(list(generated_noise_terms))
+                        elif wave_origin_bucket in {"latent_mix", "accepted_loopback", "structured_seed"}:
+                            sem_terms.extend(["mixed noise and signal", "noise", "signal"])
+                            sem_terms.extend(list(generated_noise_terms))
+                        else:
+                            sem_terms.append("signal")
+                        sem_terms = _semantic_expand_inferred_tags(sem_terms)
                         row = {
                             "file": str(out_path),
                             "label": int(yb_np[i]),
@@ -4981,7 +6009,41 @@ def _cosine_medoid_projection_scores(coords: np.ndarray) -> np.ndarray:
     return (safe @ anchor).astype(np.float64, copy=False)
 
 
-def _build_labels(records: Sequence[WaveRecord], data_root: str, label_mode: str, pseudo_classes: int):
+def _deterministic_hash_quantile_labels(
+    records: Sequence[WaveRecord],
+    data_root: str,
+    bins: int,
+) -> Tuple[np.ndarray, List[str]]:
+    n = int(len(records))
+    k = max(2, min(int(n), int(max(2, int(bins)))))
+    if n <= 0:
+        return np.zeros((0,), dtype=np.int64), []
+    root = Path(str(data_root)).resolve()
+    key_rows: List[Tuple[int, int]] = []
+    for ri, rec in enumerate(records):
+        p = Path(rec.path).resolve()
+        try:
+            rel_txt = str(p.relative_to(root)).replace("\\", "/")
+        except Exception:
+            rel_txt = str(p).replace("\\", "/")
+        digest = hashlib.sha256(rel_txt.strip().lower().encode("utf-8")).digest()
+        order_key = int.from_bytes(digest[:8], byteorder="little", signed=False)
+        key_rows.append((int(order_key), int(ri)))
+    key_rows.sort(key=lambda kv: (int(kv[0]), int(kv[1])))
+    labels = np.zeros((int(n),), dtype=np.int64)
+    for rank, (_, row_idx) in enumerate(key_rows):
+        labels[int(row_idx)] = int((int(rank) * int(k)) // max(1, int(n)))
+    class_names = [f"split_hash_bin_{i}" for i in range(int(k))]
+    return labels.astype(np.int64, copy=False), class_names
+
+
+def _build_labels(
+    records: Sequence[WaveRecord],
+    data_root: str,
+    label_mode: str,
+    pseudo_classes: int,
+    single_class_fallback: str = "spectral_cosine_quantile",
+):
     root = Path(data_root).resolve()
     if label_mode == "folder":
         names: List[str] = []
@@ -5000,6 +6062,15 @@ def _build_labels(records: Sequence[WaveRecord], data_root: str, label_mode: str
             lut = {n: i for i, n in enumerate(uniq)}
             labels = np.array([lut[n] for n in names], dtype=np.int64)
             return labels, uniq, "folder"
+
+        fallback_mode = str(single_class_fallback).strip().lower()
+        if fallback_mode in ("path_hash_quantile", "path_hash", "deterministic_path_hash"):
+            labels, class_names = _deterministic_hash_quantile_labels(
+                records=records,
+                data_root=str(data_root),
+                bins=int(pseudo_classes),
+            )
+            return labels, class_names, "folder_hash_quantile"
 
         _log("Folder labels are single-class; switching to pseudo labels from cosine-unified spectral encoding bins.")
 
@@ -5169,10 +6240,18 @@ def _prepare_streams(
         mono, bit_depth = _decode_record_to_mono(records[idx], cfg, max_points=max_points)
         if mono.size == 0:
             continue
+        path_txt = str(records[idx].path)
+        generated_terms = _latent_stream_semantic_terms_from_path(path_txt)
         streams.append(mono.astype(np.float32, copy=False))
         ys.append(int(labels[idx]))
         bits.append(int(bit_depth))
-        meta.append({"path": records[idx].path, "framerate": int(records[idx].framerate)})
+        meta.append(
+            {
+                "path": path_txt,
+                "framerate": int(records[idx].framerate),
+                "semantic_terms": list(generated_terms),
+            }
+        )
     return streams, ys, bits, meta
 
 
@@ -5257,11 +6336,17 @@ def _append_accepted_rows_to_transformer_streams(
                 continue
             train_streams.append(mono.astype(np.float32, copy=False))
             train_stream_labels.append(int(row.get("label", 0)))
+            row_terms_raw = (
+                [str(x) for x in row.get("semantic_terms", [])]
+                if isinstance(row.get("semantic_terms", []), list)
+                else []
+            )
+            row_terms_raw.extend(_latent_stream_semantic_terms_from_path(str(row.get("source", ""))))
             train_meta.append(
                 {
                     "path": str(p),
                     "framerate": int(rec.framerate),
-                    "semantic_terms": list(row.get("semantic_terms", [])) if isinstance(row.get("semantic_terms", []), list) else [],
+                    "semantic_terms": _semantic_expand_inferred_tags(row_terms_raw),
                 }
             )
             if callable(on_append_row):
@@ -5274,6 +6359,82 @@ def _append_accepted_rows_to_transformer_streams(
         except Exception:
             continue
     return int(added)
+
+
+def _repair_accepted_library_index_semantics(library_dir: Path) -> Dict[str, Any]:
+    idx_path = Path(library_dir) / "index.jsonl"
+    if not idx_path.exists():
+        return {
+            "ran": False,
+            "rows": 0,
+            "updated": 0,
+            "parse_failures": 0,
+            "reason": "missing_index",
+            "path": str(idx_path),
+        }
+    try:
+        raw_lines = idx_path.read_text(encoding="utf-8").splitlines()
+    except Exception:
+        return {
+            "ran": False,
+            "rows": 0,
+            "updated": 0,
+            "parse_failures": 0,
+            "reason": "read_failed",
+            "path": str(idx_path),
+        }
+
+    out_lines: List[str] = []
+    total_rows = 0
+    updated_rows = 0
+    parse_failures = 0
+    for line in raw_lines:
+        s = str(line).strip()
+        if not s:
+            continue
+        total_rows += 1
+        try:
+            row = json.loads(s)
+        except Exception:
+            parse_failures += 1
+            out_lines.append(s)
+            continue
+        if not isinstance(row, dict):
+            out_lines.append(s)
+            continue
+        old_terms_raw = row.get("semantic_terms", [])
+        old_terms = [str(x) for x in old_terms_raw] if isinstance(old_terms_raw, list) else []
+        wave_cat = re.sub(r"\s+", " ", str(row.get("wave_category", ""))).strip().lower()
+        terms = list(old_terms)
+        src_terms = _latent_stream_semantic_terms_from_path(str(row.get("source", "")))
+        if len(src_terms) > 0:
+            terms.extend(list(src_terms))
+        if wave_cat in {"latent_mix", "accepted_loopback", "structured_seed"}:
+            terms.extend(["mixed noise and signal", "noise", "signal"])
+        elif wave_cat == "latent_noise":
+            terms.extend(["noise"])
+        new_terms = _semantic_expand_inferred_tags(terms)
+        old_norm = _normalize_vocab_terms(old_terms)
+        if list(new_terms) != list(old_norm):
+            updated_rows += 1
+        row["semantic_terms"] = list(new_terms)
+        out_lines.append(json.dumps(row, ensure_ascii=True))
+
+    if int(updated_rows) > 0:
+        tmp_path = idx_path.with_suffix(".jsonl.tmp")
+        tmp_path.write_text(
+            "\n".join(out_lines) + ("\n" if len(out_lines) > 0 else ""),
+            encoding="utf-8",
+        )
+        tmp_path.replace(idx_path)
+    return {
+        "ran": True,
+        "rows": int(total_rows),
+        "updated": int(updated_rows),
+        "parse_failures": int(parse_failures),
+        "reason": "ok",
+        "path": str(idx_path),
+    }
 
 
 def _latent_pool_stream_kind(path: str) -> str:
@@ -5754,6 +6915,11 @@ def _expand_payload_conditions_with_semantic_bank(
         arr = np.asarray(row, dtype=np.float32).reshape(-1)
         if int(arr.size) <= 0:
             raise RuntimeError(f"Semantic payload row {i} is empty.")
+        if int(arr.size) > int(c):
+            raise RuntimeError(
+                "Semantic payload row width exceeds active semantic width; refusing truncation. "
+                f"row={int(i)} row_dim={int(arr.size)} condition_dim={int(c)}"
+            )
 
         if int(arr.size) >= int(c):
             arr_full = arr[: int(c)]
@@ -5991,17 +7157,83 @@ def _compose_payload_canvas(
     min_payloads: int,
     max_payloads: int,
 ):
-    if len(payload_images) <= 0:
+    n_payload = min(int(len(payload_images)), int(len(payload_targets)))
+    if int(n_payload) <= 0:
         return None, None, 0
+    if int(len(payload_images)) != int(len(payload_targets)):
+        raise RuntimeError(
+            "Payload canvas requires image/target parity: "
+            f"images={int(len(payload_images))} targets={int(len(payload_targets))}"
+        )
     lo = max(1, int(min_payloads))
     hi = max(lo, int(max_payloads))
     k = int(rng.integers(lo, hi + 1))
     if k <= 0:
         k = 1
 
-    idx = rng.choice(np.arange(len(payload_images)), size=int(k), replace=(k > len(payload_images))).astype(np.int64)
+    # Pick payload rows by maximizing new active-label coverage to avoid
+    # repeatedly sampling dominant single-label rows from imbalanced banks.
+    active_idx_per_row: List[np.ndarray] = []
+    expected_dim = max(1, int(num_classes))
+    for pidx in range(int(n_payload)):
+        t_row = np.asarray(payload_targets[int(pidx)], dtype=np.float32).reshape(-1)
+        if int(t_row.size) != int(expected_dim):
+            raise RuntimeError(
+                "Payload canvas target width mismatch; refusing positional truncation. "
+                f"expected={int(expected_dim)} got={int(t_row.size)} row_pick={int(pidx)}"
+            )
+        active_idx = np.where(np.asarray(t_row, dtype=np.float32) >= 0.5)[0].astype(np.int64)
+        active_idx_per_row.append(active_idx)
+
+    replace = bool(int(k) > int(n_payload))
+    selected: List[int] = []
+    covered_terms: set = set()
+    available = [int(i) for i in range(int(n_payload))]
+    sample_cap = 192
+    for _ in range(int(k)):
+        if (not replace) and int(len(available)) <= 0:
+            break
+        if replace:
+            pool = np.arange(int(n_payload), dtype=np.int64)
+        else:
+            pool = np.asarray(available, dtype=np.int64)
+        if int(pool.size) <= 0:
+            break
+        if int(pool.size) > int(sample_cap):
+            cand = rng.choice(pool, size=int(sample_cap), replace=False).astype(np.int64)
+        else:
+            cand = np.asarray(pool, dtype=np.int64)
+        best_rows: List[int] = []
+        best_key = (-1, -1)
+        for ci in cand.tolist():
+            act = active_idx_per_row[int(ci)]
+            total_n = int(act.size)
+            if int(total_n) <= 0:
+                key = (0, 0)
+            else:
+                new_n = int(sum(1 for t in act.tolist() if int(t) not in covered_terms))
+                key = (int(new_n), int(total_n))
+            if key > best_key:
+                best_key = key
+                best_rows = [int(ci)]
+            elif key == best_key:
+                best_rows.append(int(ci))
+        if int(len(best_rows)) <= 0:
+            pick = int(cand[int(rng.integers(0, int(cand.size)))])
+        else:
+            pick = int(best_rows[int(rng.integers(0, int(len(best_rows))))])
+        selected.append(int(pick))
+        for ti in active_idx_per_row[int(pick)].tolist():
+            covered_terms.add(int(ti))
+        if not replace:
+            available = [int(x) for x in available if int(x) != int(pick)]
+
+    if int(len(selected)) <= 0:
+        selected = [int(rng.integers(0, int(n_payload)))]
+    idx = np.asarray(selected, dtype=np.int64)
+    k_eff = int(idx.size)
     canvas = np.zeros((3, max(1, int(target_h)), max(1, int(target_w))), dtype=np.float32)
-    rows = np.linspace(0, int(target_h), num=int(k) + 1, dtype=np.int64)
+    rows = np.linspace(0, int(target_h), num=int(k_eff) + 1, dtype=np.int64)
     target_vec = np.zeros((max(1, int(num_classes)),), dtype=np.float32)
     used = 0
     for i, pidx in enumerate(idx.tolist()):
@@ -6012,9 +7244,15 @@ def _compose_payload_canvas(
         patch = _resize_chw_nearest(payload_images[int(pidx)], height=(r1 - r0), width=int(target_w))
         canvas[:, r0:r1, :] = patch
         t = np.asarray(payload_targets[int(pidx)], dtype=np.float32).reshape(-1)
-        d = min(int(target_vec.size), int(t.size))
-        if d > 0:
-            target_vec[:d] = np.maximum(target_vec[:d], t[:d])
+        if int(t.size) != int(target_vec.size):
+            raise RuntimeError(
+                "Payload canvas target width mismatch; refusing positional truncation. "
+                f"expected={int(target_vec.size)} got={int(t.size)} row_pick={int(pidx)}"
+            )
+        target_vec = np.maximum(
+            np.asarray(target_vec, dtype=np.float32),
+            np.asarray(t, dtype=np.float32),
+        ).astype(np.float32, copy=False)
         used += 1
     return canvas, target_vec.astype(np.float32, copy=False), int(used)
 
@@ -6120,7 +7358,7 @@ def _build_berkeley_payload_bank(
     source_root: str = "",
     force_cache_rebuild: bool = False,
 ):
-    del auto_install_scipy  # Legacy rebuild path intentionally disabled for payload-bank construction.
+    _ = bool(auto_install_scipy)  # Intentionally unused in this path; payload rebuild is SciPy-free.
 
     def _norm_txt(x: str) -> str:
         return re.sub(r"\s+", " ", str(x)).strip().lower()
@@ -6229,48 +7467,95 @@ def _build_berkeley_payload_bank(
             cache_loaded = False
 
     if not bool(cache_loaded):
-        raise RuntimeError(
-            "Berkeley payload bank requires pre-washed cache files and no longer rebuilds from legacy "
-            "prepare_sbd_multilabel. Expected cache under "
-            f"'{cache_dir}'."
+        _log(
+            "Berkeley payload bank cache missing/stale; rebuilding from Berkeley SBD source files "
+            f"into '{cache_dir}'."
         )
-        train_ds, val_ds = prepare_sbd_multilabel(
-            data_root=str(root),
-            image_size=int(size),
-            auto_install_scipy=bool(auto_install_scipy),
-        )
-        n_train = int(len(train_ds))
-        n_val = int(len(val_ds))
-        all_images: List[np.ndarray] = []
-        all_labels: List[np.ndarray] = []
+        row_specs: List[Tuple[str, np.ndarray, List[str], str]] = []
         terms_rows = []
         source_rows = []
         source_counts: Dict[str, int] = {}
-
-        for split_name, ds in [("train", train_ds), ("val", val_ds)]:
+        img_root = root / "img"
+        split_specs = [
+            ("train", root / "train.txt", root / "cache" / "sbd_train_multilabel.npz"),
+            ("val", root / "val.txt", root / "cache" / "sbd_val_multilabel.npz"),
+        ]
+        loaded_split_counts: Dict[str, int] = {"train": 0, "val": 0}
+        missing_images = 0
+        decode_failures = 0
+        for split_name, list_path, label_path in split_specs:
+            if not list_path.exists():
+                raise RuntimeError(f"Berkeley split list is missing for payload rebuild: {list_path}")
+            if not label_path.exists():
+                raise RuntimeError(
+                    "Berkeley multilabel cache is missing for payload rebuild: "
+                    f"{label_path}. Re-run berkeley_sbd_pretrain.py once to populate label caches."
+                )
+            ids = [str(x).strip() for x in list_path.read_text(encoding="utf-8").splitlines() if str(x).strip()]
+            try:
+                with np.load(str(label_path)) as z:
+                    if "labels" not in z.files:
+                        raise RuntimeError(f"'labels' key missing in {label_path}")
+                    labels_split = np.asarray(z["labels"], dtype=np.float32)
+            except Exception as e:
+                raise RuntimeError(f"Failed reading Berkeley label cache {label_path}: {type(e).__name__}: {e}") from e
+            if int(labels_split.ndim) != 2:
+                raise RuntimeError(
+                    "Berkeley label cache must be 2D [N,C]: "
+                    f"path={label_path} shape={tuple(labels_split.shape)}"
+                )
+            if int(labels_split.shape[0]) != int(len(ids)):
+                raise RuntimeError(
+                    "Berkeley split list/label cache row mismatch during payload rebuild: "
+                    f"split={split_name} list_rows={int(len(ids))} label_rows={int(labels_split.shape[0])}"
+                )
             source_key = f"berkeley_sbd_{split_name}"
-            for local_idx in range(int(len(ds))):
-                try:
-                    x, y = ds[int(local_idx)]
-                    x01 = torch.clamp((x.float() * 0.5) + 0.5, 0.0, 1.0).cpu().numpy().astype(np.float32, copy=False)
-                    yv = torch.clamp(y.float(), 0.0, 1.0).cpu().numpy().astype(np.float32, copy=False).reshape(-1)
-                    if int(yv.size) >= int(n_classes):
-                        yv = yv[: int(n_classes)]
-                    else:
-                        pad = np.zeros((int(n_classes) - int(yv.size),), dtype=np.float32)
-                        yv = np.concatenate([yv, pad], axis=0)
-                    pos = np.where(yv > 0.5)[0].astype(np.int64).tolist()
-                    label_terms = [str(class_names[int(i)]) for i in pos if 0 <= int(i) < int(len(class_names))]
-                    terms = _normalize_vocab_terms(
-                        [str(split_name), "berkeley sbd dataset", "object", "signal"] + list(label_terms)
-                    )
-                    all_images.append(np.asarray(x01, dtype=np.float32))
-                    all_labels.append(np.asarray(yv, dtype=np.float32))
-                    terms_rows.append(list(terms))
-                    source_rows.append(str(source_key))
-                    source_counts[str(source_key)] = int(source_counts.get(str(source_key), 0)) + 1
-                except Exception:
+            for local_idx, stem in enumerate(ids):
+                img_path = None
+                for ext in (".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"):
+                    cand = img_root / f"{str(stem)}{str(ext)}"
+                    if cand.exists():
+                        img_path = cand
+                        break
+                if img_path is None:
+                    missing_images += 1
                     continue
+                try:
+                    # Descriptor pass validates decode without keeping image tensors in RAM.
+                    _ = _to_rgb_chw01(path=img_path, size=int(size))
+                except Exception:
+                    decode_failures += 1
+                    continue
+                yv = np.asarray(labels_split[int(local_idx)], dtype=np.float32).reshape(-1)
+                if int(yv.size) >= int(n_classes):
+                    yv = yv[: int(n_classes)]
+                else:
+                    pad = np.zeros((int(n_classes) - int(yv.size),), dtype=np.float32)
+                    yv = np.concatenate([yv, pad], axis=0)
+                pos = np.where(np.asarray(yv, dtype=np.float32) > 0.5)[0].astype(np.int64).tolist()
+                label_terms = [str(class_names[int(i)]) for i in pos if 0 <= int(i) < int(len(class_names))]
+                terms = _normalize_vocab_terms(
+                    ["berkeley sbd dataset", "object", "signal"] + list(label_terms)
+                )
+                row_specs.append(
+                    (
+                        str(img_path),
+                        np.asarray(yv, dtype=np.float32).reshape(-1),
+                        list(terms),
+                        str(source_key),
+                    )
+                )
+                source_counts[str(source_key)] = int(source_counts.get(str(source_key), 0)) + 1
+                loaded_split_counts[str(split_name)] = int(loaded_split_counts.get(str(split_name), 0)) + 1
+
+        n_train = int(loaded_split_counts.get("train", 0))
+        n_val = int(loaded_split_counts.get("val", 0))
+        if int(n_train) <= 0 or int(n_val) <= 0:
+            raise RuntimeError(
+                "Berkeley payload rebuild produced empty core splits. "
+                f"loaded_train={int(n_train)} loaded_val={int(n_val)} "
+                f"missing_images={int(missing_images)} decode_failures={int(decode_failures)}"
+            )
 
         if ext_root.exists():
             ds_dirs = [p for p in ext_root.iterdir() if p.is_dir()]
@@ -6283,7 +7568,8 @@ def _build_berkeley_payload_bank(
                 files = sorted(files, key=lambda p: str(p).lower())
                 for fp in files:
                     try:
-                        img = _to_rgb_chw01(path=fp, size=int(size))
+                        # Descriptor pass validates decode without keeping image tensors in RAM.
+                        _ = _to_rgb_chw01(path=fp, size=int(size))
                         vec = np.zeros((int(n_classes),), dtype=np.float32)
                         rel = fp.relative_to(ds_dir)
                         label_term = ""
@@ -6296,45 +7582,128 @@ def _build_berkeley_payload_bank(
                             key = _norm_txt(cand)
                             if key in class_lut:
                                 vec[int(class_lut[key])] = 1.0
-                        all_images.append(np.asarray(img, dtype=np.float32))
-                        all_labels.append(np.asarray(vec, dtype=np.float32))
-                        terms_rows.append(list(ref_terms))
-                        source_rows.append(str(dataset_name))
+                        row_specs.append(
+                            (
+                                str(fp),
+                                np.asarray(vec, dtype=np.float32).reshape(-1),
+                                list(ref_terms),
+                                str(dataset_name),
+                            )
+                        )
                         source_counts[str(dataset_name)] = int(source_counts.get(str(dataset_name), 0)) + 1
                     except Exception:
+                        decode_failures += 1
                         continue
 
-        if len(all_images) <= 0:
+        if len(row_specs) <= 0:
             return [], [], {"available": 0, "used": 0, "available_train": 0, "available_val": 0}, []
 
-        images_np = np.stack(all_images, axis=0).astype(np.float16, copy=False)
-        labels_np = np.stack(all_labels, axis=0).astype(np.float32, copy=False)
+        rows_total = int(len(row_specs))
+        images_tmp_path = cache_dir / "images.tmp.npy"
+        labels_tmp_path = cache_dir / "labels.tmp.npy"
+        for tmp_path in [images_tmp_path, labels_tmp_path]:
+            try:
+                if tmp_path.exists():
+                    tmp_path.unlink()
+            except Exception:
+                pass
+        images_reused = False
+        existing_images_mm: Optional[np.ndarray] = None
+        if images_path.exists():
+            try:
+                existing_images_mm = np.load(str(images_path), mmap_mode="r")
+                if (
+                    int(getattr(existing_images_mm, "ndim", 0)) == 4
+                    and int(existing_images_mm.shape[0]) == int(rows_total)
+                    and int(existing_images_mm.shape[1]) == 3
+                    and int(existing_images_mm.shape[2]) == int(size)
+                    and int(existing_images_mm.shape[3]) == int(size)
+                ):
+                    images_reused = True
+            except Exception:
+                existing_images_mm = None
+                images_reused = False
+
+        terms_rows = []
+        source_rows = []
+        labels_mm = np.lib.format.open_memmap(
+            str(labels_tmp_path),
+            mode="w+",
+            dtype=np.float32,
+            shape=(int(rows_total), int(n_classes)),
+        )
+        if bool(images_reused):
+            for wi, row in enumerate(row_specs):
+                _, yv_row, terms_row, src_row = row
+                labels_mm[int(wi), :] = np.asarray(yv_row, dtype=np.float32).reshape(-1)[: int(n_classes)]
+                terms_rows.append(list(terms_row))
+                source_rows.append(str(src_row))
+                if ((int(wi) + 1) % 1024) == 0:
+                    labels_mm.flush()
+            labels_mm.flush()
+            del labels_mm
+            if labels_path.exists():
+                labels_path.unlink()
+            labels_tmp_path.replace(labels_path)
+            images_np = existing_images_mm if existing_images_mm is not None else np.load(str(images_path), mmap_mode="r")
+            labels_np = np.load(str(labels_path), mmap_mode="r")
+        else:
+            images_mm = np.lib.format.open_memmap(
+                str(images_tmp_path),
+                mode="w+",
+                dtype=np.float16,
+                shape=(int(rows_total), 3, int(size), int(size)),
+            )
+            for wi, row in enumerate(row_specs):
+                img_path_txt, yv_row, terms_row, src_row = row
+                x01 = _to_rgb_chw01(path=Path(str(img_path_txt)), size=int(size))
+                images_mm[int(wi), :, :, :] = np.asarray(x01, dtype=np.float16, copy=False)
+                labels_mm[int(wi), :] = np.asarray(yv_row, dtype=np.float32).reshape(-1)[: int(n_classes)]
+                terms_rows.append(list(terms_row))
+                source_rows.append(str(src_row))
+                if ((int(wi) + 1) % 512) == 0:
+                    images_mm.flush()
+                    labels_mm.flush()
+            images_mm.flush()
+            labels_mm.flush()
+            del images_mm
+            del labels_mm
+            if images_path.exists():
+                images_path.unlink()
+            if labels_path.exists():
+                labels_path.unlink()
+            images_tmp_path.replace(images_path)
+            labels_tmp_path.replace(labels_path)
+            images_np = np.load(str(images_path), mmap_mode="r")
+            labels_np = np.load(str(labels_path), mmap_mode="r")
+
         source_catalog = {
             "generated_at": float(time.time()),
             "external_source_root": str(ext_root),
             "external_source_signature": ext_sig,
             "source_counts": {str(k): int(v) for k, v in source_counts.items()},
-            "available_rows": int(images_np.shape[0]),
+            "available_rows": int(rows_total),
             "available_train": int(n_train),
             "available_val": int(n_val),
+            "missing_images": int(missing_images),
+            "decode_failures": int(decode_failures),
+            "images_reused": bool(images_reused),
         }
         manifest = {
             "version": int(cache_version),
             "image_size": int(size),
             "num_classes": int(n_classes),
             "class_names": list(class_names),
-            "available_rows": int(images_np.shape[0]),
+            "available_rows": int(rows_total),
             "available_train": int(n_train),
             "available_val": int(n_val),
-            "available_external": int(max(0, int(images_np.shape[0]) - int(n_train) - int(n_val))),
+            "available_external": int(max(0, int(rows_total) - int(n_train) - int(n_val))),
             "external_source_root": str(ext_root),
             "external_source_signature": ext_sig,
             "source_counts": {str(k): int(v) for k, v in source_counts.items()},
             "source_catalog": str(source_catalog_path),
             "generated_at": float(time.time()),
         }
-        np.save(str(images_path), np.asarray(images_np, dtype=np.float16))
-        np.save(str(labels_path), np.asarray(labels_np, dtype=np.float32))
         terms_path.write_text(json.dumps(terms_rows, ensure_ascii=True), encoding="utf-8")
         sources_path.write_text(json.dumps(source_rows, ensure_ascii=True), encoding="utf-8")
         source_catalog_path.write_text(json.dumps(source_catalog, indent=2), encoding="utf-8")
@@ -6351,6 +7720,59 @@ def _build_berkeley_payload_bank(
         return [], [], {"available": 0, "used": 0, "available_train": 0, "available_val": 0}, []
 
     n_total = int(images_np.shape[0])
+    if int(len(source_rows)) < int(n_total):
+        source_rows = list(source_rows) + (["unknown_source"] * int(max(0, int(n_total) - int(len(source_rows)))))
+    elif int(len(source_rows)) > int(n_total):
+        source_rows = list(source_rows[: int(n_total)])
+
+    def _source_supervised_stats(source_key: str) -> Dict[str, float]:
+        key = re.sub(r"\s+", " ", str(source_key)).strip().lower()
+        idx_rows = [
+            int(i)
+            for i in range(int(n_total))
+            if re.sub(r"\s+", " ", str(source_rows[int(i)])).strip().lower() == key
+        ]
+        if len(idx_rows) <= 0:
+            return {"rows": 0, "nonzero": 0, "min": 0, "mean": 0.0, "max": 0}
+        idx_np = np.asarray(idx_rows, dtype=np.int64)
+        y_np = np.asarray(labels_np[idx_np], dtype=np.float32)
+        if int(y_np.ndim) == 1:
+            y_np = y_np.reshape(1, -1)
+        sup_take = min(int(n_classes), int(y_np.shape[1]))
+        if int(sup_take) <= 0:
+            return {"rows": int(y_np.shape[0]), "nonzero": 0, "min": 0, "mean": 0.0, "max": 0}
+        pos_counts = np.count_nonzero(np.asarray(y_np[:, : int(sup_take)], dtype=np.float32) >= 0.5, axis=1).astype(np.int32)
+        return {
+            "rows": int(pos_counts.size),
+            "nonzero": int(np.count_nonzero(pos_counts > 0)),
+            "min": int(pos_counts.min()) if int(pos_counts.size) > 0 else 0,
+            "mean": float(np.mean(pos_counts)) if int(pos_counts.size) > 0 else 0.0,
+            "max": int(pos_counts.max()) if int(pos_counts.size) > 0 else 0,
+        }
+
+    train_lbl_stats = _source_supervised_stats("berkeley_sbd_train")
+    val_lbl_stats = _source_supervised_stats("berkeley_sbd_val")
+    if int(train_lbl_stats.get("rows", 0)) > 0 and int(train_lbl_stats.get("nonzero", 0)) < int(train_lbl_stats.get("rows", 0)):
+        raise RuntimeError(
+            "Berkeley payload cache train rows are missing supervised targets. "
+            f"nonzero={int(train_lbl_stats.get('nonzero', 0))}/{int(train_lbl_stats.get('rows', 0))}"
+        )
+    if int(val_lbl_stats.get("rows", 0)) > 0 and int(val_lbl_stats.get("nonzero", 0)) < int(val_lbl_stats.get("rows", 0)):
+        raise RuntimeError(
+            "Berkeley payload cache val rows are missing supervised targets. "
+            f"nonzero={int(val_lbl_stats.get('nonzero', 0))}/{int(val_lbl_stats.get('rows', 0))}"
+        )
+    _log(
+        "[berkeley-label-sanity] "
+        "source=payload_cache "
+        f"train={int(train_lbl_stats.get('nonzero', 0))}/{int(train_lbl_stats.get('rows', 0))} "
+        f"train_min/mean/max={int(train_lbl_stats.get('min', 0))}/"
+        f"{float(train_lbl_stats.get('mean', 0.0)):.2f}/{int(train_lbl_stats.get('max', 0))} "
+        f"val={int(val_lbl_stats.get('nonzero', 0))}/{int(val_lbl_stats.get('rows', 0))} "
+        f"val_min/mean/max={int(val_lbl_stats.get('min', 0))}/"
+        f"{float(val_lbl_stats.get('mean', 0.0)):.2f}/{int(val_lbl_stats.get('max', 0))}"
+    )
+
     take = int(n_total) if int(max_samples) <= 0 else min(int(n_total), int(max_samples))
     rng = np.random.default_rng(seed)
     if int(take) >= int(n_total):
@@ -6428,6 +7850,7 @@ def _imprint_latent_stream_targets(
     min_target_classes: int,
     max_target_classes: int,
     kind_target_vectors: Optional[Dict[str, Any]] = None,
+    semantic_term_to_idx: Optional[Dict[str, int]] = None,
     amp_enabled: bool = False,
     amp_dtype: str = "float16",
     channels_last: bool = False,
@@ -6445,6 +7868,7 @@ def _imprint_latent_stream_targets(
     imprinted = 0
     probs: List[float] = []
     target_class_count: List[int] = []
+    payload_row_count: List[int] = []
     empty_fill = float(int(cfg.empty_fill) & 0xFF) / 255.0
     kind_vec_map: Dict[str, np.ndarray] = {}
     if isinstance(kind_target_vectors, dict):
@@ -6455,6 +7879,11 @@ def _imprint_latent_stream_targets(
             arr = np.asarray(row, dtype=np.float32).reshape(-1)
             if int(arr.size) <= 0:
                 continue
+            if int(arr.size) > int(num_classes):
+                raise RuntimeError(
+                    "Latent kind target width exceeds configured class width; refusing truncation. "
+                    f"kind={str(key)} row_dim={int(arr.size)} num_classes={int(num_classes)}"
+                )
             if int(arr.size) >= int(num_classes):
                 arr = arr[: int(num_classes)]
             else:
@@ -6470,22 +7899,63 @@ def _imprint_latent_stream_targets(
             return np.array(kind_vec_map["none"], dtype=np.float32, copy=True)
         return None
 
+    def _terms_target_vector(terms_raw: Any) -> Optional[np.ndarray]:
+        if not isinstance(semantic_term_to_idx, dict) or int(len(semantic_term_to_idx)) <= 0:
+            return None
+        if not isinstance(terms_raw, (list, tuple, set)):
+            return None
+        terms = _semantic_expand_inferred_tags([str(x) for x in terms_raw])
+        if len(terms) <= 0:
+            return None
+        out = np.zeros((max(1, int(num_classes)),), dtype=np.float32)
+        hit = 0
+        for term in terms:
+            key = re.sub(r"\s+", " ", str(term)).strip().lower()
+            if not key:
+                continue
+            idx = int(semantic_term_to_idx.get(key, -1))
+            if 0 <= int(idx) < int(out.size):
+                out[int(idx)] = 1.0
+                hit += 1
+        if int(hit) <= 0:
+            return None
+        return np.asarray(out, dtype=np.float32)
+
     for s, m in zip(streams, metas):
         kind = _latent_pool_stream_kind(m.get("path", ""))
+        meta_vec = _terms_target_vector(m.get("semantic_terms", []))
         if kind == "noise":
             noise_total += 1
             out_streams.append(np.asarray(s, dtype=np.float32))
-            out_targets.append(_kind_target("noise"))
+            base_vec = _kind_target("noise")
+            if base_vec is None:
+                out_targets.append(meta_vec)
+            elif meta_vec is None:
+                out_targets.append(base_vec)
+            else:
+                out_targets.append(np.maximum(base_vec, meta_vec).astype(np.float32, copy=False))
             continue
         if kind != "mix":
             out_streams.append(np.asarray(s, dtype=np.float32))
-            out_targets.append(_kind_target("none"))
+            base_vec = _kind_target("none")
+            if base_vec is None:
+                out_targets.append(meta_vec)
+            elif meta_vec is None:
+                out_targets.append(base_vec)
+            else:
+                out_targets.append(np.maximum(base_vec, meta_vec).astype(np.float32, copy=False))
             continue
 
         mix_total += 1
         if int(num_classes) <= 0 or len(payload_images) <= 0:
             out_streams.append(np.asarray(s, dtype=np.float32))
-            out_targets.append(_kind_target("mix"))
+            base_vec = _kind_target("mix")
+            if base_vec is None:
+                out_targets.append(meta_vec)
+            elif meta_vec is None:
+                out_targets.append(base_vec)
+            else:
+                out_targets.append(np.maximum(base_vec, meta_vec).astype(np.float32, copy=False))
             continue
 
         shape = _render_source_shape_for_stream(stream_len=int(max(1, s.size)), cfg=cfg)
@@ -6506,6 +7976,11 @@ def _imprint_latent_stream_targets(
             target_vec = np.maximum(
                 np.asarray(target_vec, dtype=np.float32).reshape(-1),
                 np.asarray(mix_vec, dtype=np.float32).reshape(-1),
+            ).astype(np.float32, copy=False)
+        if meta_vec is not None and int(np.asarray(meta_vec).size) == int(np.asarray(target_vec).size):
+            target_vec = np.maximum(
+                np.asarray(target_vec, dtype=np.float32).reshape(-1),
+                np.asarray(meta_vec, dtype=np.float32).reshape(-1),
             ).astype(np.float32, copy=False)
         base_seq = _payload_canvas_to_base_sequence(
             canvas_chw=canvas,
@@ -6534,7 +8009,15 @@ def _imprint_latent_stream_targets(
                 tgt = np.where(np.asarray(target_vec, dtype=np.float32).reshape(-1) > 0.0)[0].astype(np.int64).tolist()
             if len(tgt) > 0:
                 probs.append(float(torch.sigmoid(logits[:, tgt]).mean().item()))
-        target_class_count.append(int(n_target))
+        payload_row_count.append(int(n_target))
+        active_n = int(
+            np.count_nonzero(np.asarray(target_vec, dtype=np.float32).reshape(-1) >= 0.5)
+        )
+        if int(active_n) <= 0:
+            active_n = int(
+                np.count_nonzero(np.asarray(target_vec, dtype=np.float32).reshape(-1) > 0.0)
+            )
+        target_class_count.append(int(active_n))
 
     info = {
         "streams": int(len(streams)),
@@ -6548,7 +8031,12 @@ def _imprint_latent_stream_targets(
                 if (t is not None) and (float(np.asarray(t, dtype=np.float32).reshape(-1).sum()) > 0.0)
             )
         ),
+        "target_classes_min": (int(np.min(target_class_count)) if len(target_class_count) > 0 else 0),
         "mean_target_classes_per_stream": (float(np.mean(target_class_count)) if len(target_class_count) > 0 else 0.0),
+        "target_classes_max": (int(np.max(target_class_count)) if len(target_class_count) > 0 else 0),
+        "payload_rows_min": (int(np.min(payload_row_count)) if len(payload_row_count) > 0 else 0),
+        "mean_payload_rows_per_stream": (float(np.mean(payload_row_count)) if len(payload_row_count) > 0 else 0.0),
+        "payload_rows_max": (int(np.max(payload_row_count)) if len(payload_row_count) > 0 else 0),
         "mean_target_prob_after_imprint": (float(np.mean(probs)) if len(probs) > 0 else 0.0),
     }
     return out_streams, out_targets, info
@@ -6581,6 +8069,26 @@ def parse_args():
         help="Directory to recursively scan for .wav files. If omitted, latent fallback pool is generated.",
     )
     p.add_argument("--output-dir", default="toys_to_survive_development/wav_pipeline_runs/latest")
+    p.add_argument(
+        "--hard-wipe-caches",
+        "--hard-wipe-cache",
+        dest="hard_wipe_caches",
+        action="store_true",
+        help=(
+            "Delete generated wave libraries and Berkeley payload-bank caches before startup "
+            "(accepted_wave_library, latent_wave_pool, training_supervision, cache/payload_bank_rgb*)."
+        ),
+    )
+    p.add_argument(
+        "--soft-reset-labels",
+        "--soft-reset-label-cache",
+        dest="soft_reset_labels",
+        action="store_true",
+        help=(
+            "Reset label/semantic cache artifacts while keeping cached images "
+            "(payload labels/terms/sources/manifest/source_catalog and semantic_gate_labels)."
+        ),
+    )
     p.add_argument("--max-files", type=int, default=300)
     p.add_argument("--latent-fallback-count", type=int, default=192)
     p.add_argument("--latent-fallback-seconds", type=float, default=2.0)
@@ -6820,6 +8328,15 @@ def parse_args():
         type=int,
         default=1,
         help="How many active extra semantic slots to replace each cycle when churn is enabled.",
+    )
+    p.add_argument(
+        "--semantic-vocab-churn-sweep-cycles",
+        type=int,
+        default=0,
+        help=(
+            "If >0, auto-raise per-cycle churn replacement so the currently available non-active churn terms "
+            "are swept through in roughly this many cycles (bounded by unlocked extra slots)."
+        ),
     )
     p.add_argument(
         "--semantic-vocab-regurgitated-churn-enabled",
@@ -7222,6 +8739,27 @@ def parse_args():
         type=float,
         default=0.00,
         help="Required reduction margin for spurious labels (after must be below before-margin).",
+    )
+    p.add_argument(
+        "--target-label-knockout-prob",
+        type=float,
+        default=0.0,
+        help=(
+            "Per-row probability of randomly dropping a subset of active target labels during training-target assembly "
+            "(0 disables label knockout)."
+        ),
+    )
+    p.add_argument(
+        "--target-label-knockout-max-drop-frac",
+        type=float,
+        default=0.50,
+        help="Maximum fraction of active labels that may be dropped when knockout is applied to a row.",
+    )
+    p.add_argument(
+        "--target-label-knockout-min-keep",
+        type=int,
+        default=1,
+        help="Minimum number of active labels to preserve in a row after knockout.",
     )
     p.add_argument(
         "--transformer-accepted-preload-max",
@@ -7781,6 +9319,7 @@ def main():
     )
     amp_enabled = bool(args.amp and device.type == "cuda")
     grad_accum_steps = max(1, int(args.grad_accum_steps))
+    force_payload_cache_rebuild_runtime = bool(args.berkeley_payload_cache_rebuild) or bool(getattr(args, "hard_wipe_caches", False)) or bool(getattr(args, "soft_reset_labels", False))
     stage_module_offload_runtime = bool(
         bool(args.stage_module_offload) and device.type == "cuda" and (not bool(args.compile_models))
     )
@@ -7788,6 +9327,51 @@ def main():
         _log("VRAM: stage-module-offload disabled because --compile-models is enabled.")
 
     out_dir = Path(args.output_dir)
+    semantic_cache_nonce = ""
+    do_hard_wipe = bool(getattr(args, "hard_wipe_caches", False))
+    do_soft_reset_labels = bool(getattr(args, "soft_reset_labels", False))
+    if bool(do_hard_wipe):
+        semantic_cache_nonce = str(int(time.time_ns()))
+        wipe_info = _hard_wipe_pipeline_caches(
+            output_dir=out_dir,
+            berkeley_data_root=str(args.berkeley_data_root),
+        )
+        _log(
+            "[hard-wipe-caches] "
+            f"removed={int(len(wipe_info.get('removed', [])))} "
+            f"missing={int(len(wipe_info.get('missing', [])))} "
+            f"errors={int(len(wipe_info.get('errors', [])))}"
+        )
+        for p_txt in wipe_info.get("removed", []):
+            _log(f"[hard-wipe-caches] removed: {str(p_txt)}")
+        for e_txt in wipe_info.get("errors", []):
+            _log(f"[hard-wipe-caches] error: {str(e_txt)}")
+        if int(len(wipe_info.get("errors", []))) > 0:
+            _log(
+                "[hard-wipe-caches] warning: continuing with best-effort wipe; "
+                "fresh semantic cache namespace enabled for this run."
+            )
+    elif bool(do_soft_reset_labels):
+        semantic_cache_nonce = str(int(time.time_ns()))
+        reset_info = _soft_reset_label_caches(
+            output_dir=out_dir,
+            berkeley_data_root=str(args.berkeley_data_root),
+        )
+        _log(
+            "[soft-reset-labels] "
+            f"removed={int(len(reset_info.get('removed', [])))} "
+            f"missing={int(len(reset_info.get('missing', [])))} "
+            f"errors={int(len(reset_info.get('errors', [])))}"
+        )
+        for p_txt in reset_info.get("removed", []):
+            _log(f"[soft-reset-labels] removed: {str(p_txt)}")
+        for e_txt in reset_info.get("errors", []):
+            _log(f"[soft-reset-labels] error: {str(e_txt)}")
+        if int(len(reset_info.get("errors", []))) > 0:
+            _log(
+                "[soft-reset-labels] warning: continuing with best-effort reset; "
+                "fresh semantic cache namespace enabled for this run."
+            )
     out_dir.mkdir(parents=True, exist_ok=True)
     _log(f"Output dir: {out_dir}")
     _log(f"Device: {device}")
@@ -7825,6 +9409,18 @@ def main():
         f"text_topk={int(args.semantic_vocab_text_condition_topk)}, "
         f"unknown_rows_per_cycle={int(args.semantic_vocab_unknown_label_rows_per_cycle)}, "
         f"bootstrap_origin='{str(args.semantic_vocab_bootstrap_origin_label)}'"
+    )
+    _log(
+        "Target label knockout: "
+        f"prob={float(args.target_label_knockout_prob):.3f}, "
+        f"max_drop_frac={float(args.target_label_knockout_max_drop_frac):.3f}, "
+        f"min_keep={int(args.target_label_knockout_min_keep)}"
+    )
+    _log(
+        "Semantic vocab churn: "
+        f"enabled={1 if bool(args.semantic_vocab_churn_enabled) else 0}, "
+        f"replace_per_cycle={int(args.semantic_vocab_churn_replace_per_cycle)}, "
+        f"sweep_cycles={int(args.semantic_vocab_churn_sweep_cycles)}"
     )
     _log(
         "Model capacity: "
@@ -7969,7 +9565,7 @@ def main():
         latent_fallback_info = _bootstrap_latent_wav_pool(
             out_dir=out_dir,
             seed=args.seed,
-            count=args.latent_fallback_count,
+            count=max(8, int(args.latent_fallback_count)),
             framerate=args.latent_fallback_rate,
             seconds=args.latent_fallback_seconds,
             noise_std=args.latent_noise_std,
@@ -8003,7 +9599,41 @@ def main():
         except Exception as e:
             _log(f"[skip] {p} ({e})")
     if len(records) < 8:
-        raise RuntimeError("Need at least 8 readable WAV files.")
+        shortfall = max(0, 8 - int(len(records)))
+        _log(
+            "Readable WAV pool is undersized; auto-supplementing from latent fallback: "
+            f"have={len(records)} need=8 shortfall={int(shortfall)}"
+        )
+        latent_topup = _bootstrap_latent_wav_pool(
+            out_dir=out_dir,
+            seed=args.seed + 997,
+            count=max(int(args.latent_fallback_count), int(shortfall)),
+            framerate=args.latent_fallback_rate,
+            seconds=args.latent_fallback_seconds,
+            noise_std=args.latent_noise_std,
+            reinject_dir=args.latent_reinject_dir,
+            reinject_ratio=max(0.0, min(1.0, float(args.latent_reinject_ratio))),
+            reinject_copy_gain=float(args.latent_reinject_copy_gain),
+            reinject_noise_gain=float(args.latent_reinject_noise_gain),
+            structured_ratio=max(0.0, min(1.0, float(args.latent_structured_ratio))),
+            structured_gain=float(args.latent_structured_gain),
+            structured_noise_gain=float(args.latent_structured_noise_gain),
+        )
+        topup_paths = discover_wavs(str(latent_topup.get("pool_dir", "")))
+        seen_paths = {str(Path(r.path).resolve()).lower() for r in records}
+        for p in topup_paths:
+            if int(len(records)) >= 8:
+                break
+            rp = str(Path(str(p)).resolve()).lower()
+            if rp in seen_paths:
+                continue
+            try:
+                records.append(read_wav_record(p))
+                seen_paths.add(rp)
+            except Exception:
+                continue
+        if len(records) < 8:
+            raise RuntimeError("Need at least 8 readable WAV files after latent top-up fallback.")
 
     resume_enabled = bool(args.auto_resume or str(args.resume_from).strip())
     resume_dir = Path(str(args.resume_from).strip()) if str(args.resume_from).strip() else out_dir
@@ -8044,6 +9674,7 @@ def main():
             data_root=wav_data_root,
             label_mode=label_mode,
             pseudo_classes=args.pseudo_classes,
+            single_class_fallback="path_hash_quantile",
         )
         split_labels_from_pseudo_spectral = bool(str(label_source) in ("spectral_quantile", "spectral_cosine_quantile"))
         split_num_classes = len(set(labels_for_split.tolist()))
@@ -8308,7 +9939,7 @@ def main():
             out = np.zeros((int(c),), dtype=np.float32)
             out = np.maximum(out, _semantic_condition_from_supervised_runtime(base_supervised_vec)).astype(np.float32, copy=False)
             # Presence labels are term-membership only. Origin metadata is intentionally excluded.
-            clean_terms = _normalize_vocab_terms([str(x) for x in list(terms)])
+            clean_terms = _semantic_expand_inferred_tags([str(x) for x in list(terms)])
             if len(clean_terms) <= 0:
                 return out
 
@@ -8375,6 +10006,7 @@ def main():
             t for t in semantic_vocab_pool_terms if str(t).strip().lower() not in set(base_lc)
         ]
         semantic_churn_history: List[Dict[str, Any]] = []
+        semantic_vocab_churn_cursor = 0
         semantic_core_lc = {str(x).strip().lower() for x in semantic_core_terms}
         regurgitated_churn_pool: List[Dict[str, Any]] = []
         regurgitated_churn_seen_paths: set = set()
@@ -8749,6 +10381,10 @@ def main():
                             cache_y=refresh_cache_y,
                             cache_batch_size=int(refresh_cache_batch),
                             active_classes=int(score_active_classes),
+                            target_label_knockout_prob=float(args.target_label_knockout_prob),
+                            target_label_knockout_min_keep=int(args.target_label_knockout_min_keep),
+                            target_label_knockout_max_drop_frac=float(args.target_label_knockout_max_drop_frac),
+                            target_label_knockout_seed=int(args.seed) + 61001 + int(i),
                             step_preview_callback=None,
                         )
                         refresh_rows.append({"stage": "config_search", "trial": int(i), **ref})
@@ -8975,7 +10611,7 @@ def main():
                 max_samples=int(payload_max_samples),
                 seed=args.seed + 7067,
                 source_root=str(args.berkeley_payload_source_root),
-                force_cache_rebuild=bool(args.berkeley_payload_cache_rebuild),
+                force_cache_rebuild=bool(force_payload_cache_rebuild_runtime),
             )
             _log(
                 "Latent Berkeley payload bank: "
@@ -9018,23 +10654,90 @@ def main():
             payload_images_base = [np.asarray(x, dtype=np.float32) for x in payload_images]
             payload_conditions_supervised_base = []
             payload_condition_terms_supervised_base = []
+            payload_supervised_pos_all: List[int] = []
+            payload_supervised_pos_berkeley: List[int] = []
+            payload_supervised_label_hits = np.zeros((max(1, int(supervised_num_classes)),), dtype=np.int64)
+            payload_active_vocab_lc = {
+                re.sub(r"\s+", " ", str(x)).strip().lower()
+                for x in class_names
+                if re.sub(r"\s+", " ", str(x)).strip()
+            }
             if len(payload_conditions) > 0:
                 for i, row in enumerate(payload_conditions):
                     arr = np.asarray(row, dtype=np.float32).reshape(-1)
                     if int(arr.size) <= 0:
                         raise RuntimeError(f"Semantic payload row {i} is empty.")
+                    if int(arr.size) > int(supervised_num_classes):
+                        raise RuntimeError(
+                            "Payload supervised row width exceeds classifier supervised width; refusing truncation. "
+                            f"row={int(i)} row_dim={int(arr.size)} supervised_dim={int(supervised_num_classes)}"
+                        )
                     if int(arr.size) >= int(supervised_num_classes):
                         arr = arr[: int(supervised_num_classes)]
                     else:
                         pad = np.zeros((int(supervised_num_classes) - int(arr.size),), dtype=np.float32)
                         arr = np.concatenate([arr, pad], axis=0)
-                    payload_conditions_supervised_base.append(np.clip(arr, 0.0, 1.0).astype(np.float32, copy=False))
+                    arr_clip = np.clip(arr, 0.0, 1.0).astype(np.float32, copy=False)
+                    payload_conditions_supervised_base.append(np.asarray(arr_clip, dtype=np.float32))
                     row_terms: List[str] = []
                     if int(i) < int(len(payload_condition_terms)) and isinstance(payload_condition_terms[int(i)], list):
                         row_terms = _normalize_vocab_terms([str(x) for x in payload_condition_terms[int(i)]])
                     if len(row_terms) <= 0:
                         row_terms = ["berkeley sbd dataset", "object", "signal"]
                     payload_condition_terms_supervised_base.append(list(row_terms))
+                    pos_idx = np.where(np.asarray(arr_clip, dtype=np.float32) >= 0.5)[0].astype(np.int64).tolist()
+                    payload_supervised_pos_all.append(int(len(pos_idx)))
+                    pos_label_terms_lc: List[str] = []
+                    for pi in pos_idx:
+                        if 0 <= int(pi) < int(payload_supervised_label_hits.size):
+                            payload_supervised_label_hits[int(pi)] += 1
+                        if 0 <= int(pi) < int(len(supervised_class_names)):
+                            lbl = re.sub(r"\s+", " ", str(supervised_class_names[int(pi)])).strip().lower()
+                            if lbl:
+                                pos_label_terms_lc.append(str(lbl))
+                    pos_label_terms_lc = list(dict.fromkeys(pos_label_terms_lc))
+                    missing_active_vocab = [str(t) for t in pos_label_terms_lc if str(t) not in payload_active_vocab_lc]
+                    if len(missing_active_vocab) > 0:
+                        raise RuntimeError(
+                            "Berkeley payload row has supervised labels outside active vocabulary. "
+                            f"row={int(i)} missing={','.join(missing_active_vocab[:8])}"
+                        )
+                    row_terms_lc = {
+                        re.sub(r"\s+", " ", str(x)).strip().lower()
+                        for x in row_terms
+                        if re.sub(r"\s+", " ", str(x)).strip()
+                    }
+                    if "berkeley sbd dataset" in row_terms_lc:
+                        payload_supervised_pos_berkeley.append(int(len(pos_idx)))
+                if int(len(payload_supervised_pos_berkeley)) > 0:
+                    berk_pos_np = np.asarray(payload_supervised_pos_berkeley, dtype=np.int32)
+                    if int(np.count_nonzero(berk_pos_np > 0)) < int(berk_pos_np.size):
+                        raise RuntimeError(
+                            "Berkeley payload rows cannot be label-empty in supervised target bank. "
+                            f"nonzero={int(np.count_nonzero(berk_pos_np > 0))}/{int(berk_pos_np.size)}"
+                        )
+                all_pos_np = np.asarray(payload_supervised_pos_all, dtype=np.int32) if int(len(payload_supervised_pos_all)) > 0 else np.zeros((0,), dtype=np.int32)
+                top_label_pairs = sorted(
+                    [
+                        (str(supervised_class_names[int(ci)]) if int(ci) < int(len(supervised_class_names)) else f"class_{int(ci)}", int(cnt))
+                        for ci, cnt in enumerate(payload_supervised_label_hits.tolist())
+                        if int(cnt) > 0
+                    ],
+                    key=lambda kv: (-int(kv[1]), str(kv[0]).lower()),
+                )[:8]
+                top_label_txt = "; ".join([f"{k}:{v}" for k, v in top_label_pairs]) if len(top_label_pairs) > 0 else "none"
+                _log(
+                    "[payload-supervised-targets] "
+                    f"rows={int(all_pos_np.size)} "
+                    f"all_min/mean/max={int(all_pos_np.min()) if int(all_pos_np.size) > 0 else 0}/"
+                    f"{float(np.mean(all_pos_np)) if int(all_pos_np.size) > 0 else 0.0:.2f}/"
+                    f"{int(all_pos_np.max()) if int(all_pos_np.size) > 0 else 0} "
+                    f"berkeley_rows={int(len(payload_supervised_pos_berkeley))} "
+                    f"berkeley_min/mean/max={int(np.min(payload_supervised_pos_berkeley)) if int(len(payload_supervised_pos_berkeley)) > 0 else 0}/"
+                    f"{float(np.mean(payload_supervised_pos_berkeley)) if int(len(payload_supervised_pos_berkeley)) > 0 else 0.0:.2f}/"
+                    f"{int(np.max(payload_supervised_pos_berkeley)) if int(len(payload_supervised_pos_berkeley)) > 0 else 0} "
+                    f"top={top_label_txt}"
+                )
             payload_conditions = []
             if int(semantic_extra_count) > 0 and bool(args.semantic_vocab_auto_symbol_pool):
                 symbol_samples_per_term_eff = max(4, int(args.semantic_vocab_symbol_samples_per_term))
@@ -9156,13 +10859,50 @@ def main():
             if need_payload_bank and len(payload_conditions) <= 0:
                 if len(payload_conditions_supervised_base) <= 0:
                     raise RuntimeError("Semantic payload condition bank is empty.")
-            if len(payload_conditions) != len(payload_images):
-                payload_conditions = list(payload_conditions_supervised_base)
-                if len(payload_conditions) != len(payload_images):
+            if bool(need_payload_bank):
+                payload_conditions, payload_conditioning_info = _expand_payload_conditions_with_semantic_bank(
+                    payload_conditions=payload_conditions_supervised_base,
+                    condition_num_classes=int(condition_num_classes),
+                    supervised_num_classes=int(supervised_num_classes),
+                    label_embedding_bank=label_embedding_bank,
+                    semantic_target_temperature=8.0,
+                )
+                if len(payload_conditions) == len(payload_condition_terms_supervised_base):
+                    payload_conditions = [
+                        np.maximum(
+                            np.asarray(payload_conditions[i], dtype=np.float32),
+                            _semantic_condition_from_terms_runtime(
+                                terms=payload_condition_terms_supervised_base[i],
+                                origin_terms=[],
+                            ),
+                        ).astype(np.float32, copy=False)
+                        for i in range(len(payload_conditions))
+                    ]
+                latent_payload_dims = sorted(
+                    {
+                        int(np.asarray(row, dtype=np.float32).reshape(-1).size)
+                        for row in payload_conditions
+                    }
+                )
+                bad_latent_payload_dims = [
+                    int(d) for d in latent_payload_dims if int(d) != int(condition_num_classes)
+                ]
+                if len(bad_latent_payload_dims) > 0:
                     raise RuntimeError(
-                        "Payload image/condition bank mismatch: "
-                        f"images={len(payload_images)} conditions={len(payload_conditions)}"
+                        "Latent payload imprint requires full semantic-width targets: "
+                        f"expected={int(condition_num_classes)} got_dims={bad_latent_payload_dims}"
                     )
+                _log(
+                    "[payload-latent-conditioning] "
+                    f"rows={int(len(payload_conditions))} "
+                    f"condition_dim={int(condition_num_classes)} "
+                    f"reason={str(payload_conditioning_info.get('reason', 'unknown'))}"
+                )
+            if len(payload_conditions) != len(payload_images):
+                raise RuntimeError(
+                    "Payload image/condition bank mismatch: "
+                    f"images={len(payload_images)} conditions={len(payload_conditions)}"
+                )
 
         train_stream_target_labels: Optional[List[Any]] = None
         val_stream_target_labels: Optional[List[Any]] = None
@@ -9196,6 +10936,7 @@ def main():
                 min_target_classes=int(args.latent_berkeley_imprint_min_target_classes),
                 max_target_classes=int(args.latent_berkeley_imprint_max_target_classes),
                 kind_target_vectors=semantic_kind_target_vectors,
+                semantic_term_to_idx=semantic_term_to_idx,
                 amp_enabled=amp_enabled,
                 amp_dtype=args.amp_dtype,
                 channels_last=bool(args.channels_last),
@@ -9219,6 +10960,7 @@ def main():
                 min_target_classes=int(args.latent_berkeley_imprint_min_target_classes),
                 max_target_classes=int(args.latent_berkeley_imprint_max_target_classes),
                 kind_target_vectors=semantic_kind_target_vectors,
+                semantic_term_to_idx=semantic_term_to_idx,
                 amp_enabled=amp_enabled,
                 amp_dtype=args.amp_dtype,
                 channels_last=bool(args.channels_last),
@@ -9234,11 +10976,19 @@ def main():
                 "Latent Berkeley target imprint: "
                 f"train_imprinted={train_target_info['imprinted_streams']}/{train_target_info['mix_streams']} "
                 f"(targeted={train_target_info['target_supervised_streams']}, "
-                f"mean_targets={train_target_info['mean_target_classes_per_stream']:.2f}, "
+                f"targets(min/mean/max)="
+                f"{int(train_target_info.get('target_classes_min', 0))}/"
+                f"{float(train_target_info['mean_target_classes_per_stream']):.2f}/"
+                f"{int(train_target_info.get('target_classes_max', 0))}, "
+                f"mean_payload_rows={train_target_info.get('mean_payload_rows_per_stream', 0.0):.2f}, "
                 f"mean_prob={train_target_info['mean_target_prob_after_imprint']:.4f}), "
                 f"val_imprinted={val_target_info['imprinted_streams']}/{val_target_info['mix_streams']} "
                 f"(targeted={val_target_info['target_supervised_streams']}, "
-                f"mean_targets={val_target_info['mean_target_classes_per_stream']:.2f}, "
+                f"targets(min/mean/max)="
+                f"{int(val_target_info.get('target_classes_min', 0))}/"
+                f"{float(val_target_info['mean_target_classes_per_stream']):.2f}/"
+                f"{int(val_target_info.get('target_classes_max', 0))}, "
+                f"mean_payload_rows={val_target_info.get('mean_payload_rows_per_stream', 0.0):.2f}, "
                 f"mean_prob={val_target_info['mean_target_prob_after_imprint']:.4f})"
             )
 
@@ -9347,6 +11097,15 @@ def main():
             training_preview_root.mkdir(parents=True, exist_ok=True)
         library_dir = out_dir / "accepted_wave_library"
         library_index_path = library_dir / "index.jsonl"
+        accepted_repair_info = _repair_accepted_library_index_semantics(library_dir=library_dir)
+        if bool(accepted_repair_info.get("ran", False)):
+            _log(
+                "[accepted-library] semantic repair: "
+                f"rows={int(accepted_repair_info.get('rows', 0))} "
+                f"updated={int(accepted_repair_info.get('updated', 0))} "
+                f"parse_failures={int(accepted_repair_info.get('parse_failures', 0))} "
+                f"path={str(accepted_repair_info.get('path', ''))}"
+            )
         pipeline_checkpoint_path = out_dir / "pipeline_checkpoint.pt"
         semantic_vocab_churn_runtime = bool(args.semantic_vocab_churn_enabled) and int(semantic_extra_count) > 0
         semantic_vocab_pool_terms = _normalize_vocab_terms(semantic_vocab_pool_terms)
@@ -9755,6 +11514,11 @@ def main():
                         image=img,
                         image_size=int(shared_embed_image_size),
                     )
+                    semantic_terms = _semantic_enrich_generated_terms_with_noise_spectrum(
+                        term_key=key,
+                        terms=semantic_terms,
+                        image=img,
+                    )
                     origin_terms = _origin_terms_for_symbol_key(key)
                     vec = _semantic_condition_from_terms_runtime(
                         terms=semantic_terms,
@@ -9805,6 +11569,11 @@ def main():
                             terms=_semantic_tags_for_symbol_term(key),
                             image=img,
                             image_size=int(shared_embed_image_size),
+                        )
+                        semantic_terms = _semantic_enrich_generated_terms_with_noise_spectrum(
+                            term_key=key,
+                            terms=semantic_terms,
+                            image=img,
                         )
                         origin_terms = _normalize_vocab_terms(
                             list(_origin_terms_for_symbol_key(key))
@@ -9885,6 +11654,7 @@ def main():
             autoload_gd: bool,
         ):
             nonlocal active_extra_terms
+            nonlocal semantic_vocab_churn_cursor
             nonlocal class_names, label_embedding_bank, label_texts, label_embedding_info
             nonlocal fake_label_vector_t, payload_images, payload_conditions
             nonlocal payload_conditioning_info, payload_symbol_aug_info, payload_flashcard_info
@@ -9924,7 +11694,10 @@ def main():
                     replace_count=max(1, int(args.semantic_vocab_churn_replace_per_cycle)),
                     seed=int(args.seed) + (int(cycle_local) * 1733) + (int(global_round) * 37),
                     locked_prefix_count=int(semantic_core_extra_count),
+                    churn_cursor=int(semantic_vocab_churn_cursor),
+                    sweep_cycles=int(args.semantic_vocab_churn_sweep_cycles),
                 )
+                semantic_vocab_churn_cursor = int(churn_info.get("cursor_out", semantic_vocab_churn_cursor))
             regurgitated_churn_last_info = dict(regurg_info)
             active_semantic_names = list(supervised_class_names) + list(active_extra_terms)
             class_names = list(active_semantic_names)
@@ -10037,6 +11810,32 @@ def main():
                 if len(flash_images) > 0 and len(flash_images) == len(flash_conds):
                     payload_images.extend(flash_images)
                     payload_conditions.extend(flash_conds)
+            payload_target_knockout_info: Dict[str, Any] = {
+                "enabled": bool(float(args.target_label_knockout_prob) > 0.0),
+                "prob": float(max(0.0, min(1.0, float(args.target_label_knockout_prob)))),
+                "rows_total": int(len(payload_conditions)),
+                "rows_applied": 0,
+                "labels_dropped": 0,
+                "min_keep": int(max(0, int(args.target_label_knockout_min_keep))),
+                "max_drop_frac": float(max(0.0, min(1.0, float(args.target_label_knockout_max_drop_frac)))),
+            }
+            if bool(payload_target_knockout_info.get("enabled", False)) and int(len(payload_conditions)) > 0:
+                payload_conditions, payload_target_knockout_info = _label_knockout_rows_np(
+                    rows=payload_conditions,
+                    prob=float(args.target_label_knockout_prob),
+                    seed=int(args.seed) + (int(cycle_local) * 4349) + (int(global_round) * 97),
+                    min_keep=int(args.target_label_knockout_min_keep),
+                    max_drop_frac=float(args.target_label_knockout_max_drop_frac),
+                    threshold=0.5,
+                )
+                _log(
+                    "[target-knockout] "
+                    "scope=payload_active "
+                    f"rows={int(payload_target_knockout_info.get('rows_total', 0))} "
+                    f"applied={int(payload_target_knockout_info.get('rows_applied', 0))} "
+                    f"dropped={int(payload_target_knockout_info.get('labels_dropped', 0))} "
+                    f"prob={float(payload_target_knockout_info.get('prob', 0.0)):.3f}"
+                )
 
             active_gd_vocab_hash, active_gd_vocab_profile = _compute_gd_vocab_hash(
                 supervised_class_names=supervised_class_names,
@@ -10053,6 +11852,12 @@ def main():
                 "allow_churn": bool(allow_churn),
                 "churn_changed": bool(churn_info.get("changed", False)),
                 "churn_replaced": int(churn_info.get("replaced", 0)),
+                "churn_cursor_in": int(churn_info.get("cursor_in", 0)),
+                "churn_cursor_out": int(churn_info.get("cursor_out", 0)),
+                "churn_replace_base": int(churn_info.get("replace_base", 0)),
+                "churn_replace_auto": int(churn_info.get("replace_auto", 0)),
+                "churn_candidate_terms": int(churn_info.get("candidate_terms", 0)),
+                "churn_sweep_cycles": int(churn_info.get("sweep_cycles", 0)),
                 "active_extra_terms": list(active_extra_terms),
                 "vocab_hash": str(active_gd_vocab_hash),
                 "payload_rows": int(len(payload_conditions)),
@@ -10069,6 +11874,7 @@ def main():
                 "flashcard_target_active_min": int(payload_flashcard_info.get("target_active_min", 0)),
                 "flashcard_target_active_mean": float(payload_flashcard_info.get("target_active_mean", 0.0)),
                 "flashcard_target_active_max": int(payload_flashcard_info.get("target_active_max", 0)),
+                "target_knockout": dict(payload_target_knockout_info),
                 "regurgitated_churn": dict(regurg_info),
                 "regurgitated_terms_added": int(len(regurg_terms_used)),
                 "gan_live_churn": dict(payload_symbol_aug_info.get("gan_live_info", {})),
@@ -10079,6 +11885,9 @@ def main():
                 f"cycle={int(cycle_id)} reason={str(reason)} "
                 f"extras={int(len(active_extra_terms))} changed={1 if bool(churn_info.get('changed', False)) else 0} "
                 f"replaced={int(churn_info.get('replaced', 0))} "
+                f"replace_base={int(churn_info.get('replace_base', 0))} "
+                f"replace_auto={int(churn_info.get('replace_auto', 0))} "
+                f"cursor={int(churn_info.get('cursor_in', 0))}->{int(churn_info.get('cursor_out', 0))} "
                 f"payload={int(len(payload_conditions))} symbols={int(payload_symbol_aug_info.get('rows_added', 0))} "
                 f"gan_live={int(payload_symbol_aug_info.get('gan_live_rows_added', 0))} "
                 f"unknown_symbols={int(payload_symbol_aug_info.get('unknown_rows_added', 0))} "
@@ -10191,6 +12000,11 @@ def main():
                         image=img_rgb,
                         image_size=int(shared_embed_image_size),
                     )
+                    semantic_terms = _semantic_enrich_generated_terms_with_noise_spectrum(
+                        term_key=str(key),
+                        terms=semantic_terms,
+                        image=img_rgb,
+                    )
                     gestation_images.append(img_rgb)
                     gestation_targets.append(
                         np.asarray(
@@ -10290,6 +12104,32 @@ def main():
                 )
             gestation_train_images = [np.asarray(gestation_images[int(i)], dtype=np.float32) for i in gestation_train_idx]
             gestation_train_targets = [np.asarray(gestation_targets[int(i)], dtype=np.float32).reshape(-1) for i in gestation_train_idx]
+            gestation_target_knockout_info: Dict[str, Any] = {
+                "enabled": bool(float(args.target_label_knockout_prob) > 0.0),
+                "prob": float(max(0.0, min(1.0, float(args.target_label_knockout_prob)))),
+                "rows_total": int(len(gestation_train_targets)),
+                "rows_applied": 0,
+                "labels_dropped": 0,
+                "min_keep": int(max(0, int(args.target_label_knockout_min_keep))),
+                "max_drop_frac": float(max(0.0, min(1.0, float(args.target_label_knockout_max_drop_frac)))),
+            }
+            if bool(gestation_target_knockout_info.get("enabled", False)) and int(len(gestation_train_targets)) > 0:
+                gestation_train_targets, gestation_target_knockout_info = _label_knockout_rows_np(
+                    rows=gestation_train_targets,
+                    prob=float(args.target_label_knockout_prob),
+                    seed=int(args.seed) + int(cycle_seed) + 22241,
+                    min_keep=int(args.target_label_knockout_min_keep),
+                    max_drop_frac=float(args.target_label_knockout_max_drop_frac),
+                    threshold=0.5,
+                )
+                _log(
+                    "[target-knockout] "
+                    "scope=gestation_stage1_train "
+                    f"rows={int(gestation_target_knockout_info.get('rows_total', 0))} "
+                    f"applied={int(gestation_target_knockout_info.get('rows_applied', 0))} "
+                    f"dropped={int(gestation_target_knockout_info.get('labels_dropped', 0))} "
+                    f"prob={float(gestation_target_knockout_info.get('prob', 0.0)):.3f}"
+                )
             gestation_eval_images = [np.asarray(gestation_images[int(i)], dtype=np.float32) for i in valid_gestation_val_idx]
             gestation_eval_targets = [np.asarray(gestation_targets[int(i)], dtype=np.float32).reshape(-1) for i in valid_gestation_val_idx]
             gest_train_stats = _semantic_active_target_stats(gestation_train_targets, threshold=0.5)
@@ -10326,6 +12166,8 @@ def main():
                 seed=int(args.seed) + 1703 + int(cycle_seed),
                 augment=bool(int(gestation_train_target_rows) > int(raw_gestation_train_rows)),
                 expected_target_dim=int(expected_gate_dim),
+                semantic_term_to_idx=semantic_term_to_idx,
+                augment_apply_terms=True,
             )
             gestation_gate_dataset = _BootstrapExpandedDataset(
                 images=gestation_eval_images,
@@ -10334,6 +12176,8 @@ def main():
                 seed=int(gestation_gate_eval_seed) + int(cycle_seed),
                 augment=bool(int(gestation_val_target_rows) > int(raw_gestation_val_rows)),
                 expected_target_dim=int(expected_gate_dim),
+                semantic_term_to_idx=semantic_term_to_idx,
+                augment_apply_terms=True,
             )
             gestation_gate_preview_images = []
             gestation_gate_preview_targets = []
@@ -10473,31 +12317,70 @@ def main():
                         "Stage-2 payload gate requires at least one active churn term present in current vocabulary; "
                         "none were available after normalization."
                     )
-                active_churn_set = set(active_churn_terms_lc)
-                selected_local_rows: List[int] = []
-                selected_global_picks: List[int] = []
-                for ri, term_row in enumerate(payload_gate_val_terms_base):
-                    terms = _normalize_vocab_terms([str(x) for x in list(term_row)]) if isinstance(term_row, list) else []
-                    if len(terms) <= 0:
-                        raise RuntimeError(
-                            "Stage-2 payload gate encountered empty original terms row; "
-                            f"row={int(ri)} global_pick={int(payload_gate_val_indices_base[int(ri)])}"
-                        )
-                    row_lc = {
-                        re.sub(r"\s+", " ", str(x)).strip().lower()
-                        for x in terms
-                        if re.sub(r"\s+", " ", str(x)).strip()
-                    }
-                    if len(row_lc & active_churn_set) <= 0:
+                supervised_terms_lc = []
+                for sup_name in supervised_class_names:
+                    sk = re.sub(r"\s+", " ", str(sup_name)).strip().lower()
+                    if not sk:
                         continue
-                    selected_local_rows.append(int(ri))
-                    selected_global_picks.append(int(payload_gate_val_indices_base[int(ri)]))
-                    payload_stage2_terms.append(list(terms))
+                    if sk not in active_vocab_lc:
+                        raise RuntimeError(
+                            "Stage-2 payload gate requires supervised Berkeley labels to remain inside active vocabulary. "
+                            f"Missing label term: {str(sup_name)}"
+                        )
+                    supervised_terms_lc.append(str(sk))
+                active_stage2_terms_lc = list(dict.fromkeys(list(active_vocab_lc)))
+                if int(len(active_stage2_terms_lc)) <= 0:
+                    raise RuntimeError(
+                        "Stage-2 payload gate has no active terms after resolving current active vocabulary."
+                    )
+                payload_labels_cache_path = str(payload_gate_val_info.get("labels_path", "")).strip()
+                payload_labels_mm = None
+                if str(payload_labels_cache_path):
+                    try:
+                        payload_labels_mm = np.load(str(payload_labels_cache_path), mmap_mode="r")
+                    except Exception:
+                        payload_labels_mm = None
+                if payload_labels_mm is None:
+                    raise RuntimeError(
+                        "Stage-2 payload gate requires original supervised labels cache for strict anchoring, "
+                        "but labels cache could not be loaded."
+                    )
+                selected_local_rows, selected_global_picks, payload_stage2_terms, stage2_row_sched_info = _schedule_payload_gate_rows_by_active_terms(
+                    payload_terms_rows=payload_gate_val_terms_base,
+                    payload_global_picks=payload_gate_val_indices_base,
+                    payload_labels_mm=payload_labels_mm,
+                    supervised_class_names=supervised_class_names,
+                    active_terms_lc=active_stage2_terms_lc,
+                    active_vocab_lc=list(active_vocab_lc),
+                    require_all_supervised_active=False,
+                    allow_unmapped_rows=True,
+                )
                 if int(len(selected_local_rows)) <= 0:
                     raise RuntimeError(
-                        "Stage-2 payload gate found zero rows that match the active churn vocabulary terms. "
+                        "Stage-2 payload gate found zero rows after deterministic active-term scheduling. "
                         f"active_churn_terms={int(len(active_churn_terms_lc))} "
+                        f"active_stage2_terms={int(len(active_stage2_terms_lc))} "
+                        f"rows_skipped_no_active={int(stage2_row_sched_info.get('rows_skipped_no_active', 0))} "
+                        f"rows_skipped_inactive_supervised={int(stage2_row_sched_info.get('rows_skipped_inactive_supervised', 0))} "
                         f"payload_rows={int(len(payload_gate_val_terms_base))}"
+                    )
+                _log(
+                    "[stage2-row-scheduler] "
+                    f"mode={str(stage2_row_sched_info.get('mode', 'unknown'))} "
+                    f"rows_total={int(stage2_row_sched_info.get('rows_total', 0))} "
+                    f"selected={int(stage2_row_sched_info.get('rows_selected', 0))} "
+                    f"active_terms={int(stage2_row_sched_info.get('active_terms', 0))} "
+                    f"skipped_no_active={int(stage2_row_sched_info.get('rows_skipped_no_active', 0))} "
+                    f"skipped_inactive_supervised={int(stage2_row_sched_info.get('rows_skipped_inactive_supervised', 0))}"
+                )
+                if int(stage2_row_sched_info.get("berkeley_rows_selected", 0)) > 0:
+                    _log(
+                        "[stage2-berkeley-targets] "
+                        f"rows={int(stage2_row_sched_info.get('berkeley_rows_selected', 0))} "
+                        f"min/mean/max={int(stage2_row_sched_info.get('berkeley_sup_min', 0))}/"
+                        f"{float(stage2_row_sched_info.get('berkeley_sup_mean', 0.0)):.2f}/"
+                        f"{int(stage2_row_sched_info.get('berkeley_sup_max', 0))} "
+                        f"skipped_inactive_supervised={int(stage2_row_sched_info.get('rows_skipped_inactive_supervised', 0))}"
                     )
                 payload_stage2_picks_np = np.asarray(selected_global_picks, dtype=np.int64)
                 cache_dir_txt = str(payload_gate_val_info.get("cache_dir", "")).strip()
@@ -10510,6 +12393,8 @@ def main():
                     "label_embedding_dim": int(label_embedding_info.get("dim", 0)),
                     "semantic_label_mode": "presence_v3_supervised_anchor",
                     "active_churn_terms_lc": list(active_churn_terms_lc),
+                    "active_stage2_terms_lc": list(active_stage2_terms_lc),
+                    "hard_wipe_nonce": str(semantic_cache_nonce),
                 }
                 class_blob = json.dumps(cache_identity, sort_keys=True, ensure_ascii=True, separators=(",", ":"))
                 terms_blob = json.dumps(payload_stage2_terms, ensure_ascii=True, separators=(",", ":"))
@@ -10527,19 +12412,37 @@ def main():
                                 and int(cached.shape[0]) == int(len(payload_stage2_picks_np))
                                 and int(cached.shape[1]) == int(expected_gate_dim)
                             ):
-                                payload_targets_sched_np = np.asarray(cached, dtype=np.float32)
-                                payload_semantic_cache_hit = True
+                                cached_arr = np.asarray(cached, dtype=np.float32)
+                                cached_valid = True
+                                if payload_labels_mm is not None:
+                                    for out_ri in range(int(cached_arr.shape[0])):
+                                        src_idx = int(payload_stage2_picks_np[int(out_ri)])
+                                        if not (0 <= int(src_idx) < int(payload_labels_mm.shape[0])):
+                                            cached_valid = False
+                                            break
+                                        base_sup = np.asarray(payload_labels_mm[int(src_idx)], dtype=np.float32).reshape(-1)
+                                        sup_take = min(int(supervised_num_classes), int(base_sup.size), int(expected_gate_dim))
+                                        if int(sup_take) <= 0:
+                                            continue
+                                        base_sup_clip = np.clip(np.asarray(base_sup[: int(sup_take)], dtype=np.float32), 0.0, 1.0)
+                                        vec_sup = np.clip(np.asarray(cached_arr[int(out_ri), : int(sup_take)], dtype=np.float32), 0.0, 1.0)
+                                        missing_mask = (base_sup_clip >= 0.5) & (vec_sup < 0.5)
+                                        if bool(np.any(missing_mask)):
+                                            cached_valid = False
+                                            break
+                                if bool(cached_valid):
+                                    payload_targets_sched_np = np.asarray(cached_arr, dtype=np.float32)
+                                    payload_semantic_cache_hit = True
+                                else:
+                                    payload_semantic_cache_hit = False
+                                    _log(
+                                        "[semantic-gate-cache] stale cache dropped: "
+                                        f"path={str(cache_file)} reason=missing_supervised_anchor"
+                                    )
                         except Exception:
                             payload_semantic_cache_hit = False
 
                 if not bool(payload_semantic_cache_hit):
-                    payload_labels_cache_path = str(payload_gate_val_info.get("labels_path", "")).strip()
-                    payload_labels_mm = None
-                    if str(payload_labels_cache_path):
-                        try:
-                            payload_labels_mm = np.load(str(payload_labels_cache_path), mmap_mode="r")
-                        except Exception:
-                            payload_labels_mm = None
                     if payload_labels_mm is None:
                         raise RuntimeError(
                             "Stage-2 payload gate requires original supervised labels cache for strict anchoring, "
@@ -10622,6 +12525,11 @@ def main():
                             terms=_semantic_tags_for_symbol_term(str(key)),
                             image=img_rgb,
                             image_size=int(shared_embed_image_size),
+                        )
+                        semantic_terms = _semantic_enrich_generated_terms_with_noise_spectrum(
+                            term_key=str(key),
+                            terms=semantic_terms,
+                            image=img_rgb,
                         )
                         stage2_symbol_images.append(img_rgb)
                         stage2_symbol_targets.append(
@@ -10772,6 +12680,11 @@ def main():
                     "regurgitated content",
                 }
                 active_terms_stage2_sched = []
+                for term in supervised_class_names:
+                    tk = re.sub(r"\s+", " ", str(term)).strip().lower()
+                    if not tk:
+                        continue
+                    active_terms_stage2_sched.append(str(term))
                 for term in active_extra_terms:
                     tk = re.sub(r"\s+", " ", str(term)).strip().lower()
                     if not tk:
@@ -10781,8 +12694,9 @@ def main():
                     if re.fullmatch(r"semantic slot \d+", tk):
                         continue
                     active_terms_stage2_sched.append(str(term))
+                active_terms_stage2_sched = list(dict.fromkeys(active_terms_stage2_sched))
                 if len(active_terms_stage2_sched) <= 0:
-                    active_terms_stage2_sched = list(active_extra_terms)
+                    active_terms_stage2_sched = list(class_names)
                 total_order, berkeley_gate_schedule_info = _schedule_semantic_gate_indices(
                     targets=total_targets_sched_np,
                     class_names=class_names,
@@ -10800,11 +12714,28 @@ def main():
                             [(str(k), int(v)) for k, v in hits_map.items()],
                             key=lambda kv: (-int(kv[1]), str(kv[0]).lower()),
                         )[:8]
+                        stage_counts = berkeley_gate_schedule_info.get("stage_counts", {})
+                        stage_counts_txt = ""
+                        if isinstance(stage_counts, dict):
+                            stage_counts_txt = ",".join(
+                                [
+                                    f"{str(k)}:{int(v)}"
+                                    for k, v in sorted(stage_counts.items(), key=lambda kv: str(kv[0]).lower())
+                                ]
+                            )
+                        missing_terms = berkeley_gate_schedule_info.get("missing_active_terms", [])
+                        missing_txt = ""
+                        if isinstance(missing_terms, list) and len(missing_terms) > 0:
+                            missing_txt = ",".join([str(x) for x in missing_terms[:8]])
                         _log(
                             "[semantic-gate-scheduler] "
-                            f"active_terms_in={int(len(active_extra_terms))} "
+                            f"mode={str(berkeley_gate_schedule_info.get('scheduler_mode', 'unknown'))} "
+                            f"active_terms_churn={int(len(active_extra_terms))} "
+                            f"active_terms_supervised={int(len(supervised_class_names))} "
                             f"active_terms_sched={int(len(active_terms_stage2_sched))} "
-                            f"top_hits={'; '.join([f'{k}:{v}' for k, v in top_hits])}"
+                            f"top_hits={'; '.join([f'{k}:{v}' for k, v in top_hits])} "
+                            f"stages={stage_counts_txt or 'n/a'} "
+                            f"missing={missing_txt or 'none'}"
                         )
                 except Exception:
                     pass
@@ -10853,6 +12784,8 @@ def main():
                 "semantic_kind_vectors_present": sorted([str(k) for k in semantic_kind_target_vectors.keys()]),
                 "semantic_default_core_terms": list(_default_semantic_core_terms()),
                 "semantic_vocab_pool_terms": list(semantic_vocab_pool_terms),
+                "semantic_vocab_churn_cursor": int(semantic_vocab_churn_cursor),
+                "semantic_vocab_churn_sweep_cycles": int(args.semantic_vocab_churn_sweep_cycles),
                 "semantic_churn_history": list(semantic_churn_history),
                 "regurgitated_churn_last_info": dict(regurgitated_churn_last_info),
                 "regurgitated_churn_pool_items": [
@@ -10999,11 +12932,34 @@ def main():
                         f"cache_eval={1 if bool(cache_eval_batches) else 0}"
                     )
                 try:
+                    train_target_labels_stage = train_stream_target_labels
+                    if (
+                        train_stream_target_labels is not None
+                        and float(args.target_label_knockout_prob) > 0.0
+                    ):
+                        train_target_labels_stage, train_knockout_info = _label_knockout_optional_rows_np(
+                            rows=train_stream_target_labels,
+                            prob=float(args.target_label_knockout_prob),
+                            seed=int(seed) + (int(attempt) * 101) + (ord(stage_key[0]) if stage_key else 0),
+                            min_keep=int(args.target_label_knockout_min_keep),
+                            max_drop_frac=float(args.target_label_knockout_max_drop_frac),
+                            threshold=0.5,
+                        )
+                        _log(
+                            "[target-knockout] "
+                            "scope=transformer_train "
+                            f"stage={stage_key} "
+                            f"rows={int(train_knockout_info.get('rows_total', 0))} "
+                            f"with_targets={int(train_knockout_info.get('rows_with_targets', 0))} "
+                            f"applied={int(train_knockout_info.get('rows_applied', 0))} "
+                            f"dropped={int(train_knockout_info.get('labels_dropped', 0))} "
+                            f"prob={float(train_knockout_info.get('prob', 0.0)):.3f}"
+                        )
                     transformer, stage_hist = train_transformer_feature_metric(
                         transformer=transformer,
                         classifier=classifier,
                         train_streams=train_streams,
-                        train_target_labels=train_stream_target_labels,
+                        train_target_labels=train_target_labels_stage,
                         val_streams=val_streams,
                         cfg=best_cfg,
                         sample_bits=sample_bits,
@@ -11198,6 +13154,10 @@ def main():
                     semantic_vocab_pool_terms = _normalize_vocab_terms(
                         list(semantic_vocab_pool_terms) + list(prior_pool)
                     )
+                try:
+                    semantic_vocab_churn_cursor = max(0, int(resume_semantic_runtime.get("semantic_vocab_churn_cursor", 0)))
+                except Exception:
+                    semantic_vocab_churn_cursor = 0
                 prior_regurg_pool = resume_semantic_runtime.get("regurgitated_churn_pool_items", [])
                 if isinstance(prior_regurg_pool, list) and len(prior_regurg_pool) > 0:
                     regurgitated_churn_pool = []
@@ -13138,6 +15098,7 @@ def main():
                     pin_memory=bool(args.pin_memory_wave_batches),
                     semantic_class_names=class_names,
                     semantic_label_bank=label_embedding_bank,
+                    stream_target_labels=train_stream_target_labels,
                 )
                 x_wave_val, y_wave_val, _ = _build_wave_classifier_dataset_from_transformer(
                     streams=val_streams,
@@ -13168,6 +15129,7 @@ def main():
                     pin_memory=bool(args.pin_memory_wave_batches),
                     semantic_class_names=class_names,
                     semantic_label_bank=label_embedding_bank,
+                    stream_target_labels=val_stream_target_labels,
                 )
 
                 accepted_total.extend(accepted_rows)
@@ -13393,6 +15355,10 @@ def main():
                             cache_y=None,
                             cache_batch_size=0,
                             active_classes=int(condition_num_classes) if int(condition_num_classes) > 0 else int(score_active_classes),
+                            target_label_knockout_prob=float(args.target_label_knockout_prob),
+                            target_label_knockout_min_keep=int(args.target_label_knockout_min_keep),
+                            target_label_knockout_max_drop_frac=float(args.target_label_knockout_max_drop_frac),
+                            target_label_knockout_seed=int(args.seed) + (int(cycle_id) * 10007) + (int(round_id) * 97) + 1,
                             step_preview_callback=_make_c_step_callback(cycle_id=int(cycle_id), round_id=int(round_id)),
                             stop_requested=_poll_gui_stop,
                         )
@@ -13546,6 +15512,10 @@ def main():
                             cache_y=refresh_cache_y,
                             cache_batch_size=int(refresh_cache_batch),
                             active_classes=int(score_active_classes),
+                            target_label_knockout_prob=float(args.target_label_knockout_prob),
+                            target_label_knockout_min_keep=int(args.target_label_knockout_min_keep),
+                            target_label_knockout_max_drop_frac=float(args.target_label_knockout_max_drop_frac),
+                            target_label_knockout_seed=int(args.seed) + (int(cycle_id) * 10007) + (int(round_id) * 97) + 2,
                             step_preview_callback=_make_c_step_callback(cycle_id=int(cycle_id), round_id=int(round_id)),
                             stop_requested=_poll_gui_stop,
                         )
@@ -14753,6 +16723,10 @@ def main():
                             cache_y=None,
                             cache_batch_size=0,
                             active_classes=int(condition_num_classes) if int(condition_num_classes) > 0 else int(score_active_classes),
+                            target_label_knockout_prob=float(args.target_label_knockout_prob),
+                            target_label_knockout_min_keep=int(args.target_label_knockout_min_keep),
+                            target_label_knockout_max_drop_frac=float(args.target_label_knockout_max_drop_frac),
+                            target_label_knockout_seed=int(args.seed) + (int(cycle_id) * 10007) + (int(round_id) * 97) + 1,
                             step_preview_callback=_make_c_step_callback(cycle_id=int(cycle_id), round_id=int(round_id)),
                             stop_requested=_poll_gui_stop,
                         )
@@ -14907,6 +16881,10 @@ def main():
                             cache_y=refresh_cache_y,
                             cache_batch_size=int(refresh_cache_batch),
                             active_classes=int(score_active_classes),
+                            target_label_knockout_prob=float(args.target_label_knockout_prob),
+                            target_label_knockout_min_keep=int(args.target_label_knockout_min_keep),
+                            target_label_knockout_max_drop_frac=float(args.target_label_knockout_max_drop_frac),
+                            target_label_knockout_seed=int(args.seed) + (int(cycle_id) * 10007) + (int(round_id) * 97) + 2,
                             step_preview_callback=_make_c_step_callback(cycle_id=int(cycle_id), round_id=int(round_id)),
                             stop_requested=_poll_gui_stop,
                         )
@@ -15587,6 +17565,7 @@ def main():
                         pin_memory=bool(args.pin_memory_wave_batches),
                         semantic_class_names=class_names,
                         semantic_label_bank=label_embedding_bank,
+                        stream_target_labels=train_stream_target_labels,
                     )
                     x_wave_val, y_wave_val, _ = _build_wave_classifier_dataset_from_transformer(
                         streams=val_streams,
@@ -15617,6 +17596,7 @@ def main():
                         pin_memory=bool(args.pin_memory_wave_batches),
                         semantic_class_names=class_names,
                         semantic_label_bank=label_embedding_bank,
+                        stream_target_labels=val_stream_target_labels,
                     )
                     accepted_total.extend(accepted_rows)
                     library_serial += len(accepted_rows)
