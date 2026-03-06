@@ -5399,6 +5399,12 @@ def _refresh_wave_library_semantic_centroid(
         semantic_class_names=semantic_class_names,
         semantic_label_bank=semantic_label_bank,
     )
+    if not str(label).strip():
+        if len(term_counter) > 0:
+            label = str(term_counter.most_common(1)[0][0])
+        else:
+            label = "unknown"
+        score = 0.0
     payload = {
         "updated_at": float(time.time()),
         "label": str(label),
