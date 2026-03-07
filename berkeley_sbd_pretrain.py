@@ -15,6 +15,7 @@ from PIL import Image
 from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
 from torchvision.datasets import SBDataset
+from torchvision.transforms import functional as TF
 from torchvision.transforms import InterpolationMode
 
 try:
@@ -39,33 +40,26 @@ except ModuleNotFoundError:
 
 
 VOC20_CLASSES = [
-    "black",
-    "white",
-    "gray",
-    "grey",
-    "red",
-    "green",
-    "blue",
-    "yellow",
-    "cyan",
-    "magenta",
-    "brown",
-    "noise",
-    "white noise",
-    "pink noise",
-    "brown noise",
-    "red noise",
-    "blue noise",
-    "violet noise",
-    "gray noise",
-    "uniform white noise",
-    "gaussian white noise",
-    "front",
-    "back",
-    "left",
-    "right",
-    "top",
-    "bottom",
+    "aeroplane",
+    "bicycle",
+    "bird",
+    "boat",
+    "bottle",
+    "bus",
+    "car",
+    "cat",
+    "chair",
+    "cow",
+    "dining table",
+    "dog",
+    "horse",
+    "motorbike",
+    "person",
+    "potted plant",
+    "sheep",
+    "sofa",
+    "train",
+    "tv monitor",
 ]
 
 
@@ -198,6 +192,96 @@ class SBDMultiLabelDataset(Dataset):
         return x, y
 
 
+def _binary_mask_from_segmentation(seg: np.ndarray) -> np.ndarray:
+    arr = np.asarray(seg, dtype=np.int32)
+    if int(arr.ndim) != 2:
+        raise RuntimeError(f"Invalid Berkeley segmentation mask shape: {tuple(arr.shape)}")
+    return (arr > 0).astype(np.float32, copy=False)
+
+
+def _transform_image_mask_pair(
+    img: Image.Image,
+    mask: Image.Image,
+    image_size: int,
+    train: bool,
+    symmetry_mix: Optional[SymmetryMix] = None,
+    noise_inject: Optional[NoiseInject] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    size = max(8, int(image_size))
+    if train:
+        top, left, height, width = transforms.RandomResizedCrop.get_params(
+            img,
+            scale=(0.65, 1.0),
+            ratio=(0.8, 1.25),
+        )
+        img = TF.resized_crop(
+            img,
+            top=top,
+            left=left,
+            height=height,
+            width=width,
+            size=[int(size), int(size)],
+            interpolation=InterpolationMode.BILINEAR,
+        )
+        mask = TF.resized_crop(
+            mask,
+            top=top,
+            left=left,
+            height=height,
+            width=width,
+            size=[int(size), int(size)],
+            interpolation=InterpolationMode.NEAREST,
+        )
+        if torch.rand(1).item() < 0.5:
+            img = TF.hflip(img)
+            mask = TF.hflip(mask)
+        if torch.rand(1).item() < 0.15:
+            img = TF.vflip(img)
+            mask = TF.vflip(mask)
+    else:
+        img = TF.resize(img, [int(size), int(size)], interpolation=InterpolationMode.BILINEAR)
+        mask = TF.resize(mask, [int(size), int(size)], interpolation=InterpolationMode.NEAREST)
+
+    x = TF.to_tensor(img)
+    if train and symmetry_mix is not None:
+        x = symmetry_mix(x)
+    if train and noise_inject is not None:
+        x = noise_inject(x)
+    x = TF.normalize(x, mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
+
+    mask_t = TF.to_tensor(mask)
+    mask_t = (mask_t >= 0.5).to(dtype=torch.float32)
+    return x, mask_t
+
+
+class SBDMultiLabelMaskDataset(Dataset):
+    def __init__(self, sbd_ds: SBDataset, labels: np.ndarray, image_size: int, train: bool):
+        self.sbd_ds = sbd_ds
+        self.labels = labels.astype(np.float32, copy=False)
+        self.image_size = max(8, int(image_size))
+        self.train = bool(train)
+        self.symmetry_mix = SymmetryMix(p=0.45, alpha_min=0.2, alpha_max=0.6) if self.train else None
+        self.noise_inject = NoiseInject(p=0.55, sigma_min=0.005, sigma_max=0.06, sp_prob=0.003) if self.train else None
+
+    def __len__(self):
+        return len(self.sbd_ds.images)
+
+    def __getitem__(self, idx: int):
+        img = Image.open(self.sbd_ds.images[idx]).convert("RGB")
+        seg = np.array(self.sbd_ds._get_segmentation_target(self.sbd_ds.masks[idx]), dtype=np.int32)
+        mask = Image.fromarray((_binary_mask_from_segmentation(seg) * 255.0).astype(np.uint8, copy=False), mode="L")
+        x, mask_t = _transform_image_mask_pair(
+            img=img,
+            mask=mask,
+            image_size=int(self.image_size),
+            train=bool(self.train),
+            symmetry_mix=self.symmetry_mix,
+            noise_inject=self.noise_inject,
+        )
+        y = torch.from_numpy(self.labels[idx])
+        return x, y, mask_t
+
+
 def _labels_from_segmentation_masks(ds: SBDataset, cache_path: Path):
     target_dim = max(1, int(len(VOC20_CLASSES)))
 
@@ -259,6 +343,7 @@ def prepare_sbd_multilabel(
     data_root: str,
     image_size: int,
     auto_install_scipy: bool,
+    include_masks: bool = True,
 ):
     ensure_scipy(auto_install=auto_install_scipy)
     root = Path(data_root)
@@ -296,8 +381,12 @@ def prepare_sbd_multilabel(
         ]
     )
 
-    train_ds = SBDMultiLabelDataset(train_sbd.images, train_labels, transform=tf_train)
-    val_ds = SBDMultiLabelDataset(val_sbd.images, val_labels, transform=tf_val)
+    if bool(include_masks):
+        train_ds = SBDMultiLabelMaskDataset(train_sbd, train_labels, image_size=image_size, train=True)
+        val_ds = SBDMultiLabelMaskDataset(val_sbd, val_labels, image_size=image_size, train=False)
+    else:
+        train_ds = SBDMultiLabelDataset(train_sbd.images, train_labels, transform=tf_train)
+        val_ds = SBDMultiLabelDataset(val_sbd.images, val_labels, transform=tf_val)
     return train_ds, val_ds
 
 
@@ -321,6 +410,45 @@ def multilabel_metrics(logits: torch.Tensor, targets: torch.Tensor, threshold: f
     return {"macro_f1": float(macro_f1), "micro_f1": float(micro_f1), "bit_acc": float(acc)}
 
 
+def mask_metrics(mask_logits: torch.Tensor, mask_targets: torch.Tensor, threshold: float = 0.5):
+    probs = torch.sigmoid(mask_logits)
+    preds = (probs >= float(threshold)).float()
+    t = (mask_targets >= 0.5).float()
+
+    inter = (preds * t).sum(dim=(1, 2, 3))
+    union = ((preds + t) > 0.0).float().sum(dim=(1, 2, 3))
+    pred_mass = preds.sum(dim=(1, 2, 3))
+    target_mass = t.sum(dim=(1, 2, 3))
+
+    mean_iou = torch.mean(inter / (union + 1e-8)).item()
+    mean_dice = torch.mean((2.0 * inter) / (pred_mass + target_mass + 1e-8)).item()
+    pixel_acc = preds.eq(t).float().mean().item()
+    return {
+        "mask_iou": float(mean_iou),
+        "mask_dice": float(mean_dice),
+        "mask_pixel_acc": float(pixel_acc),
+    }
+
+
+def _forward_classifier_outputs(model: nn.Module, xb: torch.Tensor) -> Dict[str, torch.Tensor]:
+    if hasattr(model, "forward_with_aux") and callable(getattr(model, "forward_with_aux")):
+        out = model.forward_with_aux(xb)
+        if (
+            isinstance(out, dict)
+            and isinstance(out.get("logits"), torch.Tensor)
+            and isinstance(out.get("mask_logits"), torch.Tensor)
+        ):
+            return out
+    raise RuntimeError("Berkeley pretrain requires classifier outputs with both logits and mask_logits.")
+
+
+def _unpack_batch(batch) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+    if isinstance(batch, (tuple, list)):
+        if len(batch) >= 3:
+            return batch[0], batch[1], batch[2]
+    raise RuntimeError("Berkeley pretrain requires (image, target, mask) batch structure.")
+
+
 @torch.no_grad()
 def evaluate(
     model: nn.Module,
@@ -329,6 +457,8 @@ def evaluate(
     amp_enabled: bool = False,
     amp_dtype: str = "float16",
     channels_last: bool = False,
+    mask_loss_weight: float = 1.0,
+    mask_threshold: float = 0.5,
 ):
     model.eval()
     amp_dtype_t = _resolve_amp_dtype(amp_dtype) if amp_enabled else torch.float16
@@ -336,30 +466,57 @@ def evaluate(
     n = 0
     logits_all = []
     targets_all = []
-    for xb, yb in loader:
+    mask_logits_all = []
+    mask_targets_all = []
+    mask_weight = max(0.0, float(mask_loss_weight))
+    for batch in loader:
+        xb, yb, mb = _unpack_batch(batch)
         xb = xb.to(device, non_blocking=True)
         if channels_last:
             xb = xb.contiguous(memory_format=torch.channels_last)
         yb = yb.to(device, non_blocking=True)
+        if mb is not None:
+            mb = mb.to(device, non_blocking=True)
         with _autocast_context(device=device, enabled=amp_enabled, amp_dtype_t=amp_dtype_t):
-            logits = model(xb)
+            out = _forward_classifier_outputs(model, xb)
+            logits = out["logits"]
             loss = F.mse_loss(torch.sigmoid(logits), yb)
+            mask_logits = out.get("mask_logits")
+            if mb is None or not isinstance(mask_logits, torch.Tensor):
+                raise RuntimeError("Berkeley evaluation requires both mask targets and mask logits.")
+            loss = loss + (mask_weight * F.binary_cross_entropy_with_logits(mask_logits, mb))
         total_loss += float(loss.item()) * int(xb.shape[0])
         n += int(xb.shape[0])
         logits_all.append(logits.detach().cpu())
         targets_all.append(yb.detach().cpu())
+        mask_logits_all.append(mask_logits.detach().cpu())
+        mask_targets_all.append(mb.detach().cpu())
 
     logits_cat = torch.cat(logits_all, dim=0)
     targets_cat = torch.cat(targets_all, dim=0)
     m = multilabel_metrics(logits_cat, targets_cat, threshold=0.5)
     m["loss"] = total_loss / max(1, n)
+    if len(mask_logits_all) > 0:
+        mask_logits_cat = torch.cat(mask_logits_all, dim=0)
+        mask_targets_cat = torch.cat(mask_targets_all, dim=0)
+        m.update(mask_metrics(mask_logits_cat, mask_targets_cat, threshold=float(mask_threshold)))
     return m
 
 
-def make_model(model_name: str, num_classes: int):
+def make_model(
+    model_name: str,
+    num_classes: int,
+    enable_mask_head: bool = False,
+    mask_decoder_channels: int = 64,
+):
     if model_name == "tiny":
-        return TinyConvClassifier(num_classes=num_classes)
+        return TinyConvClassifier(
+            num_classes=num_classes,
+            mask_decoder_channels=(int(mask_decoder_channels) if bool(enable_mask_head) else 0),
+        )
     if model_name == "resnet18":
+        if bool(enable_mask_head):
+            raise ValueError("Mask head is currently supported only for the 'tiny' Berkeley classifier.")
         from torchvision.models import resnet18
 
         m = resnet18(weights=None)
@@ -408,6 +565,11 @@ def parse_args():
     p.add_argument("--amp", action="store_true")
     p.add_argument("--amp-dtype", choices=["float16", "bfloat16"], default="float16")
     p.add_argument("--channels-last", action="store_true")
+    p.add_argument("--mask-head", dest="mask_head", action="store_true", help="Enable auxiliary foreground mask output for the tiny classifier.")
+    p.add_argument("--no-mask-head", dest="mask_head", action="store_false")
+    p.add_argument("--mask-loss-weight", type=float, default=1.0)
+    p.add_argument("--mask-threshold", type=float, default=0.5)
+    p.add_argument("--mask-decoder-channels", type=int, default=64)
     p.add_argument("--compile-model", action="store_true")
     p.add_argument("--compile-mode", default="default")
     p.add_argument("--grad-accum-steps", type=int, default=1)
@@ -417,12 +579,15 @@ def parse_args():
     p.add_argument("--loader-persistent-workers", dest="loader_persistent_workers", action="store_true")
     p.add_argument("--no-loader-persistent-workers", dest="loader_persistent_workers", action="store_false")
     p.add_argument("--loader-prefetch-factor", type=int, default=4)
-    p.set_defaults(cudnn_benchmark=True, allow_tf32=True, loader_persistent_workers=True)
+    p.set_defaults(cudnn_benchmark=True, allow_tf32=True, loader_persistent_workers=True, mask_head=True)
     return p.parse_args()
 
 
 def main():
     args = parse_args()
+    if not bool(args.mask_head):
+        _log("Overriding --no-mask-head: Berkeley pretrain now requires masks for every label.")
+        args.mask_head = True
     set_seed(args.seed)
     device = torch.device(args.device if ("cuda" not in args.device or torch.cuda.is_available()) else "cpu")
     if ("cuda" in str(args.device).lower()) and (device.type != "cuda"):
@@ -453,6 +618,7 @@ def main():
         data_root=args.data_root,
         image_size=args.image_size,
         auto_install_scipy=args.auto_install_scipy,
+        include_masks=True,
     )
 
     if args.max_train > 0 and len(train_ds) > args.max_train:
@@ -492,7 +658,12 @@ def main():
         ),
     )
 
-    model = make_model(args.model, num_classes=len(VOC20_CLASSES)).to(device)
+    model = make_model(
+        args.model,
+        num_classes=len(VOC20_CLASSES),
+        enable_mask_head=True,
+        mask_decoder_channels=int(args.mask_decoder_channels),
+    ).to(device)
     if args.channels_last:
         model = model.to(memory_format=torch.channels_last)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
@@ -522,6 +693,7 @@ def main():
         ckpt = _load_checkpoint_for_resume(args.resume_from)
         ckpt_model = ckpt.get("model_name", args.model)
         ckpt_classes = int(ckpt.get("num_classes", len(VOC20_CLASSES)))
+        ckpt_mask_head = bool(ckpt.get("mask_head_enabled", False))
         if ckpt_model != args.model:
             raise RuntimeError(
                 f"Resume model mismatch: checkpoint has '{ckpt_model}', current --model is '{args.model}'."
@@ -529,6 +701,11 @@ def main():
         if ckpt_classes != len(VOC20_CLASSES):
             raise RuntimeError(
                 f"Resume class-count mismatch: checkpoint has {ckpt_classes}, expected {len(VOC20_CLASSES)}."
+            )
+        if bool(ckpt_mask_head) != bool(args.mask_head):
+            raise RuntimeError(
+                "Resume mask-head mismatch: "
+                f"checkpoint mask_head_enabled={bool(ckpt_mask_head)} current={bool(args.mask_head)}."
             )
 
         model.load_state_dict(_clean_state_dict_prefixes(ckpt["state_dict"]), strict=True)
@@ -599,14 +776,24 @@ def main():
         run_loss = 0.0
         seen = 0
         opt.zero_grad(set_to_none=True)
-        for step_idx, (xb, yb) in enumerate(train_loader, start=1):
+        for step_idx, batch in enumerate(train_loader, start=1):
+            xb, yb, mb = _unpack_batch(batch)
             xb = xb.to(device, non_blocking=True)
             if args.channels_last:
                 xb = xb.contiguous(memory_format=torch.channels_last)
             yb = yb.to(device, non_blocking=True)
+            mb = mb.to(device, non_blocking=True)
             with _autocast_context(device=device, enabled=amp_enabled, amp_dtype_t=amp_dtype_t):
-                logits = model(xb)
+                out = _forward_classifier_outputs(model, xb)
+                logits = out["logits"]
                 loss = F.mse_loss(torch.sigmoid(logits), yb)
+                mask_logits = out.get("mask_logits")
+                if not isinstance(mask_logits, torch.Tensor):
+                    raise RuntimeError("Berkeley training requires mask logits from the classifier.")
+                loss = loss + (
+                    max(0.0, float(args.mask_loss_weight))
+                    * F.binary_cross_entropy_with_logits(mask_logits, mb)
+                )
             loss_to_backprop = loss / float(grad_accum_steps)
             if use_scaler:
                 scaler.scale(loss_to_backprop).backward()
@@ -634,6 +821,8 @@ def main():
             amp_enabled=amp_enabled,
             amp_dtype=args.amp_dtype,
             channels_last=bool(args.channels_last),
+            mask_loss_weight=float(args.mask_loss_weight),
+            mask_threshold=float(args.mask_threshold),
         )
         row = {
             "epoch": float(epoch),
@@ -644,11 +833,15 @@ def main():
             "val_bit_acc": float(val_stats["bit_acc"]),
             "lr": float(opt.param_groups[0]["lr"]),
         }
+        if "mask_iou" in val_stats:
+            row["val_mask_iou"] = float(val_stats["mask_iou"])
+            row["val_mask_dice"] = float(val_stats["mask_dice"])
         history.append(row)
         _log(
             f"epoch={epoch:02d} train_loss={row['train_loss']:.4f} "
             f"val_loss={row['val_loss']:.4f} val_macro_f1={row['val_macro_f1']:.4f} "
             f"val_micro_f1={row['val_micro_f1']:.4f}"
+            + (f" val_mask_iou={float(row['val_mask_iou']):.4f}" if "val_mask_iou" in row else "")
         )
 
         if row["val_macro_f1"] > best_score:
@@ -672,6 +865,8 @@ def main():
         amp_enabled=amp_enabled,
         amp_dtype=args.amp_dtype,
         channels_last=bool(args.channels_last),
+        mask_loss_weight=float(args.mask_loss_weight),
+        mask_threshold=float(args.mask_threshold),
     )
     final_epoch = start_epoch + int(args.epochs)
     model_state = _clean_state_dict_prefixes(model.state_dict())
@@ -684,6 +879,8 @@ def main():
         "model_name": args.model,
         "num_classes": len(VOC20_CLASSES),
         "class_names": VOC20_CLASSES,
+        "mask_head_enabled": bool(args.mask_head),
+        "mask_decoder_channels": int(args.mask_decoder_channels),
         "args": vars(args),
         "history": history,
         "last_epoch": final_epoch,

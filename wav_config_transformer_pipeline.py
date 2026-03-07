@@ -47,12 +47,44 @@ from wav_ml_models import (
     evaluate_transformer_accuracy,
     multilabel_feature_score,
     configure_torch_runtime,
+    ensure_tiny_classifier_lora_slot,
+    install_tiny_classifier_lora,
     maybe_compile_module,
+    restore_tiny_classifier_lora_snapshot,
     set_seed,
+    set_tiny_classifier_lora_state,
+    tiny_classifier_lora_snapshot,
+    tiny_classifier_lora_modules,
     train_conditional_generator_discriminator,
     train_classifier,
     train_transformer_feature_metric,
 )
+try:
+    from semantic_dataset_loaders import (
+        BootstrapDynamicDataset,
+        DiskSemanticRowsDataset,
+        OverrideTargetSubsetDataset,
+        StageDatasetManifest,
+        build_label_mask_stack,
+        build_loader_from_manifest,
+        collect_semantic_disk_rows,
+        detect_semantic_color_terms,
+        infer_semantic_support_mask,
+        semantic_mask_stack_collate,
+    )
+except ModuleNotFoundError:
+    from toys_to_survive_development.semantic_dataset_loaders import (
+        BootstrapDynamicDataset,
+        DiskSemanticRowsDataset,
+        OverrideTargetSubsetDataset,
+        StageDatasetManifest,
+        build_label_mask_stack,
+        build_loader_from_manifest,
+        collect_semantic_disk_rows,
+        detect_semantic_color_terms,
+        infer_semantic_support_mask,
+        semantic_mask_stack_collate,
+    )
 
 _ST_MODEL_CACHE: Dict[Tuple[str, str], Any] = {}
 GUI_STOP_EXIT_CODE = 42
@@ -77,6 +109,24 @@ def _autocast_context(device: torch.device, enabled: bool, amp_dtype_t: torch.dt
     if enabled and device.type == "cuda":
         return torch.autocast(device_type=device.type, dtype=amp_dtype_t)
     return nullcontext()
+
+
+def _effective_dataloader_num_workers(num_workers: int, device: Optional[torch.device] = None) -> int:
+    workers = max(0, int(num_workers))
+    if workers <= 0:
+        return 0
+    device_type = ""
+    if device is not None:
+        try:
+            device_type = str(device.type).strip().lower()
+        except Exception:
+            device_type = str(device).strip().lower()
+    if os.name == "nt" and device_type == "cuda":
+        # Windows worker collation uses named shared mappings for CPU tensors.
+        # Large semantic image+mask batches can exhaust commit/pagefile space
+        # and fail with Win32 error 1455 while collating in worker processes.
+        return 0
+    return workers
 
 
 def _dataloader_perf_kwargs(num_workers: int, persistent_workers: bool, prefetch_factor: int):
@@ -458,7 +508,7 @@ def _normalize_active_extra_terms_with_core(
     return out[: int(slots)]
 
 
-_DEFAULT_SEMANTIC_CORE_TERMS = [
+_REMOVED_SEMANTIC_SEED_TERMS = [
     "none",
     "noise",
     "signal",
@@ -480,8 +530,26 @@ _DEFAULT_SEMANTIC_CORE_TERMS = [
 ]
 
 
+_DEFAULT_SEMANTIC_CORE_TERMS: List[str] = [
+    "noise",
+    "white noise",
+    "pink noise",
+    "brown noise",
+    "red noise",
+    "blue noise",
+    "violet noise",
+    "gray noise",
+    "gaussian white noise",
+    "uniform white noise",
+]
+
+
 def _default_semantic_core_terms() -> List[str]:
     return [str(x) for x in _DEFAULT_SEMANTIC_CORE_TERMS]
+
+
+def _removed_semantic_seed_terms() -> List[str]:
+    return [str(x) for x in _REMOVED_SEMANTIC_SEED_TERMS]
 
 
 def _default_bootstrap_primitive_terms() -> List[str]:
@@ -493,6 +561,9 @@ def _default_bootstrap_primitive_terms() -> List[str]:
     )
     direction_terms = _normalize_vocab_terms(
         ["front", "back", "left", "right", "top", "bottom"]
+    )
+    structure_terms = _normalize_vocab_terms(
+        ["pattern", "edge", "shape", "texture", "bright", "dark", "smooth", "rough", "object", "signal"]
     )
     dataset_terms = {
         "berkeley sbd dataset",
@@ -510,6 +581,7 @@ def _default_bootstrap_primitive_terms() -> List[str]:
         out.append(str(term))
     out.extend([str(t) for t in color_terms])
     out.extend([str(t) for t in direction_terms])
+    out.extend([str(t) for t in structure_terms])
     return _normalize_vocab_terms(out)
 
 
@@ -522,6 +594,15 @@ def _semantic_kind_keys_for_class_names(class_names: Sequence[str]) -> List[str]
     alias_groups: Dict[str, List[str]] = {
         "none": ["none"],
         "noise": ["noise"],
+        "white noise": ["white noise", "gaussian white noise", "uniform white noise"],
+        "pink noise": ["pink noise"],
+        "brown noise": ["brown noise"],
+        "red noise": ["red noise"],
+        "blue noise": ["blue noise"],
+        "violet noise": ["violet noise"],
+        "gray noise": ["gray noise", "grey noise"],
+        "gaussian white noise": ["gaussian white noise", "white noise"],
+        "uniform white noise": ["uniform white noise", "white noise"],
         "signal": ["signal"],
         "object": ["object"],
         "mix": ["mixed noise and signal", "mix"],
@@ -557,6 +638,37 @@ def _find_semantic_term_index(class_names: Sequence[str], term: str) -> int:
         k = re.sub(r"\s+", " ", str(name)).strip().lower()
         if k == key:
             return int(i)
+    _REMOVED_SEMANTIC_SEED_TERMS = [
+        "none",
+        "noise",
+        "signal",
+        "object",
+        "mixed noise and signal",
+        "white",
+        "black",
+        "blur damage",
+        "noise damage",
+        "dropout damage",
+        "quantization damage",
+        "stride skew damage",
+        "gan image",
+        "regurgitated content",
+        "berkeley sbd dataset",
+        "mnist dataset",
+        "emnist dataset",
+        "kmnist dataset",
+    ]
+
+
+    _DEFAULT_SEMANTIC_CORE_TERMS: List[str] = []
+
+
+    def _default_semantic_core_terms() -> List[str]:
+        return [str(x) for x in _DEFAULT_SEMANTIC_CORE_TERMS]
+
+
+    def _removed_semantic_seed_terms() -> List[str]:
+        return [str(x) for x in _REMOVED_SEMANTIC_SEED_TERMS]
     return -1
 
 
@@ -584,7 +696,17 @@ def _semantic_damage_tags(term: str) -> List[str]:
         return _normalize_vocab_terms(lut[key])
     if key.endswith("damage"):
         return _normalize_vocab_terms([key, "signal"])
-    return []
+    return _REMOVED_SEMANTIC_SEED_TERMS
+_REMOVED_SEMANTIC_SEED_TERMS = [
+    "none",
+    "noise",
+    "signal",
+    "object",
+    "mixed noise and signal",
+    "mnist dataset",
+    "emnist dataset",
+    "kmnist dataset",
+]
 
 
 def _semantic_noise_family_terms() -> List[str]:
@@ -623,8 +745,8 @@ def _semantic_noise_profile_key_from_term(term: str) -> str:
 def _semantic_noise_profile_terms(profile_key: str) -> List[str]:
     key = re.sub(r"\s+", "_", str(profile_key)).strip().lower()
     lut: Dict[str, List[str]] = {
-        "uniform_white_noise": ["noise", "white noise"],
-        "gaussian_white_noise": ["noise", "white noise"],
+        "uniform_white_noise": ["noise", "white noise", "uniform white noise"],
+        "gaussian_white_noise": ["noise", "white noise", "gaussian white noise"],
         "pink_noise": ["noise", "pink noise"],
         "brown_noise": ["noise", "brown noise"],
         "red_noise": ["noise", "red noise"],
@@ -647,9 +769,13 @@ def _semantic_expand_inferred_tags(terms: Sequence[str]) -> List[str]:
         if key in ("mixed noise and signal", "mix"):
             out.extend(["mixed noise and signal", "noise", "signal"])
         if key == "noise":
-            out.extend(["noise", "white noise"])
+            out.extend(_semantic_noise_profile_terms("uniform_white_noise"))
         if key.endswith("noise") and key != "noise":
-            out.extend([key, "noise"])
+            profile_key = _semantic_noise_profile_key_from_term(key)
+            if profile_key:
+                out.extend(_semantic_noise_profile_terms(profile_key))
+            else:
+                out.extend([key, "noise"])
         if key.endswith("damage"):
             out.extend(_semantic_damage_tags(key))
     return _normalize_vocab_terms(out)
@@ -669,6 +795,17 @@ def _semantic_noise_terms_from_spectrum_sample(sample: Any) -> List[str]:
     else:
         gray = np.asarray(arr, dtype=np.float32)
     beta = 0.0
+    excess_kurtosis = 0.0
+    try:
+        flat = np.asarray(gray, dtype=np.float64).reshape(-1)
+        if int(flat.size) >= 32:
+            centered = flat - float(np.mean(flat))
+            var = float(np.mean(centered * centered))
+            if var > 1e-12:
+                m4 = float(np.mean((centered * centered) * (centered * centered)))
+                excess_kurtosis = float((m4 / (var * var)) - 3.0)
+    except Exception:
+        excess_kurtosis = 0.0
     try:
         if int(np.asarray(gray).ndim) == 2:
             g = np.asarray(gray, dtype=np.float64)
@@ -722,6 +859,9 @@ def _semantic_noise_terms_from_spectrum_sample(sample: Any) -> List[str]:
         if d < best_dist:
             best_dist = d
             best_term = str(name)
+    if best_term == "white noise":
+        dist_term = "uniform white noise" if float(excess_kurtosis) <= -0.55 else "gaussian white noise"
+        return _normalize_vocab_terms(["noise", "white noise", str(dist_term)])
     return _normalize_vocab_terms(["noise", str(best_term)])
 
 
@@ -732,7 +872,29 @@ def _semantic_tags_for_symbol_term(term: str) -> List[str]:
     berkeley_lut = getattr(_semantic_tags_for_symbol_term, "_berkeley_lut", None)
     if berkeley_lut is None:
         try:
-            berkeley_lut = {str(x).strip().lower() for x in _default_berkeley_class_names()}
+            berkeley_lut = {
+                str(x).strip().lower()
+                for x in _default_berkeley_class_names()
+                if str(x).strip()
+            }
+            # Keep only object-like Berkeley labels here; dataset tags and symbol namespaces
+            # have dedicated handlers below.
+            berkeley_lut = {
+                str(x)
+                for x in berkeley_lut
+                if str(x)
+                not in {
+                    "berkeley sbd dataset",
+                    "mnist dataset",
+                    "emnist dataset",
+                    "kmnist dataset",
+                    "object",
+                    "signal",
+                }
+                and (not bool(re.fullmatch(r"digit \d+", str(x))))
+                and (not bool(re.fullmatch(r"letter [a-z]", str(x))))
+                and (not bool(re.fullmatch(r"pictogram \d+", str(x))))
+            }
         except Exception:
             berkeley_lut = set()
         setattr(_semantic_tags_for_symbol_term, "_berkeley_lut", berkeley_lut)
@@ -961,11 +1123,12 @@ def _semantic_tonal_tags_from_image(
     mean_v = float(np.mean(flat))
     std_v = float(np.std(flat))
     if low_frac >= cov_t:
-        tags.append("black")
+        tags.extend(["black", "dark"])
     if high_frac >= cov_t:
-        tags.append("white")
+        tags.extend(["white", "bright"])
     if (abs(mean_v - 0.5) <= float(gray_mean_tolerance)) and (std_v <= float(gray_std_threshold)):
         tags.extend(["gray", "grey"])
+    tags.extend(detect_semantic_color_terms(rgb))
     return _normalize_vocab_terms(tags)
 
 
@@ -1317,9 +1480,84 @@ def _build_synthetic_semantic_symbol_pool(
             np.float32, copy=False
         )
 
+    def _spectral_noise(beta: float = 0.0, distribution: str = "gaussian") -> np.ndarray:
+        if str(distribution).strip().lower() == "uniform":
+            base = rng.uniform(-1.0, 1.0, size=(size, size)).astype(np.float32, copy=False)
+        else:
+            base = rng.standard_normal((size, size), dtype=np.float32)
+        if abs(float(beta)) > 1e-6:
+            spec = np.fft.fft2(base).astype(np.complex64, copy=False)
+            fy = np.fft.fftfreq(int(size)).astype(np.float32)[:, None]
+            fx = np.fft.fftfreq(int(size)).astype(np.float32)[None, :]
+            rr = np.sqrt((fx * fx) + (fy * fy)).astype(np.float32, copy=False)
+            rr = np.maximum(rr, np.float32(1.0 / float(max(1, size)))).astype(np.float32, copy=False)
+            shape = np.power(rr, np.float32(-0.5 * float(beta))).astype(np.float32, copy=False)
+            shape[0, 0] = np.float32(0.0)
+            base = np.fft.ifft2(spec * shape.astype(np.complex64, copy=False)).real.astype(np.float32, copy=False)
+        base = base - float(np.min(base))
+        hi = float(np.max(base))
+        if hi > 1e-8:
+            base = base / hi
+        return np.clip(base, 0.0, 1.0).astype(np.float32, copy=False)
+
     def _to_rgb(g: np.ndarray) -> np.ndarray:
         gg = np.clip(np.asarray(g, dtype=np.float32), 0.0, 1.0)
         return np.repeat(gg[None, :, :], 3, axis=0).astype(np.float32, copy=False)
+
+    def _colorize(g: np.ndarray, rgb: Tuple[float, float, float]) -> np.ndarray:
+        gg = np.clip(np.asarray(g, dtype=np.float32), 0.0, 1.0)
+        tint = np.asarray(rgb, dtype=np.float32).reshape(3, 1, 1)
+        return np.clip(gg[None, :, :] * tint, 0.0, 1.0).astype(np.float32, copy=False)
+
+    def _dot_mask(cx01: float, cy01: float, radius01: float, edge01: float = 0.018) -> np.ndarray:
+        dx = x01 - np.float32(cx01)
+        dy = y01 - np.float32(cy01)
+        dist = np.sqrt((dx * dx) + (dy * dy)).astype(np.float32, copy=False)
+        radius = np.float32(max(0.01, float(radius01)))
+        edge = np.float32(max(0.004, float(edge01)))
+        return np.clip((radius - dist) / edge, 0.0, 1.0).astype(np.float32, copy=False)
+
+    def _colored_dot_scene(term_key: str, sample_idx: int, target_rgb: Tuple[float, float, float]) -> np.ndarray:
+        local_seed = int(abs(hash((str(term_key), int(sample_idx), int(seed), int(size)))) % (2**32 - 1))
+        local_rng = np.random.default_rng(local_seed)
+        bg = np.clip(0.05 + (0.08 * _box_blur(_signal_pattern(phase=0.21 * float(sample_idx)), k=9)), 0.0, 1.0)
+        scene = np.repeat(bg[None, :, :], 3, axis=0).astype(np.float32, copy=False)
+        anchors = [
+            (0.18, 0.18), (0.50, 0.18), (0.82, 0.18),
+            (0.18, 0.50), (0.50, 0.50), (0.82, 0.50),
+            (0.18, 0.82), (0.50, 0.82), (0.82, 0.82),
+        ]
+        local_rng.shuffle(anchors)
+        target_count = int(local_rng.integers(2, 5))
+        tint = np.asarray(target_rgb, dtype=np.float32).reshape(3, 1, 1)
+        for cx, cy in anchors[:target_count]:
+            rr = float(local_rng.uniform(0.075, 0.12))
+            mask = _dot_mask(
+                cx01=float(cx) + float(local_rng.uniform(-0.035, 0.035)),
+                cy01=float(cy) + float(local_rng.uniform(-0.035, 0.035)),
+                radius01=rr,
+                edge01=float(local_rng.uniform(0.010, 0.022)),
+            )
+            dot_gain = np.float32(local_rng.uniform(0.78, 1.0))
+            scene = np.clip(scene + ((dot_gain * mask)[None, :, :] * tint), 0.0, 1.0)
+        distractor_palette = [
+            np.asarray([1.00, 0.52, 0.08], dtype=np.float32),
+            np.asarray([0.52, 1.00, 0.12], dtype=np.float32),
+            np.asarray([0.38, 0.72, 1.00], dtype=np.float32),
+            np.asarray([0.72, 0.40, 1.00], dtype=np.float32),
+        ]
+        for cx, cy in anchors[target_count: target_count + int(local_rng.integers(2, 5))]:
+            mask = _dot_mask(
+                cx01=float(cx) + float(local_rng.uniform(-0.05, 0.05)),
+                cy01=float(cy) + float(local_rng.uniform(-0.05, 0.05)),
+                radius01=float(local_rng.uniform(0.028, 0.045)),
+                edge01=float(local_rng.uniform(0.008, 0.015)),
+            )
+            distractor_rgb = distractor_palette[int(local_rng.integers(0, len(distractor_palette)))].reshape(3, 1, 1)
+            distractor_gain = np.float32(local_rng.uniform(0.22, 0.42))
+            scene = np.clip(scene + ((distractor_gain * mask)[None, :, :] * distractor_rgb), 0.0, 1.0)
+        scene = np.clip(scene + (0.015 * local_rng.standard_normal(scene.shape, dtype=np.float32)), 0.0, 1.0)
+        return scene.astype(np.float32, copy=False)
 
     def _term_image(term: str, sample_idx: int) -> np.ndarray:
         key = re.sub(r"\s+", " ", str(term)).strip().lower()
@@ -1332,6 +1570,66 @@ def _build_synthetic_semantic_symbol_pool(
             g = np.full((size, size), 0.50, dtype=np.float32)
         elif key == "noise":
             g = rng.random((size, size), dtype=np.float32)
+        elif key == "white noise":
+            g = _spectral_noise(beta=0.0, distribution="gaussian")
+        elif key == "uniform white noise":
+            g = _spectral_noise(beta=0.0, distribution="uniform")
+        elif key == "gaussian white noise":
+            g = _spectral_noise(beta=0.0, distribution="gaussian")
+        elif key == "pink noise":
+            g = _spectral_noise(beta=1.0, distribution="gaussian")
+        elif key == "brown noise":
+            g = _spectral_noise(beta=2.0, distribution="gaussian")
+        elif key == "red noise":
+            g = _spectral_noise(beta=1.8, distribution="gaussian")
+        elif key == "blue noise":
+            g = _spectral_noise(beta=-1.0, distribution="gaussian")
+        elif key == "violet noise":
+            g = _spectral_noise(beta=-2.0, distribution="gaussian")
+        elif key in ("gray noise", "grey noise"):
+            g = _spectral_noise(beta=0.5, distribution="gaussian")
+        elif key == "red":
+            return _colored_dot_scene(key, sample_idx=int(sample_idx), target_rgb=(1.0, 0.18, 0.18))
+        elif key == "green":
+            return _colored_dot_scene(key, sample_idx=int(sample_idx), target_rgb=(0.18, 1.0, 0.24))
+        elif key == "blue":
+            return _colored_dot_scene(key, sample_idx=int(sample_idx), target_rgb=(0.18, 0.42, 1.0))
+        elif key == "yellow":
+            return _colored_dot_scene(key, sample_idx=int(sample_idx), target_rgb=(1.0, 0.96, 0.20))
+        elif key == "cyan":
+            return _colored_dot_scene(key, sample_idx=int(sample_idx), target_rgb=(0.18, 0.96, 1.0))
+        elif key == "magenta":
+            return _colored_dot_scene(key, sample_idx=int(sample_idx), target_rgb=(1.0, 0.24, 0.92))
+        elif key == "brown":
+            return _colored_dot_scene(key, sample_idx=int(sample_idx), target_rgb=(0.62, 0.42, 0.20))
+        elif key in ("gray", "grey"):
+            g = np.full((size, size), 0.50, dtype=np.float32)
+        elif key == "pattern":
+            g = np.clip(
+                0.5
+                + (0.25 * np.sin((2.0 * math.pi * ((4.0 * x01) + phase))))
+                + (0.25 * np.sin((2.0 * math.pi * ((5.0 * y01) - (phase * 0.7))))),
+                0.0,
+                1.0,
+            )
+        elif key == "shape":
+            diamond = (np.abs(x01 - 0.5) + np.abs(y01 - 0.5) <= 0.28).astype(np.float32, copy=False)
+            g = np.clip((0.18 * _signal_pattern(phase=phase)) + (0.82 * diamond), 0.0, 1.0)
+        elif key == "edge":
+            ring = np.logical_and(np.abs(x01 - 0.5) + np.abs(y01 - 0.5) <= 0.32, np.abs(x01 - 0.5) + np.abs(y01 - 0.5) >= 0.25)
+            g = np.clip((0.10 * _signal_pattern(phase=phase)) + (0.90 * ring.astype(np.float32, copy=False)), 0.0, 1.0)
+        elif key == "texture":
+            fine = np.sin((2.0 * math.pi * ((13.0 * x01) + (7.0 * y01))) + phase)
+            coarse = np.sin((2.0 * math.pi * ((3.0 * x01) - (4.0 * y01))) - (phase * 0.6))
+            g = np.clip(0.5 + (0.25 * fine) + (0.25 * coarse), 0.0, 1.0)
+        elif key == "bright":
+            g = np.clip(0.72 + (0.22 * _signal_pattern(phase=phase)), 0.0, 1.0)
+        elif key == "dark":
+            g = np.clip(0.04 + (0.22 * _signal_pattern(phase=phase)), 0.0, 1.0)
+        elif key == "smooth":
+            g = _box_blur(_signal_pattern(phase=phase), k=11)
+        elif key == "rough":
+            g = np.clip(0.5 + (0.30 * _signal_pattern(phase=phase)) + (0.26 * rng.standard_normal((size, size), dtype=np.float32)), 0.0, 1.0)
         elif key == "signal":
             g = _signal_pattern(phase=phase)
         elif key == "object":
@@ -1707,6 +2005,31 @@ def _build_internal_bootstrap_symbol_pool(
             return _spectral_noise_image(sample_idx=int(sample_idx), beta=0.5, distribution="gaussian")
         if key == "signal":
             return _signal_pattern(phase=phase)
+        if key == "pattern":
+            cell = max(4, int(size // 10))
+            checker = ((np.floor(xx / float(cell)) + np.floor(yy / float(cell))) % 2.0).astype(np.float32, copy=False)
+            return np.clip((0.55 * checker) + (0.45 * _signal_pattern(phase=phase)), 0.0, 1.0)
+        if key == "shape":
+            circle = _circle_object()
+            rim = np.clip(circle - _box_blur(circle, k=11), 0.0, 1.0)
+            return np.clip((0.78 * circle) + (0.22 * rim), 0.0, 1.0)
+        if key == "edge":
+            circle = _circle_object()
+            rim = np.clip(circle - _box_blur(circle, k=9), 0.0, 1.0)
+            diag = (np.abs(x01 - y01) < 0.05).astype(np.float32, copy=False)
+            return np.clip((0.72 * rim) + (0.28 * diag), 0.0, 1.0)
+        if key == "texture":
+            fine = 0.5 + (0.25 * np.sin((2.0 * math.pi * ((10.0 * x01) + (7.0 * y01))) + phase))
+            fine += 0.25 * np.sin((2.0 * math.pi * ((5.0 * x01) - (11.0 * y01))) + (phase * 0.7))
+            return np.clip(fine, 0.0, 1.0).astype(np.float32, copy=False)
+        if key == "bright":
+            return np.clip(0.80 + (0.18 * _signal_pattern(phase=phase)), 0.0, 1.0)
+        if key == "dark":
+            return np.clip(0.06 + (0.16 * _signal_pattern(phase=phase)), 0.0, 1.0)
+        if key == "smooth":
+            return _box_blur(_signal_pattern(phase=phase), k=11)
+        if key == "rough":
+            return np.clip((0.55 * _signal_pattern(phase=phase)) + (0.45 * rng.random((size, size), dtype=np.float32)), 0.0, 1.0)
         if key == "object":
             return _circle_object()
         if key in ("mixed noise and signal", "mix"):
@@ -1798,6 +2121,86 @@ def _build_internal_bootstrap_symbol_pool(
     return pool, info
 
 
+def _build_pregestation_logic_rows(
+    image_size: int,
+    seed: int,
+    samples_per_combo: int,
+    active_terms_lc: Optional[Sequence[str]] = None,
+) -> Tuple[List[np.ndarray], List[List[str]], Dict[str, Any]]:
+    size = max(16, int(image_size))
+    per_combo = max(1, int(samples_per_combo))
+    active = {
+        re.sub(r"\s+", " ", str(x)).strip().lower()
+        for x in (active_terms_lc or [])
+        if str(x).strip()
+    }
+    all_colors = ["red", "green", "blue", "yellow", "cyan", "magenta", "brown", "white", "black", "gray"]
+    all_dirs = ["up", "down", "left", "right"]
+    colors = [c for c in all_colors if (not active or c in active)]
+    directions = [d for d in all_dirs if (not active or d in active)]
+    if len(colors) <= 0 or len(directions) <= 0:
+        return [], [], {"enabled": False, "rows": 0, "reason": "missing_color_or_direction_terms"}
+
+    rng = np.random.default_rng(int(seed))
+    yy, xx = np.mgrid[0:size, 0:size].astype(np.float32)
+    x01 = (xx / float(max(1, size - 1))).astype(np.float32, copy=False)
+    y01 = (yy / float(max(1, size - 1))).astype(np.float32, copy=False)
+    anchors = {
+        "up": (0.50, 0.18),
+        "down": (0.50, 0.82),
+        "left": (0.18, 0.50),
+        "right": (0.82, 0.50),
+    }
+    palette = {
+        "red": (1.00, 0.18, 0.18),
+        "green": (0.18, 1.00, 0.22),
+        "blue": (0.18, 0.40, 1.00),
+        "yellow": (1.00, 0.96, 0.20),
+        "cyan": (0.18, 0.96, 1.00),
+        "magenta": (1.00, 0.24, 0.92),
+        "brown": (0.62, 0.42, 0.20),
+        "white": (0.96, 0.96, 0.96),
+        "black": (0.10, 0.10, 0.10),
+        "gray": (0.56, 0.56, 0.56),
+    }
+
+    def _soft_disk(cx: float, cy: float, radius: float, edge: float) -> np.ndarray:
+        dist = np.sqrt(((x01 - np.float32(cx)) ** 2) + ((y01 - np.float32(cy)) ** 2)).astype(np.float32, copy=False)
+        return np.clip((np.float32(radius) - dist) / np.float32(max(1e-4, edge)), 0.0, 1.0).astype(np.float32, copy=False)
+
+    out_images: List[np.ndarray] = []
+    out_terms: List[List[str]] = []
+    for direction in directions:
+        cx0, cy0 = anchors[str(direction)]
+        for color in colors:
+            rgb = np.asarray(palette[str(color)], dtype=np.float32).reshape(3, 1, 1)
+            for sample_idx in range(int(per_combo)):
+                bg = np.full((3, size, size), 0.035, dtype=np.float32)
+                guide_x = np.exp(-((x01 - 0.5) ** 2) / 0.0015).astype(np.float32, copy=False)
+                guide_y = np.exp(-((y01 - 0.5) ** 2) / 0.0015).astype(np.float32, copy=False)
+                guide = np.clip(0.025 * (guide_x + guide_y), 0.0, 0.05).astype(np.float32, copy=False)
+                bg = np.clip(bg + guide[None, :, :], 0.0, 1.0)
+                jitter_x = float(rng.uniform(-0.025, 0.025))
+                jitter_y = float(rng.uniform(-0.025, 0.025))
+                radius = float(rng.uniform(0.085, 0.115))
+                edge = float(rng.uniform(0.014, 0.024))
+                disk = _soft_disk(cx=float(cx0 + jitter_x), cy=float(cy0 + jitter_y), radius=radius, edge=edge)
+                img = np.clip(bg + (disk[None, :, :] * rgb), 0.0, 1.0).astype(np.float32, copy=False)
+                out_images.append(img)
+                out_terms.append(_normalize_vocab_terms([str(color), str(direction), "object", "signal", "shape"]))
+
+    info = {
+        "enabled": True,
+        "rows": int(len(out_images)),
+        "colors": list(colors),
+        "directions": list(directions),
+        "samples_per_combo": int(per_combo),
+        "combos": int(len(colors) * len(directions)),
+        "reason": "formal_logic_color_direction",
+    }
+    return out_images, out_terms, info
+
+
 def _build_reference_flashcard_payload_rows(
     class_names: Sequence[str],
     condition_num_classes: int,
@@ -1826,6 +2229,7 @@ def _build_reference_flashcard_payload_rows(
     target_terms = [t for t in _default_semantic_core_terms() if str(t).strip().lower() in class_term_keys]
     if len(target_terms) <= 0:
         return [], [], {"enabled": False, "rows_added": 0, "reason": "no_core_terms_in_vocab"}
+    berkeley_idx = int(_find_semantic_term_index(class_names, "berkeley sbd dataset"))
 
     size = max(8, int(image_size))
     if int(size) <= 0:
@@ -2000,6 +2404,16 @@ def _build_reference_flashcard_payload_rows(
                     "Berkeley/object flashcard row dropped original supervised labels during conditioning. "
                     f"term={str(term)!r}"
                 )
+            if int(berkeley_idx) < 0:
+                raise RuntimeError(
+                    "Berkeley/object flashcard row cannot be emitted because 'berkeley sbd dataset' "
+                    "is missing from semantic class names."
+                )
+            if int(vec.size) <= int(berkeley_idx) or float(vec[int(berkeley_idx)]) < 0.5:
+                raise RuntimeError(
+                    "Berkeley/object flashcard row is missing required 'berkeley sbd dataset' target flag. "
+                    f"term={str(term)!r}"
+                )
         cards_img.append(img_rgb)
         cards_cond.append(np.asarray(vec, dtype=np.float32).reshape(-1))
         term_counts[key] = int(term_counts.get(key, 0)) + 1
@@ -2021,6 +2435,20 @@ def _build_reference_flashcard_payload_rows(
                     list(_semantic_noise_terms_from_spectrum_sample(noise_img)),
                 )
                 continue
+            if term_key.endswith("noise"):
+                noise_profile = _semantic_noise_profile_key_from_term(term_key)
+                if noise_profile:
+                    noise_img = _noise_pattern(noise_profile)
+                    _emit(
+                        term_key,
+                        _to_rgb(noise_img),
+                        None,
+                        _normalize_vocab_terms(
+                            list(_semantic_noise_profile_terms(noise_profile))
+                            + list(_semantic_noise_terms_from_spectrum_sample(noise_img))
+                        ),
+                    )
+                    continue
             if term_key == "signal":
                 _emit(term_key, _pick_signal(), None, ["signal"])
                 continue
@@ -2817,6 +3245,7 @@ def _apply_model_init(model: nn.Module, ckpt_path: str):
         return {"used": False, "loaded_keys": 0, "skipped_keys": 0, "path": str(p)}
 
     blob = _torch_load_cpu(str(p))
+    lora_restore_info = _restore_classifier_lora_from_blob(model, blob, str(p))
     src_state = _strip_module_prefix(_extract_state_dict(blob))
     dst_state = model.state_dict()
     to_load = {}
@@ -2847,12 +3276,29 @@ def _apply_model_init(model: nn.Module, ckpt_path: str):
         "missing_after_load": len(missing),
         "unexpected_after_load": len(unexpected),
         "path": str(p.resolve()),
+        "lora_restore": lora_restore_info,
     }
 
 
-def _apply_state_dict(model: nn.Module, src_state: Dict[str, torch.Tensor], source_name: str):
+def _apply_state_dict(
+    model: nn.Module,
+    src_state: Dict[str, torch.Tensor],
+    source_name: str,
+    classifier_lora: Optional[Dict[str, Any]] = None,
+):
+    lora_restore_info = _restore_classifier_lora_from_blob(
+        model,
+        ({"classifier_lora": dict(classifier_lora)} if isinstance(classifier_lora, dict) else None),
+        source_name,
+    )
     if not isinstance(src_state, dict):
-        return {"used": False, "loaded_keys": 0, "skipped_keys": 0, "source": source_name}
+        return {
+            "used": False,
+            "loaded_keys": 0,
+            "skipped_keys": 0,
+            "source": source_name,
+            "lora_restore": lora_restore_info,
+        }
     src_state = _strip_module_prefix(src_state)
     dst_state = model.state_dict()
     to_load = {}
@@ -2883,6 +3329,7 @@ def _apply_state_dict(model: nn.Module, src_state: Dict[str, torch.Tensor], sour
         "missing_after_load": len(missing),
         "unexpected_after_load": len(unexpected),
         "source": source_name,
+        "lora_restore": lora_restore_info,
     }
 
 
@@ -2929,6 +3376,35 @@ def _save_pipeline_checkpoint(path: Path, payload: Dict):
     os.replace(tmp_path, path)
 
 
+def _snapshot_classifier_lora(model: Optional[nn.Module]) -> Dict[str, Any]:
+    target = model
+    if not isinstance(target, TinyConvClassifier):
+        wrapped = getattr(model, "_orig_mod", None)
+        if isinstance(wrapped, TinyConvClassifier):
+            target = wrapped
+    if not isinstance(target, TinyConvClassifier):
+        return {"installed": False, "slot_names": []}
+    return tiny_classifier_lora_snapshot(target)
+
+
+def _restore_classifier_lora_from_blob(model: nn.Module, blob: Any, source_name: str) -> Dict[str, Any]:
+    target = model
+    if not isinstance(target, TinyConvClassifier):
+        wrapped = getattr(model, "_orig_mod", None)
+        if isinstance(wrapped, TinyConvClassifier):
+            target = wrapped
+    if not isinstance(target, TinyConvClassifier):
+        return {"used": False, "installed": False, "reason": f"unsupported_model:{type(model).__name__}", "source": source_name}
+    snapshot = None
+    if isinstance(blob, dict) and isinstance(blob.get("classifier_lora"), dict):
+        snapshot = dict(blob.get("classifier_lora"))
+    info = restore_tiny_classifier_lora_snapshot(target, snapshot)
+    if not isinstance(info, dict):
+        info = {"used": False, "installed": False, "reason": "invalid_restore_result"}
+    info["source"] = str(source_name)
+    return info
+
+
 def _save_training_segment_snapshot(
     enabled: bool,
     out_dir: Path,
@@ -2967,6 +3443,7 @@ def _save_training_segment_snapshot(
             pass
     if classifier is not None:
         payload["classifier_state"] = classifier.state_dict()
+        payload["classifier_lora"] = _snapshot_classifier_lora(classifier)
     if transformer is not None:
         payload["transformer_state"] = transformer.state_dict()
     if generator is not None:
@@ -2996,7 +3473,13 @@ def _save_training_segment_snapshot(
 
     _save_pipeline_checkpoint(out_dir / "pipeline_checkpoint.pt", payload)
     if classifier is not None:
-        torch.save({"state_dict": classifier.state_dict()}, out_dir / "classifier.pt")
+        torch.save(
+            {
+                "state_dict": classifier.state_dict(),
+                "classifier_lora": _snapshot_classifier_lora(classifier),
+            },
+            out_dir / "classifier.pt",
+        )
     if transformer is not None:
         torch.save({"state_dict": transformer.state_dict()}, out_dir / "transformer.pt")
     if generator is not None:
@@ -3028,6 +3511,7 @@ def _make_classifier_from_ckpt_meta(
             max_ch=max(32, int(classifier_max_ch)),
             context_blocks=max(0, int(classifier_context_blocks)),
             context_dropout=float(classifier_context_dropout),
+            mask_decoder_channels=max(32, int(max(16, int(classifier_base_ch)) // 2)),
         )
     if model_name == "resnet18":
         from torchvision.models import resnet18
@@ -3189,11 +3673,88 @@ def _classifier_supervision_loss(
 
 
 def _default_berkeley_class_names() -> List[str]:
-    fallback = [
-        "black",
-        "white",
-        "gray",
-        "grey",
+    class_names = [
+        "noise",
+        "pattern",
+        "signal",
+        "silence",
+        "mixed noise and signal",
+        "berkeley sbd dataset",
+        "blur damage",
+        "noise damage",
+        "dropout damage",
+        "quantization damage",
+        "stride skew damage",
+        "pulse",
+        "rhythm",
+        "change",
+        "stable",
+        "bright",
+        "dark",
+        "loud",
+        "quiet",
+        "smooth",
+        "rough",
+        "near",
+        "far",
+        "inside",
+        "outside",
+        "up",
+        "down",
+        "left",
+        "right",
+        "front",
+        "back",
+        "self",
+        "other",
+        "body",
+        "face",
+        "eye",
+        "ear",
+        "mouth",
+        "hand",
+        "touch",
+        "voice",
+        "breath",
+        "pain",
+        "comfort",
+        "hunger",
+        "thirst",
+        "alert",
+        "danger",
+        "safety",
+        "memory",
+        "familiar",
+        "unfamiliar",
+        "attention",
+        "surprise",
+        "zero",
+        "one",
+        "two",
+        "three",
+        "four",
+        "five",
+        "six",
+        "seven",
+        "eight",
+        "nine",
+        "image",
+        "sound",
+        "motion",
+        "edge",
+        "shape",
+        "texture",
+        "low band",
+        "mid band",
+        "high band",
+        "broadband",
+        "narrowband",
+        "burst",
+        "echo",
+        "object",
+        "layout",
+        "mask",
+        "composite",
         "red",
         "green",
         "blue",
@@ -3201,7 +3762,10 @@ def _default_berkeley_class_names() -> List[str]:
         "cyan",
         "magenta",
         "brown",
-        "noise",
+        "black",
+        "white",
+        "gray",
+        "grey",
         "white noise",
         "pink noise",
         "brown noise",
@@ -3209,28 +3773,10 @@ def _default_berkeley_class_names() -> List[str]:
         "blue noise",
         "violet noise",
         "gray noise",
-        "uniform white noise",
         "gaussian white noise",
-        "front",
-        "back",
-        "left",
-        "right",
-        "top",
-        "bottom",
+        "uniform white noise",
     ]
-    try:
-        from berkeley_sbd_pretrain import VOC20_CLASSES as voc20_classes
-    except ModuleNotFoundError:
-        try:
-            from toys_to_survive_development.berkeley_sbd_pretrain import VOC20_CLASSES as voc20_classes
-        except Exception:
-            voc20_classes = fallback
-    except Exception:
-        voc20_classes = fallback
-    names = [str(x).strip() for x in list(voc20_classes) if str(x).strip()]
-    if len(names) < 2:
-        return list(fallback)
-    return names
+    return [str(x).strip() for x in class_names if str(x).strip()]
 
 
 def _load_berkeley_classifier_for_metric(
@@ -3469,6 +4015,78 @@ class _PayloadCacheMemmapDataset(Dataset):
         )
 
 
+class _LazyDiskSemanticPayloadBank:
+    def __init__(self, rows: Sequence[Any], image_size: int, seed: int = 0):
+        self._dataset = DiskSemanticRowsDataset(
+            rows=list(rows),
+            image_size=int(image_size),
+            return_masks=True,
+            return_mask_stack=False,
+            degrade=False,
+            degrade_seed=int(seed),
+        )
+
+    def __len__(self) -> int:
+        return int(len(self._dataset))
+
+    def get_image(self, index: int) -> np.ndarray:
+        sample = self._dataset[int(index)]
+        if not isinstance(sample, (tuple, list)) or int(len(sample)) < 1:
+            raise RuntimeError(f"Lazy payload image row returned unsupported sample type: {type(sample).__name__}")
+        return sample[0].detach().to(torch.float32).cpu().numpy().astype(np.float32, copy=False)
+
+    def get_mask(self, index: int) -> np.ndarray:
+        sample = self._dataset[int(index)]
+        if not isinstance(sample, (tuple, list)) or int(len(sample)) < 3:
+            raise RuntimeError(f"Lazy payload mask row returned unsupported sample type: {type(sample).__name__}")
+        mask_np = sample[2].detach().to(torch.float32).cpu().numpy().astype(np.float32, copy=False)
+        if int(mask_np.ndim) == 3 and int(mask_np.shape[0]) == 1:
+            mask_np = mask_np[0]
+        return np.asarray(mask_np, dtype=np.float32)
+
+
+class _LazyDiskSemanticPayloadView(Sequence[np.ndarray]):
+    def __init__(self, bank: _LazyDiskSemanticPayloadBank, kind: str):
+        self._bank = bank
+        self._kind = str(kind).strip().lower()
+
+    def __len__(self) -> int:
+        return int(len(self._bank))
+
+    def __getitem__(self, index: int) -> np.ndarray:
+        if str(self._kind) == "image":
+            return self._bank.get_image(int(index))
+        if str(self._kind) == "mask":
+            return self._bank.get_mask(int(index))
+        raise KeyError(self._kind)
+
+
+class _ConcatArraySequence(Sequence[Any]):
+    def __init__(self, *parts: Sequence[Any]):
+        self._parts = [p for p in parts if p is not None]
+        self._lengths = [int(len(p)) for p in self._parts]
+        self._offsets: List[int] = []
+        acc = 0
+        for ln in self._lengths:
+            self._offsets.append(int(acc))
+            acc += int(ln)
+        self._total = int(acc)
+
+    def __len__(self) -> int:
+        return int(self._total)
+
+    def __getitem__(self, index: int) -> Any:
+        idx = int(index)
+        if idx < 0:
+            idx += int(self._total)
+        if idx < 0 or idx >= int(self._total):
+            raise IndexError(idx)
+        for part, off, ln in zip(self._parts, self._offsets, self._lengths):
+            if int(off) <= idx < int(off + ln):
+                return part[int(idx - off)]
+        raise IndexError(idx)
+
+
 def _split_payload_cache_indices(
     source_rows: Sequence[str],
     seed: int,
@@ -3538,60 +4156,18 @@ def _build_berkeley_refresh_loader(
     validation_split_seed: int = 0,
     persistent_workers: bool = False,
     prefetch_factor: int = 2,
+    return_mask_stack: bool = False,
 ):
-    del auto_install_scipy  # Legacy path intentionally disabled for refresh.
-    root = Path(str(data_root).strip() or "toys_to_survive_development/data/berkeley_sbd")
-    size = max(8, int(image_size))
-    cache_dir = root / "cache" / f"payload_bank_rgb{int(size)}_v2"
-    manifest_path = cache_dir / "manifest.json"
-    images_path = cache_dir / "images.npy"
-    labels_path = cache_dir / "labels.npy"
-    required = [manifest_path, images_path, labels_path]
-    missing = [str(p) for p in required if not p.exists()]
-    if len(missing) > 0:
-        raise RuntimeError(
-            "Berkeley refresh requires pre-washed payload cache files and no longer falls back to legacy "
-            f"prepare_sbd_multilabel. Missing: {missing}"
-        )
-    try:
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    except Exception as e:
-        raise RuntimeError(f"Failed to read Berkeley payload cache manifest: {manifest_path} ({e})") from e
-    if int(manifest.get("version", -1)) != 2:
-        raise RuntimeError(
-            "Unsupported Berkeley payload cache version for refresh loader "
-            f"(expected=2, got={manifest.get('version', None)})."
-        )
-    if int(manifest.get("image_size", -1)) != int(size):
-        raise RuntimeError(
-            "Berkeley payload cache image-size mismatch for refresh loader "
-            f"(cache={manifest.get('image_size', None)} requested={int(size)})."
-        )
-    x_mem = np.load(str(images_path), mmap_mode="r")
-    y_mem = np.load(str(labels_path), mmap_mode="r")
-    if int(getattr(x_mem, "ndim", 0)) != 4 or int(getattr(y_mem, "ndim", 0)) != 2:
-        raise RuntimeError(
-            "Invalid Berkeley payload cache tensor shapes "
-            f"(images={getattr(x_mem, 'shape', None)} labels={getattr(y_mem, 'shape', None)})."
-        )
-    n_rows = min(int(x_mem.shape[0]), int(y_mem.shape[0]))
+    del auto_install_scipy
+    rows, rows_info = collect_semantic_disk_rows(
+        data_root=str(data_root),
+        class_names=_default_berkeley_class_names(),
+        source_root="",
+    )
+    n_rows = int(len(rows))
     if n_rows <= 0:
-        raise RuntimeError("Berkeley payload cache is empty for refresh loader.")
-
-    sources_path = cache_dir / "sources.json"
-    source_rows: List[str] = []
-    if sources_path.exists():
-        try:
-            raw_sources = json.loads(sources_path.read_text(encoding="utf-8"))
-            if isinstance(raw_sources, list):
-                source_rows = [str(x) for x in raw_sources]
-        except Exception:
-            source_rows = []
-    if int(len(source_rows)) < int(n_rows):
-        source_rows.extend(["unknown_source"] * int(max(0, int(n_rows) - int(len(source_rows)))))
-    if int(len(source_rows)) > int(n_rows):
-        source_rows = source_rows[: int(n_rows)]
-
+        raise RuntimeError("Berkeley disk row collection is empty for refresh loader.")
+    source_rows = [str(r.source) for r in rows]
     split_seed = int(validation_split_seed) if int(validation_split_seed) != 0 else int(seed)
     train_idx, _, source_stats = _split_payload_cache_indices(
         source_rows=source_rows,
@@ -3607,26 +4183,32 @@ def _build_berkeley_refresh_loader(
     else:
         rng = np.random.default_rng(max(0, int(seed)))
         rng.shuffle(idx)
-    ds = _PayloadCacheMemmapDataset(
-        images_path=str(images_path),
-        labels_path=str(labels_path),
-        picks=idx,
-        labels_index_mode="global_pick",
+    selected_rows = [rows[int(i)] for i in idx.tolist()]
+    ds = DiskSemanticRowsDataset(
+        rows=selected_rows,
+        image_size=int(image_size),
+        return_masks=True,
+        return_mask_stack=bool(return_mask_stack),
+        degrade=True,
+        degrade_seed=int(seed),
     )
+    loader_num_workers = _effective_dataloader_num_workers(num_workers=num_workers, device=device)
     loader = DataLoader(
         ds,
         batch_size=max(1, int(batch_size)),
         shuffle=True,
-        num_workers=max(0, int(num_workers)),
+        num_workers=int(loader_num_workers),
         pin_memory=(device.type == "cuda"),
         drop_last=False,
+        collate_fn=(semantic_mask_stack_collate if bool(getattr(ds, "use_semantic_mask_stack_collate", False)) else None),
         **_dataloader_perf_kwargs(
-            num_workers=max(0, int(num_workers)),
+            num_workers=int(loader_num_workers),
             persistent_workers=bool(persistent_workers),
             prefetch_factor=int(prefetch_factor),
         ),
     )
     setattr(loader, "_refresh_source_stats", source_stats)
+    setattr(loader, "_refresh_rows_info", rows_info)
     return loader, int(len(ds))
 
 
@@ -3651,9 +4233,12 @@ def _build_berkeley_refresh_cache(
 
     xs = []
     ys = []
-    for i, (xb, yb) in enumerate(loader, start=1):
+    ms = []
+    for i, batch in enumerate(loader, start=1):
+        xb, yb, mb, _ = _unpack_masked_semantic_batch(batch, context="berkeley refresh cache")
         xs.append(xb)
         ys.append(yb)
+        ms.append(mb)
         if i >= n_batches:
             break
 
@@ -3662,19 +4247,23 @@ def _build_berkeley_refresh_cache(
 
     x = torch.cat(xs, dim=0).contiguous()
     y = torch.cat(ys, dim=0).contiguous()
+    m = torch.cat(ms, dim=0).contiguous()
     if channels_last:
         x = x.contiguous(memory_format=torch.channels_last)
 
     if target.type == "cuda":
         x = x.to(target, non_blocking=True)
         y = y.to(target, non_blocking=True)
+        m = m.to(target, non_blocking=True)
     elif device.type == "cuda":
         x = x.pin_memory()
         y = y.pin_memory()
+        m = m.pin_memory()
 
     return {
         "x": x,
         "y": y,
+        "m": m,
         "num_samples": int(y.shape[0]),
         "num_batches": len(xs),
         "device": target.type,
@@ -3684,6 +4273,7 @@ def _build_berkeley_refresh_cache(
 def _auto_berkeley_refresh_batch_size(
     cache_x: torch.Tensor,
     cache_y: torch.Tensor,
+    cache_m: Optional[torch.Tensor],
     device: torch.device,
     vram_fraction: float,
     activation_multiplier: float,
@@ -3706,6 +4296,8 @@ def _auto_berkeley_refresh_batch_size(
     sample_bytes = int(cache_x[0].numel()) * int(cache_x.element_size())
     if cache_y is not None:
         sample_bytes += int(cache_y[0].numel()) * int(cache_y.element_size())
+    if cache_m is not None:
+        sample_bytes += int(cache_m[0].numel()) * int(cache_m.element_size())
     sample_bytes = max(1, sample_bytes)
     mult = max(1.0, float(activation_multiplier))
     target = int(max(0.0, min(0.99, float(vram_fraction))) * float(max(0, free_bytes)))
@@ -3726,16 +4318,22 @@ def _build_berkeley_gate_val_loader(
     device: torch.device,
     persistent_workers: bool = False,
     prefetch_factor: int = 2,
+    return_mask_stack: bool = False,
 ):
-    try:
-        from berkeley_sbd_pretrain import prepare_sbd_multilabel
-    except ModuleNotFoundError:
-        from toys_to_survive_development.berkeley_sbd_pretrain import prepare_sbd_multilabel
-
-    _, val_ds = prepare_sbd_multilabel(
-        data_root=data_root,
-        image_size=image_size,
-        auto_install_scipy=auto_install_scipy,
+    del auto_install_scipy
+    rows, _ = collect_semantic_disk_rows(
+        data_root=str(data_root),
+        class_names=_default_berkeley_class_names(),
+        source_root="",
+    )
+    val_rows = [r for r in rows if str(r.source).strip().lower() == "berkeley_sbd_val"]
+    val_ds = DiskSemanticRowsDataset(
+        rows=val_rows,
+        image_size=int(image_size),
+        return_masks=True,
+        return_mask_stack=bool(return_mask_stack),
+        degrade=False,
+        degrade_seed=int(seed),
     )
     sampler = None
     shuffle = False
@@ -3752,16 +4350,18 @@ def _build_berkeley_gate_val_loader(
         )
         shuffle = False
 
+    loader_num_workers = _effective_dataloader_num_workers(num_workers=num_workers, device=device)
     loader = DataLoader(
         val_ds,
         batch_size=max(1, int(batch_size)),
         shuffle=bool(shuffle),
         sampler=sampler,
-        num_workers=max(0, int(num_workers)),
+        num_workers=int(loader_num_workers),
         pin_memory=(device.type == "cuda"),
         drop_last=False,
+        collate_fn=(semantic_mask_stack_collate if bool(getattr(val_ds, "use_semantic_mask_stack_collate", False)) else None),
         **_dataloader_perf_kwargs(
-            num_workers=max(0, int(num_workers)),
+            num_workers=int(loader_num_workers),
             persistent_workers=bool(persistent_workers),
             prefetch_factor=int(prefetch_factor),
         ),
@@ -4316,6 +4916,67 @@ def _build_payload_validation_gate_rows(
     return out_indices, out_terms, info
 
 
+def _build_payload_validation_gate_dataset(
+    data_root: str,
+    image_size: int,
+    seed: int,
+    external_val_fraction: float = 0.20,
+    source_root: str = "",
+    return_mask_stack: bool = False,
+) -> Tuple[Optional[Dataset], np.ndarray, List[List[str]], Dict[str, Any]]:
+    rows, rows_info = collect_semantic_disk_rows(
+        data_root=str(data_root),
+        class_names=_default_berkeley_class_names(),
+        source_root=str(source_root),
+    )
+    if int(len(rows)) <= 0:
+        info = dict(rows_info)
+        info.update({"selected_rows": 0, "label_dim": 0, "reason": "empty_disk_rows"})
+        return None, np.zeros((0, 0), dtype=np.float32), [], info
+    source_rows = [str(r.source) for r in rows]
+    _, gate_idx, source_stats = _split_payload_cache_indices(
+        source_rows=source_rows,
+        seed=int(seed),
+        external_val_fraction=float(external_val_fraction),
+    )
+    selected_rows = [rows[int(i)] for i in gate_idx if 0 <= int(i) < int(len(rows))]
+    terms_rows = [list(_normalize_vocab_terms(r.terms)) for r in selected_rows]
+    label_rows = [np.asarray(r.label_vec, dtype=np.float32).reshape(-1) for r in selected_rows]
+    label_dim = int(label_rows[0].size) if int(len(label_rows)) > 0 else 0
+    labels_np = (
+        np.stack(label_rows, axis=0).astype(np.float32, copy=False)
+        if int(len(label_rows)) > 0
+        else np.zeros((0, int(label_dim)), dtype=np.float32)
+    )
+    ds = DiskSemanticRowsDataset(
+        rows=selected_rows,
+        image_size=int(image_size),
+        return_masks=True,
+        return_mask_stack=bool(return_mask_stack),
+        degrade=False,
+        degrade_seed=int(seed),
+    )
+    refresh_rows_total = int(sum(int(v.get("refresh_selected", 0)) for v in source_stats.values()))
+    refresh_rows_berkeley_train = int(source_stats.get("berkeley_sbd_train", {}).get("refresh_selected", 0))
+    refresh_rows_berkeley_val = int(source_stats.get("berkeley_sbd_val", {}).get("refresh_selected", 0))
+    info = {
+        "available_rows": int(rows_info.get("available_rows", len(rows))),
+        "selected_rows": int(len(selected_rows)),
+        "label_dim": int(label_dim),
+        "selected_berkeley_val": int(source_stats.get("berkeley_sbd_val", {}).get("gate_selected", 0)),
+        "selected_berkeley_train": int(source_stats.get("berkeley_sbd_train", {}).get("gate_selected", 0)),
+        "refresh_rows_total": int(refresh_rows_total),
+        "refresh_rows_berkeley_train": int(refresh_rows_berkeley_train),
+        "refresh_rows_berkeley_val": int(refresh_rows_berkeley_val),
+        "external_val_fraction": float(external_val_fraction),
+        "source_stats": source_stats,
+        "cache_dir": str(Path(str(data_root).strip() or "toys_to_survive_development/data/berkeley_sbd") / "cache"),
+        "data_source": "disk_dataset_rows",
+        "source_root": str(source_root),
+    }
+    return ds, labels_np, terms_rows, info
+
+
 def _build_gate_loader_from_arrays(
     images: Sequence[np.ndarray],
     targets: Sequence[np.ndarray],
@@ -4382,15 +5043,16 @@ def _build_gate_loader_from_arrays(
     y_t = torch.from_numpy(y_np)
     ds_full: Dataset = torch.utils.data.TensorDataset(x_t, y_t)
     ds_use: Dataset = torch.utils.data.Subset(ds_full, picks.tolist())
+    loader_num_workers = _effective_dataloader_num_workers(num_workers=num_workers, device=device)
     loader = DataLoader(
         ds_use,
         batch_size=max(1, int(batch_size)),
         shuffle=False,
-        num_workers=max(0, int(num_workers)),
+        num_workers=int(loader_num_workers),
         pin_memory=(device.type == "cuda"),
         drop_last=False,
         **_dataloader_perf_kwargs(
-            num_workers=max(0, int(num_workers)),
+            num_workers=int(loader_num_workers),
             persistent_workers=bool(persistent_workers),
             prefetch_factor=int(prefetch_factor),
         ),
@@ -4427,15 +5089,18 @@ def _build_gate_loader_from_dataset(
         return None, 0
 
     ds_use: Dataset = dataset if int(picks.size) == int(n) else torch.utils.data.Subset(dataset, picks.tolist())
+    collate_fn = semantic_mask_stack_collate if bool(getattr(dataset, "use_semantic_mask_stack_collate", False)) else None
+    loader_num_workers = _effective_dataloader_num_workers(num_workers=num_workers, device=device)
     loader = DataLoader(
         ds_use,
         batch_size=max(1, int(batch_size)),
         shuffle=False,
-        num_workers=max(0, int(num_workers)),
+        num_workers=int(loader_num_workers),
         pin_memory=(device.type == "cuda"),
         drop_last=False,
+        collate_fn=collate_fn,
         **_dataloader_perf_kwargs(
-            num_workers=max(0, int(num_workers)),
+            num_workers=int(loader_num_workers),
             persistent_workers=bool(persistent_workers),
             prefetch_factor=int(prefetch_factor),
         ),
@@ -4443,166 +5108,135 @@ def _build_gate_loader_from_dataset(
     return loader, int(picks.size)
 
 
-def _augment_bootstrap_chw01(
-    img: np.ndarray,
-    seed: int,
-    return_terms: bool = False,
-) -> Any:
-    arr = np.asarray(img, dtype=np.float32)
-    if int(arr.ndim) == 3 and int(arr.shape[0]) == 3:
-        x = np.asarray(arr, dtype=np.float32, order="C")
-    elif int(arr.ndim) == 3 and int(arr.shape[2]) == 3:
-        x = np.transpose(arr, (2, 0, 1)).astype(np.float32, copy=False)
-    elif int(arr.ndim) == 2:
-        x = np.repeat(arr[None, :, :], 3, axis=0).astype(np.float32, copy=False)
+def _unpack_masked_semantic_batch(batch: Any, context: str) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, Any]]:
+    meta: Dict[str, Any] = {}
+    if isinstance(batch, dict):
+        xb = batch.get("x")
+        yb = batch.get("y")
+        mb = batch.get("mask")
+        if "mask_stacks" in batch:
+            meta["mask_stacks"] = list(batch.get("mask_stacks") or [])
+        if "mask_indices" in batch:
+            meta["mask_indices"] = list(batch.get("mask_indices") or [])
+    elif isinstance(batch, (tuple, list)) and int(len(batch)) >= 3:
+        xb, yb, mb = batch[0], batch[1], batch[2]
+        if int(len(batch)) >= 5:
+            meta["mask_stacks"] = batch[3]
+            meta["mask_indices"] = batch[4]
     else:
-        raise RuntimeError(f"Unsupported bootstrap row shape for augmentation: {tuple(arr.shape)}")
-    x = np.clip(x, 0.0, 1.0).astype(np.float32, copy=False)
-    c, h, w = int(x.shape[0]), int(x.shape[1]), int(x.shape[2])
-    rng = np.random.default_rng(int(seed))
-
-    applied_terms: List[str] = []
-
-    # Spatial permutations.
-    shift_x = int(rng.integers(-max(1, w // 14), max(1, w // 14) + 1))
-    shift_y = int(rng.integers(-max(1, h // 14), max(1, h // 14) + 1))
-    if shift_x != 0:
-        x = np.roll(x, shift=shift_x, axis=2)
-    if shift_y != 0:
-        x = np.roll(x, shift=shift_y, axis=1)
-    if float(rng.random()) < 0.45:
-        x = np.flip(x, axis=2).copy()
-    if float(rng.random()) < 0.15:
-        x = np.flip(x, axis=1).copy()
-
-    # Deformation/noise variants.
-    if float(rng.random()) < 0.55:
-        k = int(rng.choice(np.asarray([3, 5, 7], dtype=np.int32)))
-        t = torch.from_numpy(np.asarray(x, dtype=np.float32)[None, ...])
-        t = F.avg_pool2d(t, kernel_size=int(k), stride=1, padding=int(k // 2))
-        x = np.asarray(t[0].cpu().numpy(), dtype=np.float32)
-        applied_terms.extend(_semantic_damage_tags("blur damage"))
-    if float(rng.random()) < 0.45:
-        odd_shift = int(rng.integers(1, 8))
-        x[:, 1::2, :] = np.roll(x[:, 1::2, :], shift=odd_shift, axis=2)
-        applied_terms.extend(_semantic_damage_tags("stride skew damage"))
-    if float(rng.random()) < 0.35:
-        keep = float(rng.uniform(0.76, 0.96))
-        mask = (rng.random((h, w), dtype=np.float32) < keep).astype(np.float32, copy=False)
-        x = x * mask[None, :, :]
-        applied_terms.extend(_semantic_damage_tags("dropout damage"))
-    if float(rng.random()) < 0.40:
-        lv = int(rng.choice(np.asarray([4, 6, 8, 12], dtype=np.int32)))
-        x = np.round(x * float(lv - 1)) / float(lv - 1)
-        applied_terms.extend(_semantic_damage_tags("quantization damage"))
-
-    # Signal/noise tangling blend.
-    yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
-    x01 = xx / float(max(1, w - 1))
-    y01 = yy / float(max(1, h - 1))
-    fx = float(rng.uniform(1.2, 8.5))
-    fy = float(rng.uniform(1.0, 7.5))
-    ph = float(rng.uniform(0.0, 2.0 * math.pi))
-    sig = 0.5 + (0.5 * np.sin((2.0 * math.pi * ((fx * x01) + (fy * y01))) + ph))
-    noi = rng.random((h, w), dtype=np.float32)
-    noise_tags = _semantic_noise_terms_from_spectrum_sample(noi)
-    if float(rng.random()) < 0.5:
-        mix_a = float(rng.uniform(0.18, 0.62))
-        mix = np.clip((mix_a * sig) + ((1.0 - mix_a) * noi), 0.0, 1.0).astype(np.float32, copy=False)
-    else:
-        bits = int(rng.integers(2, 7))
-        s_u16 = np.round(np.clip(sig, 0.0, 1.0) * 65535.0).astype(np.uint16, copy=False)
-        n_u16 = np.round(np.clip(noi, 0.0, 1.0) * 65535.0).astype(np.uint16, copy=False)
-        payload = ((n_u16 >> int(16 - bits)) & np.uint16((1 << bits) - 1)).astype(np.uint16, copy=False)
-        keep_mask = np.uint16(0xFFFF ^ ((1 << bits) - 1))
-        mix = np.clip(((s_u16 & keep_mask) | payload).astype(np.float32) / 65535.0, 0.0, 1.0).astype(np.float32, copy=False)
-    blend = float(rng.uniform(0.08, 0.28))
-    x = np.clip(((1.0 - blend) * x) + (blend * mix[None, :, :]), 0.0, 1.0)
-    applied_terms.extend(["mixed noise and signal", "noise", "signal"])
-    applied_terms.extend(list(noise_tags))
-
-    if float(rng.random()) < 0.65:
-        std = float(rng.uniform(0.01, 0.08))
-        noise_delta = (std * rng.standard_normal((c, h, w), dtype=np.float32)).astype(np.float32, copy=False)
-        x = np.clip(x + noise_delta, 0.0, 1.0)
-        applied_terms.extend(_semantic_damage_tags("noise damage"))
-        applied_terms.extend(_semantic_noise_terms_from_spectrum_sample(noise_delta))
-    x_out = np.asarray(x, dtype=np.float32)
-    if bool(return_terms):
-        return x_out, _normalize_vocab_terms(applied_terms)
-    return x_out
-
-
-class _BootstrapExpandedDataset(Dataset):
-    def __init__(
-        self,
-        images: Sequence[np.ndarray],
-        targets: Sequence[np.ndarray],
-        total_rows: int,
-        seed: int,
-        augment: bool,
-        expected_target_dim: int = 0,
-        semantic_term_to_idx: Optional[Dict[str, int]] = None,
-        augment_apply_terms: bool = True,
-    ):
-        n = min(int(len(images)), int(len(targets)))
-        if n <= 0:
-            raise RuntimeError("BootstrapExpandedDataset requires non-empty images/targets.")
-        self.images = [np.asarray(images[i], dtype=np.float32) for i in range(int(n))]
-        self.targets = [np.asarray(targets[i], dtype=np.float32).reshape(-1) for i in range(int(n))]
-        self.base_rows = int(n)
-        self.total_rows = max(int(self.base_rows), int(total_rows))
-        self.seed = int(seed)
-        self.augment = bool(augment)
-        y_sizes = sorted({int(v.size) for v in self.targets})
-        if len(y_sizes) != 1:
-            raise RuntimeError(f"BootstrapExpandedDataset target width mismatch: {y_sizes}")
-        self.target_dim = int(y_sizes[0])
-        if int(expected_target_dim) > 0 and int(self.target_dim) != int(expected_target_dim):
-            raise RuntimeError(
-                "BootstrapExpandedDataset target width mismatch: "
-                f"got={int(self.target_dim)} expected={int(expected_target_dim)}"
-            )
-        self.semantic_term_to_idx = {
-            re.sub(r"\s+", " ", str(k)).strip().lower(): int(v)
-            for k, v in (semantic_term_to_idx.items() if isinstance(semantic_term_to_idx, dict) else [])
-            if str(k).strip()
-        }
-        self.augment_apply_terms = bool(augment_apply_terms)
-
-    def __len__(self) -> int:
-        return int(self.total_rows)
-
-    def __getitem__(self, index: int):
-        idx = int(index)
-        if idx < 0:
-            idx = int(self.total_rows) + idx
-        if idx < 0 or idx >= int(self.total_rows):
-            raise IndexError(idx)
-        cycle = int(idx // max(1, int(self.base_rows)))
-        off = int(idx % max(1, int(self.base_rows)))
-        base_idx = int((off + (cycle * 17) + int(self.seed % max(1, int(self.base_rows)))) % int(self.base_rows))
-        img = np.asarray(self.images[int(base_idx)], dtype=np.float32)
-        tgt = np.asarray(self.targets[int(base_idx)], dtype=np.float32).copy()
-        if bool(self.augment) and int(self.total_rows) > int(self.base_rows):
-            aug_seed = int((int(self.seed) * 2654435761 + int(idx) * 1103515245 + int(base_idx) * 122949829) % (2**32 - 1))
-            img, aug_terms = _augment_bootstrap_chw01(
-                img=img,
-                seed=int(aug_seed),
-                return_terms=True,
-            )
-            if bool(self.augment_apply_terms) and int(len(self.semantic_term_to_idx)) > 0 and isinstance(aug_terms, list):
-                for term in aug_terms:
-                    tk = re.sub(r"\s+", " ", str(term)).strip().lower()
-                    if not tk:
-                        continue
-                    ti = int(self.semantic_term_to_idx.get(tk, -1))
-                    if 0 <= int(ti) < int(tgt.size):
-                        tgt[int(ti)] = 1.0
-        return (
-            torch.from_numpy(np.asarray(img, dtype=np.float32)),
-            torch.from_numpy(np.asarray(tgt, dtype=np.float32)),
+        raise RuntimeError(f"{str(context)} requires (image, target, mask) batches.")
+    if not (torch.is_tensor(xb) and torch.is_tensor(yb) and torch.is_tensor(mb)):
+        raise RuntimeError(f"{str(context)} received non-tensor batch members.")
+    if int(mb.ndim) == 3:
+        mb = mb.unsqueeze(1)
+    elif int(mb.ndim) != 4:
+        raise RuntimeError(f"{str(context)} requires mask tensors with shape [B,1,H,W]; got {tuple(mb.shape)}")
+    if int(xb.shape[0]) != int(yb.shape[0]) or int(xb.shape[0]) != int(mb.shape[0]):
+        raise RuntimeError(
+            f"{str(context)} batch size mismatch: x={int(xb.shape[0])} y={int(yb.shape[0])} m={int(mb.shape[0])}"
         )
+    return xb, yb, mb.to(dtype=torch.float32), meta
+
+
+def _expand_semantic_mask_supervision_batch(
+    xb: torch.Tensor,
+    yb: torch.Tensor,
+    mb: torch.Tensor,
+    batch_meta: Optional[Dict[str, Any]],
+    mode: str,
+    context: str,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    mode_key = re.sub(r"\s+", "_", str(mode)).strip().lower()
+    if mode_key in ("", "multihot_mix", "multihot", "mixed"):
+        return xb, yb, mb
+    if mode_key not in ("single_label_passes", "single_passes", "single_label"):
+        raise RuntimeError(f"{str(context)} received unsupported semantic mask supervision mode: {mode!r}")
+    if int(xb.shape[0]) <= 0:
+        return xb, yb, mb
+    stack_list = []
+    index_list = []
+    if isinstance(batch_meta, dict):
+        stack_list = list(batch_meta.get("mask_stacks") or [])
+        index_list = list(batch_meta.get("mask_indices") or [])
+    x_rows: List[torch.Tensor] = []
+    y_rows: List[torch.Tensor] = []
+    m_rows: List[torch.Tensor] = []
+    for bi in range(int(xb.shape[0])):
+        y_row = yb[bi].detach().to(torch.float32)
+        active = torch.nonzero(y_row >= 0.5, as_tuple=False).reshape(-1)
+        if int(active.numel()) <= 0:
+            x_rows.append(xb[bi])
+            y_rows.append(y_row)
+            m_rows.append(mb[bi])
+            continue
+        sample_stack = None
+        sample_idx = None
+        if int(bi) < int(len(stack_list)):
+            sample_stack = stack_list[int(bi)]
+        if int(bi) < int(len(index_list)):
+            sample_idx = index_list[int(bi)]
+        stack_lookup: Dict[int, torch.Tensor] = {}
+        if sample_stack is not None and sample_idx is not None:
+            stack_t = sample_stack if torch.is_tensor(sample_stack) else torch.as_tensor(sample_stack, dtype=torch.float32)
+            idx_t = sample_idx if torch.is_tensor(sample_idx) else torch.as_tensor(sample_idx, dtype=torch.long)
+            stack_t = stack_t.to(device=xb.device, dtype=torch.float32)
+            idx_t = idx_t.to(device=xb.device, dtype=torch.long).reshape(-1)
+            if int(stack_t.ndim) == 2:
+                stack_t = stack_t.unsqueeze(0)
+            n_pairs = min(int(stack_t.shape[0]), int(idx_t.numel()))
+            for si in range(int(n_pairs)):
+                stack_lookup[int(idx_t[si].item())] = stack_t[si]
+        for lbl in active.tolist():
+            y_single = torch.zeros_like(y_row)
+            y_single[int(lbl)] = 1.0
+            mask_single = stack_lookup.get(int(lbl), mb[bi])
+            if int(mask_single.ndim) == 2:
+                mask_single = mask_single.unsqueeze(0)
+            x_rows.append(xb[bi])
+            y_rows.append(y_single)
+            m_rows.append(mask_single.to(dtype=torch.float32))
+    if len(x_rows) <= 0:
+        return xb, yb, mb
+    return torch.stack(x_rows, dim=0), torch.stack(y_rows, dim=0), torch.stack(m_rows, dim=0)
+
+
+def _forward_classifier_outputs_require_mask(classifier: nn.Module, xb: torch.Tensor, context: str) -> Dict[str, torch.Tensor]:
+    if hasattr(classifier, "forward_with_aux") and callable(getattr(classifier, "forward_with_aux")):
+        out = classifier.forward_with_aux(xb)
+    else:
+        out = {"logits": classifier(xb)}
+    logits = out.get("logits")
+    if not isinstance(logits, torch.Tensor):
+        raise RuntimeError(f"{str(context)} classifier forward did not return logits tensor.")
+    mask_logits = out.get("mask_logits")
+    if not isinstance(mask_logits, torch.Tensor):
+        raise RuntimeError(f"{str(context)} requires a classifier mask head and mask logits output.")
+    out["mask_logits"] = mask_logits
+    return out
+
+
+def _semantic_mask_bce_loss(mask_logits: torch.Tensor, mask_targets: torch.Tensor, context: str) -> Tuple[torch.Tensor, torch.Tensor]:
+    if int(mask_logits.ndim) == 3:
+        mask_logits = mask_logits.unsqueeze(1)
+    if int(mask_targets.ndim) == 3:
+        mask_targets = mask_targets.unsqueeze(1)
+    if int(mask_logits.ndim) != 4 or int(mask_targets.ndim) != 4:
+        raise RuntimeError(
+            f"{str(context)} mask tensors must be [B,1,H,W]; got logits={tuple(mask_logits.shape)} targets={tuple(mask_targets.shape)}"
+        )
+    if tuple(mask_logits.shape[-2:]) != tuple(mask_targets.shape[-2:]):
+        mask_logits = F.interpolate(mask_logits, size=tuple(mask_targets.shape[-2:]), mode="bilinear", align_corners=False)
+    if int(mask_logits.shape[1]) != int(mask_targets.shape[1]):
+        if int(mask_logits.shape[1]) == 1 and int(mask_targets.shape[1]) > 1:
+            mask_targets = mask_targets[:, :1, :, :]
+        elif int(mask_targets.shape[1]) == 1 and int(mask_logits.shape[1]) > 1:
+            mask_logits = mask_logits[:, :1, :, :]
+        else:
+            raise RuntimeError(
+                f"{str(context)} mask channel mismatch: logits={int(mask_logits.shape[1])} targets={int(mask_targets.shape[1])}"
+            )
+    mask_targets = torch.clamp(mask_targets.to(dtype=torch.float32), 0.0, 1.0)
+    return F.binary_cross_entropy_with_logits(mask_logits.to(dtype=torch.float32), mask_targets), mask_logits
 
 
 @torch.no_grad()
@@ -4615,6 +5249,7 @@ def _evaluate_berkeley_classifier_gate(
     amp_enabled: bool = False,
     amp_dtype: str = "float16",
     channels_last: bool = False,
+    semantic_mask_supervision_mode: str = "multihot_mix",
     preview_sink: Optional[Dict[str, Any]] = None,
 ):
     classifier.eval()
@@ -4632,12 +5267,23 @@ def _evaluate_berkeley_classifier_gate(
         return ("cuda" in txt) or ("cudnn" in txt) or ("cublas" in txt)
 
     batch_idx = 0
-    for xb, yb in loader:
+    mask_loss_total = 0.0
+    for batch in loader:
         batch_idx += 1
+        xb, yb, mb, batch_meta = _unpack_masked_semantic_batch(batch, context="berkeley gate evaluation")
         xb = xb.to(device, non_blocking=True)
         if channels_last:
             xb = xb.contiguous(memory_format=torch.channels_last)
         yb = yb.to(device, non_blocking=True)
+        mb = mb.to(device, non_blocking=True)
+        xb, yb, mb = _expand_semantic_mask_supervision_batch(
+            xb=xb,
+            yb=yb,
+            mb=mb,
+            batch_meta=batch_meta,
+            mode=str(semantic_mask_supervision_mode),
+            context="berkeley gate evaluation",
+        )
         batch_n = int(xb.shape[0])
         eval_chunk = max(1, int(batch_n))
 
@@ -4647,12 +5293,19 @@ def _evaluate_berkeley_classifier_gate(
                 batch_seen = 0
                 batch_logits: List[torch.Tensor] = []
                 batch_targets: List[torch.Tensor] = []
+                batch_mask_loss = 0.0
                 for start in range(0, batch_n, eval_chunk):
                     stop = min(batch_n, start + eval_chunk)
                     xb_part = xb[start:stop]
                     yb_part = yb[start:stop]
+                    mb_part = mb[start:stop]
                     with _autocast_context(device=device, enabled=amp_enabled, amp_dtype_t=amp_dtype_t):
-                        logits = classifier(xb_part)
+                        out = _forward_classifier_outputs_require_mask(
+                            classifier=classifier,
+                            xb=xb_part,
+                            context="berkeley gate evaluation",
+                        )
+                        logits = out["logits"]
                     supervised_dim = int(yb_part.shape[1]) if int(yb_part.ndim) == 2 else int(logits.shape[1])
                     if int(active_classes) > 0:
                         supervised_dim = min(int(supervised_dim), int(active_classes))
@@ -4663,9 +5316,15 @@ def _evaluate_berkeley_classifier_gate(
                         y_multihot=yb_part,
                         supervised_dim=int(supervised_dim),
                     )
-                    loss = loss * float(CLASSIFIER_LOSS_SCALE)
+                    mask_loss, _ = _semantic_mask_bce_loss(
+                        mask_logits=out["mask_logits"],
+                        mask_targets=mb_part,
+                        context="berkeley gate evaluation",
+                    )
+                    loss = (loss * float(CLASSIFIER_LOSS_SCALE)) + mask_loss
                     part_n = int(xb_part.shape[0])
                     batch_loss += float(loss.item()) * part_n
+                    batch_mask_loss += float(mask_loss.item()) * part_n
                     batch_seen += part_n
                     batch_logits.append(logits_sup.detach().cpu())
                     batch_targets.append(y_sup.detach().cpu())
@@ -4691,6 +5350,7 @@ def _evaluate_berkeley_classifier_gate(
                             pass
 
                 total_loss += float(batch_loss)
+                mask_loss_total += float(batch_mask_loss)
                 n += int(batch_seen)
                 logits_all.extend(batch_logits)
                 targets_all.extend(batch_targets)
@@ -4714,6 +5374,7 @@ def _evaluate_berkeley_classifier_gate(
     if n <= 0:
         return {
             "loss": 0.0,
+            "mask_bce": 0.0,
             "macro_f1": 0.0,
             "micro_f1": 0.0,
             "bit_acc": 0.0,
@@ -4739,6 +5400,7 @@ def _evaluate_berkeley_classifier_gate(
     mean_conf = torch.maximum(probs, 1.0 - probs).mean().item()
     return {
         "loss": total_loss / max(1, n),
+        "mask_bce": mask_loss_total / max(1, n),
         "macro_f1": float(macro_f1),
         "micro_f1": float(micro_f1),
         "bit_acc": float(bit_acc),
@@ -4768,8 +5430,13 @@ def _run_berkeley_refresh_epochs(
     max_seconds: float = 0.0,
     cache_x: Optional[torch.Tensor] = None,
     cache_y: Optional[torch.Tensor] = None,
+    cache_m: Optional[torch.Tensor] = None,
     cache_batch_size: int = 0,
     active_classes: int = 0,
+    semantic_mask_supervision_mode: str = "multihot_mix",
+    vram_fraction: float = 0.35,
+    activation_multiplier: float = 18.0,
+    max_forward_batch_cap: int = 0,
     target_label_knockout_prob: float = 0.0,
     target_label_knockout_min_keep: int = 1,
     target_label_knockout_max_drop_frac: float = 0.5,
@@ -4793,12 +5460,16 @@ def _run_berkeley_refresh_epochs(
     use_scaler = bool(amp_enabled and device.type == "cuda" and amp_dtype_t == torch.float16)
     scaler = _make_grad_scaler(enabled=use_scaler)
     grad_accum_steps = max(1, int(grad_accum_steps))
+    mode_key = re.sub(r"\s+", "_", str(semantic_mask_supervision_mode)).strip().lower()
     use_cache = (
         (cache_x is not None)
         and (cache_y is not None)
+        and (cache_m is not None)
         and int(getattr(cache_x, "shape", [0])[0]) > 0
         and int(getattr(cache_y, "shape", [0])[0]) == int(getattr(cache_x, "shape", [0])[0])
+        and int(getattr(cache_m, "shape", [0])[0]) == int(getattr(cache_x, "shape", [0])[0])
         and int(cache_batch_size) > 0
+        and mode_key in ("", "multihot_mix", "multihot", "mixed")
     )
     cache_batch_size = max(1, int(cache_batch_size)) if use_cache else 0
     refresh_source = "cache" if use_cache else "loader"
@@ -4835,6 +5506,7 @@ def _run_berkeley_refresh_epochs(
     total_target_steps = max(1, int(epochs) * steps_per_epoch)
     global_step = 0
     stop_now = False
+    logged_refresh_microbatch_cap = -1
     for _ in range(int(epochs)):
         step = 0
         opt.zero_grad(set_to_none=True)
@@ -4865,49 +5537,145 @@ def _run_berkeley_refresh_epochs(
                     cache_pos += take
                     need -= take
                 idx = idx_parts[0] if len(idx_parts) == 1 else torch.cat(idx_parts, dim=0)
-                xb = cache_x.index_select(0, idx)
-                yb = cache_y.index_select(0, idx)
+                xb = None
+                yb = None
+                mb = None
+                batch_meta = None
             else:
                 try:
-                    xb, yb = next(loader_iter)
+                    xb, yb, mb, batch_meta = _unpack_masked_semantic_batch(next(loader_iter), context="berkeley refresh training")
                 except StopIteration:
                     loader_iter = iter(loader)
-                    xb, yb = next(loader_iter)
-            if xb.device != device:
-                xb = xb.to(device, non_blocking=True)
-            if yb.device != device:
-                yb = yb.to(device, non_blocking=True)
-            if bool(knockout_enabled):
-                yb, rows_drop, labels_drop = _label_knockout_tensor_batch(
+                    xb, yb, mb, batch_meta = _unpack_masked_semantic_batch(next(loader_iter), context="berkeley refresh training")
+            if not bool(use_cache):
+                xb, yb, mb = _expand_semantic_mask_supervision_batch(
+                    xb=xb,
                     yb=yb,
-                    rng=knockout_rng,
-                    prob=float(knockout_prob),
-                    min_keep=int(target_label_knockout_min_keep),
-                    max_drop_frac=float(target_label_knockout_max_drop_frac),
-                    threshold=0.5,
+                    mb=mb,
+                    batch_meta=batch_meta,
+                    mode=str(semantic_mask_supervision_mode),
+                    context="berkeley refresh training",
                 )
-                knockout_rows_applied += int(rows_drop)
-                knockout_labels_dropped += int(labels_drop)
-            if channels_last:
-                xb = xb.contiguous(memory_format=torch.channels_last)
-            with _autocast_context(device=device, enabled=amp_enabled, amp_dtype_t=amp_dtype_t):
-                logits = classifier(xb)
-            supervised_dim = int(yb.shape[1]) if int(yb.ndim) == 2 else int(logits.shape[1])
-            if int(active_classes) > 0:
-                supervised_dim = min(int(supervised_dim), int(active_classes))
-            supervised_dim = max(1, int(supervised_dim))
-            loss, logits_sup, y_sup, _ = _classifier_supervision_loss(
-                classifier=classifier,
-                logits=logits,
-                y_multihot=yb,
-                supervised_dim=int(supervised_dim),
+            total_batch_n = int(idx.numel()) if use_cache else max(1, int(xb.shape[0]))
+            slice_cap = _auto_berkeley_refresh_batch_size(
+                cache_x=(cache_x if use_cache else xb),
+                cache_y=(cache_y if use_cache else yb),
+                cache_m=(cache_m if use_cache else mb),
+                device=device,
+                vram_fraction=float(vram_fraction),
+                activation_multiplier=float(activation_multiplier),
+                max_cap=(int(max_forward_batch_cap) if int(max_forward_batch_cap) > 0 else int(total_batch_n)),
             )
-            loss = loss * float(CLASSIFIER_LOSS_SCALE)
-            loss_to_backprop = loss / float(grad_accum_steps)
-            if use_scaler:
-                scaler.scale(loss_to_backprop).backward()
-            else:
-                loss_to_backprop.backward()
+            slice_cap = max(1, min(int(slice_cap), int(total_batch_n)))
+            if int(slice_cap) != int(logged_refresh_microbatch_cap):
+                _log(
+                    "[berkeley-refresh] microbatch cap: "
+                    f"batch={int(total_batch_n)} cap={int(slice_cap)} source={str(refresh_source)}"
+                )
+                logged_refresh_microbatch_cap = int(slice_cap)
+            step_loss_value = 0.0
+            step_seen = 0
+            preview_img_cpu = None
+            preview_probs_cpu = None
+            preview_target_cpu = None
+            preview_target_mask_cpu = None
+            preview_detected_mask_cpu = None
+            preview_batch_loss = 0.0
+            while True:
+                try:
+                    step_loss_value = 0.0
+                    step_seen = 0
+                    for st in range(0, int(total_batch_n), int(slice_cap)):
+                        ed = min(int(total_batch_n), int(st + slice_cap))
+                        if use_cache:
+                            idx_part = idx[st:ed]
+                            xb_part = cache_x.index_select(0, idx_part)
+                            yb_part = cache_y.index_select(0, idx_part)
+                            mb_part = cache_m.index_select(0, idx_part)
+                        else:
+                            xb_part = xb[st:ed]
+                            yb_part = yb[st:ed]
+                            mb_part = mb[st:ed]
+                        if xb_part.device != device:
+                            xb_part = xb_part.to(device, non_blocking=True)
+                        if yb_part.device != device:
+                            yb_part = yb_part.to(device, non_blocking=True)
+                        if mb_part.device != device:
+                            mb_part = mb_part.to(device, non_blocking=True)
+                        if bool(knockout_enabled):
+                            yb_part, rows_drop, labels_drop = _label_knockout_tensor_batch(
+                                yb=yb_part,
+                                rng=knockout_rng,
+                                prob=float(knockout_prob),
+                                min_keep=int(target_label_knockout_min_keep),
+                                max_drop_frac=float(target_label_knockout_max_drop_frac),
+                                threshold=0.5,
+                            )
+                            knockout_rows_applied += int(rows_drop)
+                            knockout_labels_dropped += int(labels_drop)
+                        if channels_last:
+                            xb_part = xb_part.contiguous(memory_format=torch.channels_last)
+                        with _autocast_context(device=device, enabled=amp_enabled, amp_dtype_t=amp_dtype_t):
+                            out = _forward_classifier_outputs_require_mask(
+                                classifier=classifier,
+                                xb=xb_part,
+                                context="berkeley refresh training",
+                            )
+                            logits = out["logits"]
+                        supervised_dim = int(yb_part.shape[1]) if int(yb_part.ndim) == 2 else int(logits.shape[1])
+                        if int(active_classes) > 0:
+                            supervised_dim = min(int(supervised_dim), int(active_classes))
+                        supervised_dim = max(1, int(supervised_dim))
+                        loss, _, _, _ = _classifier_supervision_loss(
+                            classifier=classifier,
+                            logits=logits,
+                            y_multihot=yb_part,
+                            supervised_dim=int(supervised_dim),
+                        )
+                        mask_loss, _ = _semantic_mask_bce_loss(
+                            mask_logits=out["mask_logits"],
+                            mask_targets=mb_part,
+                            context="berkeley refresh training",
+                        )
+                        loss = (loss * float(CLASSIFIER_LOSS_SCALE)) + mask_loss
+                        part_weight = float(ed - st) / float(max(1, int(total_batch_n)))
+                        loss_to_backprop = (loss * float(part_weight)) / float(grad_accum_steps)
+                        if use_scaler:
+                            scaler.scale(loss_to_backprop).backward()
+                        else:
+                            loss_to_backprop.backward()
+                        step_loss_value += float(loss.detach().item()) * float(ed - st)
+                        step_seen += int(ed - st)
+                        if preview_img_cpu is None and int(xb_part.shape[0]) > 0:
+                            probs_sup = torch.sigmoid(logits[:, : int(supervised_dim)].detach()).to(torch.float32)
+                            preview_img_cpu = xb_part[0].detach().to(device="cpu", dtype=torch.float32)
+                            preview_probs_cpu = probs_sup[0].detach().to(device="cpu", dtype=torch.float32)
+                            preview_target_cpu = yb_part[0, : int(supervised_dim)].detach().to(device="cpu", dtype=torch.float32)
+                            preview_target_mask_cpu = mb_part[0].detach().to(device="cpu", dtype=torch.float32)
+                            preview_detected_mask_cpu = torch.sigmoid(out["mask_logits"][0].detach()).to(device="cpu", dtype=torch.float32)
+                            preview_batch_loss = float(loss.detach().to(torch.float32).item())
+                        del xb_part, yb_part, mb_part, out, logits, loss, mask_loss
+                        if 'probs_sup' in locals():
+                            del probs_sup
+                        if device.type == "cuda":
+                            try:
+                                torch.cuda.empty_cache()
+                            except Exception:
+                                pass
+                    break
+                except torch.OutOfMemoryError:
+                    if device.type != "cuda" or int(slice_cap) <= 1:
+                        raise
+                    opt.zero_grad(set_to_none=True)
+                    try:
+                        torch.cuda.empty_cache()
+                    except Exception:
+                        pass
+                    slice_cap = max(1, int(slice_cap // 2))
+                    _log(
+                        "[berkeley-refresh] cuda oom; retrying with smaller microbatch cap "
+                        f"{int(slice_cap)}"
+                    )
             do_step = ((step + 1) % grad_accum_steps == 0) or ((step + 1) == steps_per_epoch)
             if do_step:
                 if use_scaler:
@@ -4920,8 +5688,8 @@ def _run_berkeley_refresh_epochs(
                     opt.step()
                 lr_ctl.step()
                 opt.zero_grad(set_to_none=True)
-            total_loss += float(loss.item()) * int(xb.shape[0])
-            n += int(xb.shape[0])
+            total_loss += float(step_loss_value)
+            n += int(step_seen)
             step += 1
             global_step += 1
             if int(log_every) > 0 and (global_step % int(log_every) == 0):
@@ -4938,21 +5706,28 @@ def _run_berkeley_refresh_epochs(
                     emit = ((int(global_step) % int(log_every) == 0) or (int(global_step) == int(total_target_steps)))
                 else:
                     emit = (int(global_step) == int(total_target_steps))
-                if emit and int(xb.shape[0]) > 0:
+                if emit and preview_img_cpu is not None:
                     try:
                         step_preview_callback(
                             {
                                 "global_step": int(global_step),
                                 "total_steps": int(total_target_steps),
-                                "img": xb[0].detach().to(torch.float32),
-                                "probs": torch.sigmoid(logits_sup[0].detach()).to(torch.float32),
-                                "target_vec": y_sup[0].detach().to(torch.float32),
+                                "img": preview_img_cpu,
+                                "probs": preview_probs_cpu,
+                                "target_vec": preview_target_cpu,
+                                "target_mask": preview_target_mask_cpu,
+                                "detected_mask": preview_detected_mask_cpu,
                                 "loss": float(total_loss / max(1, n)),
-                                "batch_loss": float(loss.detach().to(torch.float32).item()),
+                                "batch_loss": float(preview_batch_loss),
                             }
                         )
                     except Exception as e:
                         _log(f"[stage-opengl] C-step callback failed: {e}")
+            del preview_img_cpu, preview_probs_cpu, preview_target_cpu, preview_target_mask_cpu, preview_detected_mask_cpu
+            if xb is not None:
+                del xb, yb, mb
+            if use_cache:
+                del idx
             if float(max_seconds) > 0.0 and (time.time() - t_start) >= float(max_seconds):
                 classifier.eval()
                 return {
@@ -7358,372 +8133,26 @@ def _build_berkeley_payload_bank(
     source_root: str = "",
     force_cache_rebuild: bool = False,
 ):
-    _ = bool(auto_install_scipy)  # Intentionally unused in this path; payload rebuild is SciPy-free.
-
-    def _norm_txt(x: str) -> str:
-        return re.sub(r"\s+", " ", str(x)).strip().lower()
-
-    def _is_image_file(path: Path) -> bool:
-        return str(path.suffix).strip().lower() in {".png", ".jpg", ".jpeg", ".bmp", ".webp", ".tif", ".tiff"}
-
-    def _to_rgb_chw01(path: Path, size: int) -> np.ndarray:
-        from PIL import Image
-
-        with Image.open(str(path)) as im:
-            rgb = im.convert("RGB")
-            if int(rgb.size[0]) != int(size) or int(rgb.size[1]) != int(size):
-                rgb = rgb.resize((int(size), int(size)), resample=Image.BILINEAR)
-            arr = np.asarray(rgb, dtype=np.float32)
-        if int(arr.ndim) != 3 or int(arr.shape[2]) != 3:
-            raise RuntimeError(f"Unsupported RGB payload source image shape: {tuple(arr.shape)} ({path})")
-        arr = np.clip(arr / 255.0, 0.0, 1.0).astype(np.float32, copy=False)
-        return np.transpose(arr, (2, 0, 1)).astype(np.float32, copy=False)
-
-    def _source_signature(root: Path) -> Dict[str, Any]:
-        out: Dict[str, Any] = {"root": str(root), "exists": bool(root.exists()), "datasets": []}
-        if not root.exists():
-            return out
-        ds_dirs = [p for p in root.iterdir() if p.is_dir()]
-        ds_dirs = sorted(ds_dirs, key=lambda p: p.name.lower())
-        for ds_dir in ds_dirs:
-            files = [p for p in ds_dir.rglob("*") if p.is_file() and _is_image_file(p)]
-            if len(files) <= 0:
-                continue
-            labels = set()
-            latest = 0.0
-            for fp in files:
-                try:
-                    latest = max(float(latest), float(fp.stat().st_mtime))
-                except Exception:
-                    pass
-                try:
-                    rel = fp.relative_to(ds_dir)
-                    if len(rel.parts) > 1:
-                        lbl = re.sub(r"[_\-]+", " ", str(rel.parts[0])).strip()
-                        if str(lbl):
-                            labels.add(str(lbl))
-                except Exception:
-                    pass
-            out["datasets"].append(
-                {
-                    "name": re.sub(r"[_\-]+", " ", str(ds_dir.name)).strip(),
-                    "files": int(len(files)),
-                    "latest_mtime": int(latest),
-                    "labels": sorted([str(x) for x in labels], key=lambda s: s.lower()),
-                }
-            )
-        return out
-
+    _ = bool(auto_install_scipy)
+    _ = bool(force_cache_rebuild)
     root = Path(str(data_root).strip() or "toys_to_survive_development/data/berkeley_sbd")
     size = max(8, int(image_size))
+    rows, rows_info = collect_semantic_disk_rows(
+        data_root=str(data_root),
+        class_names=_default_berkeley_class_names(),
+        source_root=str(source_root),
+    )
+    if int(len(rows)) <= 0:
+        return [], [], {"available": 0, "used": 0, "available_train": 0, "available_val": 0}, [], []
+
+    labels_np = np.stack([np.asarray(r.label_vec, dtype=np.float32).reshape(-1) for r in rows], axis=0).astype(np.float32, copy=False)
+    terms_rows = [list(_normalize_vocab_terms(r.terms)) for r in rows]
+    source_rows = [str(r.source) for r in rows]
     class_names = _default_berkeley_class_names()
     n_classes = max(1, int(len(class_names)))
-    class_lut = {_norm_txt(name): int(i) for i, name in enumerate(class_names)}
-    ext_root = Path(str(source_root).strip()) if str(source_root).strip() else (root / "payload_sources")
-    ext_sig = _source_signature(ext_root)
-
-    cache_dir = root / "cache" / f"payload_bank_rgb{int(size)}_v2"
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    manifest_path = cache_dir / "manifest.json"
-    images_path = cache_dir / "images.npy"
-    labels_path = cache_dir / "labels.npy"
-    terms_path = cache_dir / "terms.json"
-    sources_path = cache_dir / "sources.json"
-    source_catalog_path = cache_dir / "source_catalog.json"
-    cache_version = 2
-
-    cache_loaded = False
-    images_np: Optional[np.ndarray] = None
-    labels_np: Optional[np.ndarray] = None
-    terms_rows: List[List[str]] = []
-    source_rows: List[str] = []
-    manifest: Dict[str, Any] = {}
-
-    if not bool(force_cache_rebuild):
-        try:
-            if all(p.exists() for p in [manifest_path, images_path, labels_path, terms_path, sources_path]):
-                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-                valid = True
-                valid = valid and int(manifest.get("version", -1)) == int(cache_version)
-                valid = valid and int(manifest.get("image_size", -1)) == int(size)
-                valid = valid and int(manifest.get("num_classes", -1)) == int(n_classes)
-                valid = valid and list(manifest.get("class_names", [])) == list(class_names)
-                valid = valid and manifest.get("external_source_signature", {}) == ext_sig
-                if valid:
-                    images_np = np.load(str(images_path), mmap_mode="r")
-                    labels_np = np.load(str(labels_path), mmap_mode="r")
-                    terms_rows = json.loads(terms_path.read_text(encoding="utf-8"))
-                    source_rows = json.loads(sources_path.read_text(encoding="utf-8"))
-                    n_rows = int(images_np.shape[0]) if isinstance(images_np, np.ndarray) else 0
-                    valid = valid and int(images_np.ndim) == 4 and int(images_np.shape[1]) == 3
-                    valid = valid and int(images_np.shape[2]) == int(size) and int(images_np.shape[3]) == int(size)
-                    valid = valid and int(labels_np.ndim) == 2 and int(labels_np.shape[1]) == int(n_classes)
-                    valid = valid and int(labels_np.shape[0]) == int(n_rows)
-                    valid = valid and int(len(terms_rows)) == int(n_rows)
-                    valid = valid and int(len(source_rows)) == int(n_rows)
-                    if bool(valid):
-                        cache_loaded = True
-        except Exception:
-            cache_loaded = False
-
-    if not bool(cache_loaded):
-        _log(
-            "Berkeley payload bank cache missing/stale; rebuilding from Berkeley SBD source files "
-            f"into '{cache_dir}'."
-        )
-        row_specs: List[Tuple[str, np.ndarray, List[str], str]] = []
-        terms_rows = []
-        source_rows = []
-        source_counts: Dict[str, int] = {}
-        img_root = root / "img"
-        split_specs = [
-            ("train", root / "train.txt", root / "cache" / "sbd_train_multilabel.npz"),
-            ("val", root / "val.txt", root / "cache" / "sbd_val_multilabel.npz"),
-        ]
-        loaded_split_counts: Dict[str, int] = {"train": 0, "val": 0}
-        missing_images = 0
-        decode_failures = 0
-        for split_name, list_path, label_path in split_specs:
-            if not list_path.exists():
-                raise RuntimeError(f"Berkeley split list is missing for payload rebuild: {list_path}")
-            if not label_path.exists():
-                raise RuntimeError(
-                    "Berkeley multilabel cache is missing for payload rebuild: "
-                    f"{label_path}. Re-run berkeley_sbd_pretrain.py once to populate label caches."
-                )
-            ids = [str(x).strip() for x in list_path.read_text(encoding="utf-8").splitlines() if str(x).strip()]
-            try:
-                with np.load(str(label_path)) as z:
-                    if "labels" not in z.files:
-                        raise RuntimeError(f"'labels' key missing in {label_path}")
-                    labels_split = np.asarray(z["labels"], dtype=np.float32)
-            except Exception as e:
-                raise RuntimeError(f"Failed reading Berkeley label cache {label_path}: {type(e).__name__}: {e}") from e
-            if int(labels_split.ndim) != 2:
-                raise RuntimeError(
-                    "Berkeley label cache must be 2D [N,C]: "
-                    f"path={label_path} shape={tuple(labels_split.shape)}"
-                )
-            if int(labels_split.shape[0]) != int(len(ids)):
-                raise RuntimeError(
-                    "Berkeley split list/label cache row mismatch during payload rebuild: "
-                    f"split={split_name} list_rows={int(len(ids))} label_rows={int(labels_split.shape[0])}"
-                )
-            source_key = f"berkeley_sbd_{split_name}"
-            for local_idx, stem in enumerate(ids):
-                img_path = None
-                for ext in (".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"):
-                    cand = img_root / f"{str(stem)}{str(ext)}"
-                    if cand.exists():
-                        img_path = cand
-                        break
-                if img_path is None:
-                    missing_images += 1
-                    continue
-                try:
-                    # Descriptor pass validates decode without keeping image tensors in RAM.
-                    _ = _to_rgb_chw01(path=img_path, size=int(size))
-                except Exception:
-                    decode_failures += 1
-                    continue
-                yv = np.asarray(labels_split[int(local_idx)], dtype=np.float32).reshape(-1)
-                if int(yv.size) >= int(n_classes):
-                    yv = yv[: int(n_classes)]
-                else:
-                    pad = np.zeros((int(n_classes) - int(yv.size),), dtype=np.float32)
-                    yv = np.concatenate([yv, pad], axis=0)
-                pos = np.where(np.asarray(yv, dtype=np.float32) > 0.5)[0].astype(np.int64).tolist()
-                label_terms = [str(class_names[int(i)]) for i in pos if 0 <= int(i) < int(len(class_names))]
-                terms = _normalize_vocab_terms(
-                    ["berkeley sbd dataset", "object", "signal"] + list(label_terms)
-                )
-                row_specs.append(
-                    (
-                        str(img_path),
-                        np.asarray(yv, dtype=np.float32).reshape(-1),
-                        list(terms),
-                        str(source_key),
-                    )
-                )
-                source_counts[str(source_key)] = int(source_counts.get(str(source_key), 0)) + 1
-                loaded_split_counts[str(split_name)] = int(loaded_split_counts.get(str(split_name), 0)) + 1
-
-        n_train = int(loaded_split_counts.get("train", 0))
-        n_val = int(loaded_split_counts.get("val", 0))
-        if int(n_train) <= 0 or int(n_val) <= 0:
-            raise RuntimeError(
-                "Berkeley payload rebuild produced empty core splits. "
-                f"loaded_train={int(n_train)} loaded_val={int(n_val)} "
-                f"missing_images={int(missing_images)} decode_failures={int(decode_failures)}"
-            )
-
-        if ext_root.exists():
-            ds_dirs = [p for p in ext_root.iterdir() if p.is_dir()]
-            ds_dirs = sorted(ds_dirs, key=lambda p: p.name.lower())
-            for ds_dir in ds_dirs:
-                dataset_name = re.sub(r"[_\-]+", " ", str(ds_dir.name)).strip()
-                if not str(dataset_name):
-                    continue
-                files = [p for p in ds_dir.rglob("*") if p.is_file() and _is_image_file(p)]
-                files = sorted(files, key=lambda p: str(p).lower())
-                for fp in files:
-                    try:
-                        # Descriptor pass validates decode without keeping image tensors in RAM.
-                        _ = _to_rgb_chw01(path=fp, size=int(size))
-                        vec = np.zeros((int(n_classes),), dtype=np.float32)
-                        rel = fp.relative_to(ds_dir)
-                        label_term = ""
-                        if len(rel.parts) > 1:
-                            label_term = re.sub(r"[_\-]+", " ", str(rel.parts[0])).strip()
-                        ref_terms = _normalize_vocab_terms(
-                            [str(dataset_name), f"{dataset_name} dataset", "signal"] + ([str(label_term)] if str(label_term) else [])
-                        )
-                        for cand in [str(dataset_name), f"{dataset_name} dataset", str(label_term)]:
-                            key = _norm_txt(cand)
-                            if key in class_lut:
-                                vec[int(class_lut[key])] = 1.0
-                        row_specs.append(
-                            (
-                                str(fp),
-                                np.asarray(vec, dtype=np.float32).reshape(-1),
-                                list(ref_terms),
-                                str(dataset_name),
-                            )
-                        )
-                        source_counts[str(dataset_name)] = int(source_counts.get(str(dataset_name), 0)) + 1
-                    except Exception:
-                        decode_failures += 1
-                        continue
-
-        if len(row_specs) <= 0:
-            return [], [], {"available": 0, "used": 0, "available_train": 0, "available_val": 0}, []
-
-        rows_total = int(len(row_specs))
-        images_tmp_path = cache_dir / "images.tmp.npy"
-        labels_tmp_path = cache_dir / "labels.tmp.npy"
-        for tmp_path in [images_tmp_path, labels_tmp_path]:
-            try:
-                if tmp_path.exists():
-                    tmp_path.unlink()
-            except Exception:
-                pass
-        images_reused = False
-        existing_images_mm: Optional[np.ndarray] = None
-        if images_path.exists():
-            try:
-                existing_images_mm = np.load(str(images_path), mmap_mode="r")
-                if (
-                    int(getattr(existing_images_mm, "ndim", 0)) == 4
-                    and int(existing_images_mm.shape[0]) == int(rows_total)
-                    and int(existing_images_mm.shape[1]) == 3
-                    and int(existing_images_mm.shape[2]) == int(size)
-                    and int(existing_images_mm.shape[3]) == int(size)
-                ):
-                    images_reused = True
-            except Exception:
-                existing_images_mm = None
-                images_reused = False
-
-        terms_rows = []
-        source_rows = []
-        labels_mm = np.lib.format.open_memmap(
-            str(labels_tmp_path),
-            mode="w+",
-            dtype=np.float32,
-            shape=(int(rows_total), int(n_classes)),
-        )
-        if bool(images_reused):
-            for wi, row in enumerate(row_specs):
-                _, yv_row, terms_row, src_row = row
-                labels_mm[int(wi), :] = np.asarray(yv_row, dtype=np.float32).reshape(-1)[: int(n_classes)]
-                terms_rows.append(list(terms_row))
-                source_rows.append(str(src_row))
-                if ((int(wi) + 1) % 1024) == 0:
-                    labels_mm.flush()
-            labels_mm.flush()
-            del labels_mm
-            if labels_path.exists():
-                labels_path.unlink()
-            labels_tmp_path.replace(labels_path)
-            images_np = existing_images_mm if existing_images_mm is not None else np.load(str(images_path), mmap_mode="r")
-            labels_np = np.load(str(labels_path), mmap_mode="r")
-        else:
-            images_mm = np.lib.format.open_memmap(
-                str(images_tmp_path),
-                mode="w+",
-                dtype=np.float16,
-                shape=(int(rows_total), 3, int(size), int(size)),
-            )
-            for wi, row in enumerate(row_specs):
-                img_path_txt, yv_row, terms_row, src_row = row
-                x01 = _to_rgb_chw01(path=Path(str(img_path_txt)), size=int(size))
-                images_mm[int(wi), :, :, :] = np.asarray(x01, dtype=np.float16, copy=False)
-                labels_mm[int(wi), :] = np.asarray(yv_row, dtype=np.float32).reshape(-1)[: int(n_classes)]
-                terms_rows.append(list(terms_row))
-                source_rows.append(str(src_row))
-                if ((int(wi) + 1) % 512) == 0:
-                    images_mm.flush()
-                    labels_mm.flush()
-            images_mm.flush()
-            labels_mm.flush()
-            del images_mm
-            del labels_mm
-            if images_path.exists():
-                images_path.unlink()
-            if labels_path.exists():
-                labels_path.unlink()
-            images_tmp_path.replace(images_path)
-            labels_tmp_path.replace(labels_path)
-            images_np = np.load(str(images_path), mmap_mode="r")
-            labels_np = np.load(str(labels_path), mmap_mode="r")
-
-        source_catalog = {
-            "generated_at": float(time.time()),
-            "external_source_root": str(ext_root),
-            "external_source_signature": ext_sig,
-            "source_counts": {str(k): int(v) for k, v in source_counts.items()},
-            "available_rows": int(rows_total),
-            "available_train": int(n_train),
-            "available_val": int(n_val),
-            "missing_images": int(missing_images),
-            "decode_failures": int(decode_failures),
-            "images_reused": bool(images_reused),
-        }
-        manifest = {
-            "version": int(cache_version),
-            "image_size": int(size),
-            "num_classes": int(n_classes),
-            "class_names": list(class_names),
-            "available_rows": int(rows_total),
-            "available_train": int(n_train),
-            "available_val": int(n_val),
-            "available_external": int(max(0, int(rows_total) - int(n_train) - int(n_val))),
-            "external_source_root": str(ext_root),
-            "external_source_signature": ext_sig,
-            "source_counts": {str(k): int(v) for k, v in source_counts.items()},
-            "source_catalog": str(source_catalog_path),
-            "generated_at": float(time.time()),
-        }
-        terms_path.write_text(json.dumps(terms_rows, ensure_ascii=True), encoding="utf-8")
-        sources_path.write_text(json.dumps(source_rows, ensure_ascii=True), encoding="utf-8")
-        source_catalog_path.write_text(json.dumps(source_catalog, indent=2), encoding="utf-8")
-        manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
-    else:
-        if source_catalog_path.exists():
-            try:
-                manifest = dict(manifest)
-                manifest["source_catalog"] = str(source_catalog_path)
-            except Exception:
-                pass
-
-    if images_np is None or labels_np is None:
-        return [], [], {"available": 0, "used": 0, "available_train": 0, "available_val": 0}, []
-
-    n_total = int(images_np.shape[0])
-    if int(len(source_rows)) < int(n_total):
-        source_rows = list(source_rows) + (["unknown_source"] * int(max(0, int(n_total) - int(len(source_rows)))))
-    elif int(len(source_rows)) > int(n_total):
-        source_rows = list(source_rows[: int(n_total)])
+    class_lut = {re.sub(r"\s+", " ", str(name)).strip().lower(): int(i) for i, name in enumerate(class_names)}
+    berkeley_dataset_idx = int(class_lut.get("berkeley sbd dataset", -1))
+    n_total = int(len(rows))
 
     def _source_supervised_stats(source_key: str) -> Dict[str, float]:
         key = re.sub(r"\s+", " ", str(source_key)).strip().lower()
@@ -7764,7 +8193,7 @@ def _build_berkeley_payload_bank(
         )
     _log(
         "[berkeley-label-sanity] "
-        "source=payload_cache "
+        "source=disk_dataset_rows "
         f"train={int(train_lbl_stats.get('nonzero', 0))}/{int(train_lbl_stats.get('rows', 0))} "
         f"train_min/mean/max={int(train_lbl_stats.get('min', 0))}/"
         f"{float(train_lbl_stats.get('mean', 0.0)):.2f}/{int(train_lbl_stats.get('max', 0))} "
@@ -7781,15 +8210,14 @@ def _build_berkeley_payload_bank(
     else:
         picks = rng.choice(np.arange(int(n_total), dtype=np.int64), size=int(take), replace=False).astype(np.int64)
 
-    out_images: List[np.ndarray] = []
     out_targets: List[np.ndarray] = []
     out_terms: List[List[str]] = []
+    selected_rows: List[Any] = []
     used_train = 0
     used_val = 0
     used_external = 0
     used_source_counts: Dict[str, int] = {}
     for idx in picks.tolist():
-        img = np.asarray(images_np[int(idx)], dtype=np.float32)
         yv = np.asarray(labels_np[int(idx)], dtype=np.float32).reshape(-1)
         src = str(source_rows[int(idx)]) if int(idx) < int(len(source_rows)) else ""
         terms = (
@@ -7802,9 +8230,24 @@ def _build_berkeley_payload_bank(
                 "Payload bank cache row is missing original terms; strict semantic pipeline requires "
                 f"non-empty source terms. row_index={int(idx)} source={str(src)!r}"
             )
-        out_images.append(np.clip(img, 0.0, 1.0).astype(np.float32, copy=False))
+        terms_lc = {
+            re.sub(r"\s+", " ", str(t)).strip().lower()
+            for t in terms
+            if re.sub(r"\s+", " ", str(t)).strip()
+        }
+        if "berkeley sbd dataset" not in terms_lc:
+            raise RuntimeError(
+                "Payload row missing required 'berkeley sbd dataset' term tag. "
+                f"row_index={int(idx)} source={str(src)!r}"
+            )
+        if int(yv.size) <= int(berkeley_dataset_idx) or float(yv[int(berkeley_dataset_idx)]) < 0.5:
+            raise RuntimeError(
+                "Payload row missing required 'berkeley sbd dataset' target bit. "
+                f"row_index={int(idx)} source={str(src)!r}"
+            )
         out_targets.append(np.clip(yv, 0.0, 1.0).astype(np.float32, copy=False))
         out_terms.append(list(terms))
+        selected_rows.append(rows[int(idx)])
         used_source_counts[str(src)] = int(used_source_counts.get(str(src), 0)) + 1
         if str(src).lower() == "berkeley_sbd_train":
             used_train += 1
@@ -7813,22 +8256,30 @@ def _build_berkeley_payload_bank(
         else:
             used_external += 1
 
+    payload_bank = _LazyDiskSemanticPayloadBank(
+        rows=selected_rows,
+        image_size=int(size),
+        seed=int(seed),
+    )
+    out_images = _LazyDiskSemanticPayloadView(payload_bank, kind="image")
+    out_masks = _LazyDiskSemanticPayloadView(payload_bank, kind="mask")
+
     info = {
         "available": int(n_total),
-        "used": int(len(out_images)),
-        "available_train": int(manifest.get("available_train", 0)),
-        "available_val": int(manifest.get("available_val", 0)),
-        "available_external": int(manifest.get("available_external", 0)),
+        "used": int(len(selected_rows)),
+        "available_train": int(rows_info.get("available_train", 0)),
+        "available_val": int(rows_info.get("available_val", 0)),
+        "available_external": int(rows_info.get("available_external", 0)),
         "used_train": int(used_train),
         "used_val": int(used_val),
         "used_external": int(used_external),
-        "cache_dir": str(cache_dir),
-        "cache_manifest": str(manifest_path),
-        "cache_hit": bool(cache_loaded),
-        "source_catalog": str(manifest.get("source_catalog", str(source_catalog_path))),
+        "cache_dir": str(root / "cache"),
+        "cache_manifest": "",
+        "cache_hit": False,
+        "source_catalog": "",
         "used_source_counts": {str(k): int(v) for k, v in used_source_counts.items()},
     }
-    return out_images, out_targets, info, out_terms
+    return out_images, out_targets, info, out_terms, out_masks
 
 
 def _imprint_latent_stream_targets(
@@ -8313,8 +8764,8 @@ def parse_args():
     p.add_argument(
         "--semantic-vocab-extra-slots",
         type=int,
-        default=0,
-        help="Reserve this many extra semantic slots beyond supervised Berkeley classes (0 keeps legacy behavior).",
+        default=50,
+        help="Reserve this many churn-local semantic slots beyond the invariant supervised vocabulary.",
     )
     p.add_argument(
         "--semantic-vocab-churn-enabled",
@@ -8377,6 +8828,21 @@ def parse_args():
         help="Maximum number of regurgitated reservoir items retained.",
     )
     p.add_argument(
+        "--semantic-vocab-deferred-churn-prob",
+        type=float,
+        default=0.35,
+        help=(
+            "Per-cycle probability that deferred non-basic terms (e.g., Stage-2 deferrals) are used as a churn "
+            "source when selecting next active extras."
+        ),
+    )
+    p.add_argument(
+        "--semantic-vocab-deferred-churn-max-per-cycle",
+        type=int,
+        default=8,
+        help="Maximum deferred terms consumed from the churn queue per cycle when deferred source is selected.",
+    )
+    p.add_argument(
         "--semantic-vocab-text-condition-temperature",
         type=float,
         default=8.0,
@@ -8391,8 +8857,11 @@ def parse_args():
     p.add_argument(
         "--semantic-vocab-unknown-label-rows-per-cycle",
         type=int,
-        default=8,
-        help="Additional symbol payload rows per cycle sourced from unknown (out-of-vocabulary) term labels.",
+        default=0,
+        help=(
+            "Out-of-vocabulary symbol terms are deferred into churn candidates; this controls how many are sampled "
+            "per cycle for churn-queueing (not direct classifier payload admission)."
+        ),
     )
     p.add_argument(
         "--semantic-vocab-bootstrap-origin-label",
@@ -8404,7 +8873,7 @@ def parse_args():
         dest="semantic_vocab_auto_symbol_pool",
         action="store_true",
         help=(
-            "Build semantic symbol pool from official datasets (MNIST/EMNIST/KMNIST) plus synthetic core semantic terms; "
+            "Build semantic symbol pool from official datasets (MNIST/EMNIST/KMNIST) plus synthetic bootstrap semantic terms; "
             "used for churn slots and payload augmentation."
         ),
     )
@@ -8439,6 +8908,19 @@ def parse_args():
         ),
     )
     p.add_argument(
+        "--semantic-vocab-pregestation-enabled",
+        dest="semantic_vocab_pregestation_enabled",
+        action="store_true",
+        help="Run a pre-gestation formal-logic stage with color+direction synthetic scenes before gestation refresh.",
+    )
+    p.add_argument("--no-semantic-vocab-pregestation-enabled", dest="semantic_vocab_pregestation_enabled", action="store_false")
+    p.add_argument(
+        "--semantic-vocab-pregestation-samples-per-combo",
+        type=int,
+        default=4,
+        help="How many formal color+direction logic scenes to synthesize per color/direction combination for pre-gestation.",
+    )
+    p.add_argument(
         "--semantic-vocab-symbol-include-pictograms",
         dest="semantic_vocab_symbol_include_pictograms",
         action="store_true",
@@ -8455,7 +8937,7 @@ def parse_args():
         action="store_true",
         help=(
             "Append synthetic/reference semantic flashcard rows to payload conditioning each cycle. "
-            "Flashcards cover locked core terms and blend Berkeley object seeds with symbol/damage variants."
+            "Flashcards cover currently active semantic terms and blend Berkeley object seeds with symbol/damage variants."
         ),
     )
     p.add_argument(
@@ -8467,7 +8949,7 @@ def parse_args():
         "--semantic-vocab-reference-flashcards-per-term",
         type=int,
         default=2,
-        help="How many reference flashcard rows to synthesize per locked core semantic term.",
+        help="How many reference flashcard rows to synthesize per active semantic term.",
     )
     p.add_argument(
         "--gd-vocab-library-enabled",
@@ -8540,6 +9022,12 @@ def parse_args():
     p.add_argument("--berkeley-refresh-log-every", type=int, default=0, help="0 disables periodic Berkeley-refresh progress logs.")
     p.add_argument("--berkeley-refresh-max-seconds", type=float, default=0.0, help="0 disables wall-time cap per refresh call.")
     p.add_argument(
+        "--semantic-mask-supervision-mode",
+        choices=["multihot_mix", "single_label_passes"],
+        default="multihot_mix",
+        help="Use multihot mixed-mask supervision or expand active labels into single-label mask-supervised passes.",
+    )
+    p.add_argument(
         "--berkeley-refresh-cache-batches",
         type=int,
         default=0,
@@ -8554,6 +9042,11 @@ def parse_args():
     p.add_argument("--berkeley-refresh-vram-fraction", type=float, default=0.90, help="Target fraction of free VRAM to fill for auto refresh batch.")
     p.add_argument("--berkeley-refresh-activation-mult", type=float, default=10.0, help="Activation overhead multiplier used for auto refresh batch sizing.")
     p.add_argument("--berkeley-refresh-max-batch-cap", type=int, default=0, help="Hard cap for auto refresh batch size (0 = no cap).")
+    p.add_argument("--stage-c-lora-enabled", dest="stage_c_lora_enabled", action="store_true", help="Enable Stage C LoRA-only classifier refresh on churn rows.")
+    p.add_argument("--no-stage-c-lora-enabled", dest="stage_c_lora_enabled", action="store_false")
+    p.add_argument("--stage-c-lora-rank", type=int, default=8, help="LoRA rank used for Stage C classifier overlays.")
+    p.add_argument("--stage-c-lora-alpha", type=float, default=16.0, help="LoRA alpha scaling used for Stage C classifier overlays.")
+    p.add_argument("--stage-c-lora-max-terms", type=int, default=50, help="Maximum churn terms assigned to a single Stage C LoRA slot before scheduler switches slots.")
     p.add_argument("--loader-persistent-workers", dest="loader_persistent_workers", action="store_true")
     p.add_argument("--no-loader-persistent-workers", dest="loader_persistent_workers", action="store_false")
     p.add_argument("--loader-prefetch-factor", type=int, default=4)
@@ -8818,6 +9311,9 @@ def parse_args():
     p.add_argument("--generator-log-every", type=int, default=20)
     p.add_argument("--generator-loss-adv-weight", type=float, default=0.50)
     p.add_argument("--generator-loss-cls-weight", type=float, default=1.50)
+    p.add_argument("--generator-loss-mask-weight", type=float, default=1.00)
+    p.add_argument("--generator-loss-disc-mask-weight", type=float, default=0.50)
+    p.add_argument("--generator-loss-outside-mask-weight", type=float, default=0.25)
     p.add_argument(
         "--generator-loss-wave-weight",
         type=float,
@@ -8860,6 +9356,7 @@ def parse_args():
         default="blur_stride",
         help="Degradation mode used in generator wave-coupling path.",
     )
+    p.add_argument("--generator-mask-threshold", type=float, default=0.5)
     p.add_argument("--generator-gate-min-target-prob", type=float, default=0.55)
     p.add_argument("--generator-gate-maintain-rounds", type=int, default=1)
     p.add_argument(
@@ -8972,6 +9469,15 @@ def parse_args():
         "--wave-cls-accepted-only",
         action="store_true",
         help="Train wave classifier on only accepted transformer outputs (score/l1 gated).",
+    )
+    p.add_argument(
+        "--gate-pregestation-loss-target",
+        type=float,
+        default=1.5,
+        help=(
+            "Hard pre-gestation gate: maximum allowed average classifier loss on the Stage-0 formal logic color-direction pairs set. "
+            "Stage 1 gestation does not begin until this gate is satisfied."
+        ),
     )
     p.add_argument(
         "--gate-gestation-loss-target",
@@ -9259,11 +9765,14 @@ def parse_args():
         berkeley_payload_cache_rebuild=False,
         semantic_vocab_churn_enabled=False,
         semantic_vocab_regurgitated_churn_enabled=True,
+        semantic_vocab_deferred_churn_prob=0.35,
+        semantic_vocab_deferred_churn_max_per_cycle=8,
         semantic_vocab_text_condition_topk=0,
-        semantic_vocab_unknown_label_rows_per_cycle=8,
-        semantic_vocab_auto_symbol_pool=True,
+        semantic_vocab_unknown_label_rows_per_cycle=0,
+        semantic_vocab_auto_symbol_pool=False,
+        semantic_vocab_pregestation_enabled=True,
         semantic_vocab_symbol_include_pictograms=True,
-        semantic_vocab_reference_flashcards=True,
+        semantic_vocab_reference_flashcards=False,
         gd_vocab_library_enabled=True,
         gd_vocab_library_autoload=True,
         training_preview_enabled=True,
@@ -9271,6 +9780,7 @@ def parse_args():
         stage_opengl_preview_bootstrap=True,
         stage_opengl_preview_required=False,
         checkpoint_after_training_segment=False,
+        stage_c_lora_enabled=True,
         stage_module_offload=True,
         stage_module_offload_empty_cache=True,
         joint_enabled=True,
@@ -9420,7 +9930,9 @@ def main():
         "Semantic vocab churn: "
         f"enabled={1 if bool(args.semantic_vocab_churn_enabled) else 0}, "
         f"replace_per_cycle={int(args.semantic_vocab_churn_replace_per_cycle)}, "
-        f"sweep_cycles={int(args.semantic_vocab_churn_sweep_cycles)}"
+        f"sweep_cycles={int(args.semantic_vocab_churn_sweep_cycles)}, "
+        f"deferred_prob={float(args.semantic_vocab_deferred_churn_prob):.2f}, "
+        f"deferred_max={int(args.semantic_vocab_deferred_churn_max_per_cycle)}"
     )
     _log(
         "Model capacity: "
@@ -9825,17 +10337,22 @@ def main():
             semantic_extra_terms.extend(_load_vocab_terms_json(str(args.semantic_vocab_extra_json)))
         semantic_extra_terms = _normalize_vocab_terms(semantic_extra_terms)
         base_lc = {str(x).strip().lower() for x in supervised_class_names}
-        semantic_core_terms = [
-            t for t in _normalize_vocab_terms(_default_semantic_core_terms()) if str(t).strip().lower() not in base_lc
+        removed_seed_terms_lc = {
+            str(x).strip().lower()
+            for x in _removed_semantic_seed_terms()
+            if str(x).strip()
+        }
+        semantic_core_terms: List[str] = []
+        semantic_extra_terms = [
+            t
+            for t in semantic_extra_terms
+            if str(t).strip().lower() not in base_lc and str(t).strip().lower() not in removed_seed_terms_lc
         ]
-        semantic_extra_terms = [t for t in semantic_extra_terms if str(t).strip().lower() not in base_lc]
+        semantic_requested_extra_terms = list(semantic_extra_terms)
         semantic_extra_terms = _normalize_active_extra_terms_with_core(
             active_terms=semantic_extra_terms,
             core_terms=semantic_core_terms,
-            total_slots=max(
-                max(0, int(args.semantic_vocab_extra_slots)),
-                int(len(semantic_extra_terms) + len(semantic_core_terms)),
-            ),
+            total_slots=max(0, int(args.semantic_vocab_extra_slots)),
         )
         semantic_core_extra_count = int(len(semantic_core_terms))
         semantic_class_names = list(supervised_class_names) + list(semantic_extra_terms)
@@ -9845,11 +10362,6 @@ def main():
             _log(
                 "[semantic-vocab] expanded classifier vocabulary: "
                 f"supervised={supervised_num_classes} total={semantic_num_classes} extras={semantic_extra_count}"
-            )
-        if int(semantic_core_extra_count) > 0:
-            _log(
-                "[semantic-vocab] enforced core semantic terms: "
-                f"{','.join(semantic_core_terms)} (locked={int(semantic_core_extra_count)})"
             )
         if int(args.semantic_vocab_extra_slots) > int(len(_normalize_vocab_terms(_parse_label_query_texts(str(args.semantic_vocab_extra_texts))))):
             _log(
@@ -9889,8 +10401,38 @@ def main():
         _semantic_text_condition_cache: Dict[Tuple[str, ...], np.ndarray] = {}
         _semantic_supervised_condition_cache: Dict[Tuple[int, ...], np.ndarray] = {}
         semantic_term_to_idx: Dict[str, int] = _semantic_term_index_map(class_names)
+        berkeley_term_idx_runtime = int(semantic_term_to_idx.get("berkeley sbd dataset", -1))
         _semantic_bank_norm_cache_key: Tuple[int, int, int] = (-1, -1, -1)
         _semantic_bank_norm_cache: Optional[np.ndarray] = None
+
+        def _row_has_berkeley_term_runtime(terms: Sequence[str]) -> bool:
+            if not isinstance(terms, (list, tuple)):
+                return False
+            for x in terms:
+                tk = re.sub(r"\s+", " ", str(x)).strip().lower()
+                if tk == "berkeley sbd dataset":
+                    return True
+            return False
+
+        def _assert_berkeley_target_flag_runtime(
+            vec: Optional[np.ndarray],
+            terms: Sequence[str],
+            context: str,
+        ):
+            if not bool(_row_has_berkeley_term_runtime(terms)):
+                return
+            if int(berkeley_term_idx_runtime) < 0:
+                raise RuntimeError(
+                    "Berkeley semantic authority failure: 'berkeley sbd dataset' class term is missing "
+                    f"while validating {str(context)}."
+                )
+            arr = np.asarray(vec, dtype=np.float32).reshape(-1) if vec is not None else np.zeros((0,), dtype=np.float32)
+            if int(arr.size) <= int(berkeley_term_idx_runtime) or float(arr[int(berkeley_term_idx_runtime)]) < 0.5:
+                raise RuntimeError(
+                    "Berkeley semantic authority failure: Berkeley material is missing the "
+                    "'berkeley sbd dataset' target flag "
+                    f"(context={str(context)}, idx={int(berkeley_term_idx_runtime)})."
+                )
 
         def _semantic_bank_norm_runtime() -> Optional[np.ndarray]:
             nonlocal _semantic_bank_norm_cache_key, _semantic_bank_norm_cache
@@ -9959,23 +10501,44 @@ def main():
 
         semantic_kind_keys = _semantic_kind_keys_for_class_names(semantic_class_names)
         semantic_kind_target_vectors = {}
+
+        def _semantic_condition_from_present_terms_runtime(terms: Sequence[str]) -> np.ndarray:
+            present_terms: List[str] = []
+            seen_present: set = set()
+            for term in terms:
+                tk = re.sub(r"\s+", " ", str(term)).strip().lower()
+                if not tk or tk not in semantic_term_to_idx or tk in seen_present:
+                    continue
+                seen_present.add(str(tk))
+                present_terms.append(str(term))
+            if len(present_terms) <= 0:
+                return np.zeros((int(condition_num_classes),), dtype=np.float32)
+            return np.asarray(
+                _semantic_condition_from_terms_runtime(terms=present_terms),
+                dtype=np.float32,
+            ).reshape(-1)
+
         for kind_key in semantic_kind_keys:
             kk = re.sub(r"\s+", " ", str(kind_key)).strip().lower()
             if kk in ("mix", "mixed noise and signal"):
-                terms = ["mixed noise and signal", "mix", "signal", "noise"]
+                vec = _semantic_condition_from_present_terms_runtime(
+                    ["mixed noise and signal", "mix", "signal", "noise"]
+                )
             elif kk == "regurgitated content":
-                terms = ["regurgitated content", "mixed noise and signal", "signal"]
+                vec = _semantic_condition_from_present_terms_runtime(
+                    ["regurgitated content", "mixed noise and signal", "signal"]
+                )
             else:
-                terms = [str(kind_key)]
-            semantic_kind_target_vectors[str(kind_key)] = _semantic_condition_from_terms_runtime(terms=terms)
-        mix_condition_target_default = _semantic_condition_from_terms_runtime(
-            terms=["mixed noise and signal", "signal", "noise"],
+                vec = _semantic_condition_from_present_terms_runtime([str(kind_key)])
+            semantic_kind_target_vectors[str(kind_key)] = vec
+        mix_condition_target_default = _semantic_condition_from_present_terms_runtime(
+            ["mixed noise and signal", "signal", "noise"],
         )
-        regurgitated_condition_target_default = _semantic_condition_from_terms_runtime(
-            terms=["regurgitated content", "mixed noise and signal", "signal"],
+        regurgitated_condition_target_default = _semantic_condition_from_present_terms_runtime(
+            ["regurgitated content", "mixed noise and signal", "signal"],
         )
         _log(
-            "[semantic-vocab] core kind vectors: "
+            "[semantic-vocab] runtime kind vectors: "
             f"none={1 if 'none' in semantic_kind_target_vectors else 0} "
             f"noise={1 if 'noise' in semantic_kind_target_vectors else 0} "
             f"mix={1 if 'mix' in semantic_kind_target_vectors else 0} "
@@ -9991,17 +10554,7 @@ def main():
         )
         active_extra_terms: List[str] = list(semantic_extra_terms)
         # Keep wave split labels isolated from semantic training churn.
-        semantic_vocab_pool_terms: List[str] = _normalize_vocab_terms(
-            list(active_extra_terms)
-            + [
-                str(fake_sentinel_label),
-                "regurgitated content",
-                "berkeley sbd dataset",
-                "mnist dataset",
-                "emnist dataset",
-                "kmnist dataset",
-            ]
-        )
+        semantic_vocab_pool_terms: List[str] = _normalize_vocab_terms(list(active_extra_terms))
         semantic_vocab_pool_terms = [
             t for t in semantic_vocab_pool_terms if str(t).strip().lower() not in set(base_lc)
         ]
@@ -10039,6 +10592,7 @@ def main():
         bootstrap_symbol_terms: set = set()
         gestation_symbol_terms: set = set()
         payload_images_base: List[np.ndarray] = []
+        payload_masks_base: List[np.ndarray] = []
         payload_conditions_supervised_base: List[np.ndarray] = []
         payload_condition_terms_supervised_base: List[List[str]] = []
         payload_symbol_aug_info: Dict[str, Any] = {"enabled": False, "rows_added": 0}
@@ -10050,6 +10604,193 @@ def main():
         )
         active_gd_vocab_hash = ""
         active_gd_vocab_profile: Dict[str, Any] = {}
+        deferred_churn_terms_pending: List[str] = []
+        deferred_churn_term_events: List[Dict[str, Any]] = []
+
+        def _basic_authority_terms_lc_runtime() -> set:
+            out = {
+                re.sub(r"\s+", " ", str(x)).strip().lower()
+                for x in supervised_class_names
+                if re.sub(r"\s+", " ", str(x)).strip()
+            }
+            out.update(
+                {
+                    re.sub(r"\s+", " ", str(x)).strip().lower()
+                    for x in semantic_core_terms
+                    if re.sub(r"\s+", " ", str(x)).strip()
+                }
+            )
+            return out
+
+        def _queue_terms_into_churn_runtime(terms: Sequence[str], source: str) -> List[str]:
+            nonlocal deferred_churn_terms_pending
+            norm_terms = _normalize_vocab_terms([str(t) for t in list(terms)])
+            if len(norm_terms) <= 0:
+                return []
+            basic_lc = _basic_authority_terms_lc_runtime()
+            active_lc = {
+                re.sub(r"\s+", " ", str(x)).strip().lower()
+                for x in active_extra_terms
+                if re.sub(r"\s+", " ", str(x)).strip()
+            }
+            pool_lc = {
+                re.sub(r"\s+", " ", str(x)).strip().lower()
+                for x in semantic_vocab_pool_terms
+                if re.sub(r"\s+", " ", str(x)).strip()
+            }
+            pending_lc = {
+                re.sub(r"\s+", " ", str(x)).strip().lower()
+                for x in deferred_churn_terms_pending
+                if re.sub(r"\s+", " ", str(x)).strip()
+            }
+            queued: List[str] = []
+            for term in norm_terms:
+                tk = re.sub(r"\s+", " ", str(term)).strip().lower()
+                if not tk:
+                    continue
+                if tk in basic_lc or tk in active_lc:
+                    continue
+                if re.fullmatch(r"semantic slot \d+", tk):
+                    continue
+                if tk in pool_lc:
+                    continue
+                if tk in pending_lc:
+                    continue
+                queued.append(str(term))
+                pending_lc.add(str(tk))
+            if len(queued) > 0:
+                deferred_churn_terms_pending = _normalize_vocab_terms(list(deferred_churn_terms_pending) + list(queued))
+                deferred_churn_term_events.append(
+                    {
+                        "source": str(source),
+                        "count": int(len(queued)),
+                        "terms": list(queued),
+                    }
+                )
+            return queued
+
+        def _active_terms_present_in_rows_runtime(
+            term_rows: Sequence[Sequence[str]],
+            candidate_terms: Sequence[str],
+        ) -> List[str]:
+            observed_lc: set = set()
+            for raw_terms in term_rows:
+                if not isinstance(raw_terms, (list, tuple)):
+                    continue
+                for term in raw_terms:
+                    tk = re.sub(r"\s+", " ", str(term)).strip().lower()
+                    if tk:
+                        observed_lc.add(str(tk))
+            out: List[str] = []
+            for term in _normalize_vocab_terms([str(x) for x in list(candidate_terms)]):
+                tk = re.sub(r"\s+", " ", str(term)).strip().lower()
+                if tk and tk in observed_lc:
+                    out.append(str(term))
+            return out
+
+        def _active_terms_present_in_targets_runtime(
+            targets: Sequence[Any],
+            candidate_terms: Sequence[str],
+            threshold: float = 0.5,
+        ) -> List[str]:
+            candidate_norm = _normalize_vocab_terms([str(x) for x in list(candidate_terms)])
+            if len(candidate_norm) <= 0 or len(targets) <= 0:
+                return []
+            class_map = _semantic_term_index_map(class_names)
+            candidate_pairs: List[Tuple[str, int]] = []
+            for term in candidate_norm:
+                tk = re.sub(r"\s+", " ", str(term)).strip().lower()
+                if not tk:
+                    continue
+                idx = class_map.get(tk, None)
+                if idx is None:
+                    continue
+                candidate_pairs.append((str(term), int(idx)))
+            if len(candidate_pairs) <= 0:
+                return []
+            hit_idx: set = set()
+            thr = float(max(0.0, min(1.0, float(threshold))))
+            for row in targets:
+                arr = np.asarray(row, dtype=np.float32).reshape(-1)
+                for _, idx in candidate_pairs:
+                    if 0 <= int(idx) < int(arr.size) and float(arr[int(idx)]) >= float(thr):
+                        hit_idx.add(int(idx))
+            out: List[str] = []
+            for term, idx in candidate_pairs:
+                if int(idx) in hit_idx:
+                    out.append(str(term))
+            return _normalize_vocab_terms(out)
+
+        def _payload_mask_terms_from_condition_runtime(cond_vec: Any) -> Tuple[np.ndarray, List[str], np.ndarray, np.ndarray]:
+            vec = np.asarray(cond_vec, dtype=np.float32).reshape(-1)
+            positive_idx = np.where(vec >= 0.5)[0].astype(np.int64)
+            active_terms = [str(class_names[int(i)]) for i in positive_idx.tolist() if 0 <= int(i) < int(len(class_names))]
+            return vec, active_terms, positive_idx, np.asarray(positive_idx, dtype=np.int64)
+
+        def _infer_payload_mask_payload_runtime(image: Any, cond_vec: Any) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+            _, active_terms, positive_idx, _ = _payload_mask_terms_from_condition_runtime(cond_vec)
+            mixed_mask = infer_semantic_support_mask(image=image, terms=active_terms)
+            mask_stack, mask_indices = build_label_mask_stack(mixed_mask=mixed_mask, label_vec=np.asarray(cond_vec, dtype=np.float32).reshape(-1))
+            return (
+                np.asarray(mixed_mask, dtype=np.float32),
+                np.asarray(mask_stack, dtype=np.float32),
+                np.asarray(mask_indices, dtype=np.int64),
+            )
+
+        def _prepare_payload_gan_bank_runtime(
+            payload_images_in: Sequence[np.ndarray],
+            payload_conditions_in: Sequence[Any],
+            payload_masks_in: Sequence[Any],
+            payload_mask_stacks_in: Sequence[Any],
+            payload_mask_indices_in: Sequence[Any],
+        ) -> Tuple[List[np.ndarray], List[np.ndarray], List[np.ndarray]]:
+            mode_key = re.sub(r"\s+", "_", str(args.semantic_mask_supervision_mode)).strip().lower()
+            if mode_key in ("", "multihot_mix", "multihot", "mixed"):
+                return (
+                    [np.asarray(x, dtype=np.float32) for x in payload_images_in],
+                    [np.asarray(y, dtype=np.float32).reshape(-1) for y in payload_conditions_in],
+                    [np.asarray(m, dtype=np.float32) for m in payload_masks_in],
+                )
+            out_images: List[np.ndarray] = []
+            out_conditions: List[np.ndarray] = []
+            out_masks: List[np.ndarray] = []
+            for i in range(min(int(len(payload_images_in)), int(len(payload_conditions_in)))):
+                img = np.asarray(payload_images_in[int(i)], dtype=np.float32)
+                cond = np.asarray(payload_conditions_in[int(i)], dtype=np.float32).reshape(-1)
+                mixed_mask = (
+                    np.asarray(payload_masks_in[int(i)], dtype=np.float32)
+                    if int(i) < int(len(payload_masks_in))
+                    else _infer_payload_mask_payload_runtime(img, cond)[0]
+                )
+                if int(mixed_mask.ndim) == 3 and int(mixed_mask.shape[0]) == 1:
+                    mixed_mask = mixed_mask[0]
+                stack_np = None
+                idx_np = None
+                if int(i) < int(len(payload_mask_stacks_in)):
+                    stack_np = np.asarray(payload_mask_stacks_in[int(i)], dtype=np.float32)
+                if int(i) < int(len(payload_mask_indices_in)):
+                    idx_np = np.asarray(payload_mask_indices_in[int(i)], dtype=np.int64).reshape(-1)
+                if stack_np is None or idx_np is None:
+                    stack_np, idx_np = build_label_mask_stack(mixed_mask=mixed_mask, label_vec=cond)
+                active_idx = np.where(np.asarray(cond, dtype=np.float32) >= 0.5)[0].astype(np.int64)
+                stack_lookup: Dict[int, np.ndarray] = {}
+                if stack_np is not None and idx_np is not None and int(np.asarray(stack_np).ndim) >= 3:
+                    n_pairs = min(int(np.asarray(stack_np).shape[0]), int(np.asarray(idx_np).size))
+                    for si in range(int(n_pairs)):
+                        stack_lookup[int(idx_np[int(si)])] = np.asarray(stack_np[int(si)], dtype=np.float32)
+                if int(active_idx.size) <= 0:
+                    out_images.append(np.asarray(img, dtype=np.float32))
+                    out_conditions.append(np.asarray(cond, dtype=np.float32).reshape(-1))
+                    out_masks.append(np.asarray(mixed_mask, dtype=np.float32))
+                    continue
+                for lbl in active_idx.tolist():
+                    cond_single = np.zeros_like(cond, dtype=np.float32)
+                    cond_single[int(lbl)] = 1.0
+                    out_images.append(np.asarray(img, dtype=np.float32))
+                    out_conditions.append(cond_single.astype(np.float32, copy=False))
+                    out_masks.append(np.asarray(stack_lookup.get(int(lbl), mixed_mask), dtype=np.float32))
+            return out_images, out_conditions, out_masks
+
         query_texts = _parse_label_query_texts(str(args.label_query_texts))
         if len(query_texts) > 0:
             q_emb = _encode_query_texts_for_bank(
@@ -10165,11 +10906,12 @@ def main():
                 validation_split_seed=int(gate_split_seed),
                 persistent_workers=bool(args.loader_persistent_workers),
                 prefetch_factor=int(args.loader_prefetch_factor),
+                return_mask_stack=bool(semantic_single_label_mask_mode),
             )
             _log(
                 "Berkeley refresh loader ready: "
                 f"reason={str(reason)} "
-                "source=semantic_payload_cache "
+                "source=disk_dataset_rows "
                 f"search_every={args.berkeley_refresh_every}, round_every={args.berkeley_refresh_round_every}, "
                 f"epochs={args.berkeley_refresh_epochs}, train={refresh_count}, full_non_validation_deck=1"
             )
@@ -10196,6 +10938,7 @@ def main():
                     refresh_run_batch_size = _auto_berkeley_refresh_batch_size(
                         cache_x=refresh_cache.get("x"),
                         cache_y=refresh_cache.get("y"),
+                        cache_m=refresh_cache.get("m"),
                         device=device,
                         vram_fraction=float(args.berkeley_refresh_vram_fraction),
                         activation_multiplier=float(args.berkeley_refresh_activation_mult),
@@ -10222,12 +10965,16 @@ def main():
         berkeley_gate_loader = None
         berkeley_gate_loader_count = 0
         berkeley_gate_schedule_info: Dict[str, Any] = {"rows": 0, "selected_rows": 0}
+        pregestation_stage_loader = None
+        pregestation_stage_loader_count = 0
+        pregestation_stage_info: Dict[str, Any] = {"rows": 0, "selected_rows": 0}
         gestation_stage_loader = None
         gestation_stage_loader_count = 0
         gestation_stage_info: Dict[str, Any] = {"rows": 0, "selected_rows": 0}
         gestation_gate_loader = None
         gestation_gate_loader_count = 0
         gestation_gate_info: Dict[str, Any] = {"rows": 0, "selected_rows": 0}
+        pregestation_gate_runtime_enabled = bool(float(args.gate_pregestation_loss_target) > 0.0)
         berkeley_loss_gate_enabled = (float(args.gate_berkeley_loss_target) > 0.0)
         total_gate_runtime_enabled = bool(
             float(args.gate_berkeley_min_confidence) > 0.0
@@ -10235,11 +10982,13 @@ def main():
             or bool(berkeley_loss_gate_enabled)
         )
         gestation_gate_runtime_enabled = bool(float(args.gate_gestation_loss_target) > 0.0)
-        if bool(total_gate_runtime_enabled or gestation_gate_runtime_enabled):
+        if bool(pregestation_gate_runtime_enabled or total_gate_runtime_enabled or gestation_gate_runtime_enabled):
             _log(
                 "Semantic gates enabled: "
+                f"pregestation_loss_target={float(args.gate_pregestation_loss_target):.4f}, "
                 f"gestation_loss_target={float(args.gate_gestation_loss_target):.4f}, "
                 f"total_loss_target={float(args.gate_berkeley_loss_target):.4f}, "
+                "stage0=pregestation_logic_pairs, gate0=pregestation_train_only, "
                 "stage1=gestation_train_only, gate1=gestation_val_only, "
                 "stage2=non_validation_payload_train, gate2=stage2_validation_deck[payload_validation_split_only]."
             )
@@ -10326,6 +11075,7 @@ def main():
                         )
                         refresh_cache_x = refresh_cache.get("x") if isinstance(refresh_cache, dict) else None
                         refresh_cache_y = refresh_cache.get("y") if isinstance(refresh_cache, dict) else None
+                        refresh_cache_m = refresh_cache.get("m") if isinstance(refresh_cache, dict) else None
                         refresh_cache_batch = int(refresh_run_batch_size)
                         if (
                             need_full_refresh_startup
@@ -10379,8 +11129,13 @@ def main():
                             max_seconds=float(args.berkeley_refresh_max_seconds),
                             cache_x=refresh_cache_x,
                             cache_y=refresh_cache_y,
+                            cache_m=refresh_cache_m,
                             cache_batch_size=int(refresh_cache_batch),
                             active_classes=int(score_active_classes),
+                            semantic_mask_supervision_mode=str(args.semantic_mask_supervision_mode),
+                            vram_fraction=float(args.berkeley_refresh_vram_fraction),
+                            activation_multiplier=float(args.berkeley_refresh_activation_mult),
+                            max_forward_batch_cap=int(args.berkeley_refresh_max_batch_cap),
                             target_label_knockout_prob=float(args.target_label_knockout_prob),
                             target_label_knockout_min_keep=int(args.target_label_knockout_min_keep),
                             target_label_knockout_max_drop_frac=float(args.target_label_knockout_max_drop_frac),
@@ -10484,6 +11239,7 @@ def main():
         )
 
         gate_config = {
+            "pregestation_loss_target": max(0.0, float(args.gate_pregestation_loss_target)),
             "gestation_loss_target": max(0.0, float(args.gate_gestation_loss_target)),
             "gestation_maintain_rounds": max(1, int(args.gate_gestation_maintain_rounds)),
             "berkeley_min_score": float(args.gate_berkeley_min_score),
@@ -10517,6 +11273,7 @@ def main():
         }
         _log(
             "Gate config: "
+            f"pregestation_loss_target={float(gate_config['pregestation_loss_target']):.4f}, "
             f"gestation_loss_target={float(gate_config['gestation_loss_target']):.4f}, "
             f"gestation_maintain={int(gate_config['gestation_maintain_rounds'])}, "
             f"berkeley_loss_target={float(gate_config['berkeley_loss_target']):.4f}, "
@@ -10585,8 +11342,16 @@ def main():
 
         payload_images: List[np.ndarray] = []
         payload_conditions: List[np.ndarray] = []
+        payload_masks: List[np.ndarray] = []
+        payload_mask_stacks: List[np.ndarray] = []
+        payload_mask_indices: List[np.ndarray] = []
+        semantic_single_label_mask_mode = bool(
+            re.sub(r"\s+", "_", str(args.semantic_mask_supervision_mode)).strip().lower()
+            in ("single_label_passes", "single_passes", "single_label")
+        )
         payload_bank_info = {"available": 0, "used": 0}
-        payload_gate_val_indices_base: List[int] = []
+        payload_gate_val_dataset: Optional[Dataset] = None
+        payload_gate_val_labels_base = np.zeros((0, 0), dtype=np.float32)
         payload_gate_val_terms_base: List[List[str]] = []
         payload_gate_val_info: Dict[str, Any] = {"available_rows": 0, "selected_rows": 0, "reason": "not_built"}
         payload_conditioning_info: Dict[str, Any] = {"expanded": False, "reason": "not_built"}
@@ -10604,7 +11369,7 @@ def main():
             payload_max_samples = int(args.berkeley_payload_max_samples)
             if payload_max_samples <= 0:
                 payload_max_samples = max(256, min(4096, max(1, int(args.latent_fallback_count)) * 8))
-            payload_images, payload_conditions, payload_bank_info, payload_condition_terms = _build_berkeley_payload_bank(
+            payload_images, payload_conditions, payload_bank_info, payload_condition_terms, payload_masks = _build_berkeley_payload_bank(
                 data_root=args.berkeley_data_root,
                 image_size=int(payload_size),
                 auto_install_scipy=bool(args.berkeley_auto_install_scipy),
@@ -10623,27 +11388,29 @@ def main():
                 f"cap={int(payload_max_samples)} image_size={payload_size}"
             )
             _log(
-                "[berkeley-payload-cache] "
+                "[berkeley-payload-source] "
                 f"cache_hit={1 if bool(payload_bank_info.get('cache_hit', False)) else 0} "
                 f"manifest={payload_bank_info.get('cache_manifest', '')} "
                 f"sources={payload_bank_info.get('source_catalog', '')}"
             )
-            payload_gate_val_indices_base, payload_gate_val_terms_base, payload_gate_val_info = _build_payload_validation_gate_rows(
+            payload_gate_val_dataset, payload_gate_val_labels_base, payload_gate_val_terms_base, payload_gate_val_info = _build_payload_validation_gate_dataset(
                 data_root=args.berkeley_data_root,
                 image_size=int(payload_size),
                 seed=int(gate_split_seed),
                 external_val_fraction=float(gate_external_val_fraction),
+                source_root=str(args.berkeley_payload_source_root),
+                return_mask_stack=bool(semantic_single_label_mask_mode),
             )
             _log(
                 "[gate-val-deck] "
-                "source=payload_cache "
+                f"source={str(payload_gate_val_info.get('data_source', 'disk_dataset_rows'))} "
                 f"available={int(payload_gate_val_info.get('available_rows', 0))} "
                 f"selected={int(payload_gate_val_info.get('selected_rows', 0))} "
                 f"berkeley_val={int(payload_gate_val_info.get('selected_berkeley_val', 0))} "
                 f"berkeley_train={int(payload_gate_val_info.get('selected_berkeley_train', 0))} "
                 f"refresh_nonval_total={int(payload_gate_val_info.get('refresh_rows_total', 0))} "
                 f"refresh_berkeley_train={int(payload_gate_val_info.get('refresh_rows_berkeley_train', 0))} "
-                f"cache_label_dim={int(payload_gate_val_info.get('cache_label_dim', 0))} "
+                f"label_dim={int(payload_gate_val_info.get('label_dim', 0))} "
                 f"external_frac={float(payload_gate_val_info.get('external_val_fraction', 0.0)):.2f}"
             )
             if need_payload_bank and len(payload_images) <= 0:
@@ -10651,7 +11418,8 @@ def main():
                     "Payload bank is required but no Berkeley payload images were prepared. "
                     "Check --berkeley-data-root and dataset availability."
                 )
-            payload_images_base = [np.asarray(x, dtype=np.float32) for x in payload_images]
+            payload_images_base = payload_images
+            payload_masks_base = payload_masks
             payload_conditions_supervised_base = []
             payload_condition_terms_supervised_base = []
             payload_supervised_pos_all: List[int] = []
@@ -10878,6 +11646,12 @@ def main():
                         ).astype(np.float32, copy=False)
                         for i in range(len(payload_conditions))
                     ]
+                    for i in range(len(payload_conditions)):
+                        _assert_berkeley_target_flag_runtime(
+                            vec=np.asarray(payload_conditions[i], dtype=np.float32).reshape(-1),
+                            terms=payload_condition_terms_supervised_base[i],
+                            context=f"payload_active_init row={int(i)}",
+                        )
                 latent_payload_dims = sorted(
                     {
                         int(np.asarray(row, dtype=np.float32).reshape(-1).size)
@@ -11549,55 +12323,20 @@ def main():
                 rng_sym.shuffle(unknown_bootstrap)
                 rng_sym.shuffle(unknown_other)
                 unknown_terms = list(unknown_bootstrap) + list(unknown_other)
-                for term_txt in unknown_terms:
-                    if int(unknown_rows) >= int(unknown_cap):
-                        break
+                to_queue = [str(x) for x in unknown_terms[: int(unknown_cap)]]
+                queued = _queue_terms_into_churn_runtime(
+                    terms=to_queue,
+                    source=f"symbol_unknown_deferred cycle_seed={int(cycle_seed)}",
+                )
+                for term_txt in queued:
                     key = re.sub(r"\s+", " ", str(term_txt)).strip().lower()
-                    rows = symbol_pool_by_term.get(key, [])
-                    if len(rows) <= 0:
+                    if not key:
                         continue
-                    take = min(len(rows), max(1, int(min(per_term, unknown_cap - unknown_rows))))
-                    if len(rows) <= take:
-                        picks = list(range(len(rows)))[: int(take)]
+                    unknown_term_seen.add(str(key))
+                    if str(key) in bootstrap_symbol_terms:
+                        unknown_bootstrap_seen.add(str(key))
                     else:
-                        picks = rng_sym.choice(np.arange(len(rows), dtype=np.int64), size=int(take), replace=False).astype(np.int64).tolist()
-                    for pi in picks:
-                        if int(unknown_rows) >= int(unknown_cap):
-                            break
-                        img = _image_any_to_rgb_chw01(rows[int(pi)], image_size=int(shared_embed_image_size))
-                        semantic_terms = _semantic_terms_with_tonal_tags(
-                            terms=_semantic_tags_for_symbol_term(key),
-                            image=img,
-                            image_size=int(shared_embed_image_size),
-                        )
-                        semantic_terms = _semantic_enrich_generated_terms_with_noise_spectrum(
-                            term_key=key,
-                            terms=semantic_terms,
-                            image=img,
-                        )
-                        origin_terms = _normalize_vocab_terms(
-                            list(_origin_terms_for_symbol_key(key))
-                            + [
-                                "unknown semantic label",
-                                "out of active semantic vocabulary",
-                                f"unknown semantic term::{key}",
-                            ]
-                        )
-                        vec = _semantic_condition_from_terms_runtime(
-                            terms=semantic_terms,
-                            origin_terms=origin_terms,
-                        )
-                        images_out.append(img)
-                        conds_out.append(np.asarray(vec, dtype=np.float32).reshape(-1))
-                        embedded_rows += 1
-                        unknown_rows += 1
-                        unknown_term_seen.add(str(key))
-                        if str(key) in bootstrap_symbol_terms:
-                            unknown_bootstrap_seen.add(str(key))
-                        else:
-                            unknown_other_seen.add(str(key))
-                        source_key = _origin_source_for_row(origin_terms)
-                        origin_row_counts[source_key] = int(origin_row_counts.get(source_key, 0)) + 1
+                        unknown_other_seen.add(str(key))
             if len(conds_out) > 1:
                 perm = rng_sym.permutation(np.arange(len(conds_out), dtype=np.int64)).astype(np.int64).tolist()
                 images_out = [images_out[int(i)] for i in perm]
@@ -11664,6 +12403,7 @@ def main():
             nonlocal mix_condition_target_default
             nonlocal regurgitated_condition_target_default
             nonlocal regurgitated_churn_last_info
+            nonlocal deferred_churn_terms_pending
             active_extra_terms = _normalize_active_extra_terms_with_core(
                 active_terms=active_extra_terms,
                 core_terms=semantic_core_terms,
@@ -11671,6 +12411,7 @@ def main():
             )
             churn_info = {"changed": False, "replaced": 0}
             regurg_terms_used: List[str] = []
+            deferred_terms_used: List[str] = []
             regurg_info: Dict[str, Any] = {
                 "enabled": bool(args.semantic_vocab_regurgitated_churn_enabled),
                 "triggered": False,
@@ -11681,12 +12422,49 @@ def main():
                 "terms_added": 0,
                 "reason": "inactive",
             }
+            deferred_info: Dict[str, Any] = {
+                "enabled": True,
+                "triggered": False,
+                "pool_before": int(len(deferred_churn_terms_pending)),
+                "pool_after": int(len(deferred_churn_terms_pending)),
+                "used_items": 0,
+                "prob": float(max(0.0, min(1.0, float(args.semantic_vocab_deferred_churn_prob)))),
+                "max_per_cycle": int(max(0, int(args.semantic_vocab_deferred_churn_max_per_cycle))),
+                "reason": "inactive",
+            }
             if bool(allow_churn) and bool(semantic_vocab_churn_runtime):
                 regurg_terms_used, regurg_info = _consume_regurgitated_churn_terms(
                     cycle_seed=int(args.seed) + (int(cycle_local) * 1811) + (int(global_round) * 43),
                 )
+                deferred_prob = float(max(0.0, min(1.0, float(args.semantic_vocab_deferred_churn_prob))))
+                deferred_take_cap = max(0, int(args.semantic_vocab_deferred_churn_max_per_cycle))
+                deferred_before = int(len(deferred_churn_terms_pending))
+                pick_deferred = False
+                if int(deferred_before) > 0 and int(deferred_take_cap) > 0:
+                    rng_deferred = np.random.default_rng(
+                        int(args.seed) + (int(cycle_local) * 2011) + (int(global_round) * 59)
+                    )
+                    pick_deferred = bool(float(rng_deferred.random()) < float(deferred_prob))
+                    if bool(pick_deferred):
+                        take = min(int(deferred_take_cap), int(deferred_before))
+                        deferred_terms_used = list(deferred_churn_terms_pending[: int(take)])
+                        deferred_churn_terms_pending = list(deferred_churn_terms_pending[int(take) :])
+                deferred_info = {
+                    "enabled": True,
+                    "triggered": bool(pick_deferred),
+                    "pool_before": int(deferred_before),
+                    "pool_after": int(len(deferred_churn_terms_pending)),
+                    "used_items": int(len(deferred_terms_used)),
+                    "prob": float(deferred_prob),
+                    "max_per_cycle": int(deferred_take_cap),
+                    "reason": (
+                        "sampled"
+                        if bool(pick_deferred) and int(len(deferred_terms_used)) > 0
+                        else ("prob_skip" if int(deferred_before) > 0 else "empty_pool")
+                    ),
+                }
                 pool_terms_effective = _normalize_vocab_terms(
-                    list(semantic_vocab_pool_terms) + list(regurg_terms_used)
+                    list(semantic_vocab_pool_terms) + list(regurg_terms_used) + list(deferred_terms_used)
                 )
                 active_extra_terms, churn_info = _rotate_active_extra_terms(
                     active_terms=active_extra_terms,
@@ -11717,17 +12495,21 @@ def main():
             for kind_key in semantic_kind_keys:
                 kk = re.sub(r"\s+", " ", str(kind_key)).strip().lower()
                 if kk in ("mix", "mixed noise and signal"):
-                    terms = ["mixed noise and signal", "mix", "signal", "noise"]
+                    vec = _semantic_condition_from_present_terms_runtime(
+                        ["mixed noise and signal", "mix", "signal", "noise"]
+                    )
                 elif kk == "regurgitated content":
-                    terms = ["regurgitated content", "mixed noise and signal", "signal"]
+                    vec = _semantic_condition_from_present_terms_runtime(
+                        ["regurgitated content", "mixed noise and signal", "signal"]
+                    )
                 else:
-                    terms = [str(kind_key)]
-                semantic_kind_target_vectors[str(kind_key)] = _semantic_condition_from_terms_runtime(terms=terms)
-            mix_condition_target_default = _semantic_condition_from_terms_runtime(
-                terms=["mixed noise and signal", "signal", "noise"],
+                    vec = _semantic_condition_from_present_terms_runtime([str(kind_key)])
+                semantic_kind_target_vectors[str(kind_key)] = vec
+            mix_condition_target_default = _semantic_condition_from_present_terms_runtime(
+                ["mixed noise and signal", "signal", "noise"],
             )
-            regurgitated_condition_target_default = _semantic_condition_from_terms_runtime(
-                terms=["regurgitated content", "mixed noise and signal", "signal"],
+            regurgitated_condition_target_default = _semantic_condition_from_present_terms_runtime(
+                ["regurgitated content", "mixed noise and signal", "signal"],
             )
             _apply_label_embedding_bank_to_classifier(
                 classifier=classifier,
@@ -11747,7 +12529,21 @@ def main():
                 except Exception:
                     pass
 
-            payload_images = list(payload_images_base)
+            payload_images_extra: List[np.ndarray] = []
+            payload_masks_extra: List[np.ndarray] = []
+            payload_images = payload_images_base
+            payload_masks = payload_masks_base
+            payload_mask_stacks = []
+            payload_mask_indices = []
+            if bool(semantic_single_label_mask_mode):
+                for base_i, base_cond in enumerate(payload_conditions_supervised_base):
+                    base_mask = np.asarray(payload_masks_base[int(base_i)], dtype=np.float32)
+                    stack_np, idx_np = build_label_mask_stack(
+                        mixed_mask=np.asarray(base_mask, dtype=np.float32),
+                        label_vec=np.asarray(base_cond, dtype=np.float32).reshape(-1),
+                    )
+                    payload_mask_stacks.append(np.asarray(stack_np, dtype=np.float32))
+                    payload_mask_indices.append(np.asarray(idx_np, dtype=np.int64))
             if len(payload_conditions_supervised_base) > 0:
                 payload_conditions, payload_conditioning_info = _expand_payload_conditions_with_semantic_bank(
                     payload_conditions=payload_conditions_supervised_base,
@@ -11767,6 +12563,12 @@ def main():
                         ).astype(np.float32, copy=False)
                         for i in range(len(payload_conditions))
                     ]
+                    for i in range(len(payload_conditions)):
+                        _assert_berkeley_target_flag_runtime(
+                            vec=np.asarray(payload_conditions[i], dtype=np.float32).reshape(-1),
+                            terms=payload_condition_terms_supervised_base[i],
+                            context=f"payload_active_cycle row={int(i)}",
+                        )
             else:
                 payload_conditions = []
                 payload_conditioning_info = {
@@ -11779,8 +12581,14 @@ def main():
                 cycle_seed=int(args.seed) + (int(cycle_local) * 2903) + (int(global_round) * 53),
             )
             if len(sym_images) > 0 and len(sym_images) == len(sym_conds):
-                payload_images.extend(sym_images)
+                payload_images_extra.extend(sym_images)
                 payload_conditions.extend(sym_conds)
+                for sym_img, sym_cond in zip(sym_images, sym_conds):
+                    mixed_mask, mask_stack_np, mask_idx_np = _infer_payload_mask_payload_runtime(sym_img, sym_cond)
+                    payload_masks_extra.append(np.asarray(mixed_mask, dtype=np.float32))
+                    if bool(semantic_single_label_mask_mode):
+                        payload_mask_stacks.append(np.asarray(mask_stack_np, dtype=np.float32))
+                        payload_mask_indices.append(np.asarray(mask_idx_np, dtype=np.int64))
             payload_flashcard_info = {"enabled": False, "rows_added": 0}
             if bool(args.semantic_vocab_reference_flashcards):
                 def _flashcard_gan_provider(count: int) -> List[np.ndarray]:
@@ -11808,8 +12616,16 @@ def main():
                     gan_image_provider=_flashcard_gan_provider,
                 )
                 if len(flash_images) > 0 and len(flash_images) == len(flash_conds):
-                    payload_images.extend(flash_images)
+                    payload_images_extra.extend(flash_images)
                     payload_conditions.extend(flash_conds)
+                    for flash_img, flash_cond in zip(flash_images, flash_conds):
+                        mixed_mask, mask_stack_np, mask_idx_np = _infer_payload_mask_payload_runtime(flash_img, flash_cond)
+                        payload_masks_extra.append(np.asarray(mixed_mask, dtype=np.float32))
+                        if bool(semantic_single_label_mask_mode):
+                            payload_mask_stacks.append(np.asarray(mask_stack_np, dtype=np.float32))
+                            payload_mask_indices.append(np.asarray(mask_idx_np, dtype=np.int64))
+            payload_images = _ConcatArraySequence(payload_images_base, payload_images_extra)
+            payload_masks = _ConcatArraySequence(payload_masks_base, payload_masks_extra)
             payload_target_knockout_info: Dict[str, Any] = {
                 "enabled": bool(float(args.target_label_knockout_prob) > 0.0),
                 "prob": float(max(0.0, min(1.0, float(args.target_label_knockout_prob)))),
@@ -11836,6 +12652,18 @@ def main():
                     f"dropped={int(payload_target_knockout_info.get('labels_dropped', 0))} "
                     f"prob={float(payload_target_knockout_info.get('prob', 0.0)):.3f}"
                 )
+
+            if int(len(payload_masks)) != int(len(payload_images)):
+                raise RuntimeError(
+                    "Payload image/mask bank mismatch: "
+                    f"images={int(len(payload_images))} masks={int(len(payload_masks))}"
+                )
+            if bool(semantic_single_label_mask_mode):
+                if int(len(payload_mask_stacks)) != int(len(payload_images)) or int(len(payload_mask_indices)) != int(len(payload_images)):
+                    raise RuntimeError(
+                        "Payload packed mask bank mismatch: "
+                        f"images={int(len(payload_images))} stacks={int(len(payload_mask_stacks))} indices={int(len(payload_mask_indices))}"
+                    )
 
             active_gd_vocab_hash, active_gd_vocab_profile = _compute_gd_vocab_hash(
                 supervised_class_names=supervised_class_names,
@@ -11877,6 +12705,8 @@ def main():
                 "target_knockout": dict(payload_target_knockout_info),
                 "regurgitated_churn": dict(regurg_info),
                 "regurgitated_terms_added": int(len(regurg_terms_used)),
+                "deferred_churn": dict(deferred_info),
+                "deferred_terms_added": int(len(deferred_terms_used)),
                 "gan_live_churn": dict(payload_symbol_aug_info.get("gan_live_info", {})),
             }
             semantic_churn_history.append(row)
@@ -11903,6 +12733,8 @@ def main():
                 f"regurg_used={int(regurg_info.get('used_items', 0))} "
                 f"regurg_terms={int(regurg_info.get('terms_added', 0))} "
                 f"regurg_pool={int(regurg_info.get('pool_after', len(regurgitated_churn_pool)))} "
+                f"deferred_used={int(deferred_info.get('used_items', 0))} "
+                f"deferred_pool={int(deferred_info.get('pool_after', len(deferred_churn_terms_pending)))} "
                 f"hash={str(active_gd_vocab_hash)}"
             )
             if bool(autoload_gd):
@@ -11916,6 +12748,220 @@ def main():
             allow_churn=False,
             autoload_gd=False,
         )
+
+        def _run_stage_c_lora_round(
+            cycle_id: int,
+            round_id: int,
+            global_round: int,
+            reason: str,
+        ) -> Dict[str, Any]:
+            info: Dict[str, Any] = {
+                "enabled": bool(args.stage_c_lora_enabled),
+                "ran": False,
+                "reason": ("disabled" if not bool(args.stage_c_lora_enabled) else "not_ready"),
+                "slots_total": 0,
+                "slots_trained": 0,
+                "slot_term_cap": int(max(1, int(args.stage_c_lora_max_terms))),
+                "churn_rows_total": 0,
+                "churn_rows_trained": 0,
+                "churn_rows_blocked": 0,
+                "slot_summaries": [],
+            }
+            if not bool(args.stage_c_lora_enabled):
+                return info
+            if refresh_loader is None:
+                info["reason"] = "refresh_loader_missing"
+                return info
+            if not isinstance(classifier, TinyConvClassifier):
+                info["reason"] = f"unsupported_classifier:{type(classifier).__name__}"
+                return info
+            base_dataset = getattr(refresh_loader, "dataset", None)
+            rows = getattr(base_dataset, "rows", None)
+            if not isinstance(rows, list) or int(len(rows)) <= 0:
+                info["reason"] = "refresh_rows_unavailable"
+                return info
+            active_extra_lc = {
+                re.sub(r"\s+", " ", str(x)).strip().lower()
+                for x in active_extra_terms
+                if re.sub(r"\s+", " ", str(x)).strip()
+            }
+            if int(len(active_extra_lc)) <= 0:
+                info["reason"] = "no_active_churn_terms"
+                return info
+            basic_lc = set(_basic_authority_terms_lc_runtime())
+            max_terms = max(1, int(args.stage_c_lora_max_terms))
+            churn_rows: List[Dict[str, Any]] = []
+            blocked_rows = 0
+            chunkable_terms: set = set()
+            for row_idx, row in enumerate(rows):
+                row_terms = _normalize_vocab_terms(getattr(row, "terms", []))
+                row_lc = [
+                    re.sub(r"\s+", " ", str(t)).strip().lower()
+                    for t in row_terms
+                    if re.sub(r"\s+", " ", str(t)).strip()
+                ]
+                nonbasic = [str(t) for t in row_lc if str(t) not in basic_lc]
+                if int(len(nonbasic)) <= 0:
+                    continue
+                info["churn_rows_total"] = int(info.get("churn_rows_total", 0)) + 1
+                unknown = [str(t) for t in nonbasic if str(t) not in active_extra_lc]
+                if int(len(unknown)) > 0 or int(len(set(nonbasic))) > int(max_terms):
+                    blocked_rows += 1
+                    continue
+                nonbasic = sorted(set(str(t) for t in nonbasic))
+                churn_rows.append(
+                    {
+                        "row_idx": int(row_idx),
+                        "terms": list(nonbasic),
+                        "source": str(getattr(row, "source", "")),
+                    }
+                )
+                chunkable_terms.update(str(t) for t in nonbasic)
+            info["churn_rows_blocked"] = int(blocked_rows)
+            if int(len(churn_rows)) <= 0:
+                info["reason"] = "no_switchable_churn_rows"
+                return info
+            ordered_terms = sorted([str(t) for t in chunkable_terms], key=lambda s: s.lower())
+            slot_defs: List[Dict[str, Any]] = []
+            for start in range(0, int(len(ordered_terms)), int(max_terms)):
+                slot_terms = ordered_terms[int(start) : int(start + max_terms)]
+                if int(len(slot_terms)) <= 0:
+                    continue
+                slot_term_set = {str(t) for t in slot_terms}
+                slot_rows = [
+                    int(row["row_idx"])
+                    for row in churn_rows
+                    if set(str(t) for t in row["terms"]).issubset(slot_term_set)
+                ]
+                if int(len(slot_rows)) <= 0:
+                    continue
+                row_set = {int(v) for v in slot_rows}
+                source_counts = Counter(
+                    [
+                        str(row["source"])
+                        for row in churn_rows
+                        if int(row["row_idx"]) in row_set
+                    ]
+                )
+                slot_sig = hashlib.sha1("|".join(slot_terms).encode("utf-8", errors="ignore")).hexdigest()[:12]
+                slot_defs.append(
+                    {
+                        "slot_name": f"stagec_{slot_sig}",
+                        "terms": list(slot_terms),
+                        "row_indices": list(slot_rows),
+                        "source_counts": {str(k): int(v) for k, v in source_counts.items()},
+                    }
+                )
+            info["slots_total"] = int(len(slot_defs))
+            if int(len(slot_defs)) <= 0:
+                info["reason"] = "no_switch_schedule"
+                _log(
+                    "[stage-c-lora] no LoRA switching schedule available; churn rows remain blocked "
+                    f"(cycle={int(cycle_id)} round={int(round_id)} blocked={int(info['churn_rows_total'])})"
+                )
+                return info
+            if int(len(tiny_classifier_lora_modules(classifier))) <= 0:
+                install_tiny_classifier_lora(
+                    classifier,
+                    rank=int(args.stage_c_lora_rank),
+                    alpha=float(args.stage_c_lora_alpha),
+                )
+            slot_summaries: List[Dict[str, Any]] = []
+            trained_rows_total = 0
+            try:
+                for slot_idx, slot in enumerate(slot_defs, start=1):
+                    ensure_tiny_classifier_lora_slot(classifier, slot["slot_name"])
+                    set_tiny_classifier_lora_state(classifier, slot_name=slot["slot_name"], lora_only=True)
+                    slot_loader = DataLoader(
+                        torch.utils.data.Subset(base_dataset, [int(i) for i in slot["row_indices"]]),
+                        batch_size=max(1, int(getattr(refresh_loader, "batch_size", 1) or 1)),
+                        shuffle=False,
+                        num_workers=0,
+                        pin_memory=bool(getattr(refresh_loader, "pin_memory", False)),
+                        drop_last=False,
+                        collate_fn=getattr(refresh_loader, "collate_fn", None),
+                    )
+                    slot_steps = int(args.berkeley_refresh_max_steps)
+                    if int(slot_steps) <= 0:
+                        slot_steps = int(len(slot_loader))
+                    slot_steps = max(1, min(int(slot_steps), int(len(slot_loader))))
+                    slot_ref = _run_berkeley_refresh_epochs(
+                        classifier=classifier,
+                        loader=slot_loader,
+                        device=device,
+                        epochs=1,
+                        lr=float(args.berkeley_refresh_lr),
+                        weight_decay=float(args.berkeley_refresh_weight_decay),
+                        max_steps=int(slot_steps),
+                        min_steps=0,
+                        lr_sine_cycles=float(args.lr_sine_cycles),
+                        lr_sine_frequency=float(args.lr_sine_frequency),
+                        lr_sine_tail_fraction=float(args.lr_sine_tail_fraction),
+                        lr_sine_min_scale=float(args.lr_sine_min_scale),
+                        amp_enabled=amp_enabled,
+                        amp_dtype=args.amp_dtype,
+                        channels_last=bool(args.channels_last),
+                        grad_accum_steps=grad_accum_steps,
+                        log_every=int(args.berkeley_refresh_log_every),
+                        max_seconds=float(args.berkeley_refresh_max_seconds),
+                        cache_x=None,
+                        cache_y=None,
+                        cache_m=None,
+                        cache_batch_size=0,
+                        active_classes=int(score_active_classes),
+                        semantic_mask_supervision_mode=str(args.semantic_mask_supervision_mode),
+                        vram_fraction=float(args.berkeley_refresh_vram_fraction),
+                        activation_multiplier=float(args.berkeley_refresh_activation_mult),
+                        max_forward_batch_cap=int(args.berkeley_refresh_max_batch_cap),
+                        target_label_knockout_prob=float(args.target_label_knockout_prob),
+                        target_label_knockout_min_keep=int(args.target_label_knockout_min_keep),
+                        target_label_knockout_max_drop_frac=float(args.target_label_knockout_max_drop_frac),
+                        target_label_knockout_seed=int(args.seed) + (int(cycle_id) * 10007) + (int(round_id) * 97) + 500 + int(slot_idx),
+                        step_preview_callback=_make_c_step_callback(cycle_id=int(cycle_id), round_id=int(round_id)),
+                        stop_requested=_poll_gui_stop,
+                    )
+                    refresh_rows.append(
+                        {
+                            "stage": "stage_c_lora",
+                            "cycle": int(cycle_id),
+                            "round": int(round_id),
+                            "slot_name": str(slot["slot_name"]),
+                            "slot_index": int(slot_idx),
+                            "slot_terms": list(slot["terms"]),
+                            "slot_term_count": int(len(slot["terms"])),
+                            "slot_rows": int(len(slot["row_indices"])),
+                            "source_counts": dict(slot["source_counts"]),
+                            **slot_ref,
+                        }
+                    )
+                    slot_summaries.append(
+                        {
+                            "slot_name": str(slot["slot_name"]),
+                            "terms": list(slot["terms"]),
+                            "term_count": int(len(slot["terms"])),
+                            "rows": int(len(slot["row_indices"])),
+                            "samples": int(slot_ref.get("samples", 0)),
+                            "loss": float(slot_ref.get("loss", 0.0)),
+                            "source_counts": dict(slot["source_counts"]),
+                        }
+                    )
+                    trained_rows_total += int(len(slot["row_indices"]))
+                    _log(
+                        "[stage-c-lora] "
+                        f"cycle={int(cycle_id)} round={int(round_id)} slot={int(slot_idx)}/{int(len(slot_defs))} "
+                        f"name={str(slot['slot_name'])} terms={int(len(slot['terms']))} rows={int(len(slot['row_indices']))} "
+                        f"loss={float(slot_ref.get('loss', 0.0)):.4f}"
+                    )
+            finally:
+                if int(len(tiny_classifier_lora_modules(classifier))) > 0:
+                    set_tiny_classifier_lora_state(classifier, slot_name="", lora_only=False)
+            info["ran"] = bool(int(len(slot_summaries)) > 0)
+            info["reason"] = ("trained" if bool(info["ran"]) else "no_slots_trained")
+            info["slots_trained"] = int(len(slot_summaries))
+            info["churn_rows_trained"] = int(trained_rows_total)
+            info["slot_summaries"] = list(slot_summaries)
+            return info
+
         gestation_gate_samples_seen = 0
         gestation_gate_samples_required = 0
         total_gate_samples_seen = 0
@@ -11928,6 +12974,7 @@ def main():
         total_gate_preview_targets: List[np.ndarray] = []
 
         def _rebuild_semantic_gate_loaders(reason: str, cycle_seed: int, include_payload_val: bool = True):
+            nonlocal pregestation_stage_loader, pregestation_stage_loader_count, pregestation_stage_info
             nonlocal gestation_stage_loader, gestation_stage_loader_count, gestation_stage_info
             nonlocal gestation_gate_loader, gestation_gate_loader_count, gestation_gate_info
             nonlocal berkeley_gate_loader, berkeley_gate_loader_count, berkeley_gate_schedule_info
@@ -11937,10 +12984,13 @@ def main():
             nonlocal gestation_gate_preview_images, gestation_gate_preview_targets
             nonlocal total_gate_preview_images, total_gate_preview_targets
             if int(condition_num_classes) <= 0:
+                pregestation_stage_loader = None
+                pregestation_stage_loader_count = 0
                 gestation_stage_loader = None
                 gestation_stage_loader_count = 0
                 gestation_gate_loader = None
                 berkeley_gate_loader = None
+                pregestation_stage_info = {"rows": 0, "selected_rows": 0, "reason": "condition_num_classes<=0"}
                 gestation_stage_info = {"rows": 0, "selected_rows": 0, "reason": "condition_num_classes<=0"}
                 gestation_gate_loader_count = 0
                 berkeley_gate_loader_count = 0
@@ -11967,12 +13017,51 @@ def main():
             gestation_batch = max(1, int(gestation_batch))
 
             origin_label = re.sub(r"\s+", " ", str(args.semantic_vocab_bootstrap_origin_label)).strip() or "internal bootstrap root vocab"
+            pregestation_images: List[np.ndarray] = []
+            pregestation_targets: List[np.ndarray] = []
+            pregestation_terms_rows: List[List[str]] = []
             gestation_images: List[np.ndarray] = []
             gestation_targets: List[np.ndarray] = []
             gestation_term_keys: set = set()
             gestation_term_counts: Dict[str, int] = {}
             gestation_term_indices: Dict[str, List[int]] = {}
             gestation_fallback_rebuild = False
+
+            if bool(args.semantic_vocab_pregestation_enabled):
+                pre_rows, pre_term_rows, pre_info = _build_pregestation_logic_rows(
+                    image_size=int(shared_embed_image_size),
+                    seed=int(cycle_seed) + 121,
+                    samples_per_combo=int(args.semantic_vocab_pregestation_samples_per_combo),
+                    active_terms_lc=list(semantic_term_to_idx.keys()),
+                )
+                for img_rgb, term_row in zip(pre_rows, pre_term_rows):
+                    semantic_terms = _semantic_terms_with_tonal_tags(
+                        terms=term_row,
+                        image=img_rgb,
+                        image_size=int(shared_embed_image_size),
+                    )
+                    semantic_terms = _normalize_vocab_terms(list(term_row) + list(semantic_terms))
+                    pregestation_images.append(np.asarray(img_rgb, dtype=np.float32))
+                    pregestation_terms_rows.append(list(semantic_terms))
+                    pregestation_targets.append(
+                        np.asarray(
+                            _semantic_condition_from_terms_runtime(
+                                terms=semantic_terms,
+                                origin_terms=["pre gestation formal logic", "color direction binding"],
+                            ),
+                            dtype=np.float32,
+                        ).reshape(-1)
+                    )
+                pregestation_stage_info = {
+                    "rows": int(len(pregestation_images)),
+                    "selected_rows": 0,
+                    "batch_size": int(gestation_batch),
+                    "target_dim": int(max(1, int(condition_num_classes))),
+                    "returns_masks": True,
+                    **({str(k): v for k, v in pre_info.items()} if isinstance(pre_info, dict) else {}),
+                }
+            else:
+                pregestation_stage_info = {"rows": 0, "selected_rows": 0, "reason": "disabled"}
 
             required_gestation_terms = sorted([str(x) for x in gestation_symbol_terms], key=lambda s: s.lower())
             if len(required_gestation_terms) <= 0:
@@ -11985,6 +13074,14 @@ def main():
                 key = re.sub(r"\s+", " ", str(term_key)).strip().lower()
                 if not key or len(rows) <= 0:
                     return
+                mapped_origin_terms = _normalize_vocab_terms(
+                    [str(x) for x in symbol_pool_origin_terms_by_term.get(str(key), [])]
+                )
+                accepted_vocab_terms = [
+                    str(x)
+                    for x in mapped_origin_terms
+                    if str(x).strip().lower() in semantic_term_to_idx
+                ]
                 origin_terms = _normalize_vocab_terms(
                     [
                         "symbol pool bootstrap",
@@ -11996,7 +13093,7 @@ def main():
                 for row_img in rows:
                     img_rgb = _image_any_to_rgb_chw01(row_img, image_size=int(shared_embed_image_size))
                     semantic_terms = _semantic_terms_with_tonal_tags(
-                        terms=_semantic_tags_for_symbol_term(str(key)),
+                        terms=list(_semantic_tags_for_symbol_term(str(key))) + list(accepted_vocab_terms),
                         image=img_rgb,
                         image_size=int(shared_embed_image_size),
                     )
@@ -12005,6 +13102,7 @@ def main():
                         terms=semantic_terms,
                         image=img_rgb,
                     )
+                    semantic_terms = _normalize_vocab_terms(list(semantic_terms) + list(accepted_vocab_terms))
                     gestation_images.append(img_rgb)
                     gestation_targets.append(
                         np.asarray(
@@ -12159,7 +13257,7 @@ def main():
                     int(raw_gestation_val_rows),
                     int(math.ceil(float(max(1, int(gestation_train_target_rows))) * 0.20)),
                 )
-            gestation_stage_dataset = _BootstrapExpandedDataset(
+            gestation_stage_dataset = BootstrapDynamicDataset(
                 images=gestation_train_images,
                 targets=gestation_train_targets,
                 total_rows=int(gestation_train_target_rows),
@@ -12168,8 +13266,11 @@ def main():
                 expected_target_dim=int(expected_gate_dim),
                 semantic_term_to_idx=semantic_term_to_idx,
                 augment_apply_terms=True,
+                return_masks=True,
+                return_mask_stack=bool(semantic_single_label_mask_mode),
+                dataset_name="gestation_stage_train",
             )
-            gestation_gate_dataset = _BootstrapExpandedDataset(
+            gestation_gate_dataset = BootstrapDynamicDataset(
                 images=gestation_eval_images,
                 targets=gestation_eval_targets,
                 total_rows=int(gestation_val_target_rows),
@@ -12178,13 +13279,19 @@ def main():
                 expected_target_dim=int(expected_gate_dim),
                 semantic_term_to_idx=semantic_term_to_idx,
                 augment_apply_terms=True,
+                return_masks=True,
+                return_mask_stack=bool(semantic_single_label_mask_mode),
+                dataset_name="gestation_gate_val",
             )
             gestation_gate_preview_images = []
             gestation_gate_preview_targets = []
             gest_preview_cap = min(int(len(gestation_gate_dataset)), 64)
             for preview_i in range(int(gest_preview_cap)):
                 try:
-                    gi, gt = gestation_gate_dataset[int(preview_i)]
+                    sample = gestation_gate_dataset[int(preview_i)]
+                    if not isinstance(sample, (tuple, list)) or int(len(sample)) < 2:
+                        continue
+                    gi, gt = sample[0], sample[1]
                     if torch.is_tensor(gi):
                         gi_np = gi.detach().to(torch.float32).cpu().numpy().astype(np.float32, copy=False)
                     else:
@@ -12201,17 +13308,61 @@ def main():
             if int(gestation_stage_batch) <= 0:
                 gestation_stage_batch = int(gate_loader_batch)
             gestation_stage_batch = max(1, int(gestation_stage_batch))
-            gestation_stage_loader, gestation_stage_loader_count = _build_gate_loader_from_dataset(
+            if int(len(pregestation_images)) > 0:
+                pregestation_dataset = BootstrapDynamicDataset(
+                    images=pregestation_images,
+                    targets=pregestation_targets,
+                    total_rows=int(len(pregestation_images)),
+                    seed=int(args.seed) + 1203 + int(cycle_seed),
+                    augment=False,
+                    expected_target_dim=int(expected_gate_dim),
+                    semantic_term_to_idx=semantic_term_to_idx,
+                    augment_apply_terms=False,
+                    return_masks=True,
+                    return_mask_stack=bool(semantic_single_label_mask_mode),
+                    dataset_name="pregestation_stage_train",
+                )
+                pregestation_manifest = StageDatasetManifest(
+                    name="pregestation_stage_train",
+                    dataset=pregestation_dataset,
+                    batch_size=int(gestation_stage_batch),
+                    seed=int(args.seed) + 1203,
+                    num_workers=max(0, int(args.berkeley_refresh_workers)),
+                    device_type=str(device.type),
+                    max_samples=0,
+                    ordered_indices=None,
+                    persistent_workers=bool(args.loader_persistent_workers),
+                    prefetch_factor=int(args.loader_prefetch_factor),
+                )
+                pregestation_stage_loader, pregestation_stage_loader_count = build_loader_from_manifest(pregestation_manifest)
+                if pregestation_stage_loader is None or int(pregestation_stage_loader_count) <= 0:
+                    raise RuntimeError("Pre-gestation loader is empty; cannot run formal logic warmup.")
+                pregestation_stage_info.update(
+                    {
+                        "selected_rows": int(pregestation_stage_loader_count),
+                        "manifest_name": str(pregestation_manifest.name),
+                    }
+                )
+            else:
+                pregestation_stage_loader = None
+                pregestation_stage_loader_count = 0
+                if not isinstance(pregestation_stage_info, dict):
+                    pregestation_stage_info = {"rows": 0, "selected_rows": 0}
+                if int(pregestation_stage_info.get("rows", 0)) <= 0:
+                    pregestation_stage_info["reason"] = str(pregestation_stage_info.get("reason", "no_rows"))
+            gestation_stage_manifest = StageDatasetManifest(
+                name="gestation_stage_train",
                 dataset=gestation_stage_dataset,
                 batch_size=int(gestation_stage_batch),
-                num_workers=max(0, int(args.berkeley_refresh_workers)),
-                device=device,
                 seed=int(args.seed) + 1703,
+                num_workers=max(0, int(args.berkeley_refresh_workers)),
+                device_type=str(device.type),
                 max_samples=0,
                 ordered_indices=None,
                 persistent_workers=bool(args.loader_persistent_workers),
                 prefetch_factor=int(args.loader_prefetch_factor),
             )
+            gestation_stage_loader, gestation_stage_loader_count = build_loader_from_manifest(gestation_stage_manifest)
             if gestation_stage_loader is None or int(gestation_stage_loader_count) <= 0:
                 raise RuntimeError("Stage 1 gestation loader is empty; cannot run gestation training.")
             if int(len(gestation_gate_preview_targets)) > 0:
@@ -12239,17 +13390,19 @@ def main():
                 )
                 gestation_val_max_eff = int(len(gestation_gate_order))
             gestation_dims = sorted({int(np.asarray(row, dtype=np.float32).reshape(-1).size) for row in gestation_eval_targets})
-            gestation_gate_loader, gestation_gate_loader_count = _build_gate_loader_from_dataset(
+            gestation_gate_manifest = StageDatasetManifest(
+                name="gestation_gate_val",
                 dataset=gestation_gate_dataset,
                 batch_size=int(gestation_batch),
-                num_workers=max(0, int(args.berkeley_refresh_workers)),
-                device=device,
                 seed=int(gestation_gate_eval_seed),
+                num_workers=max(0, int(args.berkeley_refresh_workers)),
+                device_type=str(device.type),
                 max_samples=int(gestation_val_max_eff),
                 ordered_indices=gestation_gate_order,
                 persistent_workers=bool(args.loader_persistent_workers),
                 prefetch_factor=int(args.loader_prefetch_factor),
             )
+            gestation_gate_loader, gestation_gate_loader_count = build_loader_from_manifest(gestation_gate_manifest)
             if gestation_gate_loader is None or int(gestation_gate_loader_count) <= 0:
                 raise RuntimeError("Gate 1 gestation validation loader is empty; cannot evaluate Gate 1.")
             gestation_stage_info = {
@@ -12258,6 +13411,8 @@ def main():
                 "expanded_rows": int(gestation_train_target_rows),
                 "batch_size": int(gestation_stage_batch),
                 "target_dim": int(expected_gate_dim),
+                "manifest_name": str(gestation_stage_manifest.name),
+                "returns_masks": True,
                 "reason": str(reason),
             }
             gestation_gate_info = {
@@ -12269,6 +13424,8 @@ def main():
                 "training_rows_expanded": int(gestation_train_target_rows),
                 "batch_size": int(gestation_batch),
                 "target_dim": int(expected_gate_dim),
+                "manifest_name": str(gestation_gate_manifest.name),
+                "returns_masks": True,
                 "reason": str(reason),
             }
             gestation_gate_samples_seen = 0
@@ -12290,10 +13447,10 @@ def main():
             payload_stage2_picks_np = np.zeros((0,), dtype=np.int64)
             payload_stage2_terms: List[List[str]] = []
             if bool(payload_enabled) and int(len(payload_gate_val_terms_base)) > 0:
-                if int(len(payload_gate_val_indices_base)) != int(len(payload_gate_val_terms_base)):
+                if int(payload_gate_val_labels_base.shape[0]) != int(len(payload_gate_val_terms_base)):
                     raise RuntimeError(
-                        "Payload gate deck index/terms length mismatch: "
-                        f"indices={int(len(payload_gate_val_indices_base))} terms={int(len(payload_gate_val_terms_base))}"
+                        "Payload gate deck label/terms length mismatch: "
+                        f"labels={int(payload_gate_val_labels_base.shape[0])} terms={int(len(payload_gate_val_terms_base))}"
                     )
                 active_vocab_lc = {
                     re.sub(r"\s+", " ", str(x)).strip().lower()
@@ -12328,31 +13485,73 @@ def main():
                             f"Missing label term: {str(sup_name)}"
                         )
                     supervised_terms_lc.append(str(sk))
-                active_stage2_terms_lc = list(dict.fromkeys(list(active_vocab_lc)))
-                if int(len(active_stage2_terms_lc)) <= 0:
-                    raise RuntimeError(
-                        "Stage-2 payload gate has no active terms after resolving current active vocabulary."
-                    )
-                payload_labels_cache_path = str(payload_gate_val_info.get("labels_path", "")).strip()
-                payload_labels_mm = None
-                if str(payload_labels_cache_path):
-                    try:
-                        payload_labels_mm = np.load(str(payload_labels_cache_path), mmap_mode="r")
-                    except Exception:
-                        payload_labels_mm = None
-                if payload_labels_mm is None:
+                payload_labels_mm = np.asarray(payload_gate_val_labels_base, dtype=np.float32)
+                if int(getattr(payload_labels_mm, "ndim", 0)) != 2 or int(payload_labels_mm.shape[0]) != int(len(payload_gate_val_terms_base)):
                     raise RuntimeError(
                         "Stage-2 payload gate requires original supervised labels cache for strict anchoring, "
-                        "but labels cache could not be loaded."
+                        "but disk-backed supervised labels were unavailable or mismatched."
+                    )
+                authority_terms_lc = set(_basic_authority_terms_lc_runtime())
+                authority_terms_lc.update(
+                    {
+                        re.sub(r"\s+", " ", str(x)).strip().lower()
+                        for x in active_extra_terms
+                        if re.sub(r"\s+", " ", str(x)).strip()
+                    }
+                )
+                payload_gate_indices_authorized: List[int] = []
+                payload_gate_terms_authorized: List[List[str]] = []
+                stage2_deferred_terms_lc: set = set()
+                stage2_deferred_rows = 0
+                for src_idx_raw, raw_terms in zip(range(int(len(payload_gate_val_terms_base))), payload_gate_val_terms_base):
+                    norm_terms = _normalize_vocab_terms([str(x) for x in list(raw_terms)]) if isinstance(raw_terms, (list, tuple)) else []
+                    if len(norm_terms) <= 0:
+                        continue
+                    row_lc = {
+                        re.sub(r"\s+", " ", str(x)).strip().lower()
+                        for x in norm_terms
+                        if re.sub(r"\s+", " ", str(x)).strip()
+                    }
+                    deferred_terms = [str(t) for t in row_lc if str(t) not in authority_terms_lc]
+                    if len(deferred_terms) > 0:
+                        queued = _queue_terms_into_churn_runtime(
+                            terms=deferred_terms,
+                            source=f"stage2_payload_deferred reason={str(reason)}",
+                        )
+                        for t in queued:
+                            tk = re.sub(r"\s+", " ", str(t)).strip().lower()
+                            if tk:
+                                stage2_deferred_terms_lc.add(str(tk))
+                        stage2_deferred_rows += 1
+                        continue
+                    payload_gate_indices_authorized.append(int(src_idx_raw))
+                    payload_gate_terms_authorized.append(list(norm_terms))
+                if int(stage2_deferred_rows) > 0:
+                    _log(
+                        "[stage2-to-churn] "
+                        f"rows_deferred={int(stage2_deferred_rows)} "
+                        f"terms_queued={int(len(stage2_deferred_terms_lc))}"
+                    )
+                active_stage2_terms_lc = _active_terms_present_in_rows_runtime(
+                    term_rows=payload_gate_terms_authorized,
+                    candidate_terms=list(active_vocab_lc),
+                )
+                if int(len(active_stage2_terms_lc)) <= 0:
+                    active_stage2_terms_lc = list(active_churn_terms_lc)
+                if int(len(active_stage2_terms_lc)) <= 0:
+                    active_stage2_terms_lc = list(dict.fromkeys(list(active_vocab_lc)))
+                if int(len(active_stage2_terms_lc)) <= 0:
+                    raise RuntimeError(
+                        "Stage-2 payload gate has no active terms after resolving current dataset labels."
                     )
                 selected_local_rows, selected_global_picks, payload_stage2_terms, stage2_row_sched_info = _schedule_payload_gate_rows_by_active_terms(
-                    payload_terms_rows=payload_gate_val_terms_base,
-                    payload_global_picks=payload_gate_val_indices_base,
+                    payload_terms_rows=payload_gate_terms_authorized,
+                    payload_global_picks=payload_gate_indices_authorized,
                     payload_labels_mm=payload_labels_mm,
                     supervised_class_names=supervised_class_names,
                     active_terms_lc=active_stage2_terms_lc,
                     active_vocab_lc=list(active_vocab_lc),
-                    require_all_supervised_active=False,
+                    require_all_supervised_active=True,
                     allow_unmapped_rows=True,
                 )
                 if int(len(selected_local_rows)) <= 0:
@@ -12360,6 +13559,8 @@ def main():
                         "Stage-2 payload gate found zero rows after deterministic active-term scheduling. "
                         f"active_churn_terms={int(len(active_churn_terms_lc))} "
                         f"active_stage2_terms={int(len(active_stage2_terms_lc))} "
+                        f"rows_authorized={int(len(payload_gate_terms_authorized))} "
+                        f"rows_deferred_to_churn={int(stage2_deferred_rows)} "
                         f"rows_skipped_no_active={int(stage2_row_sched_info.get('rows_skipped_no_active', 0))} "
                         f"rows_skipped_inactive_supervised={int(stage2_row_sched_info.get('rows_skipped_inactive_supervised', 0))} "
                         f"payload_rows={int(len(payload_gate_val_terms_base))}"
@@ -12371,7 +13572,9 @@ def main():
                     f"selected={int(stage2_row_sched_info.get('rows_selected', 0))} "
                     f"active_terms={int(stage2_row_sched_info.get('active_terms', 0))} "
                     f"skipped_no_active={int(stage2_row_sched_info.get('rows_skipped_no_active', 0))} "
-                    f"skipped_inactive_supervised={int(stage2_row_sched_info.get('rows_skipped_inactive_supervised', 0))}"
+                    f"skipped_inactive_supervised={int(stage2_row_sched_info.get('rows_skipped_inactive_supervised', 0))} "
+                    f"rows_authorized={int(len(payload_gate_terms_authorized))} "
+                    f"rows_deferred_to_churn={int(stage2_deferred_rows)}"
                 )
                 if int(stage2_row_sched_info.get("berkeley_rows_selected", 0)) > 0:
                     _log(
@@ -12430,6 +13633,19 @@ def main():
                                         if bool(np.any(missing_mask)):
                                             cached_valid = False
                                             break
+                                        try:
+                                            _assert_berkeley_target_flag_runtime(
+                                                vec=np.asarray(cached_arr[int(out_ri)], dtype=np.float32).reshape(-1),
+                                                terms=(
+                                                    payload_stage2_terms[int(out_ri)]
+                                                    if int(out_ri) < int(len(payload_stage2_terms))
+                                                    else []
+                                                ),
+                                                context=f"stage2_gate_cached row={int(out_ri)}",
+                                            )
+                                        except Exception:
+                                            cached_valid = False
+                                            break
                                 if bool(cached_valid):
                                     payload_targets_sched_np = np.asarray(cached_arr, dtype=np.float32)
                                     payload_semantic_cache_hit = True
@@ -12485,6 +13701,11 @@ def main():
                                     "Stage-2 payload gate semantic vector dropped original supervised labels; "
                                     f"row={int(out_ri)} pick={int(src_idx)}"
                                 )
+                        _assert_berkeley_target_flag_runtime(
+                            vec=vec,
+                            terms=terms,
+                            context=f"stage2_gate_build row={int(out_ri)} pick={int(src_idx)}",
+                        )
                         mat[int(out_ri), :] = np.clip(vec, 0.0, 1.0).astype(np.float32, copy=False)
                     payload_targets_sched_np = np.asarray(mat, dtype=np.float32)
                     if str(payload_semantic_cache_path):
@@ -12499,70 +13720,33 @@ def main():
                     )
                 payload_rows_in_total = int(payload_targets_sched_np.shape[0])
 
-            stage2_symbol_images: List[np.ndarray] = []
-            stage2_symbol_targets: List[np.ndarray] = []
             stage2_symbol_term_keys: set = set()
+            stage2_symbol_rows_in_total = 0
             if bool(payload_enabled) and int(len(symbol_pool_by_term)) > 0:
+                basic_lc = set(_basic_authority_terms_lc_runtime())
+                active_lc = {
+                    re.sub(r"\s+", " ", str(x)).strip().lower()
+                    for x in active_extra_terms
+                    if re.sub(r"\s+", " ", str(x)).strip()
+                }
+                stage2_symbol_deferred_terms: List[str] = []
                 for term_key in sorted([str(x) for x in symbol_pool_by_term.keys()], key=lambda s: s.lower()):
                     key = re.sub(r"\s+", " ", str(term_key)).strip().lower()
                     if not key or key in gestation_symbol_terms:
                         continue
-                    rows = symbol_pool_by_term.get(key, [])
-                    if len(rows) <= 0:
-                        continue
                     stage2_symbol_term_keys.add(str(key))
-                    origin_terms = _normalize_vocab_terms(
-                        list(symbol_pool_origin_terms_by_term.get(str(key), []))
-                        + [
-                            "symbol pool stage2",
-                            "non-gestation semantic pool",
-                            f"symbol pool stage2::{str(key)}",
-                        ]
+                    if str(key) in basic_lc or str(key) in active_lc:
+                        continue
+                    stage2_symbol_deferred_terms.append(str(key))
+                queued_stage2_symbol_terms = _queue_terms_into_churn_runtime(
+                    terms=stage2_symbol_deferred_terms,
+                    source=f"stage2_symbol_deferred reason={str(reason)}",
+                )
+                if int(len(queued_stage2_symbol_terms)) > 0:
+                    _log(
+                        "[stage2-to-churn] "
+                        f"symbol_terms_deferred={int(len(queued_stage2_symbol_terms))}"
                     )
-                    for row_img in rows:
-                        img_rgb = _image_any_to_rgb_chw01(row_img, image_size=int(shared_embed_image_size))
-                        semantic_terms = _semantic_terms_with_tonal_tags(
-                            terms=_semantic_tags_for_symbol_term(str(key)),
-                            image=img_rgb,
-                            image_size=int(shared_embed_image_size),
-                        )
-                        semantic_terms = _semantic_enrich_generated_terms_with_noise_spectrum(
-                            term_key=str(key),
-                            terms=semantic_terms,
-                            image=img_rgb,
-                        )
-                        stage2_symbol_images.append(img_rgb)
-                        stage2_symbol_targets.append(
-                            np.asarray(
-                                _semantic_condition_from_terms_runtime(
-                                    terms=semantic_terms,
-                                    origin_terms=origin_terms,
-                                ),
-                                dtype=np.float32,
-                            ).reshape(-1)
-                        )
-            stage2_symbol_targets_sched_np = (
-                np.stack([np.asarray(y, dtype=np.float32).reshape(-1) for y in stage2_symbol_targets], axis=0).astype(np.float32, copy=False)
-                if int(len(stage2_symbol_targets)) > 0
-                else np.zeros((0, int(expected_gate_dim)), dtype=np.float32)
-            )
-            stage2_symbol_dims = sorted({int(np.asarray(row, dtype=np.float32).reshape(-1).size) for row in stage2_symbol_targets})
-            bad_stage2_dims = [int(d) for d in stage2_symbol_dims if int(d) != int(expected_gate_dim)]
-            if len(bad_stage2_dims) > 0:
-                raise RuntimeError(
-                    "Stage-2 symbol targets must already be full semantic width: "
-                    f"expected={int(expected_gate_dim)} got_dims={bad_stage2_dims}"
-                )
-            stage2_target_stats = _semantic_active_target_stats(stage2_symbol_targets, threshold=0.5)
-            if int(stage2_target_stats.get("rows", 0)) > 0:
-                _log(
-                    "[stage2-symbol-target-stats] "
-                    f"rows={int(stage2_target_stats.get('rows', 0))} "
-                    f"min/mean/max={int(stage2_target_stats.get('min', 0))}/"
-                    f"{float(stage2_target_stats.get('mean', 0.0)):.2f}/"
-                    f"{int(stage2_target_stats.get('max', 0))}"
-                )
-            stage2_symbol_rows_in_total = int(stage2_symbol_targets_sched_np.shape[0])
 
             gestation_targets_sched_np = (
                 np.stack([np.asarray(y, dtype=np.float32).reshape(-1) for y in gestation_eval_targets], axis=0).astype(np.float32, copy=False)
@@ -12592,14 +13776,14 @@ def main():
             )
             total_datasets: List[Dataset] = []
             if bool(payload_enabled) and int(payload_rows_in_total) > 0:
-                payload_images_path = str(payload_gate_val_info.get("images_path", "")).strip()
-                if (not payload_images_path) or (not str(payload_semantic_cache_path).strip()):
-                    raise RuntimeError("Payload gate requires images_path and semantic label cache path.")
-                payload_dataset = _PayloadCacheMemmapDataset(
-                    images_path=str(payload_images_path),
-                    labels_path=str(payload_semantic_cache_path),
-                    picks=np.asarray(payload_stage2_picks_np, dtype=np.int64),
-                    labels_index_mode="local_dataset",
+                if payload_gate_val_dataset is None:
+                    raise RuntimeError("Payload gate requires an active disk-backed validation dataset.")
+                if not str(payload_semantic_cache_path).strip():
+                    raise RuntimeError("Payload gate requires semantic label cache path.")
+                payload_dataset = OverrideTargetSubsetDataset(
+                    dataset=payload_gate_val_dataset,
+                    indices=np.asarray(payload_stage2_picks_np, dtype=np.int64).tolist(),
+                    override_targets=np.asarray(payload_targets_sched_np, dtype=np.float32),
                 )
                 total_datasets.append(payload_dataset)
 
@@ -12624,6 +13808,7 @@ def main():
                 _log(
                     "[semantic-gate-loader] "
                     f"reason={str(reason)} "
+                    f"pre_gestation={int(pregestation_stage_loader_count)}/{int(len(pregestation_images))} "
                     f"stage1_gestation_train={int(gestation_stage_loader_count)}/{int(len(gestation_train_images))} "
                     f"gestation={int(gestation_gate_loader_count)}/{int(len(gestation_eval_images))} "
                     f"stage2_val=0/0 "
@@ -12694,7 +13879,21 @@ def main():
                     if re.fullmatch(r"semantic slot \d+", tk):
                         continue
                     active_terms_stage2_sched.append(str(term))
-                active_terms_stage2_sched = list(dict.fromkeys(active_terms_stage2_sched))
+                active_terms_stage2_sched = _active_terms_present_in_targets_runtime(
+                    targets=total_targets_sched_np,
+                    candidate_terms=active_terms_stage2_sched,
+                    threshold=float(args.gate_total_token_schedule_threshold),
+                )
+                if len(active_terms_stage2_sched) <= 0:
+                    active_terms_stage2_sched = list(
+                        dict.fromkeys(
+                            [
+                                str(term)
+                                for term in list(supervised_class_names) + list(active_extra_terms)
+                                if str(term).strip()
+                            ]
+                        )
+                    )
                 if len(active_terms_stage2_sched) <= 0:
                     active_terms_stage2_sched = list(class_names)
                 total_order, berkeley_gate_schedule_info = _schedule_semantic_gate_indices(
@@ -12755,6 +13954,7 @@ def main():
             _log(
                 "[semantic-gate-loader] "
                 f"reason={str(reason)} "
+                f"pre_gestation={int(pregestation_stage_loader_count)}/{int(len(pregestation_images))} "
                 f"stage1_gestation_train={int(gestation_stage_loader_count)}/{int(len(gestation_train_images))} "
                 f"gestation={int(gestation_gate_loader_count)}/{int(len(gestation_eval_images))} "
                 f"stage2_val={int(berkeley_gate_loader_count)}/{int(total_rows)} "
@@ -12786,7 +13986,11 @@ def main():
                 "semantic_vocab_pool_terms": list(semantic_vocab_pool_terms),
                 "semantic_vocab_churn_cursor": int(semantic_vocab_churn_cursor),
                 "semantic_vocab_churn_sweep_cycles": int(args.semantic_vocab_churn_sweep_cycles),
+                "semantic_vocab_deferred_churn_prob": float(args.semantic_vocab_deferred_churn_prob),
+                "semantic_vocab_deferred_churn_max_per_cycle": int(args.semantic_vocab_deferred_churn_max_per_cycle),
                 "semantic_churn_history": list(semantic_churn_history),
+                "deferred_churn_terms_pending": list(deferred_churn_terms_pending),
+                "deferred_churn_term_events": list(deferred_churn_term_events),
                 "regurgitated_churn_last_info": dict(regurgitated_churn_last_info),
                 "regurgitated_churn_pool_items": [
                     {
@@ -12824,6 +14028,7 @@ def main():
                 "payload_gate_validation_info": dict(payload_gate_val_info),
                 "payload_images_active_count": int(len(payload_images)),
                 "payload_conditions_active_count": int(len(payload_conditions)),
+                "pregestation_stage_loader_info": dict(pregestation_stage_info),
                 "gestation_stage_loader_info": dict(gestation_stage_info),
                 "gestation_gate_loader_info": dict(gestation_gate_info),
                 "total_gate_loader_info": dict(berkeley_gate_schedule_info),
@@ -12841,6 +14046,7 @@ def main():
             out["semantic_vocab_runtime"] = _semantic_vocab_runtime_snapshot()
             out["active_gd_vocab_hash"] = str(active_gd_vocab_hash)
             out["active_gd_vocab_profile"] = dict(active_gd_vocab_profile)
+            out["classifier_lora"] = _snapshot_classifier_lora(classifier)
             return out
 
         def _offload_inactive_stage_models(reason: str):
@@ -13143,6 +14349,24 @@ def main():
                 if isinstance(prior_hist, list) and len(prior_hist) > 0:
                     semantic_churn_history = list(prior_hist) + list(semantic_churn_history)
                 prior_terms = _normalize_vocab_terms(resume_semantic_runtime.get("active_extra_terms", []))
+                requested_extra_lc = {
+                    re.sub(r"\s+", " ", str(x)).strip().lower()
+                    for x in semantic_requested_extra_terms
+                    if re.sub(r"\s+", " ", str(x)).strip()
+                }
+                legacy_seed_lc = {
+                    re.sub(r"\s+", " ", str(x)).strip().lower()
+                    for x in _removed_semantic_seed_terms()
+                    if re.sub(r"\s+", " ", str(x)).strip()
+                }
+                prior_terms = [
+                    str(t)
+                    for t in prior_terms
+                    if (
+                        re.sub(r"\s+", " ", str(t)).strip().lower() not in legacy_seed_lc
+                        or re.sub(r"\s+", " ", str(t)).strip().lower() in requested_extra_lc
+                    )
+                ]
                 if int(semantic_extra_count) > 0 and len(prior_terms) == int(semantic_extra_count):
                     active_extra_terms = _normalize_active_extra_terms_with_core(
                         active_terms=prior_terms,
@@ -13151,9 +14375,27 @@ def main():
                     )
                 prior_pool = _normalize_vocab_terms(resume_semantic_runtime.get("semantic_vocab_pool_terms", []))
                 if len(prior_pool) > 0:
+                    prior_pool = [
+                        str(t)
+                        for t in prior_pool
+                        if re.sub(r"\s+", " ", str(t)).strip().lower() not in legacy_seed_lc
+                    ]
                     semantic_vocab_pool_terms = _normalize_vocab_terms(
                         list(semantic_vocab_pool_terms) + list(prior_pool)
                     )
+                prior_deferred = _normalize_vocab_terms(resume_semantic_runtime.get("deferred_churn_terms_pending", []))
+                if len(prior_deferred) > 0:
+                    prior_deferred = [
+                        str(t)
+                        for t in prior_deferred
+                        if re.sub(r"\s+", " ", str(t)).strip().lower() not in legacy_seed_lc
+                    ]
+                    deferred_churn_terms_pending = _normalize_vocab_terms(
+                        list(deferred_churn_terms_pending) + list(prior_deferred)
+                    )
+                prior_deferred_events = resume_semantic_runtime.get("deferred_churn_term_events", [])
+                if isinstance(prior_deferred_events, list) and len(prior_deferred_events) > 0:
+                    deferred_churn_term_events = [x for x in prior_deferred_events if isinstance(x, dict)] + list(deferred_churn_term_events)
                 try:
                     semantic_vocab_churn_cursor = max(0, int(resume_semantic_runtime.get("semantic_vocab_churn_cursor", 0)))
                 except Exception:
@@ -13319,10 +14561,12 @@ def main():
         berkeley_refresh_samples_seen = _sum_berkeley_refresh_samples(refresh_rows)
 
         gestation_gate_streak = 0
+        pregestation_gate_streak = 0
         berkeley_gate_streak = 0
         wave_gate_streak = 0
         generator_gate_streak = 0
         transformer_gate_streak = 0
+        pregestation_gate_loss_history: List[float] = []
         gestation_gate_loss_history: List[float] = []
         berkeley_gate_loss_history: List[float] = []
         berkeley_loss_target_value = max(0.0, float(gate_config.get("berkeley_loss_target", 0.0)))
@@ -13331,6 +14575,7 @@ def main():
             gs = resume_summary.get("gate_status", {})
             if isinstance(gs, dict):
                 gestation_gate_streak = int(gs.get("gestation_streak", gestation_gate_streak))
+                pregestation_gate_streak = int(gs.get("pregestation_streak", pregestation_gate_streak))
                 berkeley_gate_streak = int(gs.get("berkeley_streak", berkeley_gate_streak))
                 wave_gate_streak = int(gs.get("wave_streak", wave_gate_streak))
                 generator_gate_streak = int(gs.get("generator_streak", generator_gate_streak))
@@ -13339,6 +14584,7 @@ def main():
             gs = resume_pipeline_ckpt.get("gate_status", {})
             if isinstance(gs, dict):
                 gestation_gate_streak = int(gs.get("gestation_streak", gestation_gate_streak))
+                pregestation_gate_streak = int(gs.get("pregestation_streak", pregestation_gate_streak))
                 berkeley_gate_streak = int(gs.get("berkeley_streak", berkeley_gate_streak))
                 wave_gate_streak = int(gs.get("wave_streak", wave_gate_streak))
                 generator_gate_streak = int(gs.get("generator_streak", generator_gate_streak))
@@ -13363,6 +14609,14 @@ def main():
                     glv = float("nan")
                 if math.isfinite(glv):
                     gestation_gate_loss_history.append(float(max(0.0, glv)))
+            pev = row.get("pregestation_classifier_eval", None)
+            if isinstance(pev, dict):
+                try:
+                    plv = float(pev.get("loss", float("nan")))
+                except Exception:
+                    plv = float("nan")
+                if math.isfinite(plv):
+                    pregestation_gate_loss_history.append(float(max(0.0, plv)))
 
         resume_loss_target_prev = None
         if isinstance(gate_history, list):
@@ -13393,8 +14647,8 @@ def main():
             berkeley_gate_loss_history.clear()
 
         def _evaluate_two_stage_semantic_gates(round_index: int) -> Dict[str, Any]:
-            nonlocal gestation_gate_streak, berkeley_gate_streak
-            nonlocal gestation_gate_loss_history, berkeley_gate_loss_history
+            nonlocal pregestation_gate_streak, gestation_gate_streak, berkeley_gate_streak
+            nonlocal pregestation_gate_loss_history, gestation_gate_loss_history, berkeley_gate_loss_history
             nonlocal berkeley_loss_target_unmet
             nonlocal gestation_gate_samples_seen, gestation_gate_samples_required
             nonlocal total_gate_samples_seen, total_gate_samples_required
@@ -13402,9 +14656,62 @@ def main():
 
             gate_active_classes = int(condition_num_classes) if int(condition_num_classes) > 0 else int(score_active_classes)
 
+            pregestation_enabled = bool(float(gate_config.get("pregestation_loss_target", 0.0)) > 0.0)
+            pregestation_eval = None
+            if bool(pregestation_enabled) and pregestation_stage_loader is not None:
+                _cleanup_cuda_allocator()
+                pregestation_eval = _evaluate_berkeley_classifier_gate(
+                    classifier=classifier,
+                    loader=pregestation_stage_loader,
+                    device=device,
+                    max_steps=0,
+                    active_classes=int(gate_active_classes),
+                    amp_enabled=amp_enabled,
+                    amp_dtype=args.amp_dtype,
+                    channels_last=bool(args.channels_last),
+                    semantic_mask_supervision_mode=str(args.semantic_mask_supervision_mode),
+                )
+            if isinstance(pregestation_eval, dict):
+                try:
+                    plv = float(pregestation_eval.get("loss", float("nan")))
+                except Exception:
+                    plv = float("nan")
+                if math.isfinite(plv):
+                    pregestation_gate_loss_history.append(float(max(0.0, plv)))
+            pregestation_gate_cfg = {
+                "berkeley_min_confidence": 0.0,
+                "berkeley_min_macro_f1": 0.0,
+                "berkeley_loss_target": float(gate_config.get("pregestation_loss_target", 0.0)),
+                "berkeley_loss_min_floor": 0.0,
+            }
+            pregestation_detail = _evaluate_berkeley_confidence_loss_gate(
+                eval_stats=pregestation_eval,
+                gate_config=pregestation_gate_cfg,
+                round_index=int(round_index),
+                loss_history=pregestation_gate_loss_history,
+                refresh_samples_seen=0,
+                refresh_samples_required=0,
+            )
+            if not bool(pregestation_enabled):
+                pregestation_detail = {
+                    "pass": True,
+                    "mode": "disabled",
+                    "reason": "disabled",
+                    "loss_target": None,
+                    "loss": None,
+                    "refresh_samples_seen": 0,
+                    "refresh_samples_required": 0,
+                }
+            pregestation_pass = bool(pregestation_detail.get("pass", True))
+            if bool(pregestation_pass):
+                pregestation_gate_streak += 1
+            else:
+                pregestation_gate_streak = 0
+            pregestation_ready = bool((not bool(pregestation_enabled)) or (pregestation_gate_streak >= 1))
+
             gestation_enabled = bool(float(gate_config.get("gestation_loss_target", 0.0)) > 0.0)
             gestation_eval = None
-            if bool(gestation_enabled) and gestation_gate_loader is not None:
+            if bool(pregestation_ready) and bool(gestation_enabled) and gestation_gate_loader is not None:
                 _cleanup_cuda_allocator()
                 gestation_eval = _evaluate_berkeley_classifier_gate(
                     classifier=classifier,
@@ -13415,6 +14722,7 @@ def main():
                     amp_enabled=amp_enabled,
                     amp_dtype=args.amp_dtype,
                     channels_last=bool(args.channels_last),
+                    semantic_mask_supervision_mode=str(args.semantic_mask_supervision_mode),
                 )
             if isinstance(gestation_eval, dict):
                 seen_now = int(max(0, int(gestation_eval.get("num_samples", 0))))
@@ -13451,7 +14759,7 @@ def main():
                     "refresh_samples_seen": int(gestation_gate_samples_seen),
                     "refresh_samples_required": int(gestation_gate_samples_required),
                 }
-            gestation_pass = bool(gestation_detail.get("pass", True))
+            gestation_pass = bool(pregestation_ready) and bool(gestation_detail.get("pass", True))
             if bool(gestation_pass):
                 gestation_gate_streak += 1
             else:
@@ -13504,6 +14812,7 @@ def main():
                     amp_enabled=amp_enabled,
                     amp_dtype=args.amp_dtype,
                     channels_last=bool(args.channels_last),
+                    semantic_mask_supervision_mode=str(args.semantic_mask_supervision_mode),
                 )
             if isinstance(total_eval, dict):
                 seen_now = int(max(0, int(total_eval.get("num_samples", 0))))
@@ -13632,6 +14941,12 @@ def main():
                 "[gates] "
                 f"round={int(round_index)} "
                 f"phase={str(phase_label)} "
+                    f"pregestation_pass={1 if bool(pregestation_pass) else 0} "
+                    f"pregestation_ready={1 if bool(pregestation_ready) else 0} "
+                    f"pregestation_mode={str(pregestation_detail.get('mode', ''))} "
+                    f"pregestation_reason={str(pregestation_detail.get('reason', ''))} "
+                    f"pregestation_loss={(float(pregestation_eval.get('loss', float('nan'))) if isinstance(pregestation_eval, dict) else float('nan')):.4f} "
+                    f"pregestation_target={pregestation_detail.get('loss_target', None)} "
                 f"gestation_pass={1 if bool(gestation_pass) else 0} "
                 f"gestation_ready={1 if bool(gestation_ready) else 0} "
                 f"gestation_mode={str(gestation_detail.get('mode', ''))} "
@@ -13656,6 +14971,10 @@ def main():
                 f"g2_cov={int(total_detail.get('refresh_samples_seen', 0))}/{int(total_detail.get('refresh_samples_required', 0))}"
             )
             return {
+                "pregestation_eval": pregestation_eval,
+                "pregestation_detail": dict(pregestation_detail),
+                "pregestation_pass": bool(pregestation_pass),
+                "pregestation_ready": bool(pregestation_ready),
                 "gestation_eval": gestation_eval,
                 "gestation_detail": dict(gestation_detail),
                 "gestation_pass": bool(gestation_pass),
@@ -13669,6 +14988,9 @@ def main():
             }
 
         initial_gate_eval = _evaluate_two_stage_semantic_gates(round_index=max(0, int(len(orchestration_rows))))
+        initial_pregestation_eval = initial_gate_eval.get("pregestation_eval", None)
+        initial_pregestation_detail = dict(initial_gate_eval.get("pregestation_detail", {}))
+        initial_pregestation_pass = bool(initial_gate_eval.get("pregestation_pass", True))
         initial_gestation_eval = initial_gate_eval.get("gestation_eval", None)
         initial_gestation_detail = dict(initial_gate_eval.get("gestation_detail", {}))
         initial_gestation_pass = bool(initial_gate_eval.get("gestation_pass", True))
@@ -13683,6 +15005,14 @@ def main():
         initial_berkeley_gate_detail = dict(initial_gate_eval.get("total_detail", {}))
         initial_berkeley_gate_pass = bool(initial_gate_eval.get("total_pass", True))
         _log(
+            "Initial Stage 0 -> Gate 0: "
+            f"pass={1 if initial_pregestation_pass else 0} "
+            f"mode={initial_pregestation_detail.get('mode', 'hard_loss_full_refresh')} "
+            f"reason={initial_pregestation_detail.get('reason', 'pass')} "
+            f"loss={(float(initial_pregestation_eval.get('loss', float('nan'))) if isinstance(initial_pregestation_eval, dict) else float('nan')):.4f} "
+            f"target={initial_pregestation_detail.get('loss_target', None)}"
+        )
+        _log(
             "Initial Stage 1 -> Gate 1: "
             f"pass={1 if initial_gestation_pass else 0} "
             f"mode={initial_gestation_detail.get('mode', 'hard_loss_full_refresh')} "
@@ -13695,7 +15025,10 @@ def main():
             f"coverage={int(initial_gestation_detail.get('refresh_samples_seen', 0))}/"
             f"{int(initial_gestation_detail.get('refresh_samples_required', 0))}"
         )
-        _log("Stage 1 trains on gestation-only rows; Gate 1 evaluates gestation validation rows.")
+        _log(
+            "Stage 0 trains on pre-gestation formal logic rows and must satisfy Gate 0; "
+            "Stage 1 trains on gestation-only rows; Gate 1 evaluates gestation validation rows."
+        )
         _log(
             "Initial Stage 2: "
             f"ready={1 if bool(initial_stage_2_ready) else 0} "
@@ -13717,7 +15050,7 @@ def main():
             f"{int(initial_berkeley_gate_detail.get('refresh_samples_required', 0))} "
             f"stage2_validation_rows={int(berkeley_gate_schedule_info.get('selected_rows', 0))}"
         )
-        _log("Pipeline order: Stage 1 -> Gate 1 -> Stage 2 -> Gate 2")
+        _log("Pipeline order: Stage 0 -> Stage 1 -> Gate 1 -> Stage 2 -> Gate 2")
         initial_wave_gate_pass = (
             (float(cls_val.get("mean_entropy", 0.0)) >= gate_config["wave_min_entropy"])
             and (float(cls_val["score"]) >= gate_config["berkeley_min_score"])
@@ -13877,6 +15210,121 @@ def main():
             except Exception:
                 pass
 
+        def _preview_mask_2d(mask_like: Any, hw: Tuple[int, int]) -> Optional[torch.Tensor]:
+            if mask_like is None:
+                return None
+            if isinstance(mask_like, torch.Tensor):
+                mask_t = mask_like.detach().to(device="cpu", dtype=torch.float32)
+            else:
+                mask_t = torch.from_numpy(np.asarray(mask_like, dtype=np.float32))
+            while int(mask_t.ndim) > 2:
+                if int(mask_t.shape[0]) == 1:
+                    mask_t = mask_t[0]
+                else:
+                    mask_t = mask_t[0]
+            if int(mask_t.ndim) != 2:
+                return None
+            mask_t = mask_t.clamp(0.0, 1.0)
+            if tuple(mask_t.shape[-2:]) != (int(hw[0]), int(hw[1])):
+                mask_t = F.interpolate(
+                    mask_t[None, None, ...],
+                    size=(int(hw[0]), int(hw[1])),
+                    mode="bilinear",
+                    align_corners=False,
+                )[0, 0]
+            return mask_t.clamp(0.0, 1.0)
+
+        def _preview_rgb_tensor(img_like: Any) -> torch.Tensor:
+            if isinstance(img_like, torch.Tensor):
+                img_t = img_like.detach().to(device="cpu", dtype=torch.float32)
+            else:
+                img_t = torch.from_numpy(np.asarray(img_like, dtype=np.float32))
+            if int(img_t.ndim) == 4:
+                img_t = img_t[0]
+            if int(img_t.ndim) == 2:
+                img_t = img_t.unsqueeze(0).repeat(3, 1, 1)
+            elif int(img_t.ndim) == 3 and int(img_t.shape[0]) == 1:
+                img_t = img_t.repeat(3, 1, 1)
+            elif int(img_t.ndim) == 3 and int(img_t.shape[-1]) == 3 and int(img_t.shape[0]) != 3:
+                img_t = img_t.permute(2, 0, 1)
+            if int(img_t.ndim) != 3 or int(img_t.shape[0]) != 3:
+                raise ValueError(f"Preview image must resolve to [3,H,W], got {tuple(img_t.shape)}")
+            return img_t.clamp(0.0, 1.0)
+
+        def _preview_image_with_alpha(img_like: Any, mask_like: Any) -> torch.Tensor:
+            img_t = _preview_rgb_tensor(img_like)
+            mask_t = _preview_mask_2d(mask_like, hw=(int(img_t.shape[1]), int(img_t.shape[2])))
+            if mask_t is None:
+                mask_t = torch.ones((int(img_t.shape[1]), int(img_t.shape[2])), dtype=torch.float32)
+            return torch.cat([img_t, mask_t.unsqueeze(0)], dim=0).contiguous()
+
+        def _preview_mask_difference(
+            ref_mask_like: Any,
+            cmp_mask_like: Any,
+            base_img_like: Optional[Any] = None,
+        ) -> torch.Tensor:
+            if base_img_like is None:
+                ref_mask_t = _preview_mask_2d(ref_mask_like, hw=(int(shared_embed_image_size), int(shared_embed_image_size)))
+                if ref_mask_t is None:
+                    raise ValueError("Preview mask difference requires at least one valid mask.")
+                base_t = torch.zeros((3, int(ref_mask_t.shape[0]), int(ref_mask_t.shape[1])), dtype=torch.float32)
+            else:
+                base_t = _preview_rgb_tensor(base_img_like)
+            hw = (int(base_t.shape[1]), int(base_t.shape[2]))
+            ref_mask_t = _preview_mask_2d(ref_mask_like, hw=hw)
+            cmp_mask_t = _preview_mask_2d(cmp_mask_like, hw=hw)
+            if ref_mask_t is None and cmp_mask_t is None:
+                return base_t
+            if ref_mask_t is None:
+                ref_mask_t = torch.zeros(hw, dtype=torch.float32)
+            if cmp_mask_t is None:
+                cmp_mask_t = torch.zeros(hw, dtype=torch.float32)
+            overlap = torch.minimum(ref_mask_t, cmp_mask_t)
+            cmp_only = torch.clamp(cmp_mask_t - ref_mask_t, min=0.0, max=1.0)
+            ref_only = torch.clamp(ref_mask_t - cmp_mask_t, min=0.0, max=1.0)
+            overlay = torch.stack([cmp_only, overlap, ref_only], dim=0)
+            base_dim = base_t * 0.30
+            return torch.clamp(base_dim + (0.90 * overlay), 0.0, 1.0)
+
+        def _preview_mask_metric_rows(ref_mask_like: Any, cmp_mask_like: Any) -> List[str]:
+            ref_mask_t = _preview_mask_2d(ref_mask_like, hw=(int(shared_embed_image_size), int(shared_embed_image_size)))
+            cmp_mask_t = _preview_mask_2d(cmp_mask_like, hw=(int(shared_embed_image_size), int(shared_embed_image_size)))
+            if ref_mask_t is None and cmp_mask_t is None:
+                return ["mask:unavailable"]
+            if ref_mask_t is None:
+                ref_mask_t = torch.zeros_like(cmp_mask_t)
+            if cmp_mask_t is None:
+                cmp_mask_t = torch.zeros_like(ref_mask_t)
+            ref_bin = (ref_mask_t >= 0.5).to(torch.float32)
+            cmp_bin = (cmp_mask_t >= 0.5).to(torch.float32)
+            overlap = float((ref_bin * cmp_bin).mean().item())
+            ref_only = float(torch.clamp(ref_bin - cmp_bin, min=0.0, max=1.0).mean().item())
+            cmp_only = float(torch.clamp(cmp_bin - ref_bin, min=0.0, max=1.0).mean().item())
+            mad = float(torch.abs(ref_mask_t - cmp_mask_t).mean().item())
+            return [
+                f"overlap={overlap:.3f}",
+                f"target_only={ref_only:.3f}",
+                f"detected_only={cmp_only:.3f}",
+                f"mean_abs={mad:.3f}",
+            ]
+
+        def _classifier_probs_and_mask_preview(img_like: Any, context: str) -> Tuple[np.ndarray, Optional[torch.Tensor]]:
+            with torch.no_grad():
+                xb = _preview_rgb_tensor(img_like).unsqueeze(0).to(device=device, dtype=torch.float32)
+                if bool(args.channels_last):
+                    xb = xb.contiguous(memory_format=torch.channels_last)
+                out = _forward_classifier_outputs_require_mask(
+                    classifier=classifier,
+                    xb=xb,
+                    context=str(context),
+                )
+                probs = torch.sigmoid(out["logits"]).to(torch.float32)[0].detach().cpu().numpy().astype(np.float32, copy=False)
+                mask_logits = out.get("mask_logits", None)
+                mask_t = None
+                if isinstance(mask_logits, torch.Tensor) and int(mask_logits.shape[0]) > 0:
+                    mask_t = torch.sigmoid(mask_logits[0].detach().to(torch.float32)).to(device="cpu")
+            return probs, mask_t
+
         def _stage_gl_emit_standard(
             stage_key: str,
             cycle_id: int,
@@ -13948,6 +15396,8 @@ def main():
                     if img is None or probs is None or target_vec is None:
                         return
                     step_txt = f"step={int(payload.get('global_step', 0))}/{int(payload.get('total_steps', 0))}"
+                    target_mask = payload.get("target_mask")
+                    detected_mask = payload.get("detected_mask")
                     target_line = _format_target_line_from_condition(
                         target_vec,
                         class_names=class_names,
@@ -13966,20 +15416,25 @@ def main():
                         except Exception:
                             pass
                     p = probs.detach().to(torch.float32).cpu().numpy().astype(np.float32, copy=False).reshape(-1)
-                    _stage_gl_emit_standard(
-                        stage_key="C",
-                        cycle_id=int(cycle_id),
-                        round_id=int(round_id),
-                        step_txt=step_txt,
-                        clean_img=img,
-                        input_img=img,
-                        output_img=img,
-                        probs_in=p,
-                        probs_out=p,
-                        label_names=class_names,
-                        target_line_override=target_line,
-                        target_extra_rows=loss_rows,
+                    out_lines = _format_top_label_lines(
+                        _top_labels_from_probs(p, class_names=class_names, topk=max(1, min(len(class_names), int(p.shape[0])))),
+                        max_items=0,
                     )
+                    diff_rows = _preview_mask_metric_rows(target_mask, detected_mask)
+                    top_txt = out_lines[0] if len(out_lines) > 0 else "n/a"
+                    stage_opengl_viewer.update(
+                        clean_img=_preview_image_with_alpha(img, target_mask),
+                        input_img=_preview_mask_difference(target_mask, detected_mask, base_img_like=img),
+                        output_img=_preview_image_with_alpha(img, detected_mask),
+                        caption=f"[C] cycle={int(cycle_id)} round={int(round_id)} {step_txt} top={top_txt}",
+                        panel_titles=["C target α", "C mask Δ", "C detected α"],
+                        panel_rows=[
+                            [target_line, str(step_txt)] + list(loss_rows),
+                            list(diff_rows),
+                            [target_line, "alpha=mask_channel"] + (out_lines if len(out_lines) > 0 else ["n/a"]),
+                        ],
+                    )
+                    _log(f"[stage-opengl] C {step_txt} top={top_txt}")
                 except Exception as e:
                     _log(f"[stage-opengl] C live preview failed: {e}")
             return _cb
@@ -13999,6 +15454,12 @@ def main():
                         target_img = img
                     step_txt = f"step={int(payload.get('step', 0))}/{int(payload.get('steps_per_epoch', 0))}"
                     p = probs.detach().to(torch.float32).cpu().numpy().astype(np.float32, copy=False).reshape(-1)
+                    target_mask = payload.get("target_mask")
+                    detected_fake_mask = None
+                    try:
+                        _, detected_fake_mask = _classifier_probs_and_mask_preview(img, context=f"{stage_local} live preview")
+                    except Exception:
+                        detected_fake_mask = payload.get("fake_mask")
                     target_cond = payload.get("target_condition")
                     target_line = None
                     if target_cond is not None:
@@ -14048,21 +15509,27 @@ def main():
                         )
                     except Exception:
                         pass
-                    _stage_gl_emit_standard(
-                        stage_key=stage_local,
-                        cycle_id=int(cycle_id),
-                        round_id=int(round_id),
-                        step_txt=step_txt,
-                        clean_img=target_img,
-                        input_img=img,
-                        output_img=img,
-                        probs_in=p,
-                        probs_out=p,
-                        label_names=class_names,
-                        target_line_override=target_line,
-                        target_extra_rows=target_rows,
-                        extra_out_rows=deskew_rows,
+                    out_lines = _format_top_label_lines(
+                        _top_labels_from_probs(p, class_names=class_names, topk=max(1, min(len(class_names), int(p.shape[0])))),
+                        max_items=0,
                     )
+                    diff_rows = _preview_mask_metric_rows(target_mask, detected_fake_mask)
+                    top_txt = out_lines[0] if len(out_lines) > 0 else "n/a"
+                    stage_opengl_viewer.update(
+                        clean_img=_preview_image_with_alpha(target_img, target_mask),
+                        input_img=_preview_mask_difference(target_mask, detected_fake_mask, base_img_like=target_img),
+                        output_img=_preview_image_with_alpha(img, detected_fake_mask),
+                        caption=f"[{stage_local}] cycle={int(cycle_id)} round={int(round_id)} {step_txt} top={top_txt}",
+                        panel_titles=[f"{stage_local} target α", f"{stage_local} mask Δ", f"{stage_local} fake α"],
+                        panel_rows=[
+                            [target_line or "target:none", str(step_txt)] + list(target_rows),
+                            list(diff_rows),
+                            [target_line or "target:none", "alpha=mask_channel"]
+                            + list(deskew_rows)
+                            + (out_lines if len(out_lines) > 0 else ["n/a"]),
+                        ],
+                    )
+                    _log(f"[stage-opengl] {stage_local} {step_txt} top={top_txt}")
                 except Exception as e:
                     _log(f"[stage-opengl] {stage_local} live preview failed: {e}")
             return _cb
@@ -14572,6 +16039,14 @@ def main():
                             classifier.train()
                     p_fake = probs_fake[0].detach().cpu().numpy().astype(np.float32, copy=False)
                     p_target = probs_target[0].detach().cpu().numpy().astype(np.float32, copy=False)
+                    target_mask = None
+                    if 0 <= int(pick) < int(len(payload_masks)):
+                        target_mask = payload_masks[int(pick)]
+                    detected_fake_mask = None
+                    try:
+                        _, detected_fake_mask = _classifier_probs_and_mask_preview(fake[0], context=f"{stage_key} round preview")
+                    except Exception:
+                        detected_fake_mask = None
                     top_fake = _top_labels_from_probs(
                         p_fake,
                         class_names=class_names,
@@ -14605,15 +16080,17 @@ def main():
                             np.mean([float(p_target[int(i)]) for i in tgt_ids if int(i) < int(p_target.shape[0])])
                         )
                     target_rows = [target_line, f"target_ref_prob:{tgt_prob_target:.3f}"] + top_target_lines
-                    input_rows = top_fake_lines if len(top_fake_lines) > 0 else ["n/a"]
-                    out_rows = [target_line, f"fake_target_prob:{tgt_prob_fake:.3f}"] + input_rows
+                    input_rows = _preview_mask_metric_rows(target_mask, detected_fake_mask)
+                    out_rows = [target_line, f"fake_target_prob:{tgt_prob_fake:.3f}", "mask=classifier_checked_alpha"] + (
+                        top_fake_lines if len(top_fake_lines) > 0 else ["n/a"]
+                    )
                     top_txt = "n/a" if len(top_fake_lines) <= 0 else top_fake_lines[0]
                     stage_opengl_viewer.update(
-                        clean_img=target_img[0],
-                        input_img=fake[0],
-                        output_img=fake[0],
+                        clean_img=_preview_image_with_alpha(target_img[0], target_mask),
+                        input_img=_preview_mask_difference(target_mask, detected_fake_mask, base_img_like=target_img[0]),
+                        output_img=_preview_image_with_alpha(fake[0], detected_fake_mask),
                         caption=f"[{stage_key}] cycle={int(cycle_id)} round={int(round_id)} sample={int(pick)} top={top_txt}",
-                        panel_titles=[f"{stage_key} target ref", f"{stage_key} fake", f"{stage_key} summary"],
+                        panel_titles=[f"{stage_key} target α", f"{stage_key} mask Δ", f"{stage_key} fake α"],
                         panel_rows=[target_rows, input_rows, out_rows],
                     )
                     _log(f"[stage-opengl] {stage_key} sample={int(pick)} top={top_txt}")
@@ -14979,6 +16456,7 @@ def main():
                     max_ch=int(args.classifier_max_ch),
                     context_blocks=int(args.classifier_context_blocks),
                     context_dropout=float(args.classifier_context_dropout),
+                    mask_decoder_channels=max(32, int(max(16, int(args.classifier_base_ch))) // 2),
                 )
                 wave_classifier_init_info = _apply_classifier_init(
                     model=wave_classifier,
@@ -15326,11 +16804,62 @@ def main():
                     _offload_inactive_stage_models(
                         reason=f"cycle={int(cycle_id)} round={int(round_id)} start"
                     )
-                    gestation_ready_before_stage1 = bool(
-                        gestation_gate_streak >= gate_config["gestation_maintain_rounds"]
+                    pregestation_ready_before_stage1 = bool(
+                        (float(gate_config.get("pregestation_loss_target", 0.0)) <= 0.0)
+                        or (pregestation_gate_streak >= 1)
                     )
+                    gestation_ready_before_stage1 = bool(
+                        pregestation_ready_before_stage1
+                        and (gestation_gate_streak >= gate_config["gestation_maintain_rounds"])
+                    )
+                    did_pregestation_stage0_round = False
+                    if (not bool(pregestation_ready_before_stage1)) and (pregestation_stage_loader is not None):
+                        pregestation_stage_steps = max(1, int(len(pregestation_stage_loader)))
+                        ref_stage0 = _run_berkeley_refresh_epochs(
+                            classifier=classifier,
+                            loader=pregestation_stage_loader,
+                            device=device,
+                            epochs=int(args.berkeley_refresh_epochs),
+                            lr=float(args.berkeley_refresh_lr),
+                            weight_decay=float(args.berkeley_refresh_weight_decay),
+                            max_steps=int(pregestation_stage_steps),
+                            min_steps=int(pregestation_stage_steps),
+                            lr_sine_cycles=float(args.lr_sine_cycles),
+                            lr_sine_frequency=float(args.lr_sine_frequency),
+                            lr_sine_tail_fraction=float(args.lr_sine_tail_fraction),
+                            lr_sine_min_scale=float(args.lr_sine_min_scale),
+                            amp_enabled=amp_enabled,
+                            amp_dtype=args.amp_dtype,
+                            channels_last=bool(args.channels_last),
+                            grad_accum_steps=grad_accum_steps,
+                            log_every=int(args.berkeley_refresh_log_every),
+                            max_seconds=float(args.berkeley_refresh_max_seconds),
+                            cache_x=None,
+                            cache_y=None,
+                            cache_m=None,
+                            cache_batch_size=0,
+                            active_classes=int(condition_num_classes) if int(condition_num_classes) > 0 else int(score_active_classes),
+                            semantic_mask_supervision_mode=str(args.semantic_mask_supervision_mode),
+                            vram_fraction=float(args.berkeley_refresh_vram_fraction),
+                            activation_multiplier=float(args.berkeley_refresh_activation_mult),
+                            max_forward_batch_cap=int(args.berkeley_refresh_max_batch_cap),
+                            target_label_knockout_prob=0.0,
+                            target_label_knockout_min_keep=0,
+                            target_label_knockout_max_drop_frac=0.0,
+                            target_label_knockout_seed=int(args.seed) + (int(cycle_id) * 10007) + (int(round_id) * 97),
+                            step_preview_callback=_make_c_step_callback(cycle_id=int(cycle_id), round_id=int(round_id)),
+                            stop_requested=_poll_gui_stop,
+                        )
+                        refresh_rows.append({"stage": "stage0_pregestation", "cycle": cycle_id, "round": round_id, **ref_stage0})
+                        _log(
+                            "  Stage 0 pre-gestation refresh: "
+                            f"loss={ref_stage0['loss']:.4f} samples={ref_stage0.get('samples', 0)} "
+                            f"steps={int(ref_stage0.get('steps_per_epoch', 0))} "
+                            f"elapsed={ref_stage0.get('elapsed_sec', 0.0):.1f}s"
+                        )
+                        did_pregestation_stage0_round = True
                     did_gestation_stage1_round = False
-                    if (not bool(gestation_ready_before_stage1)) and (gestation_stage_loader is not None):
+                    if bool(pregestation_ready_before_stage1) and (not bool(gestation_ready_before_stage1)) and (gestation_stage_loader is not None):
                         gestation_stage_steps = max(1, int(len(gestation_stage_loader)))
                         ref_stage1 = _run_berkeley_refresh_epochs(
                             classifier=classifier,
@@ -15353,8 +16882,13 @@ def main():
                             max_seconds=float(args.berkeley_refresh_max_seconds),
                             cache_x=None,
                             cache_y=None,
+                            cache_m=None,
                             cache_batch_size=0,
                             active_classes=int(condition_num_classes) if int(condition_num_classes) > 0 else int(score_active_classes),
+                            semantic_mask_supervision_mode=str(args.semantic_mask_supervision_mode),
+                            vram_fraction=float(args.berkeley_refresh_vram_fraction),
+                            activation_multiplier=float(args.berkeley_refresh_activation_mult),
+                            max_forward_batch_cap=int(args.berkeley_refresh_max_batch_cap),
                             target_label_knockout_prob=float(args.target_label_knockout_prob),
                             target_label_knockout_min_keep=int(args.target_label_knockout_min_keep),
                             target_label_knockout_max_drop_frac=float(args.target_label_knockout_max_drop_frac),
@@ -15401,7 +16935,7 @@ def main():
                                 "stage1_rows": int(gestation_stage_loader_count),
                             },
                         )
-                    if bool(did_gestation_stage1_round):
+                    if bool(did_pregestation_stage0_round or did_gestation_stage1_round):
                         _cleanup_cuda_allocator()
                     gestation_refresh_ready = bool(gestation_gate_streak >= gate_config["gestation_maintain_rounds"])
                     if bool(gestation_refresh_ready) and (refresh_loader is None):
@@ -15442,6 +16976,7 @@ def main():
                         need_full_refresh_gate2 = bool(force_full_stage2_until_gate2)
                         refresh_cache_x = refresh_cache.get("x") if isinstance(refresh_cache, dict) else None
                         refresh_cache_y = refresh_cache.get("y") if isinstance(refresh_cache, dict) else None
+                        refresh_cache_m = refresh_cache.get("m") if isinstance(refresh_cache, dict) else None
                         refresh_cache_batch = int(refresh_run_batch_size)
                         if (
                             need_full_refresh_startup
@@ -15510,8 +17045,13 @@ def main():
                             max_seconds=float(args.berkeley_refresh_max_seconds),
                             cache_x=refresh_cache_x,
                             cache_y=refresh_cache_y,
+                            cache_m=refresh_cache_m,
                             cache_batch_size=int(refresh_cache_batch),
                             active_classes=int(score_active_classes),
+                            semantic_mask_supervision_mode=str(args.semantic_mask_supervision_mode),
+                            vram_fraction=float(args.berkeley_refresh_vram_fraction),
+                            activation_multiplier=float(args.berkeley_refresh_activation_mult),
+                            max_forward_batch_cap=int(args.berkeley_refresh_max_batch_cap),
                             target_label_knockout_prob=float(args.target_label_knockout_prob),
                             target_label_knockout_min_keep=int(args.target_label_knockout_min_keep),
                             target_label_knockout_max_drop_frac=float(args.target_label_knockout_max_drop_frac),
@@ -15721,6 +17261,10 @@ def main():
                         active_classes=int(score_active_classes),
                     )
                     two_stage_gate_eval = _evaluate_two_stage_semantic_gates(round_index=int(global_round))
+                    pregestation_round_eval = two_stage_gate_eval.get("pregestation_eval", None)
+                    pregestation_gate_eval = dict(two_stage_gate_eval.get("pregestation_detail", {}))
+                    pregestation_pass = bool(two_stage_gate_eval.get("pregestation_pass", True))
+                    pregestation_ready = bool(two_stage_gate_eval.get("pregestation_ready", True))
                     gestation_round_eval = two_stage_gate_eval.get("gestation_eval", None)
                     gestation_gate_eval = dict(two_stage_gate_eval.get("gestation_detail", {}))
                     gestation_pass = bool(two_stage_gate_eval.get("gestation_pass", True))
@@ -15750,6 +17294,11 @@ def main():
                         "cycle": cycle_id,
                         "round": round_id,
                         "berkeley_metric": berkeley_round_metric,
+                        "pregestation_classifier_eval": pregestation_round_eval,
+                        "pregestation_gate_detail": dict(pregestation_gate_eval),
+                        "pregestation_gate_pass": bool(pregestation_pass),
+                        "pregestation_streak": int(pregestation_gate_streak),
+                        "pregestation_ready": bool(pregestation_ready),
                         "gestation_classifier_eval": gestation_round_eval,
                         "gestation_gate_detail": dict(gestation_gate_eval),
                         "gestation_gate_pass": bool(gestation_pass),
@@ -15898,6 +17447,15 @@ def main():
                                 "gate_override": bool(gate_override_active),
                             }
                         )
+                        stage_c_lora_info = {"enabled": bool(args.stage_c_lora_enabled), "ran": False, "reason": "stage2_not_ready"}
+                        if bool(gestation_ready) and bool(two_stage_gate_eval.get("initial_stage_2_ready", False)):
+                            stage_c_lora_info = _run_stage_c_lora_round(
+                                cycle_id=int(cycle_id),
+                                round_id=int(round_id),
+                                global_round=int(global_round),
+                                reason=str(round_row.get("downstream_skipped", "stage_c")),
+                            )
+                        round_row["stage_c_lora"] = dict(stage_c_lora_info)
                         orchestration_rows.append(round_row)
                         if bool(gestation_ready) and bool(two_stage_gate_eval.get("initial_stage_2_ready", False)):
                             _run_transformer_round_preview(
@@ -15923,6 +17481,7 @@ def main():
                                         if isinstance(berkeley_round_metric, dict)
                                         else {}
                                     ),
+                                    "stage_c_lora": dict(stage_c_lora_info),
                                 },
                             )
                         if int(args.checkpoint_every_round) > 0 and (global_round % int(args.checkpoint_every_round) == 0):
@@ -15949,6 +17508,7 @@ def main():
                             classifier=classifier,
                             payload_images=payload_images,
                             payload_conditions=payload_conditions,
+                            payload_masks=payload_masks,
                             num_classes=int(condition_num_classes),
                             image_hw=image_hw,
                             device=device,
@@ -15961,6 +17521,9 @@ def main():
                             lr_d=float(args.discriminator_lr),
                             w_adv=float(args.generator_loss_adv_weight),
                             w_cls=float(args.generator_loss_cls_weight),
+                            w_mask=float(args.generator_loss_mask_weight),
+                            w_disc_mask=float(args.generator_loss_disc_mask_weight),
+                            w_outside_mask=float(args.generator_loss_outside_mask_weight),
                             w_wave=float(feedback_generator_wave_weight),
                             wave_margin=float(args.generator_wave_score_margin),
                             wave_denoise_weight=float(args.generator_wave_denoise_weight),
@@ -15993,6 +17556,7 @@ def main():
                             generator=generator,
                             classifier=classifier,
                             payload_conditions=payload_conditions,
+                            payload_masks=payload_masks,
                             num_classes=int(condition_num_classes),
                             image_hw=image_hw,
                             z_dim=max(8, int(args.generator_z_dim)),
@@ -16003,6 +17567,7 @@ def main():
                             amp_dtype=args.amp_dtype,
                             channels_last=bool(args.channels_last),
                             discriminator=discriminator,
+                            mask_threshold=float(args.generator_mask_threshold),
                             seed=args.seed + 15500 + global_round,
                         )
                         generator_pass = (
@@ -16210,6 +17775,7 @@ def main():
                             classifier=classifier,
                             payload_images=payload_images,
                             payload_conditions=payload_conditions,
+                            payload_masks=payload_masks,
                             num_classes=int(condition_num_classes),
                             image_hw=image_hw,
                             device=device,
@@ -16222,6 +17788,9 @@ def main():
                             lr_d=float(args.discriminator_lr),
                             w_adv=float(args.generator_loss_adv_weight),
                             w_cls=float(args.generator_loss_cls_weight),
+                            w_mask=float(args.generator_loss_mask_weight),
+                            w_disc_mask=float(args.generator_loss_disc_mask_weight),
+                            w_outside_mask=float(args.generator_loss_outside_mask_weight),
                             w_wave=float(feedback_generator_wave_weight),
                             wave_margin=float(args.generator_wave_score_margin),
                             wave_denoise_weight=float(args.generator_wave_denoise_weight),
@@ -16253,6 +17822,7 @@ def main():
                             generator=generator,
                             classifier=classifier,
                             payload_conditions=payload_conditions,
+                            payload_masks=payload_masks,
                             num_classes=int(condition_num_classes),
                             image_hw=image_hw,
                             z_dim=max(8, int(args.generator_z_dim)),
@@ -16263,6 +17833,7 @@ def main():
                             amp_dtype=args.amp_dtype,
                             channels_last=bool(args.channels_last),
                             discriminator=discriminator,
+                            mask_threshold=float(args.generator_mask_threshold),
                             seed=args.seed + 15100 + global_round,
                         )
                         generator_pass = float(generator_eval["target_prob"]) >= gate_config["generator_min_target_prob"]
@@ -16563,6 +18134,7 @@ def main():
                 max_ch=int(args.classifier_max_ch),
                 context_blocks=int(args.classifier_context_blocks),
                 context_dropout=float(args.classifier_context_dropout),
+                mask_decoder_channels=max(32, int(max(16, int(args.classifier_base_ch))) // 2),
             )
             wave_classifier_init_info = _apply_classifier_init(
                 model=wave_classifier,
@@ -16694,11 +18266,62 @@ def main():
                     _offload_inactive_stage_models(
                         reason=f"cycle={int(cycle_id)} round={int(round_id)} start"
                     )
-                    gestation_ready_before_stage1 = bool(
-                        gestation_gate_streak >= gate_config["gestation_maintain_rounds"]
+                    pregestation_ready_before_stage1 = bool(
+                        (float(gate_config.get("pregestation_loss_target", 0.0)) <= 0.0)
+                        or (pregestation_gate_streak >= 1)
                     )
+                    gestation_ready_before_stage1 = bool(
+                        pregestation_ready_before_stage1
+                        and (gestation_gate_streak >= gate_config["gestation_maintain_rounds"])
+                    )
+                    did_pregestation_stage0_round = False
+                    if (not bool(pregestation_ready_before_stage1)) and (pregestation_stage_loader is not None):
+                        pregestation_stage_steps = max(1, int(len(pregestation_stage_loader)))
+                        ref_stage0 = _run_berkeley_refresh_epochs(
+                            classifier=classifier,
+                            loader=pregestation_stage_loader,
+                            device=device,
+                            epochs=int(args.berkeley_refresh_epochs),
+                            lr=float(args.berkeley_refresh_lr),
+                            weight_decay=float(args.berkeley_refresh_weight_decay),
+                            max_steps=int(pregestation_stage_steps),
+                            min_steps=int(pregestation_stage_steps),
+                            lr_sine_cycles=float(args.lr_sine_cycles),
+                            lr_sine_frequency=float(args.lr_sine_frequency),
+                            lr_sine_tail_fraction=float(args.lr_sine_tail_fraction),
+                            lr_sine_min_scale=float(args.lr_sine_min_scale),
+                            amp_enabled=amp_enabled,
+                            amp_dtype=args.amp_dtype,
+                            channels_last=bool(args.channels_last),
+                            grad_accum_steps=grad_accum_steps,
+                            log_every=int(args.berkeley_refresh_log_every),
+                            max_seconds=float(args.berkeley_refresh_max_seconds),
+                            cache_x=None,
+                            cache_y=None,
+                            cache_m=None,
+                            cache_batch_size=0,
+                            active_classes=int(condition_num_classes) if int(condition_num_classes) > 0 else int(score_active_classes),
+                            semantic_mask_supervision_mode=str(args.semantic_mask_supervision_mode),
+                            vram_fraction=float(args.berkeley_refresh_vram_fraction),
+                            activation_multiplier=float(args.berkeley_refresh_activation_mult),
+                            max_forward_batch_cap=int(args.berkeley_refresh_max_batch_cap),
+                            target_label_knockout_prob=0.0,
+                            target_label_knockout_min_keep=0,
+                            target_label_knockout_max_drop_frac=0.0,
+                            target_label_knockout_seed=int(args.seed) + (int(cycle_id) * 10007) + (int(round_id) * 97),
+                            step_preview_callback=_make_c_step_callback(cycle_id=int(cycle_id), round_id=int(round_id)),
+                            stop_requested=_poll_gui_stop,
+                        )
+                        refresh_rows.append({"stage": "stage0_pregestation", "cycle": cycle_id, "round": round_id, **ref_stage0})
+                        _log(
+                            "  Stage 0 pre-gestation refresh: "
+                            f"loss={ref_stage0['loss']:.4f} samples={ref_stage0.get('samples', 0)} "
+                            f"steps={int(ref_stage0.get('steps_per_epoch', 0))} "
+                            f"elapsed={ref_stage0.get('elapsed_sec', 0.0):.1f}s"
+                        )
+                        did_pregestation_stage0_round = True
                     did_gestation_stage1_round = False
-                    if (not bool(gestation_ready_before_stage1)) and (gestation_stage_loader is not None):
+                    if bool(pregestation_ready_before_stage1) and (not bool(gestation_ready_before_stage1)) and (gestation_stage_loader is not None):
                         gestation_stage_steps = max(1, int(len(gestation_stage_loader)))
                         ref_stage1 = _run_berkeley_refresh_epochs(
                             classifier=classifier,
@@ -16721,8 +18344,13 @@ def main():
                             max_seconds=float(args.berkeley_refresh_max_seconds),
                             cache_x=None,
                             cache_y=None,
+                            cache_m=None,
                             cache_batch_size=0,
                             active_classes=int(condition_num_classes) if int(condition_num_classes) > 0 else int(score_active_classes),
+                            semantic_mask_supervision_mode=str(args.semantic_mask_supervision_mode),
+                            vram_fraction=float(args.berkeley_refresh_vram_fraction),
+                            activation_multiplier=float(args.berkeley_refresh_activation_mult),
+                            max_forward_batch_cap=int(args.berkeley_refresh_max_batch_cap),
                             target_label_knockout_prob=float(args.target_label_knockout_prob),
                             target_label_knockout_min_keep=int(args.target_label_knockout_min_keep),
                             target_label_knockout_max_drop_frac=float(args.target_label_knockout_max_drop_frac),
@@ -16770,7 +18398,7 @@ def main():
                                 "stage1_rows": int(gestation_stage_loader_count),
                             },
                         )
-                    if bool(did_gestation_stage1_round):
+                    if bool(did_pregestation_stage0_round or did_gestation_stage1_round):
                         _cleanup_cuda_allocator()
                     gestation_refresh_ready = bool(gestation_gate_streak >= gate_config["gestation_maintain_rounds"])
                     if bool(gestation_refresh_ready) and (refresh_loader is None):
@@ -16811,6 +18439,7 @@ def main():
                         need_full_refresh_gate2 = bool(force_full_stage2_until_gate2)
                         refresh_cache_x = refresh_cache.get("x") if isinstance(refresh_cache, dict) else None
                         refresh_cache_y = refresh_cache.get("y") if isinstance(refresh_cache, dict) else None
+                        refresh_cache_m = refresh_cache.get("m") if isinstance(refresh_cache, dict) else None
                         refresh_cache_batch = int(refresh_run_batch_size)
                         if (
                             need_full_refresh_startup
@@ -16879,8 +18508,13 @@ def main():
                             max_seconds=float(args.berkeley_refresh_max_seconds),
                             cache_x=refresh_cache_x,
                             cache_y=refresh_cache_y,
+                            cache_m=refresh_cache_m,
                             cache_batch_size=int(refresh_cache_batch),
                             active_classes=int(score_active_classes),
+                            semantic_mask_supervision_mode=str(args.semantic_mask_supervision_mode),
+                            vram_fraction=float(args.berkeley_refresh_vram_fraction),
+                            activation_multiplier=float(args.berkeley_refresh_activation_mult),
+                            max_forward_batch_cap=int(args.berkeley_refresh_max_batch_cap),
                             target_label_knockout_prob=float(args.target_label_knockout_prob),
                             target_label_knockout_min_keep=int(args.target_label_knockout_min_keep),
                             target_label_knockout_max_drop_frac=float(args.target_label_knockout_max_drop_frac),
@@ -17089,6 +18723,10 @@ def main():
                         active_classes=int(score_active_classes),
                     )
                     two_stage_gate_eval = _evaluate_two_stage_semantic_gates(round_index=int(global_round))
+                    pregestation_round_eval = two_stage_gate_eval.get("pregestation_eval", None)
+                    pregestation_gate_eval = dict(two_stage_gate_eval.get("pregestation_detail", {}))
+                    pregestation_pass = bool(two_stage_gate_eval.get("pregestation_pass", True))
+                    pregestation_ready = bool(two_stage_gate_eval.get("pregestation_ready", True))
                     gestation_round_eval = two_stage_gate_eval.get("gestation_eval", None)
                     gestation_gate_eval = dict(two_stage_gate_eval.get("gestation_detail", {}))
                     gestation_pass = bool(two_stage_gate_eval.get("gestation_pass", True))
@@ -17118,6 +18756,11 @@ def main():
                         "cycle": cycle_id,
                         "round": round_id,
                         "berkeley_metric": berkeley_round_metric,
+                        "pregestation_classifier_eval": pregestation_round_eval,
+                        "pregestation_gate_detail": dict(pregestation_gate_eval),
+                        "pregestation_gate_pass": bool(pregestation_pass),
+                        "pregestation_streak": int(pregestation_gate_streak),
+                        "pregestation_ready": bool(pregestation_ready),
                         "gestation_classifier_eval": gestation_round_eval,
                         "gestation_gate_detail": dict(gestation_gate_eval),
                         "gestation_gate_pass": bool(gestation_pass),
@@ -17259,6 +18902,15 @@ def main():
                                 "gate_override": bool(gate_override_active),
                             }
                         )
+                        stage_c_lora_info = {"enabled": bool(args.stage_c_lora_enabled), "ran": False, "reason": "stage2_not_ready"}
+                        if bool(gestation_ready) and bool(two_stage_gate_eval.get("initial_stage_2_ready", False)):
+                            stage_c_lora_info = _run_stage_c_lora_round(
+                                cycle_id=int(cycle_id),
+                                round_id=int(round_id),
+                                global_round=int(global_round),
+                                reason=str(round_row.get("downstream_skipped", "stage_c")),
+                            )
+                        round_row["stage_c_lora"] = dict(stage_c_lora_info)
                         orchestration_rows.append(round_row)
                         if bool(gestation_ready) and bool(two_stage_gate_eval.get("initial_stage_2_ready", False)):
                             _run_transformer_round_preview(
@@ -17284,6 +18936,7 @@ def main():
                                         if isinstance(berkeley_round_metric, dict)
                                         else {}
                                     ),
+                                    "stage_c_lora": dict(stage_c_lora_info),
                                 },
                             )
                         if int(args.checkpoint_every_round) > 0 and (global_round % int(args.checkpoint_every_round) == 0):
@@ -17976,6 +19629,7 @@ def main():
                 "label_texts": label_texts,
                 "label_embedding_info": label_embedding_info,
                 "model_name": classifier_init_info.get("model_name", "tiny"),
+                "classifier_lora": _snapshot_classifier_lora(classifier),
             },
             classifier_path,
         )
@@ -18212,6 +19866,7 @@ def main():
             "classifier_init": classifier_init_info,
             "classifier_resume": classifier_resume_info,
             "classifier_init_trials": [{"mode": "berkeley_multilabel"}],
+            "classifier_lora": _snapshot_classifier_lora(classifier),
             "classifier_val": cls_val,
             "berkeley_refresh_history": refresh_rows,
             "gate_config": gate_config,
@@ -18391,6 +20046,7 @@ def main():
                     max_ch=int(args.classifier_max_ch),
                     context_blocks=int(args.classifier_context_blocks),
                     context_dropout=float(args.classifier_context_dropout),
+                    mask_decoder_channels=max(32, int(max(16, int(args.classifier_base_ch))) // 2),
                 )
                 init_info = _apply_classifier_init(model, args.classifier_init_ckpt, args.classifier_init_scope)
                 _apply_label_embedding_bank_to_classifier(
@@ -18463,6 +20119,7 @@ def main():
                         max_ch=int(args.classifier_max_ch),
                         context_blocks=int(args.classifier_context_blocks),
                         context_dropout=float(args.classifier_context_dropout),
+                        mask_decoder_channels=max(32, int(max(16, int(args.classifier_base_ch))) // 2),
                     )
                     init_info = _apply_classifier_init(model, args.classifier_init_ckpt, args.classifier_init_scope)
                     _apply_label_embedding_bank_to_classifier(
@@ -18535,6 +20192,7 @@ def main():
         max_ch=int(args.classifier_max_ch),
         context_blocks=int(args.classifier_context_blocks),
         context_dropout=float(args.classifier_context_dropout),
+        mask_decoder_channels=max(32, int(max(16, int(args.classifier_base_ch))) // 2),
     )
     classifier_init_info = _apply_classifier_init(classifier, args.classifier_init_ckpt, args.classifier_init_scope)
     classifier_resume_info = {"used": False}
@@ -18549,6 +20207,7 @@ def main():
             classifier,
             resume_pipeline_ckpt.get("classifier_state"),
             source_name="pipeline_checkpoint",
+            classifier_lora=resume_pipeline_ckpt.get("classifier_lora"),
         )
         _log(
             "Resumed classifier from pipeline checkpoint "
@@ -18929,6 +20588,7 @@ def main():
             "class_names": class_names,
             "label_texts": label_texts,
             "label_embedding_info": label_embedding_info,
+            "classifier_lora": _snapshot_classifier_lora(classifier),
         },
         classifier_path,
     )
@@ -18994,6 +20654,7 @@ def main():
         "classifier_init": classifier_init_info,
         "classifier_resume": classifier_resume_info,
         "classifier_init_trials": init_info_search,
+        "classifier_lora": _snapshot_classifier_lora(classifier),
         "classifier_val": cls_val,
         "transformer_eval": final_eval,
         "classifier_history": classifier_hist,

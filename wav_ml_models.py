@@ -154,8 +154,8 @@ def _tensor_to_rgb_u8_image(x: torch.Tensor) -> np.ndarray:
         t = t.repeat(3, 1, 1)
     elif c == 2:
         t = torch.cat([t, t[:1]], dim=0)
-    elif c > 3:
-        t = t[:3]
+    elif c > 4:
+        t = t[:4]
 
     lo = float(t.min().item())
     hi = float(t.max().item())
@@ -258,6 +258,8 @@ class _TransformerStatusOpenGLViewer:
             GL.glViewport(0, 0, self.window_w, self.window_h)
             GL.glDisable(GL.GL_DEPTH_TEST)
             GL.glEnable(GL.GL_TEXTURE_2D)
+            GL.glEnable(GL.GL_BLEND)
+            GL.glBlendFunc(GL.GL_SRC_ALPHA, GL.GL_ONE_MINUS_SRC_ALPHA)
             GL.glClearColor(0.06, 0.06, 0.08, 1.0)
 
             tex = GL.glGenTextures(7)
@@ -302,16 +304,23 @@ class _TransformerStatusOpenGLViewer:
     def _upload_texture(self, tex_id: int, img_rgb: np.ndarray):
         gl = self._gl
         h, w, _ = img_rgb.shape
+        channels = int(img_rgb.shape[2]) if int(img_rgb.ndim) == 3 else 0
+        if int(channels) == 4:
+            internal_format = gl.GL_RGBA
+            src_format = gl.GL_RGBA
+        else:
+            internal_format = gl.GL_RGB
+            src_format = gl.GL_RGB
         gl.glBindTexture(gl.GL_TEXTURE_2D, int(tex_id))
         gl.glPixelStorei(gl.GL_UNPACK_ALIGNMENT, 1)
         gl.glTexImage2D(
             gl.GL_TEXTURE_2D,
             0,
-            gl.GL_RGB,
+            internal_format,
             int(w),
             int(h),
             0,
-            gl.GL_RGB,
+            src_format,
             gl.GL_UNSIGNED_BYTE,
             np.ascontiguousarray(img_rgb),
         )
@@ -779,6 +788,7 @@ class TinyConvClassifier(nn.Module):
         max_ch: int = 384,
         context_blocks: int = 8,
         context_dropout: float = 0.05,
+        mask_decoder_channels: int = 0,
     ):
         super().__init__()
         c0 = max(16, int(base_ch))
@@ -810,6 +820,31 @@ class TinyConvClassifier(nn.Module):
             nn.Flatten(),
             nn.Linear(c3, num_classes),
         )
+        self.mask_decoder_channels = max(0, int(mask_decoder_channels))
+        if int(self.mask_decoder_channels) > 0:
+            m0 = max(16, int(self.mask_decoder_channels))
+            m1 = max(12, int(round(m0 * 0.75)))
+            m2 = max(8, int(round(m0 * 0.5)))
+            self.mask_head = nn.Sequential(
+                nn.Conv2d(c3, m0, kernel_size=3, padding=1),
+                nn.BatchNorm2d(m0),
+                nn.GELU(),
+                nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),
+                nn.Conv2d(m0, m0, kernel_size=3, padding=1),
+                nn.BatchNorm2d(m0),
+                nn.GELU(),
+                nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),
+                nn.Conv2d(m0, m1, kernel_size=3, padding=1),
+                nn.BatchNorm2d(m1),
+                nn.GELU(),
+                nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),
+                nn.Conv2d(m1, m2, kernel_size=3, padding=1),
+                nn.BatchNorm2d(m2),
+                nn.GELU(),
+                nn.Conv2d(m2, 1, kernel_size=1),
+            )
+        else:
+            self.mask_head = None
         # Keep a wide semantic lane before projection to task/logit space.
         semantic_hidden = max(1024, int(c3) * 4)
         self.semantic_expand = nn.Sequential(
@@ -823,8 +858,11 @@ class TinyConvClassifier(nn.Module):
         self.register_buffer("label_embed_bank", torch.zeros((0, 0), dtype=torch.float32), persistent=True)
         self.register_buffer("label_embed_enabled", torch.zeros((1,), dtype=torch.uint8), persistent=True)
 
+    def extract_feature_map(self, x: torch.Tensor) -> torch.Tensor:
+        return self.features(x)
+
     def extract_features(self, x: torch.Tensor) -> torch.Tensor:
-        h = self.features(x)
+        h = self.extract_feature_map(x)
         h = self.head[0](h)
         h = self.head[1](h)
         return h
@@ -897,11 +935,321 @@ class TinyConvClassifier(nn.Module):
         feat = self.extract_features(x)
         return self.semantic_logits_from_features(feat=feat, bank=bank, temperature=temperature)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        feat = self.extract_features(x)
+    def mask_logits_from_feature_map(
+        self,
+        feature_map: torch.Tensor,
+        output_hw: Optional[Tuple[int, int]] = None,
+    ) -> torch.Tensor:
+        if self.mask_head is None:
+            raise RuntimeError("Mask head is not enabled for this TinyConvClassifier.")
+        y = self.mask_head(feature_map)
+        if output_hw is not None and tuple(y.shape[-2:]) != tuple(output_hw):
+            y = F.interpolate(y, size=output_hw, mode="bilinear", align_corners=False)
+        return y
+
+    def forward_with_aux(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
+        feature_map = self.extract_feature_map(x)
+        feat = self.head[0](feature_map)
+        feat = self.head[1](feat)
         if bool(int(self.label_embed_enabled.item())) and int(self.label_embed_bank.shape[0]) > 0:
-            return self.semantic_logits_from_features(feat=feat)
-        return self.head[-1](feat)
+            logits = self.semantic_logits_from_features(feat=feat)
+        else:
+            logits = self.head[-1](feat)
+        out: Dict[str, torch.Tensor] = {
+            "logits": logits,
+            "pooled_features": feat,
+        }
+        if self.mask_head is not None:
+            out["mask_logits"] = self.mask_logits_from_feature_map(
+                feature_map=feature_map,
+                output_hw=(int(x.shape[-2]), int(x.shape[-1])),
+            )
+        return out
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.forward_with_aux(x)["logits"]
+
+
+class _LoRALinearSlot(nn.Module):
+    def __init__(self, in_features: int, out_features: int, rank: int):
+        super().__init__()
+        r = max(1, int(rank))
+        self.down = nn.Linear(int(in_features), int(r), bias=False)
+        self.up = nn.Linear(int(r), int(out_features), bias=False)
+        nn.init.kaiming_uniform_(self.down.weight, a=math.sqrt(5.0))
+        nn.init.zeros_(self.up.weight)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.up(self.down(x))
+
+
+class _LoRAConv1x1Slot(nn.Module):
+    def __init__(self, in_channels: int, out_channels: int, rank: int):
+        super().__init__()
+        r = max(1, int(rank))
+        self.down = nn.Conv2d(int(in_channels), int(r), kernel_size=1, bias=False)
+        self.up = nn.Conv2d(int(r), int(out_channels), kernel_size=1, bias=False)
+        nn.init.kaiming_uniform_(self.down.weight, a=math.sqrt(5.0))
+        nn.init.zeros_(self.up.weight)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.up(self.down(x))
+
+
+class LoRALinear(nn.Module):
+    def __init__(self, base: nn.Linear, rank: int = 8, alpha: float = 16.0):
+        super().__init__()
+        if not isinstance(base, nn.Linear):
+            raise TypeError(f"LoRALinear requires nn.Linear, got {type(base).__name__}")
+        self.base = base
+        self.rank = max(1, int(rank))
+        self.alpha = float(max(1.0, float(alpha)))
+        self.scale = float(self.alpha / float(self.rank))
+        self.slots = nn.ModuleDict()
+        self.active_slot = ""
+
+    @property
+    def in_features(self) -> int:
+        return int(self.base.in_features)
+
+    @property
+    def out_features(self) -> int:
+        return int(self.base.out_features)
+
+    @property
+    def weight(self) -> torch.Tensor:
+        return self.base.weight
+
+    @property
+    def bias(self) -> Optional[torch.Tensor]:
+        return self.base.bias
+
+    def ensure_slot(self, slot_name: str):
+        key = str(slot_name).strip()
+        if not key:
+            raise ValueError("LoRA slot name must be non-empty.")
+        if key not in self.slots:
+            self.slots[key] = _LoRALinearSlot(
+                in_features=int(self.base.in_features),
+                out_features=int(self.base.out_features),
+                rank=int(self.rank),
+            )
+
+    def slot_names(self) -> List[str]:
+        return [str(k) for k in self.slots.keys()]
+
+    def set_active_slot(self, slot_name: str):
+        self.active_slot = str(slot_name).strip()
+
+    def set_trainable_state(self, slot_name: str, lora_only: bool):
+        key = str(slot_name).strip()
+        for p in self.base.parameters():
+            p.requires_grad_(not bool(lora_only))
+        for name, slot in self.slots.items():
+            req = bool(lora_only and str(name) == key)
+            for p in slot.parameters():
+                p.requires_grad_(bool(req))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        y = self.base(x)
+        key = str(self.active_slot).strip()
+        if key and key in self.slots:
+            y = y + (self.scale * self.slots[key](x))
+        return y
+
+
+class LoRAConv2d1x1(nn.Module):
+    def __init__(self, base: nn.Conv2d, rank: int = 8, alpha: float = 16.0):
+        super().__init__()
+        if not isinstance(base, nn.Conv2d):
+            raise TypeError(f"LoRAConv2d1x1 requires nn.Conv2d, got {type(base).__name__}")
+        if tuple(base.kernel_size) != (1, 1):
+            raise ValueError(f"LoRAConv2d1x1 only supports 1x1 convolutions, got kernel={tuple(base.kernel_size)}")
+        self.base = base
+        self.rank = max(1, int(rank))
+        self.alpha = float(max(1.0, float(alpha)))
+        self.scale = float(self.alpha / float(self.rank))
+        self.slots = nn.ModuleDict()
+        self.active_slot = ""
+
+    @property
+    def in_channels(self) -> int:
+        return int(self.base.in_channels)
+
+    @property
+    def out_channels(self) -> int:
+        return int(self.base.out_channels)
+
+    @property
+    def kernel_size(self) -> Tuple[int, int]:
+        return tuple(self.base.kernel_size)
+
+    @property
+    def weight(self) -> torch.Tensor:
+        return self.base.weight
+
+    @property
+    def bias(self) -> Optional[torch.Tensor]:
+        return self.base.bias
+
+    def ensure_slot(self, slot_name: str):
+        key = str(slot_name).strip()
+        if not key:
+            raise ValueError("LoRA slot name must be non-empty.")
+        if key not in self.slots:
+            self.slots[key] = _LoRAConv1x1Slot(
+                in_channels=int(self.base.in_channels),
+                out_channels=int(self.base.out_channels),
+                rank=int(self.rank),
+            )
+
+    def slot_names(self) -> List[str]:
+        return [str(k) for k in self.slots.keys()]
+
+    def set_active_slot(self, slot_name: str):
+        self.active_slot = str(slot_name).strip()
+
+    def set_trainable_state(self, slot_name: str, lora_only: bool):
+        key = str(slot_name).strip()
+        for p in self.base.parameters():
+            p.requires_grad_(not bool(lora_only))
+        for name, slot in self.slots.items():
+            req = bool(lora_only and str(name) == key)
+            for p in slot.parameters():
+                p.requires_grad_(bool(req))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        y = self.base(x)
+        key = str(self.active_slot).strip()
+        if key and key in self.slots:
+            y = y + (self.scale * self.slots[key](x))
+        return y
+
+
+def install_tiny_classifier_lora(model: TinyConvClassifier, rank: int = 8, alpha: float = 16.0) -> TinyConvClassifier:
+    if not isinstance(model, TinyConvClassifier):
+        raise TypeError(f"LoRA install requires TinyConvClassifier, got {type(model).__name__}")
+    if isinstance(model.semantic_expand[0], nn.Linear):
+        model.semantic_expand[0] = LoRALinear(model.semantic_expand[0], rank=int(rank), alpha=float(alpha))
+    if isinstance(model.semantic_expand[2], nn.Linear):
+        model.semantic_expand[2] = LoRALinear(model.semantic_expand[2], rank=int(rank), alpha=float(alpha))
+    if isinstance(model.embed_proj, nn.Linear):
+        model.embed_proj = LoRALinear(model.embed_proj, rank=int(rank), alpha=float(alpha))
+    if isinstance(model.head[-1], nn.Linear):
+        model.head[-1] = LoRALinear(model.head[-1], rank=int(rank), alpha=float(alpha))
+    if model.mask_head is not None and isinstance(model.mask_head[-1], nn.Conv2d) and tuple(model.mask_head[-1].kernel_size) == (1, 1):
+        model.mask_head[-1] = LoRAConv2d1x1(model.mask_head[-1], rank=int(rank), alpha=float(alpha))
+    return model
+
+
+def tiny_classifier_lora_modules(model: TinyConvClassifier) -> List[nn.Module]:
+    if not isinstance(model, TinyConvClassifier):
+        return []
+    out: List[nn.Module] = []
+    candidates = [
+        model.semantic_expand[0],
+        model.semantic_expand[2],
+        model.embed_proj,
+        model.head[-1],
+        (model.mask_head[-1] if model.mask_head is not None and int(len(model.mask_head)) > 0 else None),
+    ]
+    for mod in candidates:
+        if isinstance(mod, (LoRALinear, LoRAConv2d1x1)):
+            out.append(mod)
+    return out
+
+
+def ensure_tiny_classifier_lora_slot(model: TinyConvClassifier, slot_name: str):
+    key = str(slot_name).strip()
+    if not key:
+        raise ValueError("LoRA slot name must be non-empty.")
+    for mod in tiny_classifier_lora_modules(model):
+        mod.ensure_slot(key)
+
+
+def set_tiny_classifier_lora_state(model: TinyConvClassifier, slot_name: str = "", lora_only: bool = False):
+    key = str(slot_name).strip()
+    if bool(lora_only):
+        if not key:
+            raise ValueError("LoRA-only mode requires a non-empty slot name.")
+        ensure_tiny_classifier_lora_slot(model, key)
+    for p in model.parameters():
+        p.requires_grad_(not bool(lora_only))
+    for mod in tiny_classifier_lora_modules(model):
+        mod.set_active_slot(key if bool(lora_only) else "")
+        mod.set_trainable_state(slot_name=key, lora_only=bool(lora_only))
+
+
+def tiny_classifier_lora_snapshot(model: TinyConvClassifier) -> Dict[str, Any]:
+    if not isinstance(model, TinyConvClassifier):
+        return {"installed": False, "slot_names": []}
+    mods = tiny_classifier_lora_modules(model)
+    if int(len(mods)) <= 0:
+        return {"installed": False, "slot_names": []}
+    first = mods[0]
+    slot_names: List[str] = []
+    seen: set = set()
+    for mod in mods:
+        for slot_name in mod.slot_names():
+            key = str(slot_name).strip()
+            if (not key) or (key in seen):
+                continue
+            seen.add(key)
+            slot_names.append(key)
+    active_slot = ""
+    try:
+        active_slot = str(getattr(first, "active_slot", "")).strip()
+    except Exception:
+        active_slot = ""
+    lora_only = False
+    try:
+        lora_only = bool(active_slot) and all((not bool(p.requires_grad)) for p in model.parameters())
+    except Exception:
+        lora_only = False
+    return {
+        "installed": True,
+        "rank": int(getattr(first, "rank", 0)),
+        "alpha": float(getattr(first, "alpha", 0.0)),
+        "slot_names": list(slot_names),
+        "active_slot": str(active_slot),
+        "lora_only": bool(lora_only),
+        "module_count": int(len(mods)),
+    }
+
+
+def restore_tiny_classifier_lora_snapshot(model: TinyConvClassifier, snapshot: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    if not isinstance(model, TinyConvClassifier):
+        return {"used": False, "installed": False, "reason": f"unsupported_model:{type(model).__name__}"}
+    if not isinstance(snapshot, dict):
+        return {"used": False, "installed": False, "reason": "snapshot_missing"}
+    if not bool(snapshot.get("installed", False)):
+        return {"used": False, "installed": False, "reason": "not_installed"}
+    rank = max(1, int(snapshot.get("rank", 8)))
+    alpha = float(max(1.0, float(snapshot.get("alpha", 16.0))))
+    if int(len(tiny_classifier_lora_modules(model))) <= 0:
+        install_tiny_classifier_lora(model, rank=int(rank), alpha=float(alpha))
+    slot_names = snapshot.get("slot_names", [])
+    restored_slots = 0
+    if isinstance(slot_names, (list, tuple, set)):
+        for slot_name in slot_names:
+            key = str(slot_name).strip()
+            if not key:
+                continue
+            ensure_tiny_classifier_lora_slot(model, key)
+            restored_slots += 1
+    active_slot = str(snapshot.get("active_slot", "")).strip()
+    lora_only = bool(snapshot.get("lora_only", False)) and bool(active_slot)
+    set_tiny_classifier_lora_state(model, slot_name=active_slot if bool(lora_only) else "", lora_only=bool(lora_only))
+    return {
+        "used": True,
+        "installed": True,
+        "rank": int(rank),
+        "alpha": float(alpha),
+        "slots": int(restored_slots),
+        "active_slot": str(active_slot),
+        "lora_only": bool(lora_only),
+        "reason": "restored",
+    }
 
 
 class DeskewFilterBundle(nn.Module):
@@ -1208,6 +1556,7 @@ class ConditionalBitPlaneGenerator(nn.Module):
         base_ch: int = 64,
         depth: int = 4,
         min_ch: int = 12,
+        mask_decoder_channels: int = 0,
     ):
         super().__init__()
         self.num_classes = int(num_classes)
@@ -1216,6 +1565,7 @@ class ConditionalBitPlaneGenerator(nn.Module):
         self.image_w = max(8, int(image_hw[1]))
         self.depth = max(2, int(depth))
         self.min_ch = max(8, int(min_ch))
+        self.mask_decoder_channels = max(0, int(mask_decoder_channels))
         # Keep a high-capacity latent image seed for 256x256 synthesis.
         self.seed_h = min(int(self.image_h), 32)
         self.seed_w = min(int(self.image_w), 32)
@@ -1256,6 +1606,18 @@ class ConditionalBitPlaneGenerator(nn.Module):
             nn.GELU(),
             nn.Conv2d(int(channels[-1]), 3, kernel_size=1),
         )
+        if int(self.mask_decoder_channels) > 0:
+            m0 = max(16, int(self.mask_decoder_channels))
+            m1 = max(12, int(round(float(m0) * 0.75)))
+            self.mask_head = nn.Sequential(
+                nn.Conv2d(int(channels[-1]), m0, kernel_size=3, padding=1),
+                nn.GELU(),
+                nn.Conv2d(m0, m1, kernel_size=3, padding=1),
+                nn.GELU(),
+                nn.Conv2d(m1, 1, kernel_size=1),
+            )
+        else:
+            self.mask_head = None
 
     def _decode_sizes(self) -> List[Tuple[int, int]]:
         # Grow spatial map aggressively, then refine at target.
@@ -1272,7 +1634,7 @@ class ConditionalBitPlaneGenerator(nn.Module):
             sizes.append((int(cur_h), int(cur_w)))
         return sizes
 
-    def forward(self, z: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
+    def forward_with_aux(self, z: torch.Tensor, cond: torch.Tensor) -> Dict[str, torch.Tensor]:
         if z.ndim != 2:
             raise ValueError("Generator expects z shape [B, Z].")
         if cond.ndim != 2:
@@ -1294,7 +1656,17 @@ class ConditionalBitPlaneGenerator(nn.Module):
         out = self.out_head(h)
         if int(out.shape[2]) != int(self.image_h) or int(out.shape[3]) != int(self.image_w):
             out = F.interpolate(out, size=(int(self.image_h), int(self.image_w)), mode="nearest")
-        return torch.sigmoid(out)
+        out_img = torch.sigmoid(out)
+        aux: Dict[str, torch.Tensor] = {"image": out_img}
+        if self.mask_head is not None:
+            mask_logits = self.mask_head(h)
+            if int(mask_logits.shape[2]) != int(self.image_h) or int(mask_logits.shape[3]) != int(self.image_w):
+                mask_logits = F.interpolate(mask_logits, size=(int(self.image_h), int(self.image_w)), mode="bilinear", align_corners=False)
+            aux["mask_logits"] = mask_logits
+        return aux
+
+    def forward(self, z: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
+        return self.forward_with_aux(z, cond)["image"]
 
 
 class ConditionalBitPlaneDiscriminator(nn.Module):
@@ -1305,7 +1677,7 @@ class ConditionalBitPlaneDiscriminator(nn.Module):
         n = max(2, int(depth))
         cmax = max(c0, int(max_ch))
         layers: List[nn.Module] = []
-        in_c = 3
+        in_c = 4
         out_c = c0
         for _ in range(n):
             out_c = min(int(cmax), int(out_c))
@@ -1324,20 +1696,35 @@ class ConditionalBitPlaneDiscriminator(nn.Module):
             nn.Linear(cond_expand, feat_dim),
             nn.GELU(),
         )
-        self.head = nn.Linear(feat_dim * 2, 1)
+        self.head = nn.Linear(feat_dim * 2, 2)
 
-    def forward(self, x: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
+    def forward_with_aux(self, x: torch.Tensor, cond: torch.Tensor, mask: torch.Tensor) -> Dict[str, torch.Tensor]:
         if x.ndim != 4:
             raise ValueError("Discriminator expects x shape [B, 3, H, W].")
         if cond.ndim != 2:
             raise ValueError("Discriminator expects cond shape [B, C].")
+        if mask.ndim == 3:
+            mask = mask.unsqueeze(1)
+        if mask.ndim != 4:
+            raise ValueError("Discriminator expects mask shape [B, 1, H, W].")
+        if int(mask.shape[0]) != int(x.shape[0]):
+            raise ValueError("Discriminator batch mismatch between x and mask.")
         if int(cond.shape[1]) != int(self.num_classes):
             raise ValueError(
                 f"Discriminator condition width mismatch: got={int(cond.shape[1])} expected={int(self.num_classes)}"
             )
-        feat = self.features(x)
+        if tuple(mask.shape[-2:]) != tuple(x.shape[-2:]):
+            mask = F.interpolate(mask.to(dtype=x.dtype), size=tuple(x.shape[-2:]), mode="nearest")
+        feat = self.features(torch.cat([x, mask.to(dtype=x.dtype)], dim=1))
         cfeat = self.cond_encoder(cond.to(dtype=feat.dtype))
-        return self.head(torch.cat([feat, cfeat], dim=1)).squeeze(1)
+        logits = self.head(torch.cat([feat, cfeat], dim=1))
+        return {
+            "subject_logits": logits[:, 0],
+            "mask_logits": logits[:, 1],
+        }
+
+    def forward(self, x: torch.Tensor, cond: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        return self.forward_with_aux(x=x, cond=cond, mask=mask)["subject_logits"]
 
 
 def _payload_condition_bank(
@@ -1366,6 +1753,103 @@ def _payload_condition_bank(
     return torch.from_numpy(rows)
 
 
+def _payload_mask_bank(
+    payload_masks: Sequence[Any],
+    image_hw: Tuple[int, int],
+) -> torch.Tensor:
+    n = int(len(payload_masks))
+    h = max(1, int(image_hw[0]))
+    w = max(1, int(image_hw[1]))
+    if n <= 0:
+        return torch.zeros((0, 1, h, w), dtype=torch.float32)
+    rows = np.zeros((n, 1, h, w), dtype=np.float32)
+    for i in range(n):
+        x = payload_masks[i]
+        if isinstance(x, torch.Tensor):
+            arr = x.detach().cpu().numpy().astype(np.float32, copy=False)
+        else:
+            arr = np.asarray(x, dtype=np.float32)
+        if int(arr.ndim) == 3 and int(arr.shape[0]) == 1:
+            arr = arr[0]
+        elif int(arr.ndim) == 3:
+            arr = np.mean(arr, axis=0).astype(np.float32, copy=False)
+        elif int(arr.ndim) != 2:
+            raise RuntimeError(f"Semantic mask row {i} must be [H,W] or [1,H,W], got {tuple(arr.shape)}")
+        arr_t = torch.from_numpy(np.asarray(arr, dtype=np.float32))[None, None, ...]
+        if tuple(arr.shape) != (int(h), int(w)):
+            arr_t = F.interpolate(arr_t, size=(int(h), int(w)), mode="nearest")
+        rows[int(i), 0, :, :] = np.clip(arr_t[0, 0].cpu().numpy().astype(np.float32, copy=False), 0.0, 1.0)
+    return torch.from_numpy(rows)
+
+
+def _payload_image_bank(
+    payload_images: Sequence[Any],
+    image_hw: Tuple[int, int],
+) -> torch.Tensor:
+    n = int(len(payload_images))
+    h = max(1, int(image_hw[0]))
+    w = max(1, int(image_hw[1]))
+    if n <= 0:
+        return torch.zeros((0, 3, h, w), dtype=torch.float32)
+    rows = np.zeros((n, 3, h, w), dtype=np.float32)
+    for i in range(n):
+        x = payload_images[i]
+        if isinstance(x, torch.Tensor):
+            arr = x.detach().cpu().numpy().astype(np.float32, copy=False)
+        else:
+            arr = np.asarray(x, dtype=np.float32)
+        if int(arr.ndim) == 2:
+            arr = np.repeat(arr[None, :, :], 3, axis=0).astype(np.float32, copy=False)
+        elif int(arr.ndim) == 3 and int(arr.shape[0]) == 1:
+            arr = np.repeat(arr, 3, axis=0).astype(np.float32, copy=False)
+        elif int(arr.ndim) == 3 and int(arr.shape[0]) == 3:
+            pass
+        elif int(arr.ndim) == 3 and int(arr.shape[-1]) == 3:
+            arr = np.transpose(arr, (2, 0, 1)).astype(np.float32, copy=False)
+        else:
+            raise RuntimeError(f"Semantic payload image row {i} must be [3,H,W] or [H,W,3], got {tuple(arr.shape)}")
+        arr_t = torch.from_numpy(np.asarray(arr, dtype=np.float32))[None, ...]
+        if tuple(arr_t.shape[-2:]) != (int(h), int(w)):
+            arr_t = F.interpolate(arr_t, size=(int(h), int(w)), mode="nearest")
+        rows[int(i), :, :, :] = np.clip(arr_t[0].cpu().numpy().astype(np.float32, copy=False), 0.0, 1.0)
+    return torch.from_numpy(rows)
+
+
+def _payload_batch_bank(
+    payload_images: Sequence[Any],
+    payload_conditions: Sequence[Any],
+    payload_masks: Sequence[Any],
+    indices: Sequence[int],
+    num_classes: int,
+    image_hw: Tuple[int, int],
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    picks = [int(i) for i in list(indices)]
+    image_rows = [payload_images[int(i)] for i in picks]
+    cond_rows = [payload_conditions[int(i)] for i in picks]
+    mask_rows = [payload_masks[int(i)] for i in picks]
+    return (
+        _payload_image_bank(payload_images=image_rows, image_hw=image_hw),
+        _payload_condition_bank(payload_targets=cond_rows, num_classes=int(num_classes)),
+        _payload_mask_bank(payload_masks=mask_rows, image_hw=image_hw),
+    )
+
+
+def _payload_condition_mask_batch(
+    payload_conditions: Sequence[Any],
+    payload_masks: Sequence[Any],
+    indices: Sequence[int],
+    num_classes: int,
+    image_hw: Tuple[int, int],
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    picks = [int(i) for i in list(indices)]
+    cond_rows = [payload_conditions[int(i)] for i in picks]
+    mask_rows = [payload_masks[int(i)] for i in picks]
+    return (
+        _payload_condition_bank(payload_targets=cond_rows, num_classes=int(num_classes)),
+        _payload_mask_bank(payload_masks=mask_rows, image_hw=image_hw),
+    )
+
+
 def _align_probs_with_condition(probs: torch.Tensor, cond: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     if probs.ndim != 2:
         raise ValueError(f"Expected probs [B,C], got shape={tuple(probs.shape)}")
@@ -1387,6 +1871,7 @@ def evaluate_conditional_generator(
     generator: nn.Module,
     classifier: nn.Module,
     payload_conditions: Sequence[Any],
+    payload_masks: Sequence[Any],
     num_classes: int,
     image_hw: Tuple[int, int],
     z_dim: int,
@@ -1398,26 +1883,32 @@ def evaluate_conditional_generator(
     channels_last: bool = False,
     fake_class_idx: int = -1,
     discriminator: Optional[nn.Module] = None,
+    mask_threshold: float = 0.5,
     seed: int = 0,
 ) -> Dict[str, float]:
-    if len(payload_conditions) <= 0:
+    if len(payload_conditions) <= 0 or len(payload_masks) <= 0:
         return {
             "target_prob": 0.0,
             "mean_prob": 0.0,
             "coverage": 0.0,
             "fake_prob": 0.0,
             "disc_pass_rate": 0.0,
+            "disc_mask_pass_rate": 0.0,
+            "mask_iou": 0.0,
+            "mask_dice": 0.0,
         }
-    cond_bank_cpu = _payload_condition_bank(payload_targets=payload_conditions, num_classes=int(num_classes))
-    if int(cond_bank_cpu.shape[0]) <= 0:
+    n_payload = min(int(len(payload_conditions)), int(len(payload_masks)))
+    if int(n_payload) <= 0:
         return {
             "target_prob": 0.0,
             "mean_prob": 0.0,
             "coverage": 0.0,
             "fake_prob": 0.0,
             "disc_pass_rate": 0.0,
+            "disc_mask_pass_rate": 0.0,
+            "mask_iou": 0.0,
+            "mask_dice": 0.0,
         }
-    cond_bank = cond_bank_cpu.to(device=device, dtype=torch.float32)
     rng = np.random.default_rng(seed)
     use_amp = _should_use_amp(device=device, amp=amp)
     amp_dtype_t = _resolve_amp_dtype(amp_dtype) if use_amp else torch.float16
@@ -1433,18 +1924,35 @@ def evaluate_conditional_generator(
     sum_cov = torch.zeros((), device=device, dtype=torch.float32)
     sum_fake = torch.zeros((), device=device, dtype=torch.float32)
     sum_disc_pass = torch.zeros((), device=device, dtype=torch.float32)
+    sum_disc_mask_pass = torch.zeros((), device=device, dtype=torch.float32)
+    sum_mask_iou = torch.zeros((), device=device, dtype=torch.float32)
+    sum_mask_dice = torch.zeros((), device=device, dtype=torch.float32)
     n = 0
     for _ in range(max(1, int(steps))):
-        idx = rng.integers(0, len(payload_conditions), size=max(1, int(batch_size)))
-        idx_t = torch.as_tensor(idx, device=device, dtype=torch.long)
-        cond = cond_bank.index_select(0, idx_t).to(device=device, dtype=torch.float32)
+        idx = rng.integers(0, int(n_payload), size=max(1, int(batch_size)))
+        cond_cpu, mask_cpu = _payload_condition_mask_batch(
+            payload_conditions=payload_conditions,
+            payload_masks=payload_masks,
+            indices=idx.tolist(),
+            num_classes=int(num_classes),
+            image_hw=image_hw,
+        )
+        cond = cond_cpu.to(device=device, dtype=torch.float32)
+        mask_target = mask_cpu.to(device=device, dtype=torch.float32)
         z = torch.randn((int(cond.shape[0]), int(z_dim)), device=device)
         with _autocast_context(device=device, use_amp=use_amp, amp_dtype_t=amp_dtype_t):
-            fake = generator(z, cond).to(torch.float32)
+            gen_out = generator.forward_with_aux(z, cond) if hasattr(generator, "forward_with_aux") else {"image": generator(z, cond)}
+            fake = gen_out["image"].to(torch.float32)
             if channels_last:
                 fake = fake.contiguous(memory_format=torch.channels_last)
             logits = classifier(fake)
             probs = torch.sigmoid(logits).to(torch.float32)
+            fake_mask_logits = gen_out.get("mask_logits")
+            if not isinstance(fake_mask_logits, torch.Tensor):
+                raise RuntimeError("Conditional generator evaluation requires generator mask logits.")
+            if tuple(fake_mask_logits.shape[-2:]) != tuple(mask_target.shape[-2:]):
+                fake_mask_logits = F.interpolate(fake_mask_logits, size=tuple(mask_target.shape[-2:]), mode="bilinear", align_corners=False)
+            fake_mask_probs = torch.sigmoid(fake_mask_logits).to(torch.float32)
         probs_target, cond_target = _align_probs_with_condition(probs=probs, cond=cond)
         target_count = torch.clamp(cond_target.sum(dim=1), min=1.0)
         target_prob = ((probs_target * cond_target).sum(dim=1) / target_count).mean()
@@ -1455,16 +1963,29 @@ def evaluate_conditional_generator(
             fake_prob = probs[:, int(fake_class_idx)].mean()
         else:
             fake_prob = torch.zeros((), device=device, dtype=torch.float32)
+        fake_mask_bin = (fake_mask_probs >= float(max(0.0, min(1.0, float(mask_threshold))))).to(torch.float32)
+        target_mask_bin = (mask_target >= 0.5).to(torch.float32)
+        inter = (fake_mask_bin * target_mask_bin).sum(dim=(1, 2, 3))
+        union = ((fake_mask_bin + target_mask_bin) > 0.0).to(torch.float32).sum(dim=(1, 2, 3))
+        pred_mass = fake_mask_bin.sum(dim=(1, 2, 3))
+        tgt_mass = target_mask_bin.sum(dim=(1, 2, 3))
+        mask_iou = torch.mean(inter / (union + 1e-8))
+        mask_dice = torch.mean((2.0 * inter) / (pred_mass + tgt_mass + 1e-8))
         if discriminator is not None:
-            d_fake = discriminator(fake, cond).to(torch.float32)
-            disc_pass = (d_fake > 0.0).to(torch.float32).mean()
+            d_fake = discriminator.forward_with_aux(fake, cond, fake_mask_probs)
+            disc_pass = (d_fake["subject_logits"].to(torch.float32) > 0.0).to(torch.float32).mean()
+            disc_mask_pass = (d_fake["mask_logits"].to(torch.float32) > 0.0).to(torch.float32).mean()
         else:
             disc_pass = torch.zeros((), device=device, dtype=torch.float32)
+            disc_mask_pass = torch.zeros((), device=device, dtype=torch.float32)
         sum_target += target_prob
         sum_mean += mean_prob
         sum_cov += cov
         sum_fake += fake_prob
         sum_disc_pass += disc_pass
+        sum_disc_mask_pass += disc_mask_pass
+        sum_mask_iou += mask_iou
+        sum_mask_dice += mask_dice
         n += 1
     d = float(max(1, n))
     out = {
@@ -1473,6 +1994,9 @@ def evaluate_conditional_generator(
         "coverage": float((sum_cov / d).item()),
         "fake_prob": float((sum_fake / d).item()),
         "disc_pass_rate": float((sum_disc_pass / d).item()),
+        "disc_mask_pass_rate": float((sum_disc_mask_pass / d).item()),
+        "mask_iou": float((sum_mask_iou / d).item()),
+        "mask_dice": float((sum_mask_dice / d).item()),
     }
     if discriminator is not None:
         discriminator.train(disc_was_training)
@@ -1485,6 +2009,7 @@ def train_conditional_generator_discriminator(
     classifier: nn.Module,
     payload_images: Sequence[np.ndarray],
     payload_conditions: Sequence[Any],
+    payload_masks: Sequence[Any],
     num_classes: int,
     image_hw: Tuple[int, int],
     device: torch.device,
@@ -1497,6 +2022,9 @@ def train_conditional_generator_discriminator(
     lr_d: float = 2e-4,
     w_adv: float = 0.50,
     w_cls: float = 1.50,
+    w_mask: float = 0.0,
+    w_disc_mask: float = 0.0,
+    w_outside_mask: float = 0.0,
     w_wave: float = 0.0,
     wave_margin: float = 0.02,
     wave_denoise_weight: float = 0.25,
@@ -1519,11 +2047,15 @@ def train_conditional_generator_discriminator(
     classifier_forward_batch_cap: int = 0,
     seed: int = 0,
 ) -> Tuple[nn.Module, nn.Module, List[Dict[str, float]]]:
-    if len(payload_images) <= 0 or len(payload_conditions) <= 0:
+    if len(payload_images) <= 0 or len(payload_conditions) <= 0 or len(payload_masks) <= 0:
         raise RuntimeError("Generator/discriminator training requires non-empty payload bank.")
     if len(payload_images) != len(payload_conditions):
         raise RuntimeError(
             f"Payload image/condition mismatch: images={len(payload_images)} conditions={len(payload_conditions)}"
+        )
+    if len(payload_images) != len(payload_masks):
+        raise RuntimeError(
+            f"Payload image/mask mismatch: images={len(payload_images)} masks={len(payload_masks)}"
         )
 
     use_amp = _should_use_amp(device=device, amp=amp)
@@ -1609,12 +2141,9 @@ def train_conditional_generator_discriminator(
             parts.append(classifier(x[st : st + cap]))
         return torch.cat(parts, dim=0)
 
-    bank_x = torch.from_numpy(np.stack(payload_images, axis=0).astype(np.float32))
-    bank_cond = _payload_condition_bank(payload_targets=payload_conditions, num_classes=int(num_classes))
-    if int(bank_cond.shape[0]) != int(bank_x.shape[0]):
-        raise RuntimeError(
-            f"Payload condition/image mismatch: cond={int(bank_cond.shape[0])} images={int(bank_x.shape[0])}"
-        )
+    n_payload = min(int(len(payload_images)), int(len(payload_conditions)), int(len(payload_masks)))
+    if int(n_payload) <= 0:
+        raise RuntimeError("Generator/discriminator training requires non-empty payload bank.")
     history: List[Dict[str, float]] = []
 
     stop_now = False
@@ -1623,9 +2152,15 @@ def train_conditional_generator_discriminator(
         discriminator.train()
         run_d = 0.0
         run_g = 0.0
+        run_mask = 0.0
+        run_outside = 0.0
         run_tgt = 0.0
         run_adv = 0.0
         run_wave = 0.0
+        run_disc_mask_fake_pass = 0.0
+        run_disc_mask_fake_fail = 0.0
+        run_mask_iou = 0.0
+        run_mask_dice = 0.0
         run_disc_fake_pass = 0.0
         run_disc_fake_fail = 0.0
         n_steps = max(1, int(steps_per_epoch))
@@ -1638,9 +2173,18 @@ def train_conditional_generator_discriminator(
                         break
                 except Exception:
                     pass
-            idx = rng.integers(0, int(bank_x.shape[0]), size=max(1, int(batch_size)))
-            real = bank_x[idx].to(device=device, non_blocking=True)
-            cond = bank_cond[idx].to(device=device, non_blocking=True, dtype=torch.float32)
+            idx = rng.integers(0, int(n_payload), size=max(1, int(batch_size)))
+            real_cpu, cond_cpu, mask_cpu = _payload_batch_bank(
+                payload_images=payload_images,
+                payload_conditions=payload_conditions,
+                payload_masks=payload_masks,
+                indices=idx.tolist(),
+                num_classes=int(num_classes),
+                image_hw=image_hw,
+            )
+            real = real_cpu.to(device=device, non_blocking=True)
+            cond = cond_cpu.to(device=device, non_blocking=True, dtype=torch.float32)
+            real_mask = mask_cpu.to(device=device, non_blocking=True, dtype=torch.float32)
             if channels_last:
                 real = real.contiguous(memory_format=torch.channels_last)
             d_loss_accum = 0.0
@@ -1648,10 +2192,20 @@ def train_conditional_generator_discriminator(
                 if d_sub == 0:
                     real_d = real
                     cond_d = cond
+                    real_mask_d = real_mask
                 else:
-                    idx_d = rng.integers(0, int(bank_x.shape[0]), size=max(1, int(batch_size)))
-                    real_d = bank_x[idx_d].to(device=device, non_blocking=True)
-                    cond_d = bank_cond[idx_d].to(device=device, non_blocking=True, dtype=torch.float32)
+                    idx_d = rng.integers(0, int(n_payload), size=max(1, int(batch_size)))
+                    real_d_cpu, cond_d_cpu, mask_d_cpu = _payload_batch_bank(
+                        payload_images=payload_images,
+                        payload_conditions=payload_conditions,
+                        payload_masks=payload_masks,
+                        indices=idx_d.tolist(),
+                        num_classes=int(num_classes),
+                        image_hw=image_hw,
+                    )
+                    real_d = real_d_cpu.to(device=device, non_blocking=True)
+                    cond_d = cond_d_cpu.to(device=device, non_blocking=True, dtype=torch.float32)
+                    real_mask_d = mask_d_cpu.to(device=device, non_blocking=True, dtype=torch.float32)
                     if channels_last:
                         real_d = real_d.contiguous(memory_format=torch.channels_last)
 
@@ -1661,16 +2215,26 @@ def train_conditional_generator_discriminator(
                 for st, ed in d_ranges:
                     real_m = real_d[st:ed]
                     cond_m = cond_d[st:ed]
+                    real_mask_m = real_mask_d[st:ed]
                     z = torch.randn((int(real_m.shape[0]), int(z_dim)), device=device)
                     with _autocast_context(device=device, use_amp=use_amp, amp_dtype_t=amp_dtype_t):
-                        fake = generator(z, cond_m)
+                        gen_out = generator.forward_with_aux(z, cond_m) if hasattr(generator, "forward_with_aux") else {"image": generator(z, cond_m)}
+                        fake = gen_out["image"]
+                        fake_mask_logits = gen_out.get("mask_logits")
+                        if not isinstance(fake_mask_logits, torch.Tensor):
+                            raise RuntimeError("Conditional generator training requires generator mask logits.")
+                        if tuple(fake_mask_logits.shape[-2:]) != tuple(real_mask_m.shape[-2:]):
+                            fake_mask_logits = F.interpolate(fake_mask_logits, size=tuple(real_mask_m.shape[-2:]), mode="bilinear", align_corners=False)
+                        fake_mask_probs = torch.sigmoid(fake_mask_logits)
                         if channels_last:
                             fake = fake.contiguous(memory_format=torch.channels_last)
-                        d_real = discriminator(real_m, cond_m)
-                        d_fake = discriminator(fake.detach(), cond_m)
+                        d_real = discriminator.forward_with_aux(real_m, cond_m, real_mask_m)
+                        d_fake = discriminator.forward_with_aux(fake.detach(), cond_m, fake_mask_probs.detach())
                         d_loss = 0.5 * (
-                            F.softplus(-d_real).mean()
-                            + F.softplus(d_fake).mean()
+                            F.softplus(-d_real["subject_logits"]).mean()
+                            + F.softplus(d_fake["subject_logits"]).mean()
+                            + F.softplus(-d_real["mask_logits"]).mean()
+                            + F.softplus(d_fake["mask_logits"]).mean()
                         )
                     d_loss_back = d_loss / float(max(1, len(d_ranges)))
                     if use_scaler:
@@ -1690,27 +2254,51 @@ def train_conditional_generator_discriminator(
             g_loss_step = 0.0
             adv_loss_step = 0.0
             target_prob_step = 0.0
+            mask_loss_step = 0.0
+            outside_loss_step = 0.0
             wave_loss_step = 0.0
             disc_fake_pass_step = 0.0
+            disc_mask_fake_pass_step = 0.0
+            mask_iou_step = 0.0
+            mask_dice_step = 0.0
             preview_payload = None
             g_ranges = _chunk_ranges(total=int(real.shape[0]), chunks=grad_accum_steps)
             for st, ed in g_ranges:
                 cond_g = cond[st:ed]
                 real_g = real[st:ed]
+                real_mask_g = real_mask[st:ed]
                 z2 = torch.randn((int(real_g.shape[0]), int(z_dim)), device=device)
                 with _autocast_context(device=device, use_amp=use_amp, amp_dtype_t=amp_dtype_t):
-                    fake2 = generator(z2, cond_g)
+                    gen_out = generator.forward_with_aux(z2, cond_g) if hasattr(generator, "forward_with_aux") else {"image": generator(z2, cond_g)}
+                    fake2 = gen_out["image"]
+                    fake_mask_logits = gen_out.get("mask_logits")
+                    if not isinstance(fake_mask_logits, torch.Tensor):
+                        raise RuntimeError("Conditional generator training requires generator mask logits.")
+                    if tuple(fake_mask_logits.shape[-2:]) != tuple(real_mask_g.shape[-2:]):
+                        fake_mask_logits = F.interpolate(fake_mask_logits, size=tuple(real_mask_g.shape[-2:]), mode="bilinear", align_corners=False)
+                    fake_mask_probs = torch.sigmoid(fake_mask_logits).to(torch.float32)
                     if channels_last:
                         fake2 = fake2.contiguous(memory_format=torch.channels_last)
-                    d_fake2 = discriminator(fake2, cond_g)
-                    adv_loss = F.softplus(-d_fake2).mean()
+                    d_fake2 = discriminator.forward_with_aux(fake2, cond_g, fake_mask_probs)
+                    adv_loss = F.softplus(-d_fake2["subject_logits"]).mean()
+                    disc_mask_loss = F.softplus(-d_fake2["mask_logits"]).mean()
                     logits = _classifier_forward_chunked(fake2)
                     probs = torch.sigmoid(logits).to(torch.float32)
                     probs_target, cond_target = _align_probs_with_condition(probs=probs, cond=cond_g)
                     target_count = torch.clamp(cond_target.sum(dim=1), min=1.0)
                     target_prob = (probs_target * cond_target).sum(dim=1) / target_count
                     cls_loss = (1.0 - target_prob).mean()
-                    g_loss = (float(w_adv) * adv_loss) + (float(w_cls) * cls_loss)
+                    mask_loss = F.binary_cross_entropy_with_logits(fake_mask_logits.to(torch.float32), real_mask_g.to(torch.float32))
+                    outside_weight = torch.clamp(1.0 - real_mask_g.to(torch.float32), 0.0, 1.0)
+                    outside_denom = torch.clamp(outside_weight.sum(), min=1.0)
+                    outside_loss = ((torch.abs(fake2.to(torch.float32) - real_g.to(torch.float32)) * outside_weight).sum() / outside_denom)
+                    g_loss = (
+                        (float(w_adv) * adv_loss)
+                        + (float(w_cls) * cls_loss)
+                        + (float(w_disc_mask) * disc_mask_loss)
+                        + (float(w_mask) * mask_loss)
+                        + (float(w_outside_mask) * outside_loss)
+                    )
                     wave_loss = torch.zeros((), device=device, dtype=torch.float32)
                     if use_wave_loss and wave_shape_info is not None and wave_index is not None:
                         # Wave-coupled supervision is expensive at high resolutions.
@@ -1837,13 +2425,29 @@ def train_conditional_generator_discriminator(
                 g_loss_step += float(g_loss.detach().item()) * w
                 adv_loss_step += float(adv_loss.detach().item()) * w
                 target_prob_step += float(target_prob.detach().mean().item()) * w
+                mask_loss_step += float(mask_loss.detach().item()) * w
+                outside_loss_step += float(outside_loss.detach().item()) * w
                 wave_loss_step += float(wave_loss.detach().item()) * w
-                disc_fake_pass = float((d_fake2.detach().to(torch.float32) > 0.0).to(torch.float32).mean().item())
+                disc_fake_pass = float((d_fake2["subject_logits"].detach().to(torch.float32) > 0.0).to(torch.float32).mean().item())
+                disc_mask_fake_pass = float((d_fake2["mask_logits"].detach().to(torch.float32) > 0.0).to(torch.float32).mean().item())
+                fake_mask_bin = (fake_mask_probs >= 0.5).to(torch.float32)
+                target_mask_bin = (real_mask_g >= 0.5).to(torch.float32)
+                inter = (fake_mask_bin * target_mask_bin).sum(dim=(1, 2, 3))
+                union = ((fake_mask_bin + target_mask_bin) > 0.0).to(torch.float32).sum(dim=(1, 2, 3))
+                pred_mass = fake_mask_bin.sum(dim=(1, 2, 3))
+                tgt_mass = target_mask_bin.sum(dim=(1, 2, 3))
+                mask_iou = torch.mean(inter / (union + 1e-8))
+                mask_dice = torch.mean((2.0 * inter) / (pred_mass + tgt_mass + 1e-8))
                 disc_fake_pass_step += float(disc_fake_pass) * w
+                disc_mask_fake_pass_step += float(disc_mask_fake_pass) * w
+                mask_iou_step += float(mask_iou.detach().item()) * w
+                mask_dice_step += float(mask_dice.detach().item()) * w
                 if preview_payload is None:
                     preview_payload = {
                         "target_img": real_g[0].detach().to(torch.float32),
                         "fake_img": fake2[0].detach().to(torch.float32),
+                        "target_mask": real_mask_g[0].detach().to(torch.float32),
+                        "fake_mask": fake_mask_probs[0].detach().to(torch.float32),
                         "probs": probs[0].detach().to(torch.float32),
                         "target_condition": cond_g[0].detach().to(torch.float32).cpu(),
                         "target_prob": float(target_prob[0].detach().to(torch.float32).item()),
@@ -1858,9 +2462,15 @@ def train_conditional_generator_discriminator(
             run_g += float(g_loss_step)
             run_adv += float(adv_loss_step)
             run_tgt += float(target_prob_step)
+            run_mask += float(mask_loss_step)
+            run_outside += float(outside_loss_step)
             run_wave += float(wave_loss_step)
             run_disc_fake_pass += float(disc_fake_pass_step)
             run_disc_fake_fail += (1.0 - float(disc_fake_pass_step))
+            run_disc_mask_fake_pass += float(disc_mask_fake_pass_step)
+            run_disc_mask_fake_fail += (1.0 - float(disc_mask_fake_pass_step))
+            run_mask_iou += float(mask_iou_step)
+            run_mask_dice += float(mask_dice_step)
             steps_done = int(step_idx)
 
             if step_preview_callback is not None:
@@ -1878,12 +2488,16 @@ def train_conditional_generator_discriminator(
                                 "steps_per_epoch": int(n_steps),
                                 "target_img": preview_payload["target_img"],
                                 "fake_img": preview_payload["fake_img"],
+                                "target_mask": preview_payload["target_mask"],
+                                "fake_mask": preview_payload["fake_mask"],
                                 "probs": preview_payload["probs"],
                                 "target_condition": preview_payload["target_condition"],
                                 "target_prob": float(preview_payload["target_prob"]),
                                 "g_loss": float(g_loss_step),
                                 "d_loss": float(d_loss_step),
                                 "adv_loss": float(adv_loss_step),
+                                "mask_loss": float(mask_loss_step),
+                                "outside_loss": float(outside_loss_step),
                                 "wave_loss": float(wave_loss_step),
                                 "target_prob_avg": float(run_tgt / float(max(1, int(step_idx)))),
                                 "g_loss_avg": float(run_g / float(max(1, int(step_idx)))),
@@ -1898,14 +2512,22 @@ def train_conditional_generator_discriminator(
                 _d = float(run_d / float(step_idx))
                 _a = float(run_adv / float(step_idx))
                 _t = float(run_tgt / float(step_idx))
+                _m = float(run_mask / float(step_idx))
+                _o = float(run_outside / float(step_idx))
                 _w = float(run_wave / float(step_idx))
                 _dp = float(run_disc_fake_pass / float(step_idx))
                 _df = float(run_disc_fake_fail / float(step_idx))
+                _dmp = float(run_disc_mask_fake_pass / float(step_idx))
+                _dmf = float(run_disc_mask_fake_fail / float(step_idx))
+                _mi = float(run_mask_iou / float(step_idx))
+                _md = float(run_mask_dice / float(step_idx))
                 print(
                     f"[generator-train] epoch={epoch}/{max(1, int(epochs))} "
                     f"step={step_idx}/{n_steps} g_loss={_g:.4f} d_loss={_d:.4f} "
-                    f"adv={_a:.4f} target_prob={_t:.4f} wave={_w:.4f} "
+                    f"adv={_a:.4f} target_prob={_t:.4f} mask={_m:.4f} outside={_o:.4f} wave={_w:.4f} "
                     f"disc_fake_pass={_dp:.4f} disc_fake_fail={_df:.4f} "
+                    f"disc_mask_pass={_dmp:.4f} disc_mask_fail={_dmf:.4f} "
+                    f"mask_iou={_mi:.4f} mask_dice={_md:.4f} "
                     f"d_steps={int(disc_steps_per_gen_step)}",
                     flush=True,
                 )
@@ -1920,9 +2542,15 @@ def train_conditional_generator_discriminator(
                 "g_loss": float(run_g / denom),
                 "g_adv_loss": float(run_adv / denom),
                 "g_target_prob": float(run_tgt / denom),
+                "g_mask_loss": float(run_mask / denom),
+                "g_outside_loss": float(run_outside / denom),
                 "g_wave_loss": float(run_wave / denom),
                 "disc_fake_pass_rate": float(run_disc_fake_pass / denom),
                 "disc_fake_fail_rate": float(run_disc_fake_fail / denom),
+                "disc_mask_pass_rate": float(run_disc_mask_fake_pass / denom),
+                "disc_mask_fail_rate": float(run_disc_mask_fake_fail / denom),
+                "mask_iou": float(run_mask_iou / denom),
+                "mask_dice": float(run_mask_dice / denom),
                 "disc_steps_per_gen_step": float(disc_steps_per_gen_step),
             }
         )
