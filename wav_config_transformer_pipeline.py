@@ -5,6 +5,7 @@ import hashlib
 import json
 import math
 import os
+import queue as _preview_queue_module
 import re
 import shutil
 import sys
@@ -38,11 +39,16 @@ from wav_ml_core import (
 from wav_ml_models import (
     _TransformerStatusOpenGLViewer,
     _LossFileLogger,
+    _tensor_to_rgb_u8_image,
     LOSS_STAGE_CLASSIFIER,
     LOSS_STAGE_DISCRIMINATOR,
     LOSS_STAGE_GENERATOR,
     LOSS_STAGE_TRANSFORMER,
     LOSS_STAGE_WAVE_CLASSIFIER,
+    LOSS_STAGE_WAVE_CLASSIFIER_EVAL,
+)
+from wav_ml_viewer import ViewerIPCProxy
+from wav_ml_models import (
     ConditionalBitPlaneDiscriminator,
     ConditionalBitPlaneGenerator,
     SinusoidalLRController,
@@ -102,7 +108,7 @@ except ModuleNotFoundError:
 
 _ST_MODEL_CACHE: Dict[Tuple[str, str], Any] = {}
 GUI_STOP_EXIT_CODE = 42
-CLASSIFIER_LOSS_SCALE = 10.0
+CLASSIFIER_LOSS_SCALE = 1.0
 CLASSIFIER_SEMANTIC_COSINE_WEIGHT = 0.35
 
 
@@ -6618,23 +6624,25 @@ def _run_berkeley_refresh_epochs(
                     )
                 if step_preview_callback is not None and len(preview_items) > 0:
                     _avg_loss = float(total_loss / max(1, n))
+                    _cb_batch = []
                     for _item in preview_items:
-                        try:
-                            step_preview_callback(
-                                {
-                                    "global_step": int(global_step),
-                                    "total_steps": int(total_target_steps),
-                                    "img": _item["img"],
-                                    "probs": _item["probs"],
-                                    "target_vec": _item["target_vec"],
-                                    "target_mask": _item["target_mask"],
-                                    "detected_mask": _item["detected_mask"],
-                                    "loss": _avg_loss,
-                                    "batch_loss": float(_item["batch_loss"]),
-                                }
-                            )
-                        except Exception as e:
-                            _log(f"[stage-opengl] C-step callback failed: {e}")
+                        _cb_batch.append(
+                            {
+                                "global_step": int(global_step),
+                                "total_steps": int(total_target_steps),
+                                "img": _item["img"],
+                                "probs": _item["probs"],
+                                "target_vec": _item["target_vec"],
+                                "target_mask": _item["target_mask"],
+                                "detected_mask": _item["detected_mask"],
+                                "loss": _avg_loss,
+                                "batch_loss": float(_item["batch_loss"]),
+                            }
+                        )
+                    try:
+                        step_preview_callback(_cb_batch)
+                    except Exception as e:
+                        _log(f"[stage-opengl] C-step callback failed: {e}")
                 if xb is not None:
                     del xb, yb, mb
                 if use_cache:
@@ -6961,9 +6969,10 @@ def _run_fake_class_refresh_epochs(
             if step_preview_callback is not None and int(xb.shape[0]) > 0:
                 _avg_loss = float(total_loss / max(1, n))
                 _batch_loss = float(loss.detach().to(torch.float32).item())
+                _cb_batch = []
                 for _i in range(int(xb.shape[0])):
                     try:
-                        step_preview_callback(
+                        _cb_batch.append(
                             {
                                 "global_step": int(global_step),
                                 "total_steps": int(total_target_steps),
@@ -6991,7 +7000,11 @@ def _run_fake_class_refresh_epochs(
                             }
                         )
                     except Exception as e:
-                        _log(f"[stage-opengl] fake-refresh callback failed: {e}")
+                        _log(f"[stage-opengl] fake-refresh callback item failed: {e}")
+                try:
+                    step_preview_callback(_cb_batch)
+                except Exception as e:
+                    _log(f"[stage-opengl] fake-refresh callback failed: {e}")
         if stop_now:
             break
 
@@ -10848,6 +10861,13 @@ def parse_args():
         help="Abort run if stage OpenGL preview cannot initialize.",
     )
     p.add_argument("--no-stage-opengl-preview-required", dest="stage_opengl_preview_required", action="store_false")
+    p.add_argument(
+        "--viewer-port-file",
+        default=None,
+        help="Path to a file containing the IPC port of a running standalone GUI "
+             "(wav_ml_gui_main.py).  When set, the pipeline connects to the external "
+             "GUI via ViewerIPCProxy instead of creating its own PyGame window.",
+    )
     p.set_defaults(
         cudnn_benchmark=True,
         allow_tf32=True,
@@ -12325,7 +12345,7 @@ def main():
                             f"startup_seen={berkeley_refresh_samples_seen}/{berkeley_refresh_required_samples} "
                             f"elapsed={ref.get('elapsed_sec', 0.0):.1f}s"
                         )
-                        _save_training_segment_snapshot(
+                        _save_segment_and_notify(
                             enabled=bool(args.checkpoint_after_training_segment),
                             out_dir=out_dir,
                             objective_mode=args.objective_mode,
@@ -14105,7 +14125,7 @@ def main():
                     slot_loader = DataLoader(
                         torch.utils.data.Subset(base_dataset, [int(i) for i in slot["row_indices"]]),
                         batch_size=max(1, int(getattr(refresh_loader, "batch_size", 1) or 1)),
-                        shuffle=False,
+                        shuffle=True,
                         num_workers=int(slot_loader_num_workers),
                         pin_memory=bool(getattr(refresh_loader, "pin_memory", False)),
                         drop_last=False,
@@ -14217,6 +14237,7 @@ def main():
         gestation_gate_preview_targets: List[np.ndarray] = []
         total_gate_preview_images: List[np.ndarray] = []
         total_gate_preview_targets: List[np.ndarray] = []
+        global_round = 0
 
         def _rebuild_semantic_gate_loaders(
             reason: str,
@@ -14327,7 +14348,7 @@ def main():
                     min(int(pregestation_sub_round), len(_PREGESTATION_SUB_ROUND_MODE_SEQUENCE) - 1)
                 ]
                 # ─────────────────────────────────────────────────────────────────────
-                pregestation_seed = int(cycle_seed) + 121
+                pregestation_seed = int(cycle_seed) + 121 + (int(global_round) * 31) + (int(pregestation_rebuild_count) * 7)
                 pregestation_signature = _pregestation_base_cache_signature(
                     image_size=int(shared_embed_image_size),
                     seed=int(pregestation_seed),
@@ -14400,6 +14421,15 @@ def main():
                         pre_info = dict(pre_info)
                         pre_info["cache_hit"] = False
                         pre_info["cache_dir"] = str(cache_dir)
+                # Shuffle all parallel lists together so training batches contain a
+                # mix of colors and directions rather than sorted runs of the same label.
+                if int(len(pregestation_images)) > 1:
+                    _preg_perm = np.random.default_rng(int(pregestation_seed)).permutation(len(pregestation_images))
+                    pregestation_images = [pregestation_images[int(i)] for i in _preg_perm]
+                    pregestation_masks = [pregestation_masks[int(i)] for i in _preg_perm]
+                    pregestation_mask_stacks = [pregestation_mask_stacks[int(i)] for i in _preg_perm]
+                    pregestation_targets = [pregestation_targets[int(i)] for i in _preg_perm]
+                    pregestation_terms_rows = [pregestation_terms_rows[int(i)] for i in _preg_perm]
                 pre_stats = _semantic_active_target_stats(pregestation_targets, threshold=0.5)
                 _log(
                     "[pregestation-target-stats] "
@@ -16775,28 +16805,650 @@ def main():
 
         stage_opengl_every = max(1, int(args.stage_opengl_preview_every_round))
         stage_opengl_step_driven = bool(args.stage_opengl_preview_enabled)
-        stage_opengl_viewer = _TransformerStatusOpenGLViewer(
-            enabled=bool(args.stage_opengl_preview_enabled),
-            image_hw=image_hw,
-            scale=max(1, int(args.stage_opengl_preview_scale)),
-            cycle_slots=max(0, int(args.orchestration_cycles)),
-        )
+        _viewer_ipc_mode = bool(getattr(args, "viewer_port_file", None))
+        if _viewer_ipc_mode:
+            stage_opengl_viewer = ViewerIPCProxy(
+                port_file=str(args.viewer_port_file),
+                enabled=bool(args.stage_opengl_preview_enabled),
+                image_hw=image_hw,
+                scale=max(1, int(args.stage_opengl_preview_scale)),
+                cycle_slots=max(0, int(args.orchestration_cycles)),
+            )
+        else:
+            stage_opengl_viewer = _TransformerStatusOpenGLViewer(
+                enabled=bool(args.stage_opengl_preview_enabled),
+                image_hw=image_hw,
+                scale=max(1, int(args.stage_opengl_preview_scale)),
+                cycle_slots=max(0, int(args.orchestration_cycles)),
+            )
         stage_preview_cursor: Dict[str, int] = {}
         gui_stop_requested = False
         gui_stop_logged = False
-        _loss_logger_start = time.perf_counter()
-        _loss_logger = _LossFileLogger(
-            path=out_dir / "loss_log.bin",
-            start_time=_loss_logger_start,
-        )
+
+        # ── Background preview worker ──────────────────────────────────────────
+        # The training thread puts raw payload dicts on _preview_work_queue and
+        # returns immediately.  This daemon thread does ALL heavy work: CPU tensor
+        # transfers, render, label formatting, PIL text, loss logging, and deposits
+        # finished RGB frame dicts into stage_opengl_viewer._frame_buffer.
+        # maxsize=1024: large enough to buffer ~1 GB of payload data before the
+        # training thread blocks.  The worker drains the queue asynchronously.
+        # Training calls put() (blocking) so no frames are ever dropped.
+        _preview_work_queue: _preview_queue_module.Queue = _preview_queue_module.Queue(maxsize=1024)
+        stage_opengl_viewer.set_queue_refs(_preview_work_queue)
+
+        # ── Viewer weight-map + restore-state wiring ────────────────────────────
+        # Pass the currently active models so the weight-map sidebar renders.
+        # wave_classifier is built lazily; call set_weight_model_refs again when
+        # it comes online (search for _viewer_model_map below).
+        _viewer_model_map: Dict[str, Any] = {}
+        if classifier is not None:    _viewer_model_map["classifier"]    = classifier
+        if transformer is not None:   _viewer_model_map["transformer"]   = transformer
+        if generator is not None:     _viewer_model_map["generator"]     = generator
+        if discriminator is not None: _viewer_model_map["discriminator"] = discriminator
+        if bool(args.stage_opengl_preview_enabled):
+            stage_opengl_viewer.set_weight_model_refs(_viewer_model_map)
+            stage_opengl_viewer.set_weight_snap_dir(out_dir / "viewer_weight_snaps")
+        # Restore-state plumbing: the callback is invoked (on the main thread, inside
+        # pump()) when the user clicks RESTORE STATE in the viewer.  We capture the
+        # offset here and apply it at the next safe training-loop boundary via
+        # _apply_any_viewer_restore().
+        _restore_request_lock = threading.Lock()
+        _restore_request: List[int] = []  # 0 or 1 element: the pending offset
+        def _on_viewer_restore_state(offset: int) -> None:
+            with _restore_request_lock:
+                _restore_request.clear()
+                _restore_request.append(int(offset))
+        if bool(args.stage_opengl_preview_enabled):
+            stage_opengl_viewer.set_restore_state_callback(_on_viewer_restore_state)
+
+        _preview_worker_stop = threading.Event()
+        _preview_cpu_device = torch.device("cpu")
+
+        def _preview_detach_payload(p: Dict[str, Any]) -> Dict[str, Any]:
+            """Shallow-copy a payload dict, moving any tensors to CPU synchronously
+            so the training buffer is fully released before this function returns.
+            non_blocking=True is intentionally avoided: it allows the CUDA DMA
+            transfer to still be in-flight when .clone() is called, meaning the
+            clone may read partially-written memory while the training step reuses
+            the source GPU buffer."""
+            out: Dict[str, Any] = {}
+            for k, v in p.items():
+                out[k] = v.detach().cpu().clone() if isinstance(v, torch.Tensor) else v
+            return out
+
+        def _preview_worker_loop():
+            while not _preview_worker_stop.is_set():
+                try:
+                    item = _preview_work_queue.get(timeout=0.1)
+                except _preview_queue_module.Empty:
+                    continue
+                try:
+                    _preview_process_item(item)
+                except Exception as _e:
+                    try:
+                        print(f"[preview-worker] error: {_e}", flush=True)
+                    except Exception:
+                        pass
+                finally:
+                    _preview_work_queue.task_done()
+
+        def _preview_to_rgb(t: Any) -> np.ndarray:
+            """Tensor or ndarray -> RGB uint8 numpy, sized to panel, on CPU."""
+            if isinstance(t, torch.Tensor):
+                t = t.detach().to(device=_preview_cpu_device, dtype=torch.float32)
+            return stage_opengl_viewer._resize_rgb_to_panel(_tensor_to_rgb_u8_image(t))
+
+        # ── Vectorised numpy helpers for the preview worker ────────────────────
+
+        def _pv_to_np(v: Any) -> np.ndarray:
+            """Any tensor/array → float32 numpy (no shape change)."""
+            if isinstance(v, torch.Tensor):
+                return v.detach().numpy().astype(np.float32, copy=False)
+            return np.asarray(v, dtype=np.float32)
+
+        def _pv_img_nchw(raws: List[Any]) -> np.ndarray:
+            """List of raw img payloads → [N, 3, H, W] float32, normalised to [0,1]."""
+            out = []
+            for v in raws:
+                a = _pv_to_np(v)
+                if a.ndim == 4: a = a[0]
+                if a.ndim == 2: a = np.stack([a, a, a])
+                elif a.shape[0] == 1: a = np.repeat(a, 3, axis=0)
+                elif a.ndim == 3 and a.shape[-1] == 3 and a.shape[0] != 3:
+                    a = a.transpose(2, 0, 1)
+                out.append(np.clip(a[:3].astype(np.float32), 0.0, 1.0))
+            return np.stack(out)  # [N, 3, H, W]
+
+        def _pv_mask_np(v: Any, H: int, W: int) -> Optional[np.ndarray]:
+            """Any mask payload → [H, W] float32, or None."""
+            if v is None:
+                return None
+            a = _pv_to_np(v)
+            while a.ndim > 2:
+                a = a[0]
+            if a.ndim != 2:
+                return None
+            a = np.clip(a, 0.0, 1.0)
+            if a.shape != (H, W):
+                ih, iw = int(a.shape[0]), int(a.shape[1])
+                yi = np.floor(np.arange(H) * ih / H).astype(np.int32).clip(0, ih - 1)
+                xi = np.floor(np.arange(W) * iw / W).astype(np.int32).clip(0, iw - 1)
+                a = a[yi[:, None], xi[None, :]]
+            return a
+
+        def _pv_masks_np(
+            items: List[Optional[Any]], H: int, W: int, fill: float
+        ) -> np.ndarray:
+            """List of mask payloads → [N, H, W] float32, filling None with `fill`."""
+            def _one(v: Optional[Any]) -> np.ndarray:
+                m = _pv_mask_np(v, H, W)
+                return m if m is not None else np.full((H, W), fill, dtype=np.float32)
+            return np.stack([_one(v) for v in items])
+
+        def _pv_probs_batch(pls: List[Dict], key: str = "probs") -> Dict[int, np.ndarray]:
+            """Batch-convert all probs in `pls` → {pl_idx: [C] float32 numpy}."""
+            idxs = [i for i, pl in enumerate(pls) if pl.get(key) is not None]
+            if not idxs:
+                return {}
+            raw = [_pv_to_np(pls[i][key]).reshape(-1) for i in idxs]
+            max_c = max(r.shape[0] for r in raw)
+            mat = np.zeros((len(idxs), max_c), dtype=np.float32)
+            for k, r in enumerate(raw):
+                mat[k, :r.shape[0]] = r
+            return {i: mat[k] for k, i in enumerate(idxs)}
+
+        def _pv_batch_resize(imgs_nhwc: np.ndarray, out_h: int, out_w: int) -> np.ndarray:
+            """[N, H, W, C] uint8 → [N, out_h, out_w, C] uint8, pure-numpy nearest."""
+            N, H, W, C = imgs_nhwc.shape
+            if H == out_h and W == out_w:
+                return np.ascontiguousarray(imgs_nhwc)
+            yi = np.floor(np.arange(out_h) * H / out_h).astype(np.int32).clip(0, H - 1)
+            xi = np.floor(np.arange(out_w) * W / out_w).astype(np.int32).clip(0, W - 1)
+            return np.ascontiguousarray(imgs_nhwc[:, yi[:, None], xi[None, :], :])
+
+        def _pv_nchw_to_u8(nchw: np.ndarray) -> np.ndarray:
+            """[N, 3|4, H, W] float32 → [N, H, W, 3|4] uint8 (per-image normalise)."""
+            N = nchw.shape[0]
+            lo = nchw.reshape(N, -1).min(axis=1).reshape(N, 1, 1, 1)
+            hi = nchw.reshape(N, -1).max(axis=1).reshape(N, 1, 1, 1)
+            rng = hi - lo
+            normed = np.where(rng > 1e-6, (nchw - lo) / rng, np.zeros_like(nchw))
+            return np.round(np.clip(normed, 0.0, 1.0).transpose(0, 2, 3, 1) * 255.0).astype(np.uint8)
+
+        # ── Preview item processor ─────────────────────────────────────────────
+
+        def _preview_process_item(item: Dict[str, Any]):
+            stage    = str(item["stage"])
+            cycle_id = int(item["cycle_id"])
+            round_id = int(item["round_id"])
+            payloads: List[Dict[str, Any]] = item["payloads"]
+            if not payloads:
+                return
+            ph = int(stage_opengl_viewer.panel_h)
+            pw = int(stage_opengl_viewer.panel_w)
+
+            if stage == "C":
+                # ── Classifier stage ────────────────────────────────────────
+                _loss_val = float("nan")
+                _batch_loss = float("nan")
+                for _pl in payloads:
+                    if "loss" in _pl and not math.isfinite(_loss_val):
+                        try: _loss_val = float(_pl["loss"])
+                        except Exception: pass
+                    if "batch_loss" in _pl:
+                        try: _batch_loss = float(_pl["batch_loss"])
+                        except Exception: pass
+                eff_loss = _batch_loss if math.isfinite(_batch_loss) else _loss_val
+                _loss_logger.log(int(round_id), LOSS_STAGE_CLASSIFIER, eff_loss)
+                step_txt = f"step={int(payloads[0].get('global_step', 0))}/{int(payloads[0].get('total_steps', 0))}"
+                valid_pls = [pl for pl in payloads if pl.get("img") is not None]
+                if not valid_pls:
+                    return
+                N = len(valid_pls)
+                try:
+                    imgs_nchw = _pv_img_nchw([pl["img"] for pl in valid_pls])  # [N, 3, H, W]
+                except Exception:
+                    return
+                H, W = int(imgs_nchw.shape[2]), int(imgs_nchw.shape[3])
+                # batch-convert masks [N, H, W]
+                tm_np = _pv_masks_np([pl.get("target_mask")   for pl in valid_pls], H, W, fill=1.0)
+                dm_np = _pv_masks_np([pl.get("detected_mask") for pl in valid_pls], H, W, fill=0.0)
+                # batch probs {idx: [C]}
+                probs_by_idx = _pv_probs_batch(valid_pls)
+                # vectorised compositing [N, C, H, W]
+                panel1 = np.concatenate([imgs_nchw, tm_np[:, None]], axis=1)  # [N, 4, H, W]
+                overlap  = np.minimum(tm_np, dm_np)
+                cmp_only = np.clip(dm_np - tm_np, 0.0, 1.0)
+                ref_only = np.clip(tm_np - dm_np, 0.0, 1.0)
+                panel2 = np.clip(imgs_nchw * 0.30 + 0.90 * np.stack([cmp_only, overlap, ref_only], axis=1), 0.0, 1.0)
+                panel3 = np.concatenate([imgs_nchw, dm_np[:, None]], axis=1)  # [N, 4, H, W]
+                # [N, H, W, C] uint8
+                p1u = np.round(panel1.transpose(0, 2, 3, 1) * 255.0).astype(np.uint8)
+                p2u = np.round(panel2.transpose(0, 2, 3, 1) * 255.0).astype(np.uint8)
+                p3u = np.round(panel3.transpose(0, 2, 3, 1) * 255.0).astype(np.uint8)
+                # single batch resize per panel channel-group
+                p1r = _pv_batch_resize(p1u, ph, pw)
+                p2r = _pv_batch_resize(p2u, ph, pw)
+                p3r = _pv_batch_resize(p3u, ph, pw)
+                # vectorised mask metrics [N]
+                rb = (tm_np >= 0.5).astype(np.float32)
+                cb = (dm_np >= 0.5).astype(np.float32)
+                ov_s  = (rb * cb).mean(axis=(1, 2))
+                ro_s  = np.clip(rb - cb, 0.0, 1.0).mean(axis=(1, 2))
+                co_s  = np.clip(cb - rb, 0.0, 1.0).mean(axis=(1, 2))
+                mad_s = np.abs(tm_np - dm_np).mean(axis=(1, 2))
+                for i, pl in enumerate(valid_pls):
+                    target_vec = pl.get("target_vec")
+                    target_line = "target:none"
+                    if target_vec is not None:
+                        try: target_line = _format_target_line_from_condition(
+                            target_vec, class_names=class_names, max_items=0, threshold=0.5)
+                        except Exception: pass
+                    loss_rows: List[str] = []
+                    for _lk, _ll in (("loss", "loss"), ("batch_loss", "batch")):
+                        if _lk in pl:
+                            try: loss_rows.append(f"{_ll}={float(pl[_lk]):.4f}")
+                            except Exception: pass
+                    out_lines: List[str] = []
+                    if i in probs_by_idx:
+                        try:
+                            p = probs_by_idx[i]
+                            out_lines = _format_top_label_lines(
+                                _top_labels_from_probs(p, class_names=class_names, topk=max(1, min(len(class_names), int(p.shape[0])))),
+                                max_items=0)
+                        except Exception: pass
+                    diff_rows = [
+                        f"overlap={float(ov_s[i]):.3f}",
+                        f"target_only={float(ro_s[i]):.3f}",
+                        f"detected_only={float(co_s[i]):.3f}",
+                        f"mean_abs={float(mad_s[i]):.3f}",
+                    ]
+                    stage_opengl_viewer.enqueue_frame({
+                        "images": [np.ascontiguousarray(p1r[i]), np.ascontiguousarray(p2r[i]), np.ascontiguousarray(p3r[i])],
+                        "caption": f"[C] cycle={cycle_id} round={round_id} {step_txt} top={out_lines[0] if out_lines else 'n/a'}",
+                        "titles": ["C target α", "C mask Δ", "C detected α"],
+                        "rows": [
+                            [target_line, step_txt] + loss_rows,
+                            diff_rows,
+                            [target_line, "alpha=mask_channel"] + (out_lines or ["n/a"]),
+                        ],
+                        "losses": {LOSS_STAGE_CLASSIFIER: eff_loss},
+                    })
+
+            elif stage == "G":
+                # ── Generator stage ─────────────────────────────────────────
+                _g_loss = _d_loss = float("nan")
+                for _pl in payloads:
+                    if "g_loss" in _pl and not math.isfinite(_g_loss):
+                        try: _g_loss = float(_pl["g_loss"])
+                        except Exception: pass
+                    if "d_loss" in _pl and not math.isfinite(_d_loss):
+                        try: _d_loss = float(_pl["d_loss"])
+                        except Exception: pass
+                _loss_logger.log(round_id, LOSS_STAGE_GENERATOR, _g_loss, aux=_d_loss)
+                _loss_logger.log(round_id, LOSS_STAGE_DISCRIMINATOR, _d_loss, aux=_g_loss)
+                stage_local = str(item.get("stage_local", "G"))
+                step_txt = f"step={int(payloads[0].get('step', 0))}/{int(payloads[0].get('steps_per_epoch', 0))}"
+                valid_pls = [pl for pl in payloads if pl.get("fake_img") is not None]
+                if not valid_pls:
+                    return
+                N = len(valid_pls)
+                try:
+                    fake_nchw = _pv_img_nchw([pl["fake_img"] for pl in valid_pls])
+                    tgt_nchw  = _pv_img_nchw([pl.get("target_img") or pl["fake_img"] for pl in valid_pls])
+                except Exception:
+                    return
+                H, W = int(fake_nchw.shape[2]), int(fake_nchw.shape[3])
+                tm_np = _pv_masks_np([pl.get("target_mask") for pl in valid_pls], H, W, fill=1.0)
+                fm_np = _pv_masks_np([pl.get("fake_mask")   for pl in valid_pls], H, W, fill=0.0)
+                probs_by_idx = _pv_probs_batch(valid_pls)
+                panel1 = np.concatenate([tgt_nchw,  tm_np[:, None]], axis=1)
+                overlap  = np.minimum(tm_np, fm_np)
+                cmp_only = np.clip(fm_np - tm_np, 0.0, 1.0)
+                ref_only = np.clip(tm_np - fm_np, 0.0, 1.0)
+                panel2 = np.clip(tgt_nchw * 0.30 + 0.90 * np.stack([cmp_only, overlap, ref_only], axis=1), 0.0, 1.0)
+                panel3 = np.concatenate([fake_nchw, fm_np[:, None]], axis=1)
+                p1u = np.round(panel1.transpose(0, 2, 3, 1) * 255.0).astype(np.uint8)
+                p2u = np.round(panel2.transpose(0, 2, 3, 1) * 255.0).astype(np.uint8)
+                p3u = np.round(panel3.transpose(0, 2, 3, 1) * 255.0).astype(np.uint8)
+                p1r = _pv_batch_resize(p1u, ph, pw)
+                p2r = _pv_batch_resize(p2u, ph, pw)
+                p3r = _pv_batch_resize(p3u, ph, pw)
+                rb = (tm_np >= 0.5).astype(np.float32)
+                cb = (fm_np >= 0.5).astype(np.float32)
+                ov_s  = (rb * cb).mean(axis=(1, 2))
+                ro_s  = np.clip(rb - cb, 0.0, 1.0).mean(axis=(1, 2))
+                co_s  = np.clip(cb - rb, 0.0, 1.0).mean(axis=(1, 2))
+                mad_s = np.abs(tm_np - fm_np).mean(axis=(1, 2))
+                for i, pl in enumerate(valid_pls):
+                    target_cond = pl.get("target_condition")
+                    target_line = "target:none"
+                    if target_cond is not None:
+                        try: target_line = _format_target_line_from_condition(
+                            target_cond, class_names=class_names, max_items=0, threshold=0.5)
+                        except Exception: pass
+                    out_lines: List[str] = []
+                    if i in probs_by_idx:
+                        try:
+                            p = probs_by_idx[i]
+                            out_lines = _format_top_label_lines(
+                                _top_labels_from_probs(p, class_names=class_names, topk=max(1, min(len(class_names), int(p.shape[0])))),
+                                max_items=0)
+                        except Exception: pass
+                    target_rows: List[str] = []
+                    for _lk, _ll in (("g_loss","g"),("d_loss","d"),("adv_loss","adv"),("wave_loss","wave")):
+                        if _lk in pl:
+                            try: target_rows.append(f"{_ll}={float(pl[_lk]):.4f}")
+                            except Exception: pass
+                    deskew_rows: List[str] = []
+                    deskew_preview = pl.get("deskew_preview")
+                    if isinstance(deskew_preview, dict):
+                        try:
+                            tgt  = float(deskew_preview.get("target_skew", 0.0))
+                            pred = float(deskew_preview.get("pred_skew", 0.0))
+                            app  = float(deskew_preview.get("applied_skew", 0.0))
+                            rem  = float(deskew_preview.get("remaining_skew", 0.0))
+                            post = float(deskew_preview.get("post_residual_skew", 0.0))
+                            conf = float(deskew_preview.get("confidence", 0.0))
+                            deskew_rows.append(f"deskew sample tgt={tgt:+.4f} pred={pred:+.4f} app={app:+.4f} conf={conf:.3f}")
+                            deskew_rows.append(f"deskew sample rem={rem:+.4f} post={post:+.4f}")
+                        except Exception: pass
+                    try:
+                        deskew_rows.append(
+                            f"deskew avg "
+                            f"|tgt|={float(pl.get('deskew_target_abs',0.0)):.4f} "
+                            f"|pred|={float(pl.get('deskew_pred_abs',0.0)):.4f} "
+                            f"|app|={float(pl.get('deskew_applied_abs',0.0)):.4f} "
+                            f"|rem|={float(pl.get('deskew_remaining_abs',0.0)):.4f} "
+                            f"|post|={float(pl.get('deskew_post_abs',0.0)):.4f} "
+                            f"conf={float(pl.get('deskew_confidence_mean',0.0)):.3f}")
+                    except Exception: pass
+                    diff_rows = [
+                        f"overlap={float(ov_s[i]):.3f}",
+                        f"target_only={float(ro_s[i]):.3f}",
+                        f"detected_only={float(co_s[i]):.3f}",
+                        f"mean_abs={float(mad_s[i]):.3f}",
+                    ]
+                    stage_opengl_viewer.enqueue_frame({
+                        "images": [np.ascontiguousarray(p1r[i]), np.ascontiguousarray(p2r[i]), np.ascontiguousarray(p3r[i])],
+                        "caption": f"[{stage_local}] cycle={cycle_id} round={round_id} {step_txt} top={out_lines[0] if out_lines else 'n/a'}",
+                        "titles": [f"{stage_local} target α", f"{stage_local} mask Δ", f"{stage_local} fake α"],
+                        "rows": [
+                            [target_line, step_txt] + target_rows,
+                            diff_rows,
+                            [target_line, "alpha=mask_channel"] + deskew_rows + (out_lines or ["n/a"]),
+                        ],
+                        "losses": {LOSS_STAGE_GENERATOR: _g_loss, LOSS_STAGE_DISCRIMINATOR: _d_loss},
+                    })
+
+            elif stage == "R":
+                # ── Transformer/Render stage ─────────────────────────────────
+                _r_loss = float("nan")
+                for _pl in payloads:
+                    if "loss" in _pl:
+                        try: _r_loss = float(_pl["loss"]); break
+                        except Exception: pass
+                _loss_logger.log(round_id, LOSS_STAGE_TRANSFORMER, _r_loss)
+                stage_local = str(item.get("stage_local", "R"))
+                step_txt = f"step={int(payloads[0].get('step', 0))}/{int(payloads[0].get('steps_per_epoch', 0))}"
+                valid_pls = [pl for pl in payloads if all(pl.get(k) is not None for k in ("x_clean", "x_in", "x_out"))]
+                if not valid_pls:
+                    return
+                # batch wave rendering: cat all waves → one render call per signal type
+                try:
+                    def _as_wave(v: Any) -> torch.Tensor:
+                        if isinstance(v, torch.Tensor):
+                            return v.to(dtype=torch.float32)
+                        return torch.from_numpy(np.asarray(v, dtype=np.float32))
+                    with torch.no_grad():
+                        all_clean = torch.cat([_as_wave(pl["x_clean"]) for pl in valid_pls], dim=0)
+                        all_in    = torch.cat([_as_wave(pl["x_in"])    for pl in valid_pls], dim=0)
+                        all_out   = torch.cat([_as_wave(pl["x_out"])   for pl in valid_pls], dim=0)
+                        imgs_clean = render_mono_wave_to_tensor(all_clean, cfg=best_cfg, image_hw=image_hw, sample_bits=int(sample_bits))
+                        imgs_in    = render_mono_wave_to_tensor(all_in,    cfg=best_cfg, image_hw=image_hw, sample_bits=int(sample_bits))
+                        imgs_out   = render_mono_wave_to_tensor(all_out,   cfg=best_cfg, image_hw=image_hw, sample_bits=int(sample_bits))
+                    # [N, 3, H, W] tensors → numpy in one call
+                    c_np  = imgs_clean.detach().numpy().astype(np.float32, copy=False)
+                    in_np = imgs_in.detach().numpy().astype(np.float32, copy=False)
+                    o_np  = imgs_out.detach().numpy().astype(np.float32, copy=False)
+                except Exception:
+                    return
+                # per-image normalise + to uint8 [N, H, W, 3]
+                p1u = _pv_nchw_to_u8(c_np)
+                p2u = _pv_nchw_to_u8(in_np)
+                p3u = _pv_nchw_to_u8(o_np)
+                p1r = _pv_batch_resize(p1u, ph, pw)
+                p2r = _pv_batch_resize(p2u, ph, pw)
+                p3r = _pv_batch_resize(p3u, ph, pw)
+                for k, pl in enumerate(valid_pls):
+                    target_cond = pl.get("target_condition")
+                    target_line = "target:none"
+                    if target_cond is not None:
+                        try: target_line = _format_target_line_from_condition(
+                            target_cond, class_names=class_names, max_items=0, threshold=0.5)
+                        except Exception: pass
+                    loss_rows: List[str] = []
+                    for _lk, _ll in (("loss","loss"),("denoise_l1","denoise"),("high_bits_l1","hi"),("low_bits_l1","lo"),("score_after","after"),("score_gap","gap")):
+                        if _lk in pl:
+                            try: loss_rows.append(f"{_ll}={float(pl[_lk]):.4f}")
+                            except Exception: pass
+                    deskew_rows: List[str] = []
+                    deskew_preview = pl.get("deskew_preview")
+                    if isinstance(deskew_preview, dict):
+                        try:
+                            tgt  = float(deskew_preview.get("target_skew", 0.0))
+                            pred = float(deskew_preview.get("pred_skew", 0.0))
+                            app  = float(deskew_preview.get("applied_skew", 0.0))
+                            rem  = float(deskew_preview.get("remaining_skew", 0.0))
+                            post = float(deskew_preview.get("post_residual_skew", 0.0))
+                            conf = float(deskew_preview.get("confidence", 0.0))
+                            deskew_rows.append(f"deskew sample tgt={tgt:+.4f} pred={pred:+.4f} app={app:+.4f} conf={conf:.3f}")
+                            deskew_rows.append(f"deskew sample rem={rem:+.4f} post={post:+.4f}")
+                        except Exception: pass
+                    try:
+                        deskew_rows.append(
+                            f"deskew avg "
+                            f"|tgt|={float(pl.get('deskew_target_abs',0.0)):.4f} "
+                            f"|pred|={float(pl.get('deskew_pred_abs',0.0)):.4f} "
+                            f"|app|={float(pl.get('deskew_applied_abs',0.0)):.4f} "
+                            f"|rem|={float(pl.get('deskew_remaining_abs',0.0)):.4f} "
+                            f"|post|={float(pl.get('deskew_post_abs',0.0)):.4f} "
+                            f"conf={float(pl.get('deskew_confidence_mean',0.0)):.3f}")
+                    except Exception: pass
+                    stage_opengl_viewer.enqueue_frame({
+                        "images": [np.ascontiguousarray(p1r[k]), np.ascontiguousarray(p2r[k]), np.ascontiguousarray(p3r[k])],
+                        "caption": f"[{stage_local}] cycle={cycle_id} round={round_id} {step_txt} loss={_r_loss:.4f}",
+                        "titles": [f"{stage_local} clean", f"{stage_local} in", f"{stage_local} out"],
+                        "rows": [
+                            [target_line, step_txt] + loss_rows,
+                            loss_rows,
+                            [target_line] + deskew_rows,
+                        ],
+                        "losses": {LOSS_STAGE_TRANSFORMER: _r_loss},
+                    })
+
+            elif stage == "W":
+                # ── Wave classifier stage ────────────────────────────────────
+                _w_loss = float("nan")
+                for _pl in payloads:
+                    if "batch_loss" in _pl and not math.isfinite(_w_loss):
+                        try: _w_loss = float(_pl["batch_loss"])
+                        except Exception: pass
+                    if "train_loss" in _pl and not math.isfinite(_w_loss):
+                        try: _w_loss = float(_pl["train_loss"])
+                        except Exception: pass
+                _loss_logger.log(round_id, LOSS_STAGE_WAVE_CLASSIFIER, _w_loss)
+                step_txt = f"step={int(payloads[0].get('step', 0))}/{int(payloads[0].get('steps_per_epoch', 0))}"
+                valid_pls = [pl for pl in payloads if pl.get("img") is not None]
+                if not valid_pls:
+                    return
+                try:
+                    imgs_nchw = _pv_img_nchw([pl["img"] for pl in valid_pls])  # [N, 3, H, W]
+                except Exception:
+                    return
+                probs_by_idx = _pv_probs_batch(valid_pls)
+                imgs_u8 = _pv_nchw_to_u8(imgs_nchw)          # [N, H, W, 3]
+                imgs_r  = _pv_batch_resize(imgs_u8, ph, pw)  # [N, ph, pw, 3]
+                for i, pl in enumerate(valid_pls):
+                    try:
+                        target_class = int(pl.get("target_class", -1))
+                        target_line = f"target:{str(split_class_names[target_class])}" if 0 <= target_class < len(split_class_names) else "target:none"
+                        loss_rows: List[str] = []
+                        for _lk, _ll in (("train_loss","loss"),("batch_loss","batch")):
+                            if _lk in pl:
+                                try: loss_rows.append(f"{_ll}={float(pl[_lk]):.4f}")
+                                except Exception: pass
+                        out_lines: List[str] = []
+                        if i in probs_by_idx:
+                            try:
+                                p = probs_by_idx[i]
+                                out_lines = _format_top_label_lines(
+                                    _top_labels_from_probs(p, class_names=split_class_names, topk=max(1, min(len(split_class_names), int(p.shape[0])))),
+                                    max_items=0)
+                            except Exception: pass
+                        img_rgb = np.ascontiguousarray(imgs_r[i])
+                        stage_opengl_viewer.enqueue_frame({
+                            "images": [img_rgb, img_rgb, img_rgb],
+                            "caption": f"[W] cycle={cycle_id} round={round_id} {step_txt} top={out_lines[0] if out_lines else 'n/a'}",
+                            "titles": ["W target", "W input", "W out"],
+                            "rows": [
+                                [target_line, step_txt] + loss_rows,
+                                out_lines or ["n/a"],
+                                [target_line] + (out_lines or ["n/a"]),
+                            ],
+                            "losses": {LOSS_STAGE_WAVE_CLASSIFIER: _w_loss},
+                        })
+                    except Exception: pass
+
+        _preview_worker_thread = threading.Thread(
+            target=_preview_worker_loop, name="preview-worker", daemon=True)
+        _preview_worker_thread.start()
+        # ── End background preview worker setup ────────────────────────────────
+        # Reset the loss log: rename any existing file so this session starts fresh
+        # with wall-clock timestamps.  The previous file is kept for history loading.
+        _loss_log_path      = out_dir / "loss_log.bin"
+        _loss_log_prev_path = out_dir / "loss_log_prev.bin"
         try:
-            _existing_recs = _LossFileLogger.load(out_dir / "loss_log.bin")
-            for _rec in _existing_recs:
-                stage_opengl_viewer.update_loss(int(_rec["stage"]), float(_rec["loss"]))
-            if len(_existing_recs) > 0:
-                _log(f"[loss-logger] loaded {len(_existing_recs)} existing records into graph")
-        except Exception as _e:
-            _log(f"[loss-logger] could not pre-load existing records: {_e}")
+            if _loss_log_path.exists():
+                _loss_log_path.replace(_loss_log_prev_path)
+                _log("[loss-logger] rotated loss_log.bin → loss_log_prev.bin for new session")
+        except Exception as _rot_err:
+            _log(f"[loss-logger] could not rotate loss log: {_rot_err}")
+        _loss_logger = _LossFileLogger(path=_loss_log_path)
+        # History loading: when using IPC mode the standalone GUI (wav_ml_gui_main.py)
+        # already loaded history from files before the pipeline connected.  Skip the
+        # redundant work here to avoid duplicating data into the viewer.
+        if not _viewer_ipc_mode:
+            # Load summary history first so the binary log (current session) extends from it.
+            try:
+                _summary_json_path = out_dir / "summary.json"
+                if _summary_json_path.exists():
+                    import json as _json
+                    _summary_data = _json.loads(_summary_json_path.read_text(encoding="utf-8"))
+                    _summary_loaded = 0
+                    for _row in _summary_data.get("berkeley_refresh_history", []):
+                        try:
+                            _v = float(_row.get("loss", float("nan")))
+                            if math.isfinite(_v):
+                                stage_opengl_viewer.update_loss(LOSS_STAGE_CLASSIFIER, _v)
+                                _summary_loaded += 1
+                        except Exception:
+                            pass
+                    for _row in _summary_data.get("generator_history", []):
+                        try:
+                            _gv = float(_row.get("g_loss", float("nan")))
+                            _dv = float(_row.get("d_loss", float("nan")))
+                            if math.isfinite(_gv):
+                                stage_opengl_viewer.update_loss(LOSS_STAGE_GENERATOR, _gv)
+                                _summary_loaded += 1
+                            if math.isfinite(_dv):
+                                stage_opengl_viewer.update_loss(LOSS_STAGE_DISCRIMINATOR, _dv)
+                                _summary_loaded += 1
+                        except Exception:
+                            pass
+                    for _row in _summary_data.get("transformer_history", []):
+                        try:
+                            _v = float(_row.get("train_loss", float("nan")))
+                            if math.isfinite(_v):
+                                stage_opengl_viewer.update_loss(LOSS_STAGE_TRANSFORMER, _v)
+                                _summary_loaded += 1
+                        except Exception:
+                            pass
+                    for _row in _summary_data.get("wave_classifier_history", []):
+                        try:
+                            _v = float(_row.get("train_loss", float(_row.get("loss", float("nan")))))
+                            if math.isfinite(_v):
+                                stage_opengl_viewer.update_loss(LOSS_STAGE_WAVE_CLASSIFIER, _v)
+                                _summary_loaded += 1
+                        except Exception:
+                            pass
+                        try:
+                            _ev = float(_row.get("val_loss", float("nan")))
+                            if math.isfinite(_ev):
+                                stage_opengl_viewer.update_loss(LOSS_STAGE_WAVE_CLASSIFIER_EVAL, _ev)
+                                _summary_loaded += 1
+                        except Exception:
+                            pass
+                    if _summary_loaded > 0:
+                        _log(f"[loss-logger] loaded {_summary_loaded} historical values from summary.json into graph")
+            except Exception as _e:
+                _log(f"[loss-logger] could not pre-load summary.json: {_e}")
+
+            try:
+                _existing_recs = _LossFileLogger.load(_loss_log_prev_path)
+                for _rec in _existing_recs:
+                    stage_opengl_viewer.update_loss(
+                        int(_rec["stage"]), float(_rec["loss"]), ts=float(_rec["ts"])
+                    )
+                if len(_existing_recs) > 0:
+                    _log(f"[loss-logger] loaded {len(_existing_recs)} existing records into graph")
+            except Exception as _e:
+                _log(f"[loss-logger] could not pre-load existing records: {_e}")
+
+            # ── Pre-existing checkpoint markers ───────────────────────────────────
+            # Scan for checkpoint files saved in previous sessions.  Use their
+            # filesystem mtime as the wall-clock time so notify_checkpoint_at_walltime
+            # can place gold markers at the correct x-position on the loss graph.
+            try:
+                _ckpt_candidates = [
+                    out_dir / "pipeline_checkpoint.pt",
+                    out_dir / "classifier.pt",
+                    out_dir / "transformer.pt",
+                    out_dir / "generator.pt",
+                    out_dir / "discriminator.pt",
+                    out_dir / "wave_classifier.pt",
+                ]
+                _seen_ckpt_times: list = []
+                for _cp in _ckpt_candidates:
+                    if not _cp.exists():
+                        continue
+                    _cmtime = _cp.stat().st_mtime
+                    # Deduplicate: checkpoints saved in one batch share an mtime within 1s.
+                    if not any(abs(_cmtime - _t) < 1.0 for _t in _seen_ckpt_times):
+                        _seen_ckpt_times.append(_cmtime)
+                        stage_opengl_viewer.notify_checkpoint_at_walltime(_cmtime)
+                if _seen_ckpt_times:
+                    _log(f"[loss-logger] placed {len(_seen_ckpt_times)} pre-existing checkpoint marker(s) on graph")
+            except Exception as _e:
+                _log(f"[loss-logger] could not scan pre-existing checkpoints: {_e}")
+
+            # ── Batch-launcher weight backups ─────────────────────────────────────
+            # The batch script (run_iterative_wav_pipeline.bat) stores timestamped
+            # backup directories under out_dir/_weight_backup/.  Scan them so all past
+            # checkpoint saves show as gold markers on the loss graph.
+            try:
+                _bk_dir = out_dir / "_weight_backup"
+                if _bk_dir.is_dir():
+                    stage_opengl_viewer.set_checkpoint_backup_dir(_bk_dir)
+                    _log(f"[loss-logger] scanned batch backup dir: {_bk_dir}")
+            except Exception as _e:
+                _log(f"[loss-logger] could not scan batch backups: {_e}")
+
+            # Trim the graph's left edge to 5% before the earliest checkpoint marker.
+            try:
+                stage_opengl_viewer.trim_graph_to_first_checkpoint()
+            except Exception:
+                pass
 
         def _poll_gui_stop(note: str = "") -> bool:
             nonlocal gui_stop_requested, gui_stop_logged
@@ -16808,6 +17460,7 @@ def main():
                 stage_opengl_viewer.pump()
             except Exception as e:
                 _log(f"[stage-opengl] event pump failed: {e}")
+            _apply_any_viewer_restore()
             if stage_opengl_viewer.stop_requested():
                 gui_stop_requested = True
                 if not gui_stop_logged:
@@ -16815,6 +17468,65 @@ def main():
                     _log(f"[stage-opengl] close requested{tail}; stopping at next safe boundary.")
                     gui_stop_logged = True
             return gui_stop_requested
+
+        def _save_segment_and_notify(*args_s, **kwargs_s):
+            """Thin wrapper: call _save_training_segment_snapshot then notify the viewer.
+
+            Replaces every internal call to _save_training_segment_snapshot so that
+            each pipeline checkpoint save is recorded as a gold marker on the loss graph
+            without touching any of the 13 individual call sites.
+            """
+            _save_training_segment_snapshot(*args_s, **kwargs_s)
+            if bool(args.stage_opengl_preview_enabled):
+                try:
+                    stage_opengl_viewer.notify_pipeline_checkpoint_saved()
+                except Exception:
+                    pass
+
+        def _apply_any_viewer_restore() -> bool:
+            """Apply a pending viewer-requested weight restore.  Returns True if one was applied.
+
+            The RESTORE STATE button in the viewer calls the registered callback which
+            stores the scrub offset here.  On the next _poll_gui_stop() call (which
+            runs on the main thread, between training steps) we ask the viewer for the
+            nearest saved CPU state-dict snapshot at that offset, then call
+            _apply_state_dict on every active model in _viewer_model_map.
+            Training continues from the restored weights on the very next step."""
+            if not bool(args.stage_opengl_preview_enabled):
+                return False
+            with _restore_request_lock:
+                if not _restore_request:
+                    return False
+                _offset = _restore_request.pop(0)
+            _restore_states = stage_opengl_viewer.get_restore_state_dicts(_offset)
+            if not _restore_states:
+                _log(
+                    f"[stage-opengl] RESTORE at -{_offset} ticks requested, "
+                    "but no weight snapshot exists at that point yet "
+                    f"(stride={stage_opengl_viewer._weight_snap_stride}, "
+                    f"snaps_saved={len(stage_opengl_viewer._weight_state_sparse_deque)})."
+                )
+                return False
+            _log(
+                f"[stage-opengl] RESTORE at -{_offset} ticks: "
+                f"applying snapshots for {list(_restore_states.keys())}"
+            )
+            for _rname, _rsd in _restore_states.items():
+                _rmodel = _viewer_model_map.get(_rname)
+                if _rmodel is None:
+                    continue
+                try:
+                    _rinfo = _apply_state_dict(
+                        _rmodel, _rsd,
+                        source_name=f"viewer_restore:{_rname}@-{_offset}"
+                    )
+                    _log(
+                        f"  {_rname}: loaded={_rinfo.get('loaded_keys', 0)}, "
+                        f"skipped={_rinfo.get('skipped_keys', 0)}"
+                    )
+                except Exception as _re:
+                    _log(f"  {_rname}: restore failed – {_re}")
+            return True
 
         def _sync_stage_cycle_roster(total_cycles: int):
             if not bool(args.stage_opengl_preview_enabled):
@@ -17111,329 +17823,57 @@ def main():
                 panel_rows=[target_rows, in_rows, out_rows],
                 frame_losses=frame_losses,
             )
-            _log(f"[stage-opengl] {stage_key} {step_txt} top={top_txt}")
 
         def _make_c_step_callback(cycle_id: int, round_id: int):
-            def _cb(payload: Dict[str, Any]):
+            def _cb(payload_batch: List[Dict[str, Any]]):
                 if _poll_gui_stop(note="C-step"):
                     return
-                try:
-                    img = payload.get("img")
-                    probs = payload.get("probs")
-                    target_vec = payload.get("target_vec")
-                    if img is None or probs is None or target_vec is None:
-                        return
-                    step_txt = f"step={int(payload.get('global_step', 0))}/{int(payload.get('total_steps', 0))}"
-                    target_mask = payload.get("target_mask")
-                    detected_mask = payload.get("detected_mask")
-                    target_line = _format_target_line_from_condition(
-                        target_vec,
-                        class_names=class_names,
-                        max_items=0,
-                        threshold=0.5,
-                    )
-                    loss_rows: List[str] = []
-                    _loss_val = float("nan")
-                    if "loss" in payload:
-                        try:
-                            _loss_val = float(payload.get('loss', 0.0))
-                            loss_rows.append(f"loss={_loss_val:.4f}")
-                        except Exception:
-                            pass
-                    if "batch_loss" in payload:
-                        try:
-                            _bl = float(payload.get('batch_loss', 0.0))
-                            loss_rows.append(f"batch={_bl:.4f}")
-                            if not math.isfinite(_loss_val):
-                                _loss_val = _bl
-                        except Exception:
-                            pass
-                    _loss_logger.log(int(round_id), LOSS_STAGE_CLASSIFIER, _loss_val)
-                    p = probs.detach().to(torch.float32).cpu().numpy().astype(np.float32, copy=False).reshape(-1)
-                    out_lines = _format_top_label_lines(
-                        _top_labels_from_probs(p, class_names=class_names, topk=max(1, min(len(class_names), int(p.shape[0])))),
-                        max_items=0,
-                    )
-                    diff_rows = _preview_mask_metric_rows(target_mask, detected_mask)
-                    top_txt = out_lines[0] if len(out_lines) > 0 else "n/a"
-                    stage_opengl_viewer.update(
-                        clean_img=_preview_image_with_alpha(img, target_mask),
-                        input_img=_preview_mask_difference(target_mask, detected_mask, base_img_like=img),
-                        output_img=_preview_image_with_alpha(img, detected_mask),
-                        caption=f"[C] cycle={int(cycle_id)} round={int(round_id)} {step_txt} top={top_txt}",
-                        panel_titles=["C target α", "C mask Δ", "C detected α"],
-                        panel_rows=[
-                            [target_line, str(step_txt)] + list(loss_rows),
-                            list(diff_rows),
-                            [target_line, "alpha=mask_channel"] + (out_lines if len(out_lines) > 0 else ["n/a"]),
-                        ],
-                        frame_losses={LOSS_STAGE_CLASSIFIER: _loss_val},
-                    )
-                    _log(f"[stage-opengl] C {step_txt} top={top_txt}")
-                except Exception as e:
-                    _log(f"[stage-opengl] C live preview failed: {e}")
+                _preview_work_queue.put({
+                    "stage": "C",
+                    "cycle_id": int(cycle_id),
+                    "round_id": int(round_id),
+                    "payloads": [_preview_detach_payload(p) for p in payload_batch],
+                })
             return _cb
 
         def _make_g_step_callback(stage_key: str, cycle_id: int, round_id: int):
             stage_local = str(stage_key).strip().upper()
-            def _cb(payload: Dict[str, Any]):
+            def _cb(payload_batch: List[Dict[str, Any]]):
                 if _poll_gui_stop(note=f"{stage_local}-step"):
                     return
-                try:
-                    img = payload.get("fake_img")
-                    target_img = payload.get("target_img")
-                    probs = payload.get("probs")
-                    if img is None or probs is None:
-                        return
-                    if target_img is None:
-                        target_img = img
-                    step_txt = f"step={int(payload.get('step', 0))}/{int(payload.get('steps_per_epoch', 0))}"
-                    p = probs.detach().to(torch.float32).cpu().numpy().astype(np.float32, copy=False).reshape(-1)
-                    target_mask = payload.get("target_mask")
-                    detected_fake_mask = None
-                    try:
-                        _, detected_fake_mask = _classifier_probs_and_mask_preview(img, context=f"{stage_local} live preview")
-                    except Exception:
-                        detected_fake_mask = payload.get("fake_mask")
-                    target_cond = payload.get("target_condition")
-                    target_line = None
-                    if target_cond is not None:
-                        target_line = _format_target_line_from_condition(
-                            target_cond,
-                            class_names=class_names,
-                            max_items=0,
-                            threshold=0.5,
-                        )
-                    target_rows: List[str] = []
-                    _g_loss_val = float("nan")
-                    _d_loss_val = float("nan")
-                    for k, lbl in (
-                        ("g_loss", "g"),
-                        ("d_loss", "d"),
-                        ("adv_loss", "adv"),
-                        ("wave_loss", "wave"),
-                    ):
-                        if k in payload:
-                            try:
-                                _v = float(payload.get(k, 0.0))
-                                target_rows.append(f"{lbl}={_v:.4f}")
-                                if k == "g_loss":
-                                    _g_loss_val = _v
-                                elif k == "d_loss":
-                                    _d_loss_val = _v
-                            except Exception:
-                                pass
-                    _loss_logger.log(int(round_id), LOSS_STAGE_GENERATOR, _g_loss_val, aux=_d_loss_val)
-                    _loss_logger.log(int(round_id), LOSS_STAGE_DISCRIMINATOR, _d_loss_val, aux=_g_loss_val)
-                    deskew_rows: List[str] = []
-                    deskew_preview = payload.get("deskew_preview", None)
-                    if isinstance(deskew_preview, dict):
-                        try:
-                            tgt = float(deskew_preview.get("target_skew", 0.0))
-                            pred = float(deskew_preview.get("pred_skew", 0.0))
-                            app = float(deskew_preview.get("applied_skew", 0.0))
-                            rem = float(deskew_preview.get("remaining_skew", 0.0))
-                            post = float(deskew_preview.get("post_residual_skew", 0.0))
-                            conf = float(deskew_preview.get("confidence", 0.0))
-                            deskew_rows.append(
-                                f"deskew sample tgt={tgt:+.4f} pred={pred:+.4f} app={app:+.4f} conf={conf:.3f}"
-                            )
-                            deskew_rows.append(f"deskew sample rem={rem:+.4f} post={post:+.4f}")
-                        except Exception:
-                            pass
-                    try:
-                        deskew_rows.append(
-                            "deskew avg "
-                            f"|tgt|={float(payload.get('deskew_target_abs', 0.0)):.4f} "
-                            f"|pred|={float(payload.get('deskew_pred_abs', 0.0)):.4f} "
-                            f"|app|={float(payload.get('deskew_applied_abs', 0.0)):.4f} "
-                            f"|rem|={float(payload.get('deskew_remaining_abs', 0.0)):.4f} "
-                            f"|post|={float(payload.get('deskew_post_abs', 0.0)):.4f} "
-                            f"conf={float(payload.get('deskew_confidence_mean', 0.0)):.3f}"
-                        )
-                    except Exception:
-                        pass
-                    out_lines = _format_top_label_lines(
-                        _top_labels_from_probs(p, class_names=class_names, topk=max(1, min(len(class_names), int(p.shape[0])))),
-                        max_items=0,
-                    )
-                    diff_rows = _preview_mask_metric_rows(target_mask, detected_fake_mask)
-                    top_txt = out_lines[0] if len(out_lines) > 0 else "n/a"
-                    stage_opengl_viewer.update(
-                        clean_img=_preview_image_with_alpha(target_img, target_mask),
-                        input_img=_preview_mask_difference(target_mask, detected_fake_mask, base_img_like=target_img),
-                        output_img=_preview_image_with_alpha(img, detected_fake_mask),
-                        caption=f"[{stage_local}] cycle={int(cycle_id)} round={int(round_id)} {step_txt} top={top_txt}",
-                        panel_titles=[f"{stage_local} target α", f"{stage_local} mask Δ", f"{stage_local} fake α"],
-                        panel_rows=[
-                            [target_line or "target:none", str(step_txt)] + list(target_rows),
-                            list(diff_rows),
-                            [target_line or "target:none", "alpha=mask_channel"]
-                            + list(deskew_rows)
-                            + (out_lines if len(out_lines) > 0 else ["n/a"]),
-                        ],
-                        frame_losses={
-                            LOSS_STAGE_GENERATOR: _g_loss_val,
-                            LOSS_STAGE_DISCRIMINATOR: _d_loss_val,
-                        },
-                    )
-                    _log(f"[stage-opengl] {stage_local} {step_txt} top={top_txt}")
-                except Exception as e:
-                    _log(f"[stage-opengl] {stage_local} live preview failed: {e}")
+                _preview_work_queue.put({
+                    "stage": "G",
+                    "stage_local": stage_local,
+                    "cycle_id": int(cycle_id),
+                    "round_id": int(round_id),
+                    "payloads": [_preview_detach_payload(p) for p in payload_batch],
+                })
             return _cb
 
         def _make_r_step_callback(stage_key: str, cycle_id: int, round_id: int):
             stage_local = str(stage_key).strip().upper()
-            def _cb(payload: Dict[str, Any]):
+            def _cb(payload_batch: List[Dict[str, Any]]):
                 if _poll_gui_stop(note=f"{stage_local}-step"):
                     return
-                try:
-                    x_clean = payload.get("x_clean")
-                    x_in = payload.get("x_in")
-                    x_out = payload.get("x_out")
-                    if x_clean is None or x_in is None or x_out is None:
-                        return
-                    step_txt = f"step={int(payload.get('step', 0))}/{int(payload.get('steps_per_epoch', 0))}"
-                    with torch.no_grad():
-                        xc = x_clean.to(device=device, dtype=torch.float32)
-                        xi = x_in.to(device=device, dtype=torch.float32)
-                        xo = x_out.to(device=device, dtype=torch.float32)
-                        img_clean = render_mono_wave_to_tensor(xc, cfg=best_cfg, image_hw=image_hw, sample_bits=int(sample_bits))
-                        img_in = render_mono_wave_to_tensor(xi, cfg=best_cfg, image_hw=image_hw, sample_bits=int(sample_bits))
-                        img_out = render_mono_wave_to_tensor(xo, cfg=best_cfg, image_hw=image_hw, sample_bits=int(sample_bits))
-                        cls_in = img_in
-                        cls_out = img_out
-                        if bool(args.channels_last):
-                            cls_in = cls_in.contiguous(memory_format=torch.channels_last)
-                            cls_out = cls_out.contiguous(memory_format=torch.channels_last)
-                        p_in = torch.sigmoid(classifier(cls_in))[0].detach().to(torch.float32).cpu().numpy().astype(np.float32, copy=False)
-                        p_out = torch.sigmoid(classifier(cls_out))[0].detach().to(torch.float32).cpu().numpy().astype(np.float32, copy=False)
-                    target_cond = payload.get("target_condition")
-                    target_line = None
-                    if target_cond is not None:
-                        target_line = _format_target_line_from_condition(
-                            target_cond,
-                            class_names=class_names,
-                            max_items=0,
-                            threshold=0.5,
-                        )
-                    loss_rows: List[str] = []
-                    _r_loss_val = float("nan")
-                    for k, lbl in (
-                        ("loss", "loss"),
-                        ("denoise_l1", "denoise"),
-                        ("high_bits_l1", "hi"),
-                        ("low_bits_l1", "lo"),
-                        ("score_after", "after"),
-                        ("score_gap", "gap"),
-                    ):
-                        if k in payload:
-                            try:
-                                _v = float(payload.get(k, 0.0))
-                                loss_rows.append(f"{lbl}={_v:.4f}")
-                                if k == "loss":
-                                    _r_loss_val = _v
-                            except Exception:
-                                pass
-                    _loss_logger.log(int(round_id), LOSS_STAGE_TRANSFORMER, _r_loss_val)
-                    deskew_rows: List[str] = []
-                    deskew_preview = payload.get("deskew_preview", None)
-                    if isinstance(deskew_preview, dict):
-                        try:
-                            tgt = float(deskew_preview.get("target_skew", 0.0))
-                            pred = float(deskew_preview.get("pred_skew", 0.0))
-                            app = float(deskew_preview.get("applied_skew", 0.0))
-                            rem = float(deskew_preview.get("remaining_skew", 0.0))
-                            post = float(deskew_preview.get("post_residual_skew", 0.0))
-                            conf = float(deskew_preview.get("confidence", 0.0))
-                            deskew_rows.append(
-                                f"deskew sample tgt={tgt:+.4f} pred={pred:+.4f} app={app:+.4f} conf={conf:.3f}"
-                            )
-                            deskew_rows.append(f"deskew sample rem={rem:+.4f} post={post:+.4f}")
-                        except Exception:
-                            pass
-                    try:
-                        deskew_rows.append(
-                            "deskew avg "
-                            f"|tgt|={float(payload.get('deskew_target_abs', 0.0)):.4f} "
-                            f"|pred|={float(payload.get('deskew_pred_abs', 0.0)):.4f} "
-                            f"|app|={float(payload.get('deskew_applied_abs', 0.0)):.4f} "
-                            f"|rem|={float(payload.get('deskew_remaining_abs', 0.0)):.4f} "
-                            f"|post|={float(payload.get('deskew_post_abs', 0.0)):.4f} "
-                            f"conf={float(payload.get('deskew_confidence_mean', 0.0)):.3f}"
-                        )
-                    except Exception:
-                        pass
-                    _stage_gl_emit_standard(
-                        stage_key=stage_local,
-                        cycle_id=int(cycle_id),
-                        round_id=int(round_id),
-                        step_txt=step_txt,
-                        clean_img=img_clean[0],
-                        input_img=img_in[0],
-                        output_img=img_out[0],
-                        probs_in=p_in,
-                        probs_out=p_out,
-                        label_names=class_names,
-                        target_line_override=target_line,
-                        target_extra_rows=loss_rows,
-                        extra_out_rows=deskew_rows,
-                        frame_losses={LOSS_STAGE_TRANSFORMER: _r_loss_val},
-                    )
-                except Exception as e:
-                    _log(f"[stage-opengl] {stage_local} live preview failed: {e}")
+                _preview_work_queue.put({
+                    "stage": "R",
+                    "stage_local": stage_local,
+                    "cycle_id": int(cycle_id),
+                    "round_id": int(round_id),
+                    "payloads": [_preview_detach_payload(p) for p in payload_batch],
+                })
             return _cb
 
         def _make_w_step_callback(cycle_id: int, round_id: int):
-            def _cb(payload: Dict[str, Any]):
+            def _cb(payload_batch: List[Dict[str, Any]]):
                 if _poll_gui_stop(note="W-step"):
                     return
-                try:
-                    img = payload.get("img")
-                    probs = payload.get("probs")
-                    target_class = int(payload.get("target_class", -1))
-                    if img is None or probs is None:
-                        return
-                    step_txt = f"step={int(payload.get('step', 0))}/{int(payload.get('steps_per_epoch', 0))}"
-                    if int(target_class) >= 0 and int(target_class) < len(split_class_names):
-                        target_line = f"target:{str(split_class_names[int(target_class)])}"
-                    else:
-                        target_line = "target:none"
-                    loss_rows: List[str] = []
-                    _w_loss_val = float("nan")
-                    if "train_loss" in payload:
-                        try:
-                            _w_loss_val = float(payload.get('train_loss', 0.0))
-                            loss_rows.append(f"loss={_w_loss_val:.4f}")
-                        except Exception:
-                            pass
-                    if "batch_loss" in payload:
-                        try:
-                            _bl = float(payload.get('batch_loss', 0.0))
-                            loss_rows.append(f"batch={_bl:.4f}")
-                            if not math.isfinite(_w_loss_val):
-                                _w_loss_val = _bl
-                        except Exception:
-                            pass
-                    _loss_logger.log(int(round_id), LOSS_STAGE_WAVE_CLASSIFIER, _w_loss_val)
-                    p = probs.detach().to(torch.float32).cpu().numpy().astype(np.float32, copy=False).reshape(-1)
-                    _stage_gl_emit_standard(
-                        stage_key="W",
-                        cycle_id=int(cycle_id),
-                        round_id=int(round_id),
-                        step_txt=step_txt,
-                        clean_img=img,
-                        input_img=img,
-                        output_img=img,
-                        probs_in=p,
-                        probs_out=p,
-                        label_names=split_class_names,
-                        target_line_override=target_line,
-                        target_extra_rows=loss_rows,
-                        frame_losses={LOSS_STAGE_WAVE_CLASSIFIER: _w_loss_val},
-                    )
-                except Exception as e:
-                    _log(f"[stage-opengl] W live preview failed: {e}")
+                _preview_work_queue.put({
+                    "stage": "W",
+                    "cycle_id": int(cycle_id),
+                    "round_id": int(round_id),
+                    "payloads": [_preview_detach_payload(p) for p in payload_batch],
+                })
             return _cb
 
         def _run_transformer_round_preview(stage: str, cycle_id: int, round_id: int, global_round: int, extra: Optional[Dict] = None):
@@ -17504,26 +17944,24 @@ def main():
                     if int(len(gestation_gate_preview_images)) <= 0:
                         _log("[stage-opengl] STAGE 1 preview skipped: no gestation samples.")
                     else:
-                        pick = _next_stage_index(
-                            "S1",
-                            len(gestation_gate_preview_images),
-                            seed_term=(int(args.seed) + (int(cycle_id) * 1103) + (int(round_id) * 173) + int(global_round)),
-                        )
-                        target_vec = None
-                        if 0 <= int(pick) < int(len(gestation_gate_preview_targets)):
-                            target_vec = np.asarray(gestation_gate_preview_targets[int(pick)], dtype=np.float32).reshape(-1)
                         s_rows = [
                             f"rows={int(gestation_gate_info.get('rows', len(gestation_gate_preview_images)))}",
                             f"selected={int(gestation_gate_info.get('selected_rows', len(gestation_gate_preview_images)))}",
                             "source=fixed_core_vocab",
                         ]
-                        _render_semantic_standard(
-                            stage_emit_key="S1",
-                            img_np=np.asarray(gestation_gate_preview_images[int(pick)], dtype=np.float32),
-                            target_vec=target_vec,
-                            step_txt=f"sample={int(pick)}",
-                            detail_rows=s_rows,
-                        )
+                        for pick in range(len(gestation_gate_preview_images)):
+                            if _poll_gui_stop(note="S1-preview"):
+                                break
+                            target_vec = None
+                            if 0 <= int(pick) < int(len(gestation_gate_preview_targets)):
+                                target_vec = np.asarray(gestation_gate_preview_targets[int(pick)], dtype=np.float32).reshape(-1)
+                            _render_semantic_standard(
+                                stage_emit_key="S1",
+                                img_np=np.asarray(gestation_gate_preview_images[int(pick)], dtype=np.float32),
+                                target_vec=target_vec,
+                                step_txt=f"sample={int(pick)}",
+                                detail_rows=s_rows,
+                            )
                 return
 
             if stage_key == "G1":
@@ -17534,14 +17972,6 @@ def main():
                     if int(len(gestation_gate_preview_images)) <= 0:
                         _log("[stage-opengl] GATE 1 preview skipped: no gestation samples.")
                     else:
-                        pick = _next_stage_index(
-                            "G1",
-                            len(gestation_gate_preview_images),
-                            seed_term=(int(args.seed) + (int(cycle_id) * 1301) + (int(round_id) * 211) + int(global_round)),
-                        )
-                        target_vec = None
-                        if 0 <= int(pick) < int(len(gestation_gate_preview_targets)):
-                            target_vec = np.asarray(gestation_gate_preview_targets[int(pick)], dtype=np.float32).reshape(-1)
                         g_rows: List[str] = [f"pass={1 if bool(gate1_pass) else 0}"]
                         if isinstance(gate1_detail, dict):
                             g_rows.append(f"reason={str(gate1_detail.get('reason', ''))}")
@@ -17559,21 +17989,27 @@ def main():
                                 g_rows.append(f"loss={float(gate1_eval.get('loss', float('nan'))):.4f}")
                             except Exception:
                                 pass
-                        g1_step_txt = f"sample={int(pick)}"
+                        g1_loss_txt = ""
                         if isinstance(gate1_eval, dict):
                             try:
                                 g1_loss = float(gate1_eval.get("loss", float("nan")))
                                 if math.isfinite(g1_loss):
-                                    g1_step_txt = f"{g1_step_txt} loss={g1_loss:.4f}"
+                                    g1_loss_txt = f" loss={g1_loss:.4f}"
                             except Exception:
                                 pass
-                        _render_semantic_standard(
-                            stage_emit_key="G1",
-                            img_np=np.asarray(gestation_gate_preview_images[int(pick)], dtype=np.float32),
-                            target_vec=target_vec,
-                            step_txt=g1_step_txt,
-                            detail_rows=g_rows,
-                        )
+                        for pick in range(len(gestation_gate_preview_images)):
+                            if _poll_gui_stop(note="G1-preview"):
+                                break
+                            target_vec = None
+                            if 0 <= int(pick) < int(len(gestation_gate_preview_targets)):
+                                target_vec = np.asarray(gestation_gate_preview_targets[int(pick)], dtype=np.float32).reshape(-1)
+                            _render_semantic_standard(
+                                stage_emit_key="G1",
+                                img_np=np.asarray(gestation_gate_preview_images[int(pick)], dtype=np.float32),
+                                target_vec=target_vec,
+                                step_txt=f"sample={int(pick)}{g1_loss_txt}",
+                                detail_rows=g_rows,
+                            )
                 return
 
             if stage_key == "S2":
@@ -17581,14 +18017,6 @@ def main():
                     if int(len(payload_images)) <= 0:
                         _log("[stage-opengl] STAGE 2 preview skipped: no non-validation samples.")
                     else:
-                        pick = _next_stage_index(
-                            "S2",
-                            len(payload_images),
-                            seed_term=(int(args.seed) + (int(cycle_id) * 1601) + (int(round_id) * 239) + int(global_round)),
-                        )
-                        target_vec = None
-                        if 0 <= int(pick) < int(len(payload_conditions)):
-                            target_vec = np.asarray(payload_conditions[int(pick)], dtype=np.float32).reshape(-1)
                         s2_ready = bool(extra.get("initial_stage_2_ready", False)) if isinstance(extra, dict) else False
                         s2_mode = str(extra.get("initial_stage_2_mode", "")) if isinstance(extra, dict) else ""
                         s_rows = [
@@ -17597,13 +18025,19 @@ def main():
                             f"rows={int(len(payload_images))}",
                             "source=non_validation_total_set",
                         ]
-                        _render_semantic_standard(
-                            stage_emit_key="S2",
-                            img_np=np.asarray(payload_images[int(pick)], dtype=np.float32),
-                            target_vec=target_vec,
-                            step_txt=f"sample={int(pick)}",
-                            detail_rows=s_rows,
-                        )
+                        for pick in range(len(payload_images)):
+                            if _poll_gui_stop(note="S2-preview"):
+                                break
+                            target_vec = None
+                            if 0 <= int(pick) < int(len(payload_conditions)):
+                                target_vec = np.asarray(payload_conditions[int(pick)], dtype=np.float32).reshape(-1)
+                            _render_semantic_standard(
+                                stage_emit_key="S2",
+                                img_np=np.asarray(payload_images[int(pick)], dtype=np.float32),
+                                target_vec=target_vec,
+                                step_txt=f"sample={int(pick)}",
+                                detail_rows=s_rows,
+                            )
                 return
 
             if stage_key == "G2":
@@ -17614,14 +18048,6 @@ def main():
                     if int(len(total_gate_preview_images)) <= 0:
                         _log("[stage-opengl] GATE 2 preview skipped: no total-gate samples.")
                     else:
-                        pick = _next_stage_index(
-                            "G2",
-                            len(total_gate_preview_images),
-                            seed_term=(int(args.seed) + (int(cycle_id) * 1801) + (int(round_id) * 271) + int(global_round)),
-                        )
-                        target_vec = None
-                        if 0 <= int(pick) < int(len(total_gate_preview_targets)):
-                            target_vec = np.asarray(total_gate_preview_targets[int(pick)], dtype=np.float32).reshape(-1)
                         g2_rows: List[str] = [f"pass={1 if bool(gate2_pass) else 0}"]
                         if isinstance(gate2_detail, dict):
                             g2_rows.append(f"mode={str(gate2_detail.get('mode', ''))}")
@@ -17648,21 +18074,27 @@ def main():
                                 g2_rows.append(f"macro_f1={float(gate2_eval.get('macro_f1', float('nan'))):.4f}")
                             except Exception:
                                 pass
-                        g2_step_txt = f"sample={int(pick)}"
+                        g2_loss_txt = ""
                         if isinstance(gate2_eval, dict):
                             try:
                                 g2_loss = float(gate2_eval.get("loss", float("nan")))
                                 if math.isfinite(g2_loss):
-                                    g2_step_txt = f"{g2_step_txt} loss={g2_loss:.4f}"
+                                    g2_loss_txt = f" loss={g2_loss:.4f}"
                             except Exception:
                                 pass
-                        _render_semantic_standard(
-                            stage_emit_key="G2",
-                            img_np=np.asarray(total_gate_preview_images[int(pick)], dtype=np.float32),
-                            target_vec=target_vec,
-                            step_txt=g2_step_txt,
-                            detail_rows=g2_rows,
-                        )
+                        for pick in range(len(total_gate_preview_images)):
+                            if _poll_gui_stop(note="G2-preview"):
+                                break
+                            target_vec = None
+                            if 0 <= int(pick) < int(len(total_gate_preview_targets)):
+                                target_vec = np.asarray(total_gate_preview_targets[int(pick)], dtype=np.float32).reshape(-1)
+                            _render_semantic_standard(
+                                stage_emit_key="G2",
+                                img_np=np.asarray(total_gate_preview_images[int(pick)], dtype=np.float32),
+                                target_vec=target_vec,
+                                step_txt=f"sample={int(pick)}{g2_loss_txt}",
+                                detail_rows=g2_rows,
+                            )
                 return
 
             if stage_key == "C":
@@ -17989,7 +18421,7 @@ def main():
                         step_preview_callback=_make_r_step_callback("R", cycle_id=0, round_id=0),
                     )
                     transformer_hist.extend(run_hist)
-                    _save_training_segment_snapshot(
+                    _save_segment_and_notify(
                         enabled=bool(args.checkpoint_after_training_segment),
                         out_dir=out_dir,
                         objective_mode=args.objective_mode,
@@ -18711,7 +19143,7 @@ def main():
                         except Exception:
                             pass
                         did_gestation_stage1_round = True
-                        _save_training_segment_snapshot(
+                        _save_segment_and_notify(
                             enabled=bool(args.checkpoint_after_training_segment),
                             out_dir=out_dir,
                             objective_mode=args.objective_mode,
@@ -18894,7 +19326,7 @@ def main():
                         ref_loss = float(ref.get("loss", float("nan")))
                         if berkeley_loss_target_value > 0.0:
                             berkeley_loss_target_unmet = bool((not math.isfinite(ref_loss)) or (ref_loss > berkeley_loss_target_value))
-                        _save_training_segment_snapshot(
+                        _save_segment_and_notify(
                             enabled=bool(args.checkpoint_after_training_segment),
                             out_dir=out_dir,
                             objective_mode=args.objective_mode,
@@ -19525,7 +19957,7 @@ def main():
                                 "wave_feedback_gate_reason": str(wave_feedback_gate_reason),
                             }
                         )
-                        _save_training_segment_snapshot(
+                        _save_segment_and_notify(
                             enabled=bool(args.checkpoint_after_training_segment),
                             out_dir=out_dir,
                             objective_mode=args.objective_mode,
@@ -19713,7 +20145,7 @@ def main():
                                 "transformer_ready": None,
                             }
                         )
-                        _save_training_segment_snapshot(
+                        _save_segment_and_notify(
                             enabled=bool(args.checkpoint_after_training_segment),
                             out_dir=out_dir,
                             objective_mode=args.objective_mode,
@@ -19810,7 +20242,7 @@ def main():
                         rr["cycle"] = float(cycle_id)
                         rr["round"] = float(round_id)
                         transformer_hist.append(rr)
-                    _save_training_segment_snapshot(
+                    _save_segment_and_notify(
                         enabled=bool(args.checkpoint_after_training_segment),
                         out_dir=out_dir,
                         objective_mode=args.objective_mode,
@@ -20261,7 +20693,7 @@ def main():
                         except Exception:
                             pass
                         did_gestation_stage1_round = True
-                        _save_training_segment_snapshot(
+                        _save_segment_and_notify(
                             enabled=bool(args.checkpoint_after_training_segment),
                             out_dir=out_dir,
                             objective_mode=args.objective_mode,
@@ -20445,7 +20877,7 @@ def main():
                         ref_loss = float(ref.get("loss", float("nan")))
                         if berkeley_loss_target_value > 0.0:
                             berkeley_loss_target_unmet = bool((not math.isfinite(ref_loss)) or (ref_loss > berkeley_loss_target_value))
-                        _save_training_segment_snapshot(
+                        _save_segment_and_notify(
                             enabled=bool(args.checkpoint_after_training_segment),
                             out_dir=out_dir,
                             objective_mode=args.objective_mode,
@@ -20932,7 +21364,7 @@ def main():
                         rr["cycle"] = float(cycle_id)
                         rr["round"] = float(round_id)
                         transformer_hist.append(rr)
-                    _save_training_segment_snapshot(
+                    _save_segment_and_notify(
                         enabled=bool(args.checkpoint_after_training_segment),
                         out_dir=out_dir,
                         objective_mode=args.objective_mode,
@@ -21302,7 +21734,7 @@ def main():
                                     "  wave zero-shot skipped: "
                                     f"reason={round_row['wave_zero_shot'].get('reason', 'unknown')}"
                                 )
-                        _save_training_segment_snapshot(
+                        _save_segment_and_notify(
                             enabled=bool(args.checkpoint_after_training_segment),
                             out_dir=out_dir,
                             objective_mode=args.objective_mode,
@@ -21856,6 +22288,11 @@ def main():
         }
         summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
         try:
+            _preview_worker_stop.set()
+            _preview_worker_thread.join(timeout=4.0)
+        except Exception:
+            pass
+        try:
             stage_opengl_viewer.close()
         except Exception:
             pass
@@ -22210,7 +22647,7 @@ def main():
         grad_clip=float(args.classifier_grad_clip),
     )
     classifier_hist.extend(run_classifier_hist)
-    _save_training_segment_snapshot(
+    _save_segment_and_notify(
         enabled=bool(args.checkpoint_after_training_segment),
         out_dir=out_dir,
         objective_mode=args.objective_mode,
@@ -22451,7 +22888,7 @@ def main():
         grad_clip=float(args.transformer_grad_clip),
     )
     transformer_hist.extend(run_transformer_hist)
-    _save_training_segment_snapshot(
+    _save_segment_and_notify(
         enabled=bool(args.checkpoint_after_training_segment),
         out_dir=out_dir,
         objective_mode=args.objective_mode,

@@ -4,6 +4,8 @@ setlocal EnableExtensions EnableDelayedExpansion
 REM Run from repo root: c:\dev\Powershell\nodus
 set "PYTHON=python"
 set "SCRIPT=toys_to_survive_development\wav_config_transformer_pipeline.py"
+set "GRAPH_SCRIPT=toys_to_survive_development\wav_pipeline_graph.py"
+set "GUI_SCRIPT=toys_to_survive_development\wav_ml_gui_main.py"
 set "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True"
 set "HF_HUB_OFFLINE=1"
 set "TRANSFORMERS_OFFLINE=1"
@@ -46,6 +48,8 @@ set "STAGE_OPENGL_SCALE=1"
 set "STAGE_OPENGL_EVERY=1"
 set "STAGE_OPENGL_BOOTSTRAP=1"
 set "STAGE_OPENGL_REQUIRED=1"
+set "STAGE_OPENGL_LAUNCH_STANDALONE=1"
+set "VIEWER_PORT_FILE=%OUTPUT_DIR%\.viewer_port"
 
 REM Optional WAV source. Leave empty to use latent fallback + reinjection.
 set "WAV_ROOT="
@@ -63,24 +67,24 @@ set "ENFORCE_RENDER_BIT_HIGH=11"
 set "ENFORCE_RENDER_MAX_POINTS=262144"
 
 REM Gate settings (downstream will be skipped until these are maintained)
-set "GATE_PREGESTATION_LOSS_TARGET=1.6"
-set "GATE_PREGESTATION_MAINTAIN=2"
+set "GATE_PREGESTATION_LOSS_TARGET=.98"
+set "GATE_PREGESTATION_MAINTAIN=1"
 set "PREGESTATION_SUB_ROUNDS=2"
 set "PREGESTATION_TEMP_TREND=1.5"
 set "PREGESTATION_TEMP_OSCILLATION_AMPLITUDE=0.4"
 set "PREGESTATION_TEMP_OSCILLATION_PERIOD=4"
 set "PREGESTATION_STAGE_BATCH_SIZE=32"
 set "PREGESTATION_STAGE_DECK_PASSES=4"
-set "PREGESTATION_STAGE_MIN_STEPS=12000"
-set "GATE_GESTATION_LOSS_TARGET=1.6"
-set "GATE_GESTATION_MAINTAIN=2"
-set "GATE_GESTATION_BATCH_SIZE=64"
+set "PREGESTATION_STAGE_MIN_STEPS=256"
+set "GATE_GESTATION_LOSS_TARGET=.98"
+set "GATE_GESTATION_MAINTAIN=1"
+set "GATE_GESTATION_BATCH_SIZE=32"
 set "GATE_TOTAL_TOKEN_SCHEDULE=1"
 set "GATE_TOTAL_TOKEN_SCHEDULE_THRESHOLD=0.55"
 set "GATE_BERKELEY_MIN=0.8"
-set "GATE_BERKELEY_LOSS_TARGET=1.6"
-set "GATE_BERKELEY_MAINTAIN=2"
-set "GATE_BERKELEY_BATCH_SIZE=64"
+set "GATE_BERKELEY_LOSS_TARGET=.98"
+set "GATE_BERKELEY_MAINTAIN=1"
+set "GATE_BERKELEY_BATCH_SIZE=32"
 set "GATE_TRANS_AFTER_MIN=0.265"
 set "GATE_TRANS_GAIN_MIN=0.0005"
 set "GATE_TRANS_MAINTAIN=2"
@@ -256,6 +260,7 @@ set "ENDLESS_MAX_RUNS=0"
 set "ENDLESS_SEED_STRIDE=9973"
 set "ENDLESS_SLEEP_SECONDS=2"
 set "GUI_STOP_EXIT_CODE=42"
+set "USE_GRAPH_PIPELINE=0"
 set "WEIGHT_BACKUP_ENABLED=1"
 set "WEIGHT_BACKUP_SUBDIR=_weight_backup"
 set "WEIGHT_BACKUP_MAX_KEEP=10"
@@ -368,6 +373,13 @@ if not exist "%SCRIPT%" (
   echo Missing script: %SCRIPT%
   exit /b 1
 )
+if "%USE_GRAPH_PIPELINE%"=="1" (
+  set "SCRIPT=%GRAPH_SCRIPT%"
+)
+if not exist "%SCRIPT%" (
+  echo Missing script: %SCRIPT%
+  exit /b 1
+)
 
 set "LOCAL_ST_MODEL_SNAPSHOTS=%HF_HOME%\hub\models--sentence-transformers--all-MiniLM-L6-v2\snapshots"
 set "LOCAL_ST_MODEL_DIR="
@@ -383,6 +395,7 @@ if not defined LOCAL_ST_MODEL_DIR (
 )
 set "LABEL_EMBED_MODEL=!LOCAL_ST_MODEL_DIR!"
 echo [launcher] Local embedding model: !LABEL_EMBED_MODEL!
+echo [launcher] pipeline entrypoint: %SCRIPT%
 
 echo [launcher] Berkeley pretrain disabled; classifier init starts from scratch.
 
@@ -401,6 +414,7 @@ if /I "%ORCH_MODE%"=="staged_cgrw" (
 
 set /a RUN_INDEX=0
 call :backup_weights startup
+call :launch_gui
 
 :run_loop
 set /a RUN_INDEX+=1
@@ -454,6 +468,36 @@ if exist "%RUNTIME_OVERRIDES_FILE%" (
 )
 exit /b 0
 
+:launch_gui
+if not "%STAGE_OPENGL_LAUNCH_STANDALONE%"=="1" exit /b 0
+if not exist "%GUI_SCRIPT%" (
+  echo [launcher] standalone GUI script not found: %GUI_SCRIPT%
+  exit /b 0
+)
+if exist "%VIEWER_PORT_FILE%" del /f /q "%VIEWER_PORT_FILE%" >nul 2>&1
+echo [launcher] launching standalone GUI...
+start "nodus-viewer" /B %PYTHON% %GUI_SCRIPT% ^
+  --output-dir "%OUTPUT_DIR%" ^
+  --image-size %IMAGE_SIZE% ^
+  --scale %STAGE_OPENGL_SCALE% ^
+  --cycle-slots %ORCH_CYCLES% ^
+  --port-file "%VIEWER_PORT_FILE%"
+
+set /a _GUI_WAIT_LOOPS=0
+:wait_for_gui_port
+if exist "%VIEWER_PORT_FILE%" (
+  echo [launcher] GUI ready: %VIEWER_PORT_FILE%
+  exit /b 0
+)
+set /a _GUI_WAIT_LOOPS+=1
+if !_GUI_WAIT_LOOPS! GEQ 80 (
+  echo [launcher] warning: GUI port file not detected yet (%VIEWER_PORT_FILE%).
+  echo [launcher] pipeline will still start and attempt to connect.
+  exit /b 0
+)
+timeout /t 1 /nobreak >nul
+goto wait_for_gui_port
+
 :run_pipeline
 set "RUN_SEED=%~1"
 set "RUN_EXTRA_ARG=%~2"
@@ -482,6 +526,7 @@ set "RUN_EXTRA_ARG=%~2"
   --stage-opengl-preview-required ^
   --stage-opengl-preview-scale %STAGE_OPENGL_SCALE% ^
   --stage-opengl-preview-every-round %STAGE_OPENGL_EVERY% ^
+  --viewer-port-file "%VIEWER_PORT_FILE%" ^
   --enforce-render-config ^
   --enforce-render-bitmode %ENFORCE_RENDER_BITMODE% ^
   --enforce-render-use-channels %ENFORCE_RENDER_USE_CHANNELS% ^

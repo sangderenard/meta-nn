@@ -1,8 +1,6 @@
 import copy
 import math
 import random
-import time
-from collections import deque
 from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
@@ -15,104 +13,20 @@ import torch.nn.functional as F
 
 from wav_ml_core import COLOR_MODE_MAP, COLOR_MODES, RenderConfig, normalize_bit_window, render_mono_wave_to_tensor
 
-# ---------------------------------------------------------------------------
-# Loss logging constants and binary record format
-# ---------------------------------------------------------------------------
-LOSS_STAGE_CLASSIFIER = 0
-LOSS_STAGE_GENERATOR = 1
-LOSS_STAGE_DISCRIMINATOR = 2
-LOSS_STAGE_TRANSFORMER = 3
-LOSS_STAGE_WAVE_CLASSIFIER = 4
+# Re-export viewer symbols so existing ``from wav_ml_models import ...`` works.
+from wav_ml_viewer import (  # noqa: F401
+    LOSS_RECORD_DTYPE,
+    LOSS_STAGE_CLASSIFIER,
+    LOSS_STAGE_DISCRIMINATOR,
+    LOSS_STAGE_GENERATOR,
+    LOSS_STAGE_TRANSFORMER,
+    LOSS_STAGE_WAVE_CLASSIFIER,
+    LOSS_STAGE_WAVE_CLASSIFIER_EVAL,
+    _LossFileLogger,
+    _TransformerStatusOpenGLViewer,
+    _tensor_to_rgb_u8_image,
+)
 
-_LOSS_STAGE_NAMES: Dict[int, str] = {
-    LOSS_STAGE_CLASSIFIER: "cls",
-    LOSS_STAGE_GENERATOR: "gen",
-    LOSS_STAGE_DISCRIMINATOR: "disc",
-    LOSS_STAGE_TRANSFORMER: "trans",
-    LOSS_STAGE_WAVE_CLASSIFIER: "wcls",
-}
-
-_LOSS_STAGE_COLORS: Dict[int, tuple] = {
-    LOSS_STAGE_CLASSIFIER:     (80,  200, 220),  # cyan
-    LOSS_STAGE_GENERATOR:      (80,  200, 100),  # green
-    LOSS_STAGE_DISCRIMINATOR:  (240, 140,  40),  # orange
-    LOSS_STAGE_TRANSFORMER:    (240, 220,  60),  # yellow
-    LOSS_STAGE_WAVE_CLASSIFIER:(220,  80, 220),  # magenta
-}
-
-# 20 bytes per record: step(i4) round(i2) stage(u1) pad(u1) loss(f4) aux(f4) ts(f4)
-LOSS_RECORD_DTYPE = np.dtype([
-    ("step",  "<i4"),
-    ("round", "<i2"),
-    ("stage", "<u1"),
-    ("_pad",  "<u1"),
-    ("loss",  "<f4"),
-    ("aux",   "<f4"),
-    ("ts",    "<f4"),
-])
-
-
-class _LossFileLogger:
-    """Appends fixed-size binary loss records to a file for later analysis."""
-
-    _FLUSH_EVERY = 200
-
-    def __init__(self, path, start_time: float):
-        self._path = Path(path)
-        self._start_time = float(start_time)
-        self._file = None
-        try:
-            existing_bytes = int(self._path.stat().st_size) if self._path.exists() else 0
-            self._counter = int(existing_bytes // LOSS_RECORD_DTYPE.itemsize)
-            self._file = open(self._path, "ab")
-        except Exception as e:
-            self._counter = 0
-            print(f"[loss-logger] could not open {path}: {e}", flush=True)
-
-    def log(self, round_idx: int, stage_id: int, loss: float, aux: float = 0.0):
-        if self._file is None:
-            return
-        self._counter += 1
-        ts = float(time.perf_counter()) - self._start_time
-        rec = np.zeros(1, dtype=LOSS_RECORD_DTYPE)
-        rec["step"][0]  = max(-(2**31), min(2**31 - 1, int(self._counter)))
-        rec["round"][0] = max(-32768,   min(32767,     int(round_idx)))
-        rec["stage"][0] = int(stage_id) & 0xFF
-        rec["loss"][0]  = float(loss) if math.isfinite(float(loss)) else float("nan")
-        rec["aux"][0]   = float(aux)  if math.isfinite(float(aux))  else float("nan")
-        rec["ts"][0]    = min(float(ts), 3.4e38)
-        try:
-            self._file.write(rec.tobytes())
-            if self._counter % self._FLUSH_EVERY == 0:
-                self._file.flush()
-        except Exception:
-            pass
-
-    def flush(self):
-        if self._file is not None:
-            try:
-                self._file.flush()
-            except Exception:
-                pass
-
-    def close(self):
-        if self._file is not None:
-            try:
-                self._file.flush()
-                self._file.close()
-            except Exception:
-                pass
-            self._file = None
-
-    @staticmethod
-    def load(path) -> np.ndarray:
-        """Load all records from a loss_log.bin file into a structured numpy array."""
-        p = Path(path)
-        if not p.exists() or p.stat().st_size == 0:
-            return np.zeros(0, dtype=LOSS_RECORD_DTYPE)
-        data = p.read_bytes()
-        n = len(data) // LOSS_RECORD_DTYPE.itemsize
-        return np.frombuffer(data[: n * LOSS_RECORD_DTYPE.itemsize], dtype=LOSS_RECORD_DTYPE).copy()
 
 
 def set_seed(seed: int):
@@ -236,664 +150,6 @@ def _wave_bit_window_ste(wave_mono: torch.Tensor, sample_bits: int, bit_low: int
 def _binary_entropy_01(x: torch.Tensor) -> torch.Tensor:
     p = torch.clamp(x, 1e-6, 1.0 - 1e-6)
     return -(p * torch.log2(p)) - ((1.0 - p) * torch.log2(1.0 - p))
-
-
-def _tensor_to_rgb_u8_image(x: torch.Tensor) -> np.ndarray:
-    t = x.detach().to(device="cpu", dtype=torch.float32)
-    if t.ndim == 4:
-        t = t[0]
-    if t.ndim == 2:
-        t = t.unsqueeze(0)
-    if t.ndim != 3:
-        raise ValueError(f"Expected tensor image with ndim 2/3/4, got shape={tuple(t.shape)}")
-
-    c = int(t.shape[0])
-    if c <= 0:
-        raise ValueError("Cannot visualize empty-channel tensor.")
-    if c == 1:
-        t = t.repeat(3, 1, 1)
-    elif c == 2:
-        t = torch.cat([t, t[:1]], dim=0)
-    elif c > 4:
-        t = t[:4]
-
-    lo = float(t.min().item())
-    hi = float(t.max().item())
-    if hi <= lo + 1e-6:
-        t = torch.zeros_like(t)
-    elif lo < 0.0 or hi > 1.0:
-        t = (t - lo) / (hi - lo)
-    t = torch.clamp(t, 0.0, 1.0)
-    img = (t.permute(1, 2, 0).contiguous().numpy() * 255.0).astype(np.uint8)
-    return np.ascontiguousarray(img)
-
-
-class _TransformerStatusOpenGLViewer:
-    def __init__(
-        self,
-        enabled: bool,
-        image_hw: Tuple[int, int],
-        scale: int = 3,
-        cycle_slots: int = 0,
-        graph_h: int = 120,
-    ):
-        self.enabled = bool(enabled)
-        self.image_h = max(8, int(image_hw[0]))
-        self.image_w = max(8, int(image_hw[1]))
-        _ = max(1, int(scale))
-
-        self.panel_w = max(8, min(256, int(self.image_w)))
-        self.panel_h = max(8, min(256, int(self.image_h)))
-        self.num_panels = 3
-        self.top_bar_h = 56
-        self.graph_h = max(0, int(graph_h))
-        self.window_w = int(self.panel_w * self.num_panels)
-        self.window_h = int(self.top_bar_h + (self.panel_h * 2) + self.graph_h)
-
-        self._ready = False
-        self._failed = False
-        self._pygame = None
-        self._gl = None
-        self._textures = None
-        self._stop_requested = False
-
-        self._last_present_t = 0.0
-        self._max_idle_present_dt = 0.25
-        self._frame_buffer: deque = deque(maxlen=1024)
-        # Dynamic frame rate: slews between slow (empty buffer) and fast (full buffer)
-        self._anim_frame_dt: float = 0.5          # current inter-frame interval, seconds
-        self._anim_dt_slow: float = 0.5           # floor rate when buffer is empty  (2 fps)
-        self._anim_dt_fast: float = 1.0 / 120.0  # ceiling rate when buffer is full (120 fps)
-        self._anim_slew_tau: float = 0.25         # time constant for slew, seconds
-        self._last_anim_t: float = 0.0
-        self._last_slew_t: float = 0.0
-        self._has_presented_frame = False
-        self._top_bar_dirty = True
-        self._panel_text_dirty = True
-
-        self._caption = ""
-        self._panel_titles = ["target", "input", "output"]
-        self._panel_rows = [[], [], []]
-        self._panel_text_rgb = [
-            np.full((self.panel_h, self.panel_w, 3), 14, dtype=np.uint8),
-            np.full((self.panel_h, self.panel_w, 3), 14, dtype=np.uint8),
-            np.full((self.panel_h, self.panel_w, 3), 14, dtype=np.uint8),
-        ]
-        self._top_bar_rgb = np.full((self.top_bar_h, self.window_w, 3), 18, dtype=np.uint8)
-
-        self._cycle_selected: List[bool] = []
-        self._gate_override = False
-        self._control_boxes: List[Tuple[str, int, Tuple[int, int, int, int]]] = []
-        self.set_cycle_roster(total_cycles=int(cycle_slots))
-
-        self._loss_graph_data: Dict[int, deque] = {}
-        self._graph_dirty = False
-        self._graph_rgb: Optional[np.ndarray] = (
-            np.full((self.graph_h, self.window_w, 3), 14, dtype=np.uint8)
-            if self.graph_h > 0 else None
-        )
-
-    def set_cycle_roster(self, total_cycles: int, selected: Optional[Sequence[bool]] = None):
-        n = max(0, int(total_cycles))
-        prev = list(self._cycle_selected)
-        if n <= 0:
-            self._cycle_selected = []
-        else:
-            out = [True] * n
-            for i in range(min(len(prev), n)):
-                out[i] = bool(prev[i])
-            if selected is not None:
-                for i, v in enumerate(list(selected)[:n]):
-                    out[i] = bool(v)
-            self._cycle_selected = out
-        self._top_bar_dirty = True
-
-    def selected_cycle_ids(self) -> List[int]:
-        return [int(i + 1) for i, v in enumerate(self._cycle_selected) if bool(v)]
-
-    def is_cycle_selected(self, cycle_local: int) -> bool:
-        idx = int(cycle_local) - 1
-        if idx < 0 or idx >= len(self._cycle_selected):
-            return True
-        return bool(self._cycle_selected[idx])
-
-    def gate_override_enabled(self) -> bool:
-        return bool(self._gate_override)
-
-    def _init(self):
-        if (not self.enabled) or self._ready or self._failed:
-            return
-        try:
-            import pygame
-            from OpenGL import GL
-
-            pygame.display.init()
-            pygame.display.gl_set_attribute(pygame.GL_DOUBLEBUFFER, 1)
-            pygame.display.set_mode((self.window_w, self.window_h), pygame.OPENGL | pygame.DOUBLEBUF)
-            pygame.display.set_caption("Stage Status Viewer")
-
-            GL.glViewport(0, 0, self.window_w, self.window_h)
-            GL.glDisable(GL.GL_DEPTH_TEST)
-            GL.glEnable(GL.GL_TEXTURE_2D)
-            GL.glEnable(GL.GL_BLEND)
-            GL.glBlendFunc(GL.GL_SRC_ALPHA, GL.GL_ONE_MINUS_SRC_ALPHA)
-            GL.glClearColor(0.06, 0.06, 0.08, 1.0)
-
-            tex = GL.glGenTextures(8)
-            if isinstance(tex, int):
-                tex = [int(tex)]
-                while len(tex) < 8:
-                    tex.append(int(GL.glGenTextures(1)))
-            else:
-                tex = [int(t) for t in list(tex)]
-                while len(tex) < 8:
-                    tex.append(int(GL.glGenTextures(1)))
-            self._textures = {
-                "img": [int(tex[0]), int(tex[1]), int(tex[2])],
-                "text": [int(tex[3]), int(tex[4]), int(tex[5])],
-                "bar": int(tex[6]),
-                "graph": int(tex[7]),
-            }
-            for tid in (
-                self._textures["img"]
-                + self._textures["text"]
-                + [int(self._textures["bar"])]
-            ):
-                GL.glBindTexture(GL.GL_TEXTURE_2D, int(tid))
-                GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_MIN_FILTER, GL.GL_LINEAR)
-                GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_MAG_FILTER, GL.GL_LINEAR)
-                GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_WRAP_S, GL.GL_CLAMP_TO_EDGE)
-                GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_WRAP_T, GL.GL_CLAMP_TO_EDGE)
-
-            self._pygame = pygame
-            self._gl = GL
-            self._ready = True
-            self._top_bar_dirty = True
-            self._panel_text_dirty = True
-            print(
-                f"[transformer-viz] pygame+OpenGL ready ({self.window_w}x{self.window_h})",
-                flush=True,
-            )
-        except Exception as e:
-            self._failed = True
-            self.enabled = False
-            print(f"[transformer-viz] disabled: could not initialize pygame OpenGL viewer ({e})", flush=True)
-
-    def _upload_texture(self, tex_id: int, img_rgb: np.ndarray):
-        gl = self._gl
-        h, w, _ = img_rgb.shape
-        channels = int(img_rgb.shape[2]) if int(img_rgb.ndim) == 3 else 0
-        if int(channels) == 4:
-            internal_format = gl.GL_RGBA
-            src_format = gl.GL_RGBA
-        else:
-            internal_format = gl.GL_RGB
-            src_format = gl.GL_RGB
-        gl.glBindTexture(gl.GL_TEXTURE_2D, int(tex_id))
-        gl.glPixelStorei(gl.GL_UNPACK_ALIGNMENT, 1)
-        gl.glTexImage2D(
-            gl.GL_TEXTURE_2D,
-            0,
-            internal_format,
-            int(w),
-            int(h),
-            0,
-            src_format,
-            gl.GL_UNSIGNED_BYTE,
-            np.ascontiguousarray(img_rgb),
-        )
-
-    def _resize_rgb_to_panel(self, img_rgb: np.ndarray) -> np.ndarray:
-        h = int(img_rgb.shape[0])
-        w = int(img_rgb.shape[1])
-        if (h == int(self.panel_h)) and (w == int(self.panel_w)):
-            return np.ascontiguousarray(img_rgb)
-        t = torch.from_numpy(img_rgb.astype(np.float32, copy=False)).permute(2, 0, 1).unsqueeze(0)
-        t = F.interpolate(t, size=(int(self.panel_h), int(self.panel_w)), mode="nearest")
-        out = t.squeeze(0).permute(1, 2, 0).clamp(0.0, 255.0).to(torch.uint8).cpu().numpy()
-        return np.ascontiguousarray(out)
-
-    def _normalize_panel_text(
-        self,
-        panel_titles: Optional[Sequence[str]],
-        panel_rows: Optional[Sequence[Sequence[str]]],
-    ) -> Tuple[List[str], List[List[str]]]:
-        titles = []
-        rows = []
-        for i in range(3):
-            if panel_titles is not None and i < len(panel_titles):
-                titles.append(str(panel_titles[i]))
-            else:
-                titles.append(self._panel_titles[i] if i < len(self._panel_titles) else "")
-            cur_rows: List[str] = []
-            if panel_rows is not None and i < len(panel_rows):
-                src_rows = panel_rows[i]
-                if isinstance(src_rows, (list, tuple)):
-                    for r in src_rows:
-                        txt = str(r).strip()
-                        if txt:
-                            cur_rows.append(txt)
-            rows.append(cur_rows)
-        return titles, rows
-
-    def _render_panel_text(self, title: str, rows: Sequence[str]) -> np.ndarray:
-        out = np.full((self.panel_h, self.panel_w, 3), 16, dtype=np.uint8)
-        try:
-            from PIL import Image, ImageDraw, ImageFont
-
-            im = Image.fromarray(out).convert("RGB")
-            draw = ImageDraw.Draw(im)
-            font = ImageFont.load_default()
-
-            draw.rectangle([(0, 0), (self.panel_w - 1, self.panel_h - 1)], fill=(20, 24, 30))
-            draw.rectangle([(0, 0), (self.panel_w - 1, 15)], fill=(34, 42, 52))
-            draw.text((4, 2), str(title)[:48], fill=(255, 225, 70), font=font)
-            draw.line([(0, 16), (self.panel_w - 1, 16)], fill=(70, 76, 88), width=1)
-            y = 20
-            for r in list(rows)[: max(1, (self.panel_h - 20) // 11)]:
-                draw.text((4, y), str(r)[:72], fill=(230, 234, 240), font=font)
-                y += 11
-                if y >= (self.panel_h - 10):
-                    break
-            return np.asarray(im, dtype=np.uint8)
-        except Exception:
-            return out
-
-    def _render_top_bar(self) -> np.ndarray:
-        out = np.full((self.top_bar_h, self.window_w, 3), 18, dtype=np.uint8)
-        self._control_boxes = []
-        try:
-            from PIL import Image, ImageDraw, ImageFont
-
-            im = Image.fromarray(out).convert("RGB")
-            draw = ImageDraw.Draw(im)
-            font = ImageFont.load_default()
-
-            draw.rectangle([(0, 0), (self.window_w - 1, self.top_bar_h - 1)], fill=(18, 22, 28))
-            draw.line(
-                [(0, self.top_bar_h - 1), (self.window_w - 1, self.top_bar_h - 1)],
-                fill=(70, 76, 88),
-                width=1,
-            )
-            cap = str(self._caption).strip()
-            if cap:
-                draw.text((6, 4), cap[: max(16, (self.window_w // 6) - 4)], fill=(230, 234, 240), font=font)
-
-            x = 8
-            y = 24
-            for i, is_on in enumerate(self._cycle_selected):
-                token_w = 42
-                if x + token_w >= (self.window_w - 170):
-                    break
-                box = (x, y, x + 11, y + 11)
-                fill = (52, 120, 66) if bool(is_on) else (36, 40, 44)
-                draw.rectangle([box[0], box[1], box[2], box[3]], outline=(186, 194, 204), fill=fill)
-                if bool(is_on):
-                    draw.line([(box[0] + 2, box[1] + 6), (box[0] + 5, box[1] + 9)], fill=(236, 244, 248), width=1)
-                    draw.line([(box[0] + 5, box[1] + 9), (box[0] + 9, box[1] + 2)], fill=(236, 244, 248), width=1)
-                draw.text((x + 15, y - 1), f"C{i + 1}", fill=(224, 230, 236), font=font)
-                self._control_boxes.append(("cycle", int(i), box))
-                x += token_w
-
-            ox = max(x + 4, self.window_w - 166)
-            oy = y
-            o_box = (ox, oy, ox + 11, oy + 11)
-            o_fill = (126, 84, 36) if bool(self._gate_override) else (36, 40, 44)
-            draw.rectangle([o_box[0], o_box[1], o_box[2], o_box[3]], outline=(186, 194, 204), fill=o_fill)
-            if bool(self._gate_override):
-                draw.line([(o_box[0] + 2, o_box[1] + 6), (o_box[0] + 5, o_box[1] + 9)], fill=(236, 244, 248), width=1)
-                draw.line([(o_box[0] + 5, o_box[1] + 9), (o_box[0] + 9, o_box[1] + 2)], fill=(236, 244, 248), width=1)
-            draw.text((ox + 15, oy - 1), "Override gates", fill=(230, 208, 170), font=font)
-            self._control_boxes.append(("override", -1, o_box))
-
-            active = self.selected_cycle_ids()
-            active_txt = ",".join(str(i) for i in active) if len(active) > 0 else "none"
-            draw.text(
-                (6, self.top_bar_h - 14),
-                f"cycles={active_txt} gate_override={1 if self._gate_override else 0}",
-                fill=(180, 188, 198),
-                font=font,
-            )
-            return np.asarray(im, dtype=np.uint8)
-        except Exception:
-            return out
-
-    def _draw_texture_px(self, tex_id: int, x0: int, y0: int, x1: int, y1: int):
-        gl = self._gl
-        xf0 = -1.0 + (2.0 * float(x0) / float(max(1, self.window_w)))
-        xf1 = -1.0 + (2.0 * float(x1) / float(max(1, self.window_w)))
-        yt = 1.0 - (2.0 * float(y0) / float(max(1, self.window_h)))
-        yb = 1.0 - (2.0 * float(y1) / float(max(1, self.window_h)))
-        gl.glBindTexture(gl.GL_TEXTURE_2D, int(tex_id))
-        gl.glBegin(gl.GL_QUADS)
-        gl.glTexCoord2f(0.0, 1.0)
-        gl.glVertex2f(float(xf0), float(yb))
-        gl.glTexCoord2f(1.0, 1.0)
-        gl.glVertex2f(float(xf1), float(yb))
-        gl.glTexCoord2f(1.0, 0.0)
-        gl.glVertex2f(float(xf1), float(yt))
-        gl.glTexCoord2f(0.0, 0.0)
-        gl.glVertex2f(float(xf0), float(yt))
-        gl.glEnd()
-
-    def _present(self, force: bool = False):
-        if (not self._ready) or (not self.enabled) or self._stop_requested:
-            return
-        now = time.perf_counter()
-
-        # Slew the frame rate: buffer fill drives target dt, exponential smoothing applies it
-        _buf_cap = self._frame_buffer.maxlen or 1
-        fill = float(len(self._frame_buffer)) / float(_buf_cap)
-        # quadratic ease: bias toward fast end as buffer fills
-        target_dt = self._anim_dt_fast + (self._anim_dt_slow - self._anim_dt_fast) * ((1.0 - fill) ** 2)
-        _slew_elapsed = max(1e-4, now - self._last_slew_t)
-        self._last_slew_t = now
-        alpha = 1.0 - math.exp(-_slew_elapsed / max(1e-4, self._anim_slew_tau))
-        self._anim_frame_dt += alpha * (target_dt - self._anim_frame_dt)
-
-        # Advance animation: pop one frame per tick, add its losses to graph
-        if (now - self._last_anim_t) >= self._anim_frame_dt and len(self._frame_buffer) > 0:
-            frame = self._frame_buffer.popleft()
-            imgs = frame.get("images", None)
-            if isinstance(imgs, list) and len(imgs) == 3:
-                for i, tid in enumerate(self._textures["img"]):
-                    self._upload_texture(int(tid), np.asarray(imgs[i], dtype=np.uint8))
-            self._caption = str(frame.get("caption", ""))
-            self._panel_titles = [str(x) for x in frame.get("titles", self._panel_titles)]
-            self._panel_rows = [list(r) for r in frame.get("rows", self._panel_rows)]
-            self._panel_text_dirty = True
-            self._top_bar_dirty = True
-            for sid, lv in frame.get("losses", {}).items():
-                self.update_loss(int(sid), float(lv))
-            self._last_anim_t = now
-
-        dirty = bool(self._top_bar_dirty or self._panel_text_dirty or self._graph_dirty)
-        idle_refresh_due = bool(
-            self._has_presented_frame and ((now - self._last_present_t) >= float(self._max_idle_present_dt))
-        )
-        if (not dirty) and (not force) and (not idle_refresh_due):
-            return
-
-        if self._panel_text_dirty:
-            for i in range(3):
-                title = self._panel_titles[i] if i < len(self._panel_titles) else ""
-                rows = self._panel_rows[i] if i < len(self._panel_rows) else []
-                self._panel_text_rgb[i] = self._render_panel_text(title=title, rows=rows)
-                self._upload_texture(int(self._textures["text"][i]), self._panel_text_rgb[i])
-            self._panel_text_dirty = False
-
-        if self._top_bar_dirty:
-            self._top_bar_rgb = self._render_top_bar()
-            self._upload_texture(int(self._textures["bar"]), self._top_bar_rgb)
-            self._top_bar_dirty = False
-
-        if self.graph_h > 0 and self._graph_dirty:
-            self._graph_rgb = self._render_loss_graph()
-            self._upload_texture(int(self._textures["graph"]), self._graph_rgb)
-            self._graph_dirty = False
-
-        gl = self._gl
-        gl.glClear(gl.GL_COLOR_BUFFER_BIT)
-
-        self._draw_texture_px(
-            int(self._textures["bar"]),
-            0,
-            0,
-            self.window_w,
-            self.top_bar_h,
-        )
-        for i in range(3):
-            x0 = int(i * self.panel_w)
-            x1 = int((i + 1) * self.panel_w)
-            self._draw_texture_px(
-                int(self._textures["text"][i]),
-                x0,
-                self.top_bar_h,
-                x1,
-                self.top_bar_h + self.panel_h,
-            )
-            self._draw_texture_px(
-                int(self._textures["img"][i]),
-                x0,
-                self.top_bar_h + self.panel_h,
-                x1,
-                self.top_bar_h + (2 * self.panel_h),
-            )
-
-        if self.graph_h > 0 and self._graph_rgb is not None:
-            graph_y0 = int(self.top_bar_h + (2 * self.panel_h))
-            self._draw_texture_px(
-                int(self._textures["graph"]),
-                0,
-                graph_y0,
-                self.window_w,
-                graph_y0 + self.graph_h,
-            )
-
-        gate_mode = "manual" if self._gate_override else "auto"
-        self._pygame.display.set_caption(f"Stage Status Viewer | gate={gate_mode} | {self._caption}")
-        self._pygame.display.flip()
-        self._last_present_t = now
-        self._has_presented_frame = True
-
-    def _handle_click(self, x: int, y: int) -> bool:
-        xi = int(x)
-        yi = int(y)
-        if yi < 0 or yi >= int(self.top_bar_h):
-            return False
-        for kind, idx, box in self._control_boxes:
-            if (xi >= int(box[0])) and (xi <= int(box[2])) and (yi >= int(box[1])) and (yi <= int(box[3])):
-                if kind == "cycle":
-                    if int(idx) >= 0 and int(idx) < len(self._cycle_selected):
-                        self._cycle_selected[int(idx)] = not bool(self._cycle_selected[int(idx)])
-                        self._top_bar_dirty = True
-                        return True
-                elif kind == "override":
-                    self._gate_override = not bool(self._gate_override)
-                    self._top_bar_dirty = True
-                    return True
-        return False
-
-    def _poll_events(self):
-        if (not self._ready) or (self._pygame is None):
-            return
-        try:
-            for event in self._pygame.event.get():
-                if event.type == self._pygame.QUIT:
-                    self._stop_requested = True
-                    self.enabled = False
-                    self.close()
-                    return
-                if event.type == self._pygame.MOUSEBUTTONDOWN and int(getattr(event, "button", 0)) == 1:
-                    pos = getattr(event, "pos", None)
-                    if isinstance(pos, (list, tuple)) and len(pos) >= 2:
-                        if self._handle_click(int(pos[0]), int(pos[1])):
-                            self._present(force=True)
-        except Exception:
-            pass
-
-    def pump(self):
-        if not self.enabled:
-            return
-        self._init()
-        if not self._ready:
-            return
-        self._poll_events()
-        self._present(force=False)
-
-    def stop_requested(self) -> bool:
-        return bool(self._stop_requested)
-
-    def update_loss(self, stage_id: int, loss: float, aux: float = 0.0):
-        """Record a per-step loss value and mark the graph dirty for redraw."""
-        if self.graph_h <= 0:
-            return
-        sid = int(stage_id)
-        if sid not in self._loss_graph_data:
-            self._loss_graph_data[sid] = deque(maxlen=5_000_000)
-        v = float(loss)
-        self._loss_graph_data[sid].append(v if math.isfinite(v) else float("nan"))
-        self._graph_dirty = True
-
-    def _render_loss_graph(self) -> np.ndarray:
-        try:
-            from PIL import Image, ImageDraw, ImageFont
-        except Exception:
-            return np.full((self.graph_h, self.window_w, 3), 14, dtype=np.uint8)
-
-        W = int(self.window_w)
-        H = int(self.graph_h)
-        im = Image.new("RGB", (W, H), (14, 18, 22))
-        draw = ImageDraw.Draw(im)
-        font = ImageFont.load_default()
-
-        # Plot margins
-        mx0, mx1 = 52, W - 6
-        my0, my1 = 14, H - 6
-        plot_w = max(1, mx1 - mx0)
-        plot_h = max(1, my1 - my0)
-
-        # Compute global Y range from all finite values
-        all_finite: List[float] = []
-        for dq in self._loss_graph_data.values():
-            all_finite.extend(v for v in dq if math.isfinite(v) and v >= 0.0)
-
-        if len(all_finite) < 2:
-            draw.text((mx0, my0 + plot_h // 2 - 4), "no data yet", fill=(80, 88, 100), font=font)
-            return np.asarray(im, dtype=np.uint8)
-
-        raw_min = min(all_finite)
-        raw_max = max(all_finite)
-        span = raw_max - raw_min
-        y_min = max(0.0, raw_min - span * 0.05)
-        y_max = raw_max + span * 0.05
-        if y_max <= y_min + 1e-9:
-            y_max = y_min + 1.0
-
-        def _y_px(v: float) -> int:
-            frac = (float(v) - y_min) / (y_max - y_min)
-            return int(my1 - frac * plot_h)
-
-        # Horizontal gridlines + Y axis labels
-        for frac, alpha in ((0.0, 1), (0.25, 0), (0.5, 0), (0.75, 0), (1.0, 1)):
-            gy = int(my1 - frac * plot_h)
-            draw.line([(mx0, gy), (mx1, gy)], fill=(34, 40, 50) if alpha == 0 else (55, 62, 74))
-            lv = y_min + frac * (y_max - y_min)
-            draw.text((2, gy - 5), f"{lv:.3f}", fill=(110, 120, 136), font=font)
-
-        # Plot each series
-        for sid in sorted(self._loss_graph_data.keys()):
-            dq = self._loss_graph_data[sid]
-            if len(dq) == 0:
-                continue
-            vals = list(dq)
-            n = len(vals)
-            color = _LOSS_STAGE_COLORS.get(sid, (200, 200, 200))
-
-            # Downsample to plot_w buckets via mean to avoid overdraw
-            if n > plot_w:
-                bucket = n / float(plot_w)
-                downsampled: List[float] = []
-                for bi in range(plot_w):
-                    i0 = int(bi * bucket)
-                    i1 = max(i0 + 1, int((bi + 1) * bucket))
-                    chunk = [vals[i] for i in range(i0, min(i1, n)) if math.isfinite(vals[i])]
-                    downsampled.append(sum(chunk) / len(chunk) if chunk else float("nan"))
-                vals = downsampled
-                n = plot_w
-
-            pts: List[Optional[Tuple[int, int]]] = []
-            for i, v in enumerate(vals):
-                if not math.isfinite(v):
-                    pts.append(None)
-                    continue
-                xp = int(mx0 + (float(i) / float(max(1, n - 1))) * float(plot_w))
-                yp = max(my0, min(my1, _y_px(v)))
-                pts.append((xp, yp))
-
-            prev = None
-            for pt in pts:
-                if pt is not None and prev is not None:
-                    draw.line([prev, pt], fill=color, width=1)
-                prev = pt if pt is not None else None
-
-        # Legend (horizontal, top of graph)
-        lx = mx0
-        for sid in sorted(_LOSS_STAGE_COLORS.keys()):
-            if sid not in self._loss_graph_data or len(self._loss_graph_data[sid]) == 0:
-                continue
-            color = _LOSS_STAGE_COLORS[sid]
-            name = _LOSS_STAGE_NAMES.get(sid, f"s{sid}")
-            dq = self._loss_graph_data[sid]
-            last_v = next((v for v in reversed(dq) if math.isfinite(v)), float("nan"))
-            label = f"{name}={last_v:.4f}" if math.isfinite(last_v) else name
-            draw.rectangle([(lx, 2), (lx + 7, 9)], fill=color)
-            draw.text((lx + 10, 1), label, fill=color, font=font)
-            lx += max(56, len(label) * 6 + 18)
-            if lx > W - 60:
-                break
-
-        return np.asarray(im, dtype=np.uint8)
-
-    def update(
-        self,
-        clean_img: torch.Tensor,
-        input_img: torch.Tensor,
-        output_img: torch.Tensor,
-        caption: str,
-        panel_titles: Optional[Sequence[str]] = None,
-        panel_rows: Optional[Sequence[Sequence[str]]] = None,
-        frame_losses: Optional[Dict[int, float]] = None,
-    ):
-        if not self.enabled:
-            return
-        self._init()
-        if not self._ready:
-            return
-        self._poll_events()
-        if self._stop_requested or (not self._ready):
-            return
-
-        # Store losses in the frame so the graph advances in sync with each popped image
-        clean_rgb = self._resize_rgb_to_panel(_tensor_to_rgb_u8_image(clean_img))
-        in_rgb = self._resize_rgb_to_panel(_tensor_to_rgb_u8_image(input_img))
-        out_rgb = self._resize_rgb_to_panel(_tensor_to_rgb_u8_image(output_img))
-        titles, rows = self._normalize_panel_text(panel_titles=panel_titles, panel_rows=panel_rows)
-        self._frame_buffer.append({
-            "images": [clean_rgb, in_rgb, out_rgb],
-            "caption": str(caption),
-            "titles": titles,
-            "rows": rows,
-            "losses": dict(frame_losses) if frame_losses is not None else {},
-        })
-        self._present(force=False)
-
-    def close(self):
-        if self._ready:
-            try:
-                if self._gl is not None and self._textures is not None:
-                    tex_ids = (
-                        list(self._textures.get("img", []))
-                        + list(self._textures.get("text", []))
-                        + [self._textures.get("bar", 0)]
-                        + [self._textures.get("graph", 0)]
-                    )
-                    tex_ids = [int(t) for t in tex_ids if int(t) > 0]
-                    if len(tex_ids) > 0:
-                        self._gl.glDeleteTextures(tex_ids)
-            except Exception:
-                pass
-            try:
-                if self._pygame is not None:
-                    self._pygame.display.quit()
-                    self._pygame.quit()
-            except Exception:
-                pass
-        self._ready = False
-        self._textures = None
-        self._pygame = None
-        self._gl = None
-
 
 _STFT_WINDOW_CACHE: Dict[Tuple[str, torch.dtype, int], torch.Tensor] = {}
 
@@ -2752,33 +2008,35 @@ def train_conditional_generator_discriminator(
                 _msk_ls = float(mask_loss_step)
                 _out_ls = float(outside_loss_step)
                 _wav_ls = float(wave_loss_step)
+                batch_payloads = []
                 for _item in preview_items:
-                    try:
-                        step_preview_callback(
-                            {
-                                "epoch": int(epoch),
-                                "step": int(step_idx),
-                                "steps_per_epoch": int(n_steps),
-                                "target_img": _item["target_img"],
-                                "fake_img": _item["fake_img"],
-                                "target_mask": _item["target_mask"],
-                                "fake_mask": _item["fake_mask"],
-                                "probs": _item["probs"],
-                                "target_condition": _item["target_condition"],
-                                "target_prob": float(_item["target_prob"]),
-                                "g_loss": float(_g_ls),
-                                "d_loss": float(_d_ls),
-                                "adv_loss": float(_adv_ls),
-                                "mask_loss": float(_msk_ls),
-                                "outside_loss": float(_out_ls),
-                                "wave_loss": float(_wav_ls),
-                                "target_prob_avg": float(run_tgt / float(max(1, int(step_idx)))),
-                                "g_loss_avg": float(run_g / float(max(1, int(step_idx)))),
-                                "d_loss_avg": float(run_d / float(max(1, int(step_idx)))),
-                            }
-                        )
-                    except Exception:
-                        pass
+                    batch_payloads.append(
+                        {
+                            "epoch": int(epoch),
+                            "step": int(step_idx),
+                            "steps_per_epoch": int(n_steps),
+                            "target_img": _item["target_img"],
+                            "fake_img": _item["fake_img"],
+                            "target_mask": _item["target_mask"],
+                            "fake_mask": _item["fake_mask"],
+                            "probs": _item["probs"],
+                            "target_condition": _item["target_condition"],
+                            "target_prob": float(_item["target_prob"]),
+                            "g_loss": float(_g_ls),
+                            "d_loss": float(_d_ls),
+                            "adv_loss": float(_adv_ls),
+                            "mask_loss": float(_msk_ls),
+                            "outside_loss": float(_out_ls),
+                            "wave_loss": float(_wav_ls),
+                            "target_prob_avg": float(run_tgt / float(max(1, int(step_idx)))),
+                            "g_loss_avg": float(run_g / float(max(1, int(step_idx)))),
+                            "d_loss_avg": float(run_d / float(max(1, int(step_idx)))),
+                        }
+                    )
+                try:
+                    step_preview_callback(batch_payloads)
+                except Exception:
+                    pass
             preview_items = []
 
             if int(log_every_steps) > 0 and ((int(step_idx) % int(log_every_steps) == 0) or (int(step_idx) == int(n_steps))):
@@ -3049,10 +2307,11 @@ def train_classifier(
             if step_preview_callback is not None and int(xb.shape[0]) > 0:
                 _batch_loss = float(loss.detach().to(torch.float32).item())
                 _train_loss = float(total_loss / float(max(1, n_seen)))
+                _preview_batch = []
                 for _i in range(int(xb.shape[0])):
                     try:
                         _probs_i = torch.softmax(logits[_i].detach().to(torch.float32), dim=0)
-                        step_preview_callback(
+                        _preview_batch.append(
                             {
                                 "epoch": int(epoch),
                                 "step": int(step_idx),
@@ -3066,6 +2325,10 @@ def train_classifier(
                         )
                     except Exception:
                         pass
+                try:
+                    step_preview_callback(_preview_batch)
+                except Exception:
+                    pass
 
         if stop_now:
             break
@@ -4730,6 +3993,7 @@ def train_transformer_feature_metric(
                 _avg_loss = float(loss.detach().to(torch.float32).item())
                 _avg_score_after = float(score_after.detach().to(torch.float32).item())
                 _avg_score_gap = float(score_gap.detach().to(torch.float32).item())
+                _preview_batch = []
                 for _pi in range(_B):
                     try:
                         _tc = target_cond[_pi].detach().to(torch.float32).cpu() if (target_cond is not None and _pi < int(target_cond.shape[0])) else None
@@ -4743,7 +4007,7 @@ def train_transformer_feature_metric(
                             _deskew = {"target_skew": _tv, "pred_skew": _pv, "applied_skew": _av, "remaining_skew": float(_tv + _av), "post_residual_skew": _pov, "confidence": _cv}
                         except Exception:
                             _deskew = None
-                        step_preview_callback(
+                        _preview_batch.append(
                             {
                                 "epoch": int(epoch),
                                 "step": int(step_idx),
@@ -4772,6 +4036,10 @@ def train_transformer_feature_metric(
                         )
                     except Exception:
                         pass
+                try:
+                    step_preview_callback(_preview_batch)
+                except Exception:
+                    pass
             step_t2 = time.perf_counter()
             loss_to_backprop = loss / float(grad_accum_steps)
             if use_scaler:
