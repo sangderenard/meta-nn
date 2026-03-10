@@ -151,9 +151,7 @@ def _run_from_plan(plan_path: Path, override_output_dir: str = None) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # Build a minimal args namespace from plan's worker_hints.
-    # Nodes derive their typed configs from plan.config_blobs (via
-    # build_training_graph_from_plan), so only cross-cutting runtime
-    # keys need to be present in args.
+    # The plan carries the node config blobs; args only provide runtime knobs.
     args = types.SimpleNamespace(
         output_dir=str(output_dir),
         device=str(hints.get("device_preference", "auto")),
@@ -172,7 +170,7 @@ def _run_from_plan(plan_path: Path, override_output_dir: str = None) -> None:
     )
 
     try:
-        run(args=args, output_dir=output_dir)
+        run(args=args, output_dir=output_dir, initial_plan=plan)
     except KeyboardInterrupt:
         print("\n[wav_pipeline_graph] interrupted by user", flush=True)
         sys.exit(0)

@@ -552,6 +552,37 @@ def _reconstruct_config(cls, blob: dict):
     return cls(**{k: v for k, v in blob.items() if k in valid_fields})
 
 
+def _parse_positive_int(value, *, field_name: str, default: int) -> int:
+    """Parse integer worker hints with clear validation errors."""
+    if value is None:
+        return int(default)
+    try:
+        parsed = int(value)
+    except Exception as exc:
+        raise ValueError(f"Invalid plan worker_hints[{field_name!r}]={value!r}: expected integer") from exc
+    if parsed < 1:
+        raise ValueError(f"Invalid plan worker_hints[{field_name!r}]={value!r}: expected >= 1")
+    return parsed
+
+
+def _validate_training_graph_plan(plan) -> None:
+    """Validate minimally required plan fields before materializing nodes."""
+    if plan is None:
+        raise ValueError("TrainingGraphPlan is required")
+
+    blobs = getattr(plan, "config_blobs", None)
+    if blobs is not None and not isinstance(blobs, dict):
+        raise ValueError("Invalid plan: config_blobs must be a mapping")
+
+    hints = dict(getattr(plan, "worker_hints", {}) or {})
+    _parse_positive_int(hints.get("save_every_n_rounds", 1), field_name="save_every_n_rounds", default=1)
+    _parse_positive_int(
+        hints.get("berkeley_refresh_every_n_rounds", 4),
+        field_name="berkeley_refresh_every_n_rounds",
+        default=4,
+    )
+
+
 def build_training_graph_from_plan(plan) -> PipelineGraph:
     """Materialize an executable PipelineGraph from a saved TrainingGraphPlan.
 
@@ -588,9 +619,14 @@ def build_training_graph_from_plan(plan) -> PipelineGraph:
             # Key not present in plan (e.g. older plan file) → use defaults
             cfg[key] = cls()
 
+    _validate_training_graph_plan(plan)
     hints = dict(plan.worker_hints or {})
-    save_every = int(hints.get("save_every_n_rounds", 1))
-    berkeley_refresh = int(hints.get("berkeley_refresh_every_n_rounds", 4))
+    save_every = _parse_positive_int(hints.get("save_every_n_rounds", 1), field_name="save_every_n_rounds", default=1)
+    berkeley_refresh = _parse_positive_int(
+        hints.get("berkeley_refresh_every_n_rounds", 4),
+        field_name="berkeley_refresh_every_n_rounds",
+        default=4,
+    )
 
     return build_pipeline_graph(
         classifier_cfg=cfg["classifier"],
@@ -985,7 +1021,7 @@ def build_pipeline_graph(
 # Execution loop
 # ---------------------------------------------------------------------------
 
-def run(args, output_dir: Path) -> None:
+def run(args, output_dir: Path, initial_plan=None) -> None:
     """Main execution entry point called from the CLI shim.
 
     Builds the pipeline context, constructs node configs from parsed args,
@@ -1023,15 +1059,24 @@ def run(args, output_dir: Path) -> None:
 
     _restore_context_from_resume(ctx)
 
-    # -- Node configs from args -------------------------------------------
+    # -- Node configs / orchestration parameters --------------------------
+    plan_hints = dict(getattr(initial_plan, "worker_hints", {}) or {}) if initial_plan is not None else {}
     cfg = _build_configs_from_args(args)
-    cycles = int(_arg_value(args, "orchestration_cycles", "cycles", default=1))
-    rounds_per_cycle = int(_arg_value(args, "orchestration_rounds", "rounds_per_cycle", default=1))
+    cycles = _parse_positive_int(
+        plan_hints.get("orchestration_cycles", _arg_value(args, "orchestration_cycles", "cycles", default=1)),
+        field_name="orchestration_cycles",
+        default=1,
+    )
+    rounds_per_cycle = _parse_positive_int(
+        plan_hints.get("orchestration_rounds", _arg_value(args, "orchestration_rounds", "rounds_per_cycle", default=1)),
+        field_name="orchestration_rounds",
+        default=1,
+    )
     default_cycle_ids = [int(i) for i in range(1, cycles + 1)]
 
     # Store orchestration parameters in context so nodes can read them
     # without falling back to ctx.args (needed for plan-driven mode).
-    ctx.orchestration_mode = str(_arg_value(args, "orchestration_mode", default="staged_cgrw") or "staged_cgrw")
+    ctx.orchestration_mode = str(plan_hints.get("orchestration_mode", _arg_value(args, "orchestration_mode", default="staged_cgrw")) or "staged_cgrw")
     ctx.orchestration_cycles = cycles
     ctx.orchestration_rounds = rounds_per_cycle
     ctx.viewer_proxy = _make_viewer_proxy(args, cycles)
@@ -1044,26 +1089,30 @@ def run(args, output_dir: Path) -> None:
                 _log(f"[orchestrator] WARNING: could not initialize GUI cycle roster: {exc}")
 
     # -- Graph construction -----------------------------------------------
-    graph = build_pipeline_graph(
-        classifier_cfg=cfg["classifier"],
-        transformer_cfg=cfg["transformer"],
-        generator_cfg=cfg["generator"],
-        wave_cfg=cfg["wave"],
-        vocab_cfg=cfg["vocab"],
-        embedding_cfg=cfg["embedding"],
-        wave_pool_cfg=cfg["wave_pool"],
-        pregestation_cfg=cfg["pregestation"],
-        gestation_cfg=cfg["gestation"],
-        berkeley_payload_cfg=cfg["berkeley_payload"],
-        berkeley_data_cfg=cfg["berkeley_data"],
-        berkeley_gate_cfg=cfg["berkeley_gate"],
-        transformer_gate_cfg=cfg["transformer_gate"],
-        generator_gate_cfg=cfg["generator_gate"],
-        wave_gate_cfg=cfg["wave_gate"],
-        save_every_n_rounds=int(_arg_value(args, "checkpoint_every_round", "save_every_n_rounds", default=1)),
-        berkeley_refresh_every_n_rounds=int(_arg_value(args, "berkeley_refresh_round_every", "berkeley_refresh_every", default=4)),
-    )
-    ctx.graph_plan = build_training_graph_plan(args, output_dir, graph=graph, cfg=cfg)
+    if initial_plan is not None:
+        graph = build_training_graph_from_plan(initial_plan)
+        ctx.graph_plan = initial_plan
+    else:
+        graph = build_pipeline_graph(
+            classifier_cfg=cfg["classifier"],
+            transformer_cfg=cfg["transformer"],
+            generator_cfg=cfg["generator"],
+            wave_cfg=cfg["wave"],
+            vocab_cfg=cfg["vocab"],
+            embedding_cfg=cfg["embedding"],
+            wave_pool_cfg=cfg["wave_pool"],
+            pregestation_cfg=cfg["pregestation"],
+            gestation_cfg=cfg["gestation"],
+            berkeley_payload_cfg=cfg["berkeley_payload"],
+            berkeley_data_cfg=cfg["berkeley_data"],
+            berkeley_gate_cfg=cfg["berkeley_gate"],
+            transformer_gate_cfg=cfg["transformer_gate"],
+            generator_gate_cfg=cfg["generator_gate"],
+            wave_gate_cfg=cfg["wave_gate"],
+            save_every_n_rounds=int(_arg_value(args, "checkpoint_every_round", "save_every_n_rounds", default=1)),
+            berkeley_refresh_every_n_rounds=int(_arg_value(args, "berkeley_refresh_round_every", "berkeley_refresh_every", default=4)),
+        )
+        ctx.graph_plan = build_training_graph_plan(args, output_dir, graph=graph, cfg=cfg)
     ctx.plan_id = str(ctx.graph_plan.plan_id)
     if ctx.graph_plan_path is not None:
         try:

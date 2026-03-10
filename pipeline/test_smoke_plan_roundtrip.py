@@ -191,6 +191,21 @@ def test_run_from_plan_namespace(plan: TrainingGraphPlan):
     _assert(isinstance(ns.orchestration_rounds, int), "orchestration_rounds is int")
 
 
+# ── test: plan validation guardrails ──────────────────────────────────────────
+
+def test_plan_validation_guardrails(plan: TrainingGraphPlan):
+    print("\n--- test_plan_validation_guardrails ---")
+    broken = TrainingGraphPlan.from_dict(plan.to_dict())
+    broken.worker_hints = dict(broken.worker_hints or {})
+    broken.worker_hints["save_every_n_rounds"] = 0
+    try:
+        build_training_graph_from_plan(broken)
+    except ValueError as exc:
+        _assert("save_every_n_rounds" in str(exc), "invalid save_every_n_rounds raises ValueError")
+    else:
+        _fail("expected ValueError for invalid save_every_n_rounds")
+
+
 # ── main ──────────────────────────────────────────────────────────────────────
 
 def main():
@@ -200,6 +215,7 @@ def main():
     reloaded_plan = test_json_roundtrip(plan, node_count, edge_count)
     test_rebuild_from_plan(reloaded_plan, node_count, edge_count)
     test_run_from_plan_namespace(reloaded_plan)
+    test_plan_validation_guardrails(reloaded_plan)
     print("\n=== All checks passed ===")
 
 
