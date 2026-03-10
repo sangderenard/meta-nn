@@ -1,4 +1,5 @@
 import argparse
+import copy
 import gc
 import hashlib
 import json
@@ -7,6 +8,7 @@ import os
 import re
 import shutil
 import sys
+import threading
 import time
 import wave
 from collections import Counter
@@ -35,6 +37,12 @@ from wav_ml_core import (
 )
 from wav_ml_models import (
     _TransformerStatusOpenGLViewer,
+    _LossFileLogger,
+    LOSS_STAGE_CLASSIFIER,
+    LOSS_STAGE_DISCRIMINATOR,
+    LOSS_STAGE_GENERATOR,
+    LOSS_STAGE_TRANSFORMER,
+    LOSS_STAGE_WAVE_CLASSIFIER,
     ConditionalBitPlaneDiscriminator,
     ConditionalBitPlaneGenerator,
     SinusoidalLRController,
@@ -65,11 +73,14 @@ try:
         DiskSemanticRowsDataset,
         OverrideTargetSubsetDataset,
         StageDatasetManifest,
+        _composite_mask_stack,
+        _semantic_color_score_maps,
         build_label_mask_stack,
         build_loader_from_manifest,
         collect_semantic_disk_rows,
         detect_semantic_color_terms,
         infer_semantic_support_mask,
+        maybe_wrap_loader_with_threaded_prefetch,
         semantic_mask_stack_collate,
     )
 except ModuleNotFoundError:
@@ -78,11 +89,14 @@ except ModuleNotFoundError:
         DiskSemanticRowsDataset,
         OverrideTargetSubsetDataset,
         StageDatasetManifest,
+        _composite_mask_stack,
+        _semantic_color_score_maps,
         build_label_mask_stack,
         build_loader_from_manifest,
         collect_semantic_disk_rows,
         detect_semantic_color_terms,
         infer_semantic_support_mask,
+        maybe_wrap_loader_with_threaded_prefetch,
         semantic_mask_stack_collate,
     )
 
@@ -111,6 +125,27 @@ def _autocast_context(device: torch.device, enabled: bool, amp_dtype_t: torch.dt
     return nullcontext()
 
 
+def _cuda_device_supports_amp_dtype(device: torch.device, amp_dtype_t: torch.dtype) -> bool:
+    if device.type != "cuda":
+        return True
+    if amp_dtype_t != torch.bfloat16:
+        return True
+    try:
+        major, _minor = torch.cuda.get_device_capability(device)
+        return int(major) >= 8
+    except Exception:
+        return False
+
+
+def _is_cuda_backend_engine_error(exc: BaseException) -> bool:
+    txt = str(exc).lower()
+    return (
+        "unable to find an engine to execute this computation" in txt
+        or "unable to find an engine" in txt
+        or "find was unable to find an engine" in txt
+    )
+
+
 def _effective_dataloader_num_workers(num_workers: int, device: Optional[torch.device] = None) -> int:
     workers = max(0, int(num_workers))
     if workers <= 0:
@@ -122,9 +157,9 @@ def _effective_dataloader_num_workers(num_workers: int, device: Optional[torch.d
         except Exception:
             device_type = str(device).strip().lower()
     if os.name == "nt" and device_type == "cuda":
-        # Windows worker collation uses named shared mappings for CPU tensors.
-        # Large semantic image+mask batches can exhaust commit/pagefile space
-        # and fail with Win32 error 1455 while collating in worker processes.
+        # Windows worker processes still hit named shared-mapping pressure for
+        # large semantic batches. Keep process workers at 0 and recover async
+        # preparation via threaded prefetch wrappers at the loader boundary.
         return 0
     return workers
 
@@ -136,6 +171,67 @@ def _dataloader_perf_kwargs(num_workers: int, persistent_workers: bool, prefetch
     if int(prefetch_factor) > 0:
         out["prefetch_factor"] = int(prefetch_factor)
     return out
+
+
+def _resolve_aux_compute_device(primary_device: Optional[torch.device] = None) -> torch.device:
+    return torch.device("cpu")
+
+
+def _refresh_cache_is_staging_safe(
+    cache_x: Optional[torch.Tensor],
+    cache_y: Optional[torch.Tensor],
+    cache_m: Optional[torch.Tensor],
+    model_device: torch.device,
+) -> bool:
+    tensors = [cache_x, cache_y, cache_m]
+    real = [t for t in tensors if isinstance(t, torch.Tensor)]
+    if len(real) <= 0:
+        return False
+    for t in real:
+        try:
+            if bool(t.requires_grad):
+                return False
+        except Exception:
+            return False
+    devs = {str(t.device) for t in real}
+    if len(devs) != 1:
+        return False
+    cache_dev = next(iter(devs))
+    if cache_dev == str(model_device):
+        return True
+    return cache_dev == "cpu"
+
+
+def _unwrap_module_for_replica(module: nn.Module) -> nn.Module:
+    wrapped = getattr(module, "_orig_mod", None)
+    if isinstance(wrapped, nn.Module):
+        return wrapped
+    return module
+
+
+def _sync_gate_classifier_replica(
+    source_classifier: nn.Module,
+    gate_classifier: Optional[nn.Module],
+    gate_device: torch.device,
+    channels_last: bool = False,
+) -> Tuple[nn.Module, Dict[str, Any]]:
+    source_base = _unwrap_module_for_replica(source_classifier)
+    created = False
+    if gate_classifier is None:
+        gate_classifier = copy.deepcopy(source_base)
+        created = True
+    gate_classifier = gate_classifier.to(device=gate_device, dtype=torch.float32)
+    gate_classifier.load_state_dict(source_base.state_dict(), strict=True)
+    gate_classifier.eval()
+    for p in gate_classifier.parameters():
+        p.requires_grad_(False)
+    if bool(channels_last):
+        gate_classifier = gate_classifier.to(memory_format=torch.channels_last)
+    return gate_classifier, {
+        "created": bool(created),
+        "device": str(gate_device),
+        "source_device": str(next(source_base.parameters()).device),
+    }
 
 
 def _make_grad_scaler(enabled: bool):
@@ -171,7 +267,7 @@ def _torch_load_cpu(path: str):
         return torch.load(path, map_location="cpu", weights_only=False)
 
 
-def _hard_wipe_pipeline_caches(output_dir: Path, berkeley_data_root: str) -> Dict[str, Any]:
+def _hard_wipe_pipeline_caches(output_dir: Path, berkeley_data_root: str, semantic_stage_cache_dir: str = "") -> Dict[str, Any]:
     out_dir = Path(output_dir)
     berkeley_root = Path(str(berkeley_data_root).strip() or "toys_to_survive_development/data/berkeley_sbd")
     targets: List[Path] = [
@@ -179,8 +275,15 @@ def _hard_wipe_pipeline_caches(output_dir: Path, berkeley_data_root: str) -> Dic
         out_dir / "latent_wave_pool",
         out_dir / "training_supervision",
     ]
+    semantic_stage_root = (
+        Path(str(semantic_stage_cache_dir).strip())
+        if str(semantic_stage_cache_dir).strip()
+        else (out_dir / "semantic_stage_cache")
+    )
+    targets.append(semantic_stage_root)
     berkeley_cache_root = berkeley_root / "cache"
     if berkeley_cache_root.exists():
+        targets.append(berkeley_cache_root / "semantic_mask_cache")
         for payload_dir in sorted(berkeley_cache_root.glob("payload_bank_rgb*")):
             targets.append(Path(payload_dir))
 
@@ -224,10 +327,17 @@ def _hard_wipe_pipeline_caches(output_dir: Path, berkeley_data_root: str) -> Dic
     return info
 
 
-def _soft_reset_label_caches(output_dir: Path, berkeley_data_root: str) -> Dict[str, Any]:
+def _soft_reset_label_caches(output_dir: Path, berkeley_data_root: str, semantic_stage_cache_dir: str = "") -> Dict[str, Any]:
     _ = Path(output_dir)
     berkeley_root = Path(str(berkeley_data_root).strip() or "toys_to_survive_development/data/berkeley_sbd")
     targets: List[Path] = []
+    semantic_stage_root = (
+        Path(str(semantic_stage_cache_dir).strip())
+        if str(semantic_stage_cache_dir).strip()
+        else (Path(output_dir) / "semantic_stage_cache")
+    )
+    if semantic_stage_root.exists():
+        targets.append(semantic_stage_root)
     berkeley_cache_root = berkeley_root / "cache"
     if berkeley_cache_root.exists():
         for payload_dir in sorted(berkeley_cache_root.glob("payload_bank_rgb*")):
@@ -282,6 +392,331 @@ def _soft_reset_label_caches(output_dir: Path, berkeley_data_root: str) -> Dict[
         else:
             info["errors"].append(f"{str(p)} ({str(err)})")
     return info
+
+
+def _sanitize_cache_component(name: str) -> str:
+    txt = re.sub(r"[^a-z0-9_\-]+", "_", str(name).strip().lower())
+    txt = re.sub(r"_+", "_", txt).strip("_")
+    return txt or "stage"
+
+
+def _resolve_semantic_stage_cache_root(output_dir: Path, cache_dir: str, cache_nonce: str = "") -> Path:
+    base = Path(str(cache_dir).strip()) if str(cache_dir).strip() else (Path(output_dir) / "semantic_stage_cache")
+    if str(cache_nonce).strip():
+        return base / f"session_{_sanitize_cache_component(str(cache_nonce))}"
+    return base
+
+
+def _semantic_stage_cache_dir(root_dir: Optional[Path], stage_name: str) -> str:
+    if root_dir is None:
+        return ""
+    return str(Path(root_dir) / _sanitize_cache_component(stage_name))
+
+
+def _resolve_semantic_stage_cache_cap_mb(global_cap_mb: int, specific_cap_mb: int) -> int:
+    specific = int(specific_cap_mb)
+    if int(specific) >= 0:
+        return max(0, int(specific))
+    return max(0, int(global_cap_mb))
+
+
+def _log_bootstrap_dataset_cache(stage_name: str, dataset: Any) -> None:
+    info = getattr(dataset, "persistent_cache_info", None)
+    if not isinstance(info, dict) or not bool(info.get("enabled", False)):
+        return
+    _log(
+        "[semantic-stage-cache] "
+        f"stage={str(stage_name)} "
+        f"desired={int(info.get('desired_rows', 0))} "
+        f"cached={int(info.get('cached_rows', 0))} "
+        f"cache_hit={1 if bool(info.get('cache_hit', False)) else 0} "
+        f"rebuilt={1 if bool(info.get('rebuilt', False)) else 0} "
+        f"generated={int(info.get('generated_rows', 0))} "
+        f"max_mb={float(int(info.get('max_bytes', 0))) / (1024.0 * 1024.0):.1f} "
+        f"dir={str(info.get('cache_dir', ''))}"
+    )
+
+
+def _pregestation_base_cache_dir(root_dir: Optional[Path]) -> Path:
+    base_root = Path(root_dir) if root_dir is not None else Path(".")
+    return Path(base_root) / "_pregestation_logic_rows"
+
+
+def _pregestation_base_cache_signature(
+    image_size: int,
+    seed: int,
+    samples_per_combo: int,
+    active_terms_lc: Sequence[str],
+    semantic_term_to_idx: Optional[Dict[str, int]] = None,
+    mode: str = "direction_color",
+    displacement_temperature_bucket: int = 4,
+) -> str:
+    """Return a deterministic hex digest that uniquely identifies a pregestation
+    data batch.  *mode* and a quantised temperature bucket are included so that
+    different modes / temperature levels produce distinct cache slots."""
+    payload = {
+        "image_size": int(image_size),
+        "seed": int(seed),
+        "samples_per_combo": int(samples_per_combo),
+        "mode": str(mode).strip().lower(),
+        "displacement_temperature_bucket": int(displacement_temperature_bucket),
+        "active_terms_lc": sorted(
+            {
+                re.sub(r"\s+", " ", str(x)).strip().lower()
+                for x in list(active_terms_lc)
+                if str(x).strip()
+            }
+        ),
+        "semantic_term_to_idx": sorted(
+            [
+                [re.sub(r"\s+", " ", str(k)).strip().lower(), int(v)]
+                for k, v in (semantic_term_to_idx.items() if isinstance(semantic_term_to_idx, dict) else [])
+                if str(k).strip()
+            ]
+        ),
+    }
+    return str(hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=True).encode("utf-8")).hexdigest())
+
+
+def _pregestation_loop_pool_dir(cache_root: Optional[Path]) -> Path:
+    return _pregestation_base_cache_dir(cache_root) / "_loop_pool"
+
+
+def _pregestation_loop_slot_dir(loop_root: Path, slot_idx: int) -> Path:
+    return Path(loop_root) / f"loop_slot_{int(slot_idx):04d}"
+
+
+def _pregestation_load_cache_control(loop_root: Path) -> Dict[str, Any]:
+    path = Path(loop_root) / ".cache_control.json"
+    if not path.exists():
+        return {"loop_cursor": 0}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(data, dict):
+            return data
+    except Exception:
+        pass
+    return {"loop_cursor": 0}
+
+
+def _pregestation_store_cache_control(loop_root: Path, payload: Dict[str, Any]) -> None:
+    Path(loop_root).mkdir(parents=True, exist_ok=True)
+    path = Path(loop_root) / ".cache_control.json"
+    try:
+        path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def _pregestation_read_slot(
+    slot_dir: Path,
+    signature: str,
+) -> Optional[Tuple[List[np.ndarray], List[np.ndarray], List[np.ndarray], List[np.ndarray], List[List[str]], Dict[str, Any]]]:
+    """Try to load a valid pregestation cache entry from *slot_dir*.
+
+    Returns a 6-tuple: (images, composite_masks, mask_stacks, targets, term_rows, info).
+    mask_stacks contains per-element [k, H, W] arrays (all individual ground-truth masks).
+    composite_masks contains the pre-computed [H, W] composite for the dataloader.
+    Older cache slots without mask_stacks.npy will return empty lists for mask_stacks.
+    """
+    manifest_path = slot_dir / "manifest.json"
+    images_path = slot_dir / "images.npy"
+    targets_path = slot_dir / "targets.npy"
+    terms_path = slot_dir / "terms.json"
+    if not manifest_path.exists() or not images_path.exists() or not targets_path.exists() or not terms_path.exists():
+        return None
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if int(manifest.get("version", -1)) != 1:
+            return None
+        if str(manifest.get("signature", "")) != str(signature):
+            return None
+        images_mm = np.load(str(images_path), mmap_mode="r")
+        targets_mm = np.load(str(targets_path), mmap_mode="r")
+        raw_terms = json.loads(terms_path.read_text(encoding="utf-8"))
+        if int(getattr(images_mm, "ndim", 0)) != 4 or int(getattr(targets_mm, "ndim", 0)) != 2 or not isinstance(raw_terms, list):
+            return None
+        rows = min(int(images_mm.shape[0]), int(targets_mm.shape[0]), int(len(raw_terms)))
+        if int(rows) <= 0:
+            return None
+        images = [np.asarray(images_mm[int(i)], dtype=np.float32) for i in range(int(rows))]
+        targets = [np.asarray(targets_mm[int(i)], dtype=np.float32).reshape(-1) for i in range(int(rows))]
+        term_rows = [
+            [re.sub(r"\s+", " ", str(t)).strip() for t in list(raw_terms[int(i)]) if str(t).strip()]
+            for i in range(int(rows))
+        ]
+        # Load composite masks (optional — older cache slots won't have them).
+        masks_path = slot_dir / "masks.npy"
+        if masks_path.exists():
+            masks_mm = np.load(str(masks_path), mmap_mode="r")
+            if int(getattr(masks_mm, "ndim", 0)) == 3 and int(masks_mm.shape[0]) >= int(rows):
+                masks = [np.asarray(masks_mm[int(i)], dtype=np.float32) for i in range(int(rows))]
+            else:
+                masks = []
+        else:
+            masks = []
+        # Load per-element mask stacks (optional — older cache slots won't have them).
+        # Shape on disk: [N, max_slots, H, W]; each entry is a [max_slots, H, W] stack.
+        mask_stacks: List[np.ndarray] = []
+        mask_stacks_path = slot_dir / "mask_stacks.npy"
+        if mask_stacks_path.exists():
+            try:
+                stacks_mm = np.load(str(mask_stacks_path), mmap_mode="r")
+                if int(getattr(stacks_mm, "ndim", 0)) == 4 and int(stacks_mm.shape[0]) >= int(rows):
+                    mask_stacks = [np.asarray(stacks_mm[int(i)], dtype=np.float32) for i in range(int(rows))]
+            except Exception:
+                mask_stacks = []
+        info = dict(manifest.get("info", {})) if isinstance(manifest.get("info", {}), dict) else {}
+        info["cache_hit"] = True
+        info["cache_dir"] = str(slot_dir)
+        return images, masks, mask_stacks, targets, term_rows, info
+    except Exception:
+        return None
+
+
+def _pregestation_write_slot(
+    slot_dir: Path,
+    signature: str,
+    images_np: np.ndarray,
+    masks_np: np.ndarray,
+    mask_stacks_np: np.ndarray,
+    targets_np: np.ndarray,
+    terms_payload: List[List[str]],
+    info: Dict[str, Any],
+) -> None:
+    slot_dir.mkdir(parents=True, exist_ok=True)
+    np.save(str(slot_dir / "images.npy"), images_np)
+    np.save(str(slot_dir / "masks.npy"), masks_np)
+    np.save(str(slot_dir / "mask_stacks.npy"), mask_stacks_np)
+    np.save(str(slot_dir / "targets.npy"), targets_np)
+    (slot_dir / "terms.json").write_text(json.dumps(terms_payload, indent=2), encoding="utf-8")
+    (slot_dir / "manifest.json").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "signature": str(signature),
+                "rows": int(images_np.shape[0]),
+                "target_dim": int(targets_np.shape[1]) if int(targets_np.ndim) == 2 else 0,
+                "mask_stack_slots": int(mask_stacks_np.shape[1]) if int(mask_stacks_np.ndim) == 4 else 0,
+                "info": dict(info),
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+
+def _load_pregestation_base_cache(
+    cache_root: Optional[Path],
+    signature: str,
+) -> Optional[Tuple[List[np.ndarray], List[np.ndarray], List[np.ndarray], List[np.ndarray], List[List[str]], Dict[str, Any]]]:
+    """Load a matching pregestation cache entry from the loop pool, if present.
+
+    Returns a 6-tuple: (images, composite_masks, mask_stacks, targets, term_rows, info).
+    """
+    if cache_root is None:
+        return None
+    loop_root = _pregestation_loop_pool_dir(cache_root)
+    if not loop_root.exists():
+        return None
+    try:
+        control = _pregestation_load_cache_control(loop_root)
+        slot_count = max(1, int(control.get("slot_count", 1)))
+        for slot_idx in range(int(slot_count)):
+            slot_dir = _pregestation_loop_slot_dir(loop_root, slot_idx)
+            result = _pregestation_read_slot(slot_dir, signature)
+            if result is not None:
+                return result
+    except Exception:
+        pass
+    return None
+
+
+def _write_pregestation_base_cache(
+    cache_root: Optional[Path],
+    signature: str,
+    images: Sequence[np.ndarray],
+    masks: Sequence[np.ndarray],
+    mask_stacks: Sequence[np.ndarray],
+    targets: Sequence[np.ndarray],
+    term_rows: Sequence[Sequence[str]],
+    info: Dict[str, Any],
+    max_bytes: int = 0,
+) -> Optional[Path]:
+    """Write a pregestation cache entry into the loop pool.
+
+    The pool size (in slots) is computed from *max_bytes* divided by the
+    estimated single-entry size, matching the BootstrapDynamicDataset loop
+    strategy.  The cursor advances round-robin so old entries are overwritten
+    rather than evicted.
+
+    mask_stacks holds per-element ground-truth masks for every image row
+    (shape per entry: [k, H, W]).  They are padded to max_k=3 slots and
+    stored as mask_stacks.npy alongside the composite masks.npy.
+    """
+    if cache_root is None:
+        return None
+    loop_root = _pregestation_loop_pool_dir(cache_root)
+    loop_root.mkdir(parents=True, exist_ok=True)
+
+    images_np = np.stack([np.asarray(x, dtype=np.float32) for x in images], axis=0).astype(np.float32, copy=False)
+    masks_list = [np.asarray(m, dtype=np.float32) for m in masks]
+    masks_np = np.stack(masks_list, axis=0).astype(np.float32, copy=False) if len(masks_list) > 0 else np.zeros((0,), dtype=np.float32)
+    targets_np = np.stack([np.asarray(y, dtype=np.float32).reshape(-1) for y in targets], axis=0).astype(np.float32, copy=False)
+    terms_payload = [
+        [re.sub(r"\s+", " ", str(t)).strip() for t in list(row) if str(t).strip()]
+        for row in term_rows
+    ]
+    # Pad per-element mask stacks to a uniform depth so all rows in the
+    # array have the same shape [max_k, H, W].  max_k is derived from the
+    # actual deepest stack (geometric + any post-hoc color masks), with a
+    # minimum of 3 to stay compatible with older cache readers.
+    # Unused slots are zero-filled.
+    _max_k = max(
+        (
+            int(np.asarray(_ms, dtype=np.float32).shape[0])
+            for _ms in mask_stacks
+            if np.asarray(_ms, dtype=np.float32).ndim == 3
+        ),
+        default=3,
+    )
+    _max_k = max(_max_k, 3)
+    _stacks_list: List[np.ndarray] = []
+    for _ms in mask_stacks:
+        _arr = np.asarray(_ms, dtype=np.float32)
+        if _arr.ndim == 3:
+            _k, _H, _W = int(_arr.shape[0]), int(_arr.shape[1]), int(_arr.shape[2])
+        else:
+            _k, _H, _W = 0, int(images_np.shape[-2]), int(images_np.shape[-1])
+            _arr = np.zeros((0, _H, _W), dtype=np.float32)
+        if _k < _max_k:
+            _pad = np.zeros((_max_k - _k, _H, _W), dtype=np.float32)
+            _arr = np.concatenate([_arr, _pad], axis=0)
+        else:
+            _arr = _arr[:_max_k]
+        _stacks_list.append(_arr)
+    if int(len(_stacks_list)) > 0:
+        mask_stacks_np = np.stack(_stacks_list, axis=0).astype(np.float32, copy=False)  # [N, 3, H, W]
+    else:
+        mask_stacks_np = np.zeros((0, _max_k, int(images_np.shape[-2]), int(images_np.shape[-1])), dtype=np.float32)
+
+    # Estimate bytes for one slot: images + masks + mask_stacks + targets
+    estimated_bytes = max(1, int(images_np.nbytes) + int(masks_np.nbytes) + int(mask_stacks_np.nbytes) + int(targets_np.nbytes))
+    cap_bytes = max(0, int(max_bytes))
+    slot_count = 1
+    if int(cap_bytes) > 0 and int(estimated_bytes) > 0:
+        slot_count = max(1, int(cap_bytes) // int(estimated_bytes))
+
+    control = _pregestation_load_cache_control(loop_root)
+    cursor = int(control.get("loop_cursor", 0))
+    slot_idx = int(cursor % max(1, int(slot_count)))
+    control["loop_cursor"] = int((slot_idx + 1) % max(1, int(slot_count)))
+    control["slot_count"] = int(slot_count)
+    _pregestation_store_cache_control(loop_root, control)
+
+    slot_dir = _pregestation_loop_slot_dir(loop_root, slot_idx)
+    _pregestation_write_slot(slot_dir, signature, images_np, masks_np, mask_stacks_np, targets_np, terms_payload, dict(info))
+    return slot_dir
 
 
 def _normalize_l2_rows_np(x: np.ndarray) -> np.ndarray:
@@ -784,7 +1219,7 @@ def _semantic_expand_inferred_tags(terms: Sequence[str]) -> List[str]:
 def _semantic_noise_terms_from_spectrum_sample(sample: Any) -> List[str]:
     arr = np.asarray(sample, dtype=np.float32)
     if int(arr.size) <= 0:
-        return ["noise"]
+        return []
     if int(arr.ndim) == 3:
         if int(arr.shape[0]) in (1, 3, 4):
             gray = np.mean(np.asarray(arr[:3, ...], dtype=np.float32), axis=0)
@@ -794,6 +1229,30 @@ def _semantic_noise_terms_from_spectrum_sample(sample: Any) -> List[str]:
             gray = np.asarray(arr, dtype=np.float32).reshape(-1)
     else:
         gray = np.asarray(arr, dtype=np.float32)
+    flat0 = np.asarray(gray, dtype=np.float64).reshape(-1)
+    if int(flat0.size) < 32:
+        return []
+    try:
+        dyn = float(np.max(flat0) - np.min(flat0)) if int(flat0.size) > 0 else 0.0
+        centered0 = flat0 - float(np.mean(flat0))
+        var0 = float(np.mean(centered0 * centered0)) if int(flat0.size) > 0 else 0.0
+        diff0 = np.diff(flat0) if int(flat0.size) > 1 else np.zeros((0,), dtype=np.float64)
+        mean_abs_diff0 = float(np.mean(np.abs(diff0))) if int(diff0.size) > 0 else 0.0
+        entropy01 = 0.0
+        if dyn > 1e-12:
+            norm0 = np.clip((flat0 - float(np.min(flat0))) / dyn, 0.0, 1.0)
+            hist0, _ = np.histogram(norm0, bins=64, range=(0.0, 1.0))
+            hist0 = np.asarray(hist0, dtype=np.float64)
+            hist0 = hist0 / max(1.0, float(np.sum(hist0)))
+            hist0 = hist0[hist0 > 0.0]
+            if int(hist0.size) > 0:
+                entropy01 = float(-np.sum(hist0 * np.log2(hist0)) / np.log2(64.0))
+        if dyn < 1e-3 or var0 < 1e-8:
+            return []
+        if entropy01 < 0.08 and mean_abs_diff0 < 2e-3:
+            return []
+    except Exception:
+        pass
     beta = 0.0
     excess_kurtosis = 0.0
     try:
@@ -1128,6 +1587,15 @@ def _semantic_tonal_tags_from_image(
         tags.extend(["white", "bright"])
     if (abs(mean_v - 0.5) <= float(gray_mean_tolerance)) and (std_v <= float(gray_std_threshold)):
         tags.extend(["gray", "grey"])
+    # warm/cool color temperature: compare mean R vs mean B channel balance
+    if int(arr.shape[0]) >= 3:
+        _r_mean = float(np.mean(arr[0]))
+        _b_mean = float(np.mean(arr[2]))
+        _temp_diff = _r_mean - _b_mean
+        if _temp_diff >= 0.10:
+            tags.append("warm")
+        elif _temp_diff <= -0.10:
+            tags.append("cool")
     tags.extend(detect_semantic_color_terms(rgb))
     return _normalize_vocab_terms(tags)
 
@@ -2121,14 +2589,84 @@ def _build_internal_bootstrap_symbol_pool(
     return pool, info
 
 
+# ---------------------------------------------------------------------------
+# Pregestation mode configuration registry
+# ---------------------------------------------------------------------------
+# Each entry describes one training curriculum "stage" for the pre-gestation
+# image generator.  Sub-round index 0 uses the first entry, sub-round 1 uses
+# the second, etc.  Add new entries to extend the curriculum.
+#
+# Keys per mode config:
+#   include_diagonal            bool   – generate corner-position samples when d_temp is high
+#   diagonal_d_temp_threshold   float  – d_temp at which diagonal samples start appearing
+#   diagonal_fraction_at_max    float  – fraction of per_combo samples that are diagonal at max d_temp
+#   diagonal_max_d_temp         float  – d_temp value where diagonal_fraction reaches its maximum
+#   include_depth               bool   – add cross-occluder + front/behind labeling
+#   depth_occluder              str|None – "cross" or None
+#   depth_labels                tuple  – (front_label, behind_label) strings
+PREGESTATION_MODE_CONFIGS: Dict[str, Dict[str, Any]] = {
+    "direction_color": {
+        "name": "direction_color",
+        "include_diagonal": True,
+        "diagonal_d_temp_threshold": 1.05,
+        "diagonal_fraction_at_max": 0.50,
+        "diagonal_max_d_temp": 3.0,
+        "include_depth": False,
+        "depth_occluder": None,
+        "depth_labels": (),
+    },
+    "direction_color_depth": {
+        "name": "direction_color_depth",
+        "include_diagonal": True,
+        "diagonal_d_temp_threshold": 1.05,
+        "diagonal_fraction_at_max": 0.50,
+        "diagonal_max_d_temp": 3.0,
+        "include_depth": True,
+        "depth_occluder": "cross",
+        "depth_labels": ("front", "behind"),
+    },
+}
+
+# Sub-round index → mode name.  pregestation_sub_round=0 → index 0, etc.
+_PREGESTATION_SUB_ROUND_MODE_SEQUENCE: List[str] = [
+    "direction_color",
+    "direction_color_depth",
+]
+
+
 def _build_pregestation_logic_rows(
     image_size: int,
     seed: int,
     samples_per_combo: int,
     active_terms_lc: Optional[Sequence[str]] = None,
-) -> Tuple[List[np.ndarray], List[List[str]], Dict[str, Any]]:
+    circle_radius_temperature: float = 1.0,
+    circle_displacement_temperature: float = 1.0,
+    mode: str = "direction_color",
+) -> Tuple[List[np.ndarray], List[np.ndarray], List[List[str]], Dict[str, Any]]:
+    """Build pre-gestation training images according to *mode*.
+
+    Modes (see PREGESTATION_MODE_CONFIGS):
+      "direction_color"       – colored circles at cardinal positions; diagonal
+                                placements with two direction labels appear when
+                                circle_displacement_temperature is high.
+      "direction_color_depth" – same curriculum plus a full-length cross occluder
+                                that adds front / behind depth labeling.  The
+                                object-presence mask is always the FULL disk
+                                regardless of how much of the circle is visible.
+    """
     size = max(16, int(image_size))
     per_combo = max(1, int(samples_per_combo))
+    r_temp = float(max(0.1, float(circle_radius_temperature)))
+    d_temp = float(max(0.1, float(circle_displacement_temperature)))
+    mode = str(mode).strip().lower() or "direction_color"
+    mode_cfg = PREGESTATION_MODE_CONFIGS.get(mode, PREGESTATION_MODE_CONFIGS["direction_color"])
+    _include_depth = bool(mode_cfg.get("include_depth", False))
+    _depth_labels: Tuple[str, ...] = tuple(str(lbl) for lbl in mode_cfg.get("depth_labels", ("front", "behind")))
+    _include_diagonal = bool(mode_cfg.get("include_diagonal", True))
+    _diag_thresh = float(mode_cfg.get("diagonal_d_temp_threshold", 1.05))
+    _diag_max_temp = float(mode_cfg.get("diagonal_max_d_temp", 3.0))
+    _diag_frac_max = float(mode_cfg.get("diagonal_fraction_at_max", 0.50))
+
     active = {
         re.sub(r"\s+", " ", str(x)).strip().lower()
         for x in (active_terms_lc or [])
@@ -2139,18 +2677,58 @@ def _build_pregestation_logic_rows(
     colors = [c for c in all_colors if (not active or c in active)]
     directions = [d for d in all_dirs if (not active or d in active)]
     if len(colors) <= 0 or len(directions) <= 0:
-        return [], [], {"enabled": False, "rows": 0, "reason": "missing_color_or_direction_terms"}
+        return [], [], [], {"enabled": False, "rows": 0, "reason": "missing_color_or_direction_terms"}
 
     rng = np.random.default_rng(int(seed))
     yy, xx = np.mgrid[0:size, 0:size].astype(np.float32)
     x01 = (xx / float(max(1, size - 1))).astype(np.float32, copy=False)
     y01 = (yy / float(max(1, size - 1))).astype(np.float32, copy=False)
+
+    # Anchor displacement from center (0.5, 0.5).  Temperature scales the offset so
+    # d_temp=1.0 → default displacement; d_temp<1 → closer to center; d_temp>1 → farther.
+    _base_offset = 0.32
+    _d = float(_base_offset * d_temp)
     anchors = {
-        "up": (0.50, 0.18),
-        "down": (0.50, 0.82),
-        "left": (0.18, 0.50),
-        "right": (0.82, 0.50),
+        "up":    (0.50, max(0.05, 0.50 - _d)),
+        "down":  (0.50, min(0.95, 0.50 + _d)),
+        "left":  (max(0.05, 0.50 - _d), 0.50),
+        "right": (min(0.95, 0.50 + _d), 0.50),
     }
+
+    # Diagonal anchors: equidistant from center as cardinal anchors so all
+    # placements inhabit a single isotropic ring.
+    _diag_offset = float(_d / float(np.sqrt(2.0)))
+    dirs_set = set(directions)
+
+    # Diagonal fraction: rises from 0 at d_temp=threshold to diag_frac_max at
+    # d_temp=diagonal_max_d_temp.  At high temperatures the model must distinguish
+    # circles that fall near image corners as belonging to TWO direction quadrants.
+    _diag_frac = 0.0
+    if _include_diagonal and d_temp > _diag_thresh:
+        _diag_range = max(1e-6, _diag_max_temp - _diag_thresh)
+        _diag_frac = min(_diag_frac_max, _diag_frac_max * (d_temp - _diag_thresh) / _diag_range)
+
+    # Build the list of (direction_labels, cx_base, cy_base) for diagonal samples.
+    diagonal_combos: List[Tuple[List[str], float, float]] = []
+    if _diag_frac > 0.0:
+        if "up" in dirs_set and "left" in dirs_set:
+            diagonal_combos.append((["up", "left"],
+                                    max(0.05, 0.5 - _diag_offset),
+                                    max(0.05, 0.5 - _diag_offset)))
+        if "up" in dirs_set and "right" in dirs_set:
+            diagonal_combos.append((["up", "right"],
+                                    min(0.95, 0.5 + _diag_offset),
+                                    max(0.05, 0.5 - _diag_offset)))
+        if "down" in dirs_set and "left" in dirs_set:
+            diagonal_combos.append((["down", "left"],
+                                    max(0.05, 0.5 - _diag_offset),
+                                    min(0.95, 0.5 + _diag_offset)))
+        if "down" in dirs_set and "right" in dirs_set:
+            diagonal_combos.append((["down", "right"],
+                                    min(0.95, 0.5 + _diag_offset),
+                                    min(0.95, 0.5 + _diag_offset)))
+    diag_per_combo = max(1, int(per_combo * _diag_frac)) if _diag_frac > 0.0 else 0
+
     palette = {
         "red": (1.00, 0.18, 0.18),
         "green": (0.18, 1.00, 0.22),
@@ -2168,13 +2746,28 @@ def _build_pregestation_logic_rows(
         dist = np.sqrt(((x01 - np.float32(cx)) ** 2) + ((y01 - np.float32(cy)) ** 2)).astype(np.float32, copy=False)
         return np.clip((np.float32(radius) - dist) / np.float32(max(1e-4, edge)), 0.0, 1.0).astype(np.float32, copy=False)
 
+    # -- Cross occluder (depth mode only) ------------------------------------
+    # Full-length cross whose arms pass through all four cardinal anchor regions.
+    # arm_half controls half-width of each bar in normalized image coordinates.
+    _cross_arm_half = 0.055
+    _cross_alpha = np.clip(
+        (np.abs(y01 - 0.5) < _cross_arm_half).astype(np.float32)
+        + (np.abs(x01 - 0.5) < _cross_arm_half).astype(np.float32),
+        0.0, 1.0,
+    )  # shape (H, W), in [0, 1]
+    _cross_color_rgb = np.asarray([0.50, 0.50, 0.50], dtype=np.float32).reshape(3, 1, 1)
+
     out_images: List[np.ndarray] = []
+    out_masks: List[np.ndarray] = []
+    out_mask_stacks: List[np.ndarray] = []
     out_terms: List[List[str]] = []
-    for direction in directions:
-        cx0, cy0 = anchors[str(direction)]
+
+    def _build_samples(dir_labels: List[str], cx0: float, cy0: float, n: int) -> None:
+        """Generate n samples per color for the given anchor and direction labels."""
         for color in colors:
             rgb = np.asarray(palette[str(color)], dtype=np.float32).reshape(3, 1, 1)
-            for sample_idx in range(int(per_combo)):
+            for _ in range(n):
+                # Background with faint central guide lines.
                 bg = np.full((3, size, size), 0.035, dtype=np.float32)
                 guide_x = np.exp(-((x01 - 0.5) ** 2) / 0.0015).astype(np.float32, copy=False)
                 guide_y = np.exp(-((y01 - 0.5) ** 2) / 0.0015).astype(np.float32, copy=False)
@@ -2182,23 +2775,147 @@ def _build_pregestation_logic_rows(
                 bg = np.clip(bg + guide[None, :, :], 0.0, 1.0)
                 jitter_x = float(rng.uniform(-0.025, 0.025))
                 jitter_y = float(rng.uniform(-0.025, 0.025))
-                radius = float(rng.uniform(0.085, 0.115))
+                # r_temp scales the base radius range: temp=1 → [0.085, 0.115].
+                _r_lo = float(0.085 * r_temp)
+                _r_hi = float(0.115 * r_temp)
+                radius = float(rng.uniform(_r_lo, _r_hi))
                 edge = float(rng.uniform(0.014, 0.024))
-                disk = _soft_disk(cx=float(cx0 + jitter_x), cy=float(cy0 + jitter_y), radius=radius, edge=edge)
-                img = np.clip(bg + (disk[None, :, :] * rgb), 0.0, 1.0).astype(np.float32, copy=False)
+                disk = _soft_disk(cx=float(cx0 + jitter_x), cy=float(cy0 + jitter_y),
+                                  radius=radius, edge=edge)
+                disk_3d = disk[None, :, :]
+
+                if _include_depth and len(_depth_labels) >= 2:
+                    # 50 / 50 front vs behind assignment per sample.
+                    depth = _depth_labels[0] if rng.random() < 0.5 else _depth_labels[1]
+                    cross_3d = _cross_alpha[None, :, :]
+                    if depth == _depth_labels[0]:
+                        # "front": composite cross onto bg, then circle on top.
+                        layer = bg * (1.0 - cross_3d) + _cross_color_rgb * cross_3d
+                        img = np.clip(layer * (1.0 - disk_3d) + rgb * disk_3d,
+                                      0.0, 1.0).astype(np.float32, copy=False)
+                    else:
+                        # "behind": composite circle onto bg, then cross on top.
+                        # The mask below still records the full disk — "the thing
+                        # is HERE even though the cross is covering part of it."
+                        layer = bg * (1.0 - disk_3d) + rgb * disk_3d
+                        img = np.clip(layer * (1.0 - cross_3d) + _cross_color_rgb * cross_3d,
+                                      0.0, 1.0).astype(np.float32, copy=False)
+                    extra_terms: List[str] = [depth]
+                else:
+                    img = np.clip(bg + disk_3d * rgb, 0.0, 1.0).astype(np.float32, copy=False)
+                    extra_terms = []
+
+                # Object permanence policy: every element gets its FULL spatial
+                # extent as its mask, regardless of compositing order.  All
+                # per-element masks are stacked and stored in the cache so that
+                # no ground-truth information is discarded.  The composite
+                # normalization of the stack is the single mask passed to the
+                # dataloader at training time.
+
+                bg_terms = ["dark", "signal", "shape"]
+                circle_terms = list(dir_labels) + [str(color), "object", "signal", "shape"] + extra_terms
+                bg_mask = np.ones((size, size), dtype=np.float32)
+                disk_mask = disk.astype(np.float32, copy=False)
+
+                if _include_depth and len(_depth_labels) >= 2:
+                    cross_terms = ["gray", "shape", "signal"]
+                    cross_mask = _cross_alpha.astype(np.float32, copy=False)
+                    elem_masks = [bg_mask, disk_mask, cross_mask]
+                    merged = _normalize_vocab_terms(bg_terms + circle_terms + cross_terms)
+                else:
+                    elem_masks = [bg_mask, disk_mask]
+                    merged = _normalize_vocab_terms(bg_terms + circle_terms)
+
+                # Composite mask: additive-sum all per-element masks, normalized
+                # to [0, 1].  This is the mask the dataloader sees at training time.
+                elem_stack = np.stack(elem_masks, axis=0)  # [k, H, W]
+                composite_mask = _composite_mask_stack(elem_stack)
+
                 out_images.append(img)
-                out_terms.append(_normalize_vocab_terms([str(color), str(direction), "object", "signal", "shape"]))
+                out_masks.append(composite_mask)
+                out_mask_stacks.append(elem_stack)
+                out_terms.append(merged)
+
+    # Cardinal combos (always generated).
+    for direction in directions:
+        cx0, cy0 = anchors[str(direction)]
+        _build_samples([str(direction)], cx0, cy0, per_combo)
+
+    # Diagonal combos (generated when displacement temperature is high enough).
+    for (dlabels, dcx, dcy) in diagonal_combos:
+        _build_samples(dlabels, dcx, dcy, diag_per_combo)
 
     info = {
         "enabled": True,
         "rows": int(len(out_images)),
+        "mode": str(mode),
         "colors": list(colors),
         "directions": list(directions),
         "samples_per_combo": int(per_combo),
         "combos": int(len(colors) * len(directions)),
-        "reason": "formal_logic_color_direction",
+        "diagonal_combos": int(len(diagonal_combos)),
+        "diagonal_samples_per_combo": int(diag_per_combo),
+        "diagonal_fraction": float(_diag_frac),
+        "include_depth": bool(_include_depth),
+        "circle_radius_temperature": float(r_temp),
+        "circle_displacement_temperature": float(d_temp),
+        "reason": f"formal_logic_{mode}",
     }
-    return out_images, out_terms, info
+    return out_images, out_masks, out_mask_stacks, out_terms, info
+
+
+# Recognized color term names whose score maps can be extracted by
+# _semantic_color_score_maps.  "grey" is an alias for "gray" and both are
+# included so either spelling in the term list triggers mask extraction.
+_PREGESTATION_OBSERVED_COLOR_TERMS: Tuple[str, ...] = (
+    "red", "orange", "green", "blue", "yellow", "cyan",
+    "magenta", "brown", "black", "white", "gray", "grey",
+)
+
+
+def _enrich_pregestation_stack_with_observed_color_masks(
+    image_chw01: np.ndarray,
+    elem_stack: np.ndarray,
+    term_row: Sequence[str],
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Extend a geometric mask stack with pixel-observed color masks.
+
+    For each color term present in *term_row* that belongs to the known
+    colorimetric vocabulary, extract the corresponding per-pixel color score
+    map from *image_chw01* and append it to *elem_stack* as an additional
+    mask slot.  The output ``extended_stack`` has shape ``[k + k', H, W]``
+    where ``k'`` is the number of matched color terms.  The composite
+    normalization is recomputed from the extended stack.
+
+    This solves the denormalization problem cleanly: because the raw
+    per-element geometric masks are available in *elem_stack* we never need
+    to invert the normalized composite.  We simply append to the raw stack
+    and let ``_composite_mask_stack`` renormalize the combined result.
+
+    Returns ``(extended_stack, composite)`` — terms are not modified.
+    """
+    chw = np.asarray(image_chw01, dtype=np.float32)
+    color_maps = _semantic_color_score_maps(chw)
+    norm_terms = {re.sub(r"\s+", " ", str(t)).strip().lower() for t in term_row}
+
+    observed: List[np.ndarray] = []
+    for color_name in _PREGESTATION_OBSERVED_COLOR_TERMS:
+        if str(color_name) not in norm_terms:
+            continue
+        cmap = color_maps.get(str(color_name))
+        if cmap is None:
+            continue
+        score = np.asarray(cmap, dtype=np.float32)
+        vmax = float(np.max(score))
+        if vmax > 1e-8:
+            observed.append(np.clip(score / float(vmax), 0.0, 1.0).astype(np.float32, copy=False))
+
+    if len(observed) == 0:
+        return elem_stack, _composite_mask_stack(elem_stack)
+
+    observed_np = np.stack(observed, axis=0)  # [k', H, W]
+    extended = np.concatenate([elem_stack, observed_np], axis=0)  # [k + k', H, W]
+    return extended, _composite_mask_stack(extended)
 
 
 def _build_reference_flashcard_payload_rows(
@@ -3372,8 +4089,26 @@ def _load_json(path: Path):
 def _save_pipeline_checkpoint(path: Path, payload: Dict):
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = path.with_suffix(path.suffix + ".tmp")
-    torch.save(payload, tmp_path)
-    os.replace(tmp_path, path)
+    try:
+        torch.save(payload, tmp_path)
+    except Exception as _ckpt_err:
+        # Disk full or write error — clean up partial file and warn, but do not crash training.
+        try:
+            if tmp_path.exists():
+                tmp_path.unlink()
+        except Exception:
+            pass
+        print(f"[checkpoint] WARNING: save failed (disk full?), skipping: {path.name} — {_ckpt_err}", flush=True)
+        return
+    try:
+        os.replace(tmp_path, path)
+    except Exception as _mv_err:
+        try:
+            if tmp_path.exists():
+                tmp_path.unlink()
+        except Exception:
+            pass
+        print(f"[checkpoint] WARNING: rename failed, skipping: {path.name} — {_mv_err}", flush=True)
 
 
 def _snapshot_classifier_lora(model: Optional[nn.Module]) -> Dict[str, Any]:
@@ -3635,6 +4370,7 @@ def _classifier_supervision_loss(
     y_multihot: torch.Tensor,
     supervised_dim: int,
     semantic_cosine_weight: float = CLASSIFIER_SEMANTIC_COSINE_WEIGHT,
+    semantic_soft_target_max: float = 0.0,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, Any]]:
     dim = max(1, int(supervised_dim))
     logits_sup = logits
@@ -3642,13 +4378,14 @@ def _classifier_supervision_loss(
         logits_sup = logits_sup[:, : int(dim)]
     y_sup = _align_multilabel_targets_dim(y_multihot, out_dim=int(logits_sup.shape[1])).to(dtype=torch.float32)
     logits_sup_f = logits_sup.to(dtype=torch.float32)
-    bce = F.binary_cross_entropy_with_logits(logits_sup_f, y_sup, reduction="mean")
 
     use_geom = False
     cos_loss = torch.zeros((), device=logits_sup_f.device, dtype=torch.float32)
     w_geom = float(max(0.0, semantic_cosine_weight))
+    soft_max = float(max(0.0, semantic_soft_target_max))
+    y_eff = y_sup
     if (
-        w_geom > 0.0
+        (w_geom > 0.0 or soft_max > 0.0)
         and isinstance(classifier, TinyConvClassifier)
         and bool(int(classifier.label_embed_enabled.item()))
         and int(classifier.label_embed_bank.ndim) == 2
@@ -3660,11 +4397,17 @@ def _classifier_supervision_loss(
         pred_probs = torch.sigmoid(logits_sup_f)
         pred_emb = _embed_multihot_distribution(weights=pred_probs, bank_norm=bank)
         tgt_emb = _embed_multihot_distribution(weights=y_sup, bank_norm=bank)
-        cos_loss = (1.0 - torch.sum(pred_emb * tgt_emb, dim=1)).mean()
-        use_geom = True
+        if soft_max > 0.0:
+            sim = torch.mm(tgt_emb, bank.t())  # [B, C] — similarity of each class to this sample's positive centroid
+            neg_mask = y_sup < 0.5
+            y_eff = torch.where(neg_mask, torch.clamp(sim, min=0.0, max=soft_max), y_sup)
+        if w_geom > 0.0:
+            cos_loss = (1.0 - torch.sum(pred_emb * tgt_emb, dim=1)).mean()
+            use_geom = True
 
+    bce = F.binary_cross_entropy_with_logits(logits_sup_f, y_eff, reduction="mean")
     total = bce + (float(w_geom) * cos_loss if use_geom else 0.0)
-    return total, logits_sup, y_sup, {
+    return total, logits_sup, y_eff, {
         "bce": float(bce.detach().item()),
         "cos": float(cos_loss.detach().item()) if use_geom else 0.0,
         "used_geometry": bool(use_geom),
@@ -4207,6 +4950,13 @@ def _build_berkeley_refresh_loader(
             prefetch_factor=int(prefetch_factor),
         ),
     )
+    loader = maybe_wrap_loader_with_threaded_prefetch(
+        loader=loader,
+        requested_workers=int(num_workers),
+        effective_workers=int(loader_num_workers),
+        device_type=str(device.type),
+        prefetch_factor=int(prefetch_factor),
+    )
     setattr(loader, "_refresh_source_stats", source_stats)
     setattr(loader, "_refresh_rows_info", rows_info)
     return loader, int(len(ds))
@@ -4225,11 +4975,9 @@ def _build_berkeley_refresh_cache(
         return None
 
     if mode == "cuda":
-        target = torch.device("cuda:0" if device.type == "cuda" else "cpu")
-    elif mode == "cpu":
-        target = torch.device("cpu")
+        target = torch.device(str(device))
     else:
-        target = torch.device("cuda:0" if device.type == "cuda" else "cpu")
+        target = torch.device("cpu")
 
     xs = []
     ys = []
@@ -4245,16 +4993,41 @@ def _build_berkeley_refresh_cache(
     if len(xs) == 0:
         return None
 
-    x = torch.cat(xs, dim=0).contiguous()
-    y = torch.cat(ys, dim=0).contiguous()
-    m = torch.cat(ms, dim=0).contiguous()
+    x = torch.cat(xs, dim=0).contiguous().detach()
+    y = torch.cat(ys, dim=0).contiguous().detach()
+    m = torch.cat(ms, dim=0).contiguous().detach()
     if channels_last:
         x = x.contiguous(memory_format=torch.channels_last)
 
-    if target.type == "cuda":
-        x = x.to(target, non_blocking=True)
-        y = y.to(target, non_blocking=True)
-        m = m.to(target, non_blocking=True)
+    estimated_bytes = int(x.numel()) * int(x.element_size())
+    estimated_bytes += int(y.numel()) * int(y.element_size())
+    estimated_bytes += int(m.numel()) * int(m.element_size())
+    target_effective = torch.device(str(target))
+    target_free_bytes = 0
+    if target_effective.type == "cuda":
+        try:
+            target_free_bytes, _ = torch.cuda.mem_get_info(target_effective)
+        except Exception:
+            try:
+                target_free_bytes, _ = torch.cuda.mem_get_info()
+            except Exception:
+                target_free_bytes = 0
+        # PyTorch's caching allocator holds reserved-but-not-allocated blocks that
+        # CUDA considers occupied but are freely reusable by the allocator.  Add
+        # this cache back so the staging guard uses effective usable VRAM, not
+        # just the CUDA-reported free bytes.
+        try:
+            _pt_cache = max(0, int(torch.cuda.memory_reserved(target_effective)) - int(torch.cuda.memory_allocated(target_effective)))
+            target_free_bytes = int(target_free_bytes) + _pt_cache
+        except Exception:
+            pass
+        if int(target_free_bytes) > 0 and int(estimated_bytes) >= int(0.25 * float(target_free_bytes)):
+            target_effective = torch.device("cpu")
+
+    if target_effective.type == "cuda":
+        x = x.to(target_effective, non_blocking=True)
+        y = y.to(target_effective, non_blocking=True)
+        m = m.to(target_effective, non_blocking=True)
     elif device.type == "cuda":
         x = x.pin_memory()
         y = y.pin_memory()
@@ -4266,7 +5039,12 @@ def _build_berkeley_refresh_cache(
         "m": m,
         "num_samples": int(y.shape[0]),
         "num_batches": len(xs),
-        "device": target.type,
+        "device": str(target_effective),
+        "requested_device": str(target),
+        "estimated_bytes": int(estimated_bytes),
+        "target_free_bytes": int(target_free_bytes),
+        "staging_only": True,
+        "cross_device_staging": bool(target_effective.type == "cuda" and str(target_effective) != str(device)),
     }
 
 
@@ -4292,6 +5070,14 @@ def _auto_berkeley_refresh_batch_size(
             free_bytes, _ = torch.cuda.mem_get_info()
         except Exception:
             free_bytes = 0
+    # PyTorch's caching allocator keeps reserved-but-idle blocks that CUDA marks
+    # as occupied.  Add that back so the microbatch limit sees actual usable VRAM
+    # rather than just CUDA-free bytes, which ignores allocator cache entirely.
+    try:
+        _pt_cache = max(0, int(torch.cuda.memory_reserved(device)) - int(torch.cuda.memory_allocated(device)))
+        free_bytes = int(free_bytes) + _pt_cache
+    except Exception:
+        pass
 
     sample_bytes = int(cache_x[0].numel()) * int(cache_x.element_size())
     if cache_y is not None:
@@ -4305,6 +5091,29 @@ def _auto_berkeley_refresh_batch_size(
         return max(1, min(64, hard_cap))
     est = int(target // int(sample_bytes * mult))
     return max(1, min(est, hard_cap))
+
+
+def _cuda_mem_diag(device: torch.device) -> str:
+    if device.type != "cuda":
+        return "device=cpu"
+    try:
+        free_bytes, total_bytes = torch.cuda.mem_get_info(device)
+    except Exception:
+        free_bytes, total_bytes = 0, 0
+    try:
+        allocated = int(torch.cuda.memory_allocated(device))
+    except Exception:
+        allocated = 0
+    try:
+        reserved = int(torch.cuda.memory_reserved(device))
+    except Exception:
+        reserved = 0
+    mib = float(1024 * 1024)
+    return (
+        f"device={str(device)} "
+        f"free_mb={float(free_bytes) / mib:.1f} total_mb={float(total_bytes) / mib:.1f} "
+        f"allocated_mb={float(allocated) / mib:.1f} reserved_mb={float(reserved) / mib:.1f}"
+    )
 
 
 def _build_berkeley_gate_val_loader(
@@ -4365,6 +5174,13 @@ def _build_berkeley_gate_val_loader(
             persistent_workers=bool(persistent_workers),
             prefetch_factor=int(prefetch_factor),
         ),
+    )
+    loader = maybe_wrap_loader_with_threaded_prefetch(
+        loader=loader,
+        requested_workers=int(num_workers),
+        effective_workers=int(loader_num_workers),
+        device_type=str(device.type),
+        prefetch_factor=int(prefetch_factor),
     )
     return loader, int(sample_count)
 
@@ -4819,7 +5635,7 @@ def _build_payload_validation_gate_rows(
     missing = [str(p) for p in required if not p.exists()]
     if len(missing) > 0:
         raise RuntimeError(
-            "Gate payload validation deck requires pre-washed payload cache files. "
+            "Gate payload validation deck requires payload cache artifacts. "
             f"Missing: {missing}"
         )
     try:
@@ -4973,6 +5789,14 @@ def _build_payload_validation_gate_dataset(
         "cache_dir": str(Path(str(data_root).strip() or "toys_to_survive_development/data/berkeley_sbd") / "cache"),
         "data_source": "disk_dataset_rows",
         "source_root": str(source_root),
+        "mask_cache_hits": int(rows_info.get("mask_cache_hits", 0)),
+        "mask_cache_writes": int(rows_info.get("mask_cache_writes", 0)),
+        "mask_cache_failures": int(rows_info.get("mask_cache_failures", 0)),
+        "mask_cache_seconds": float(rows_info.get("mask_cache_seconds", 0.0)),
+        "mask_cache_threads": int(rows_info.get("mask_cache_threads", 0)),
+        "row_build_threads": int(rows_info.get("row_build_threads", 0)),
+        "row_build_seconds": float(rows_info.get("row_build_seconds", 0.0)),
+        "inprocess_cache_hit": bool(rows_info.get("inprocess_cache_hit", False)),
     }
     return ds, labels_np, terms_rows, info
 
@@ -5057,6 +5881,13 @@ def _build_gate_loader_from_arrays(
             prefetch_factor=int(prefetch_factor),
         ),
     )
+    loader = maybe_wrap_loader_with_threaded_prefetch(
+        loader=loader,
+        requested_workers=int(num_workers),
+        effective_workers=int(loader_num_workers),
+        device_type=str(device.type),
+        prefetch_factor=int(prefetch_factor),
+    )
     return loader, int(picks.size)
 
 
@@ -5104,6 +5935,13 @@ def _build_gate_loader_from_dataset(
             persistent_workers=bool(persistent_workers),
             prefetch_factor=int(prefetch_factor),
         ),
+    )
+    loader = maybe_wrap_loader_with_threaded_prefetch(
+        loader=loader,
+        requested_workers=int(num_workers),
+        effective_workers=int(loader_num_workers),
+        device_type=str(device.type),
+        prefetch_factor=int(prefetch_factor),
     )
     return loader, int(picks.size)
 
@@ -5251,9 +6089,18 @@ def _evaluate_berkeley_classifier_gate(
     channels_last: bool = False,
     semantic_mask_supervision_mode: str = "multihot_mix",
     preview_sink: Optional[Dict[str, Any]] = None,
+    semantic_cosine_weight: float = CLASSIFIER_SEMANTIC_COSINE_WEIGHT,
 ):
     classifier.eval()
     amp_dtype_t = _resolve_amp_dtype(amp_dtype) if amp_enabled else torch.float16
+    runtime_amp_enabled = bool(amp_enabled and device.type == "cuda")
+    runtime_channels_last = bool(channels_last)
+    if bool(runtime_amp_enabled) and not _cuda_device_supports_amp_dtype(device=device, amp_dtype_t=amp_dtype_t):
+        print(
+            f"[berkeley-gate] disabling AMP on device={device} because amp_dtype={amp_dtype} is unsupported there",
+            flush=True,
+        )
+        runtime_amp_enabled = False
     total_loss = 0.0
     n = 0
     logits_all = []
@@ -5271,11 +6118,6 @@ def _evaluate_berkeley_classifier_gate(
     for batch in loader:
         batch_idx += 1
         xb, yb, mb, batch_meta = _unpack_masked_semantic_batch(batch, context="berkeley gate evaluation")
-        xb = xb.to(device, non_blocking=True)
-        if channels_last:
-            xb = xb.contiguous(memory_format=torch.channels_last)
-        yb = yb.to(device, non_blocking=True)
-        mb = mb.to(device, non_blocking=True)
         xb, yb, mb = _expand_semantic_mask_supervision_batch(
             xb=xb,
             yb=yb,
@@ -5299,29 +6141,42 @@ def _evaluate_berkeley_classifier_gate(
                     xb_part = xb[start:stop]
                     yb_part = yb[start:stop]
                     mb_part = mb[start:stop]
-                    with _autocast_context(device=device, enabled=amp_enabled, amp_dtype_t=amp_dtype_t):
-                        out = _forward_classifier_outputs_require_mask(
+                    if xb_part.device != device:
+                        if runtime_channels_last:
+                            xb_part = xb_part.to(device=device, non_blocking=True, memory_format=torch.channels_last)
+                        else:
+                            xb_part = xb_part.to(device, non_blocking=True)
+                    elif runtime_channels_last:
+                        xb_part = xb_part.contiguous(memory_format=torch.channels_last)
+                    if yb_part.device != device:
+                        yb_part = yb_part.to(device, non_blocking=True)
+                    if mb_part.device != device:
+                        mb_part = mb_part.to(device, non_blocking=True)
+                    with torch.no_grad():
+                        with _autocast_context(device=device, enabled=runtime_amp_enabled, amp_dtype_t=amp_dtype_t):
+                            out = _forward_classifier_outputs_require_mask(
+                                classifier=classifier,
+                                xb=xb_part,
+                                context="berkeley gate evaluation",
+                            )
+                            logits = out["logits"]
+                        supervised_dim = int(yb_part.shape[1]) if int(yb_part.ndim) == 2 else int(logits.shape[1])
+                        if int(active_classes) > 0:
+                            supervised_dim = min(int(supervised_dim), int(active_classes))
+                        supervised_dim = max(1, int(supervised_dim))
+                        loss, logits_sup, y_sup, _ = _classifier_supervision_loss(
                             classifier=classifier,
-                            xb=xb_part,
+                            logits=logits,
+                            y_multihot=yb_part,
+                            supervised_dim=int(supervised_dim),
+                            semantic_cosine_weight=float(semantic_cosine_weight),
+                        )
+                        mask_loss, _ = _semantic_mask_bce_loss(
+                            mask_logits=out["mask_logits"],
+                            mask_targets=mb_part,
                             context="berkeley gate evaluation",
                         )
-                        logits = out["logits"]
-                    supervised_dim = int(yb_part.shape[1]) if int(yb_part.ndim) == 2 else int(logits.shape[1])
-                    if int(active_classes) > 0:
-                        supervised_dim = min(int(supervised_dim), int(active_classes))
-                    supervised_dim = max(1, int(supervised_dim))
-                    loss, logits_sup, y_sup, _ = _classifier_supervision_loss(
-                        classifier=classifier,
-                        logits=logits,
-                        y_multihot=yb_part,
-                        supervised_dim=int(supervised_dim),
-                    )
-                    mask_loss, _ = _semantic_mask_bce_loss(
-                        mask_logits=out["mask_logits"],
-                        mask_targets=mb_part,
-                        context="berkeley gate evaluation",
-                    )
-                    loss = (loss * float(CLASSIFIER_LOSS_SCALE)) + mask_loss
+                        loss = (loss * float(CLASSIFIER_LOSS_SCALE)) + mask_loss
                     part_n = int(xb_part.shape[0])
                     batch_loss += float(loss.item()) * part_n
                     batch_mask_loss += float(mask_loss.item()) * part_n
@@ -5348,6 +6203,7 @@ def _evaluate_berkeley_classifier_gate(
                             )
                         except Exception:
                             pass
+                    del xb_part, yb_part, mb_part, out, logits, loss, mask_loss, logits_sup, y_sup
 
                 total_loss += float(batch_loss)
                 mask_loss_total += float(batch_mask_loss)
@@ -5356,6 +6212,25 @@ def _evaluate_berkeley_classifier_gate(
                 targets_all.extend(batch_targets)
                 break
             except RuntimeError as e:
+                if device.type == "cuda" and _is_cuda_backend_engine_error(e):
+                    if bool(runtime_amp_enabled):
+                        runtime_amp_enabled = False
+                        torch.cuda.empty_cache()
+                        print(
+                            f"[berkeley-gate] backend engine selection failed on device={device}; retrying with AMP disabled",
+                            flush=True,
+                        )
+                        continue
+                    if bool(runtime_channels_last):
+                        runtime_channels_last = False
+                        classifier = classifier.to(memory_format=torch.contiguous_format)
+                        xb = xb.contiguous()
+                        torch.cuda.empty_cache()
+                        print(
+                            f"[berkeley-gate] backend engine selection failed on device={device}; retrying with contiguous tensors",
+                            flush=True,
+                        )
+                        continue
                 if device.type != "cuda" or (not _is_cuda_oom(e)) or int(eval_chunk) <= 1:
                     raise
                 next_chunk = max(1, int(eval_chunk) // 2)
@@ -5443,6 +6318,9 @@ def _run_berkeley_refresh_epochs(
     target_label_knockout_seed: int = 0,
     step_preview_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
     stop_requested: Optional[Callable[[], bool]] = None,
+    grad_clip: float = 1.0,
+    semantic_soft_target_max: float = 0.0,
+    semantic_cosine_weight: float = CLASSIFIER_SEMANTIC_COSINE_WEIGHT,
 ):
     if epochs <= 0:
         return {"ran": False, "loss": 0.0}
@@ -5454,8 +6332,18 @@ def _run_berkeley_refresh_epochs(
             p.requires_grad_(True)
 
     classifier.train()
-    if channels_last:
+    runtime_channels_last = bool(channels_last)
+    if runtime_channels_last:
         classifier = classifier.to(memory_format=torch.channels_last)
+    restore_cudnn_benchmark = None
+    if device.type == "cuda" and hasattr(torch.backends, "cudnn"):
+        try:
+            restore_cudnn_benchmark = bool(torch.backends.cudnn.benchmark)
+            if bool(restore_cudnn_benchmark):
+                torch.backends.cudnn.benchmark = False
+                _log("[berkeley-refresh] disabled cudnn benchmark for refresh stage to avoid one-sample workspace spikes")
+        except Exception:
+            restore_cudnn_benchmark = None
     amp_dtype_t = _resolve_amp_dtype(amp_dtype) if amp_enabled else torch.float16
     use_scaler = bool(amp_enabled and device.type == "cuda" and amp_dtype_t == torch.float16)
     scaler = _make_grad_scaler(enabled=use_scaler)
@@ -5470,9 +6358,12 @@ def _run_berkeley_refresh_epochs(
         and int(getattr(cache_m, "shape", [0])[0]) == int(getattr(cache_x, "shape", [0])[0])
         and int(cache_batch_size) > 0
         and mode_key in ("", "multihot_mix", "multihot", "mixed")
+        and bool(_refresh_cache_is_staging_safe(cache_x=cache_x, cache_y=cache_y, cache_m=cache_m, model_device=device))
     )
     cache_batch_size = max(1, int(cache_batch_size)) if use_cache else 0
     refresh_source = "cache" if use_cache else "loader"
+    if bool(use_cache) and cache_x is not None and str(cache_x.device) != str(device):
+        refresh_source = f"cache-staging:{str(cache_x.device)}->{str(device)}"
     knockout_prob = float(max(0.0, min(1.0, float(target_label_knockout_prob))))
     knockout_enabled = bool(knockout_prob > 0.0)
     knockout_rng = np.random.default_rng(max(0, int(target_label_knockout_seed)))
@@ -5503,247 +6394,273 @@ def _run_berkeley_refresh_epochs(
     total_loss = 0.0
     n = 0
     t_start = time.time()
+    if device.type == "cuda":
+        _log(f"[berkeley-refresh] cuda preflight: {_cuda_mem_diag(device)}")
     total_target_steps = max(1, int(epochs) * steps_per_epoch)
     global_step = 0
     stop_now = False
     logged_refresh_microbatch_cap = -1
-    for _ in range(int(epochs)):
-        step = 0
-        opt.zero_grad(set_to_none=True)
-        if use_cache:
-            cache_n = int(cache_x.shape[0])
-            cache_perm = torch.randperm(cache_n, device=cache_x.device)
-            cache_pos = 0
-        else:
-            loader_iter = iter(loader)
-
-        while step < steps_per_epoch:
-            if stop_requested is not None:
-                try:
-                    if bool(stop_requested()):
-                        stop_now = True
-                        break
-                except Exception:
-                    pass
+    try:
+        for _ in range(int(epochs)):
+            step = 0
+            opt.zero_grad(set_to_none=True)
             if use_cache:
-                idx_parts: List[torch.Tensor] = []
-                need = int(cache_batch_size)
-                while need > 0:
-                    if cache_pos >= cache_n:
-                        cache_perm = torch.randperm(cache_n, device=cache_x.device)
-                        cache_pos = 0
-                    take = min(need, cache_n - cache_pos)
-                    idx_parts.append(cache_perm[cache_pos : cache_pos + take])
-                    cache_pos += take
-                    need -= take
-                idx = idx_parts[0] if len(idx_parts) == 1 else torch.cat(idx_parts, dim=0)
-                xb = None
-                yb = None
-                mb = None
-                batch_meta = None
+                cache_n = int(cache_x.shape[0])
+                cache_perm = torch.randperm(cache_n, device=cache_x.device)
+                cache_pos = 0
             else:
-                try:
-                    xb, yb, mb, batch_meta = _unpack_masked_semantic_batch(next(loader_iter), context="berkeley refresh training")
-                except StopIteration:
-                    loader_iter = iter(loader)
-                    xb, yb, mb, batch_meta = _unpack_masked_semantic_batch(next(loader_iter), context="berkeley refresh training")
-            if not bool(use_cache):
-                xb, yb, mb = _expand_semantic_mask_supervision_batch(
-                    xb=xb,
-                    yb=yb,
-                    mb=mb,
-                    batch_meta=batch_meta,
-                    mode=str(semantic_mask_supervision_mode),
-                    context="berkeley refresh training",
-                )
-            total_batch_n = int(idx.numel()) if use_cache else max(1, int(xb.shape[0]))
-            slice_cap = _auto_berkeley_refresh_batch_size(
-                cache_x=(cache_x if use_cache else xb),
-                cache_y=(cache_y if use_cache else yb),
-                cache_m=(cache_m if use_cache else mb),
-                device=device,
-                vram_fraction=float(vram_fraction),
-                activation_multiplier=float(activation_multiplier),
-                max_cap=(int(max_forward_batch_cap) if int(max_forward_batch_cap) > 0 else int(total_batch_n)),
-            )
-            slice_cap = max(1, min(int(slice_cap), int(total_batch_n)))
-            if int(slice_cap) != int(logged_refresh_microbatch_cap):
-                _log(
-                    "[berkeley-refresh] microbatch cap: "
-                    f"batch={int(total_batch_n)} cap={int(slice_cap)} source={str(refresh_source)}"
-                )
-                logged_refresh_microbatch_cap = int(slice_cap)
-            step_loss_value = 0.0
-            step_seen = 0
-            preview_img_cpu = None
-            preview_probs_cpu = None
-            preview_target_cpu = None
-            preview_target_mask_cpu = None
-            preview_detected_mask_cpu = None
-            preview_batch_loss = 0.0
-            while True:
-                try:
-                    step_loss_value = 0.0
-                    step_seen = 0
-                    for st in range(0, int(total_batch_n), int(slice_cap)):
-                        ed = min(int(total_batch_n), int(st + slice_cap))
-                        if use_cache:
-                            idx_part = idx[st:ed]
-                            xb_part = cache_x.index_select(0, idx_part)
-                            yb_part = cache_y.index_select(0, idx_part)
-                            mb_part = cache_m.index_select(0, idx_part)
-                        else:
-                            xb_part = xb[st:ed]
-                            yb_part = yb[st:ed]
-                            mb_part = mb[st:ed]
-                        if xb_part.device != device:
-                            xb_part = xb_part.to(device, non_blocking=True)
-                        if yb_part.device != device:
-                            yb_part = yb_part.to(device, non_blocking=True)
-                        if mb_part.device != device:
-                            mb_part = mb_part.to(device, non_blocking=True)
-                        if bool(knockout_enabled):
-                            yb_part, rows_drop, labels_drop = _label_knockout_tensor_batch(
-                                yb=yb_part,
-                                rng=knockout_rng,
-                                prob=float(knockout_prob),
-                                min_keep=int(target_label_knockout_min_keep),
-                                max_drop_frac=float(target_label_knockout_max_drop_frac),
-                                threshold=0.5,
-                            )
-                            knockout_rows_applied += int(rows_drop)
-                            knockout_labels_dropped += int(labels_drop)
-                        if channels_last:
-                            xb_part = xb_part.contiguous(memory_format=torch.channels_last)
-                        with _autocast_context(device=device, enabled=amp_enabled, amp_dtype_t=amp_dtype_t):
-                            out = _forward_classifier_outputs_require_mask(
-                                classifier=classifier,
-                                xb=xb_part,
-                                context="berkeley refresh training",
-                            )
-                            logits = out["logits"]
-                        supervised_dim = int(yb_part.shape[1]) if int(yb_part.ndim) == 2 else int(logits.shape[1])
-                        if int(active_classes) > 0:
-                            supervised_dim = min(int(supervised_dim), int(active_classes))
-                        supervised_dim = max(1, int(supervised_dim))
-                        loss, _, _, _ = _classifier_supervision_loss(
-                            classifier=classifier,
-                            logits=logits,
-                            y_multihot=yb_part,
-                            supervised_dim=int(supervised_dim),
-                        )
-                        mask_loss, _ = _semantic_mask_bce_loss(
-                            mask_logits=out["mask_logits"],
-                            mask_targets=mb_part,
-                            context="berkeley refresh training",
-                        )
-                        loss = (loss * float(CLASSIFIER_LOSS_SCALE)) + mask_loss
-                        part_weight = float(ed - st) / float(max(1, int(total_batch_n)))
-                        loss_to_backprop = (loss * float(part_weight)) / float(grad_accum_steps)
-                        if use_scaler:
-                            scaler.scale(loss_to_backprop).backward()
-                        else:
-                            loss_to_backprop.backward()
-                        step_loss_value += float(loss.detach().item()) * float(ed - st)
-                        step_seen += int(ed - st)
-                        if preview_img_cpu is None and int(xb_part.shape[0]) > 0:
-                            probs_sup = torch.sigmoid(logits[:, : int(supervised_dim)].detach()).to(torch.float32)
-                            preview_img_cpu = xb_part[0].detach().to(device="cpu", dtype=torch.float32)
-                            preview_probs_cpu = probs_sup[0].detach().to(device="cpu", dtype=torch.float32)
-                            preview_target_cpu = yb_part[0, : int(supervised_dim)].detach().to(device="cpu", dtype=torch.float32)
-                            preview_target_mask_cpu = mb_part[0].detach().to(device="cpu", dtype=torch.float32)
-                            preview_detected_mask_cpu = torch.sigmoid(out["mask_logits"][0].detach()).to(device="cpu", dtype=torch.float32)
-                            preview_batch_loss = float(loss.detach().to(torch.float32).item())
-                        del xb_part, yb_part, mb_part, out, logits, loss, mask_loss
-                        if 'probs_sup' in locals():
-                            del probs_sup
-                        if device.type == "cuda":
-                            try:
-                                torch.cuda.empty_cache()
-                            except Exception:
-                                pass
-                    break
-                except torch.OutOfMemoryError:
-                    if device.type != "cuda" or int(slice_cap) <= 1:
-                        raise
-                    opt.zero_grad(set_to_none=True)
+                loader_iter = iter(loader)
+
+            while step < steps_per_epoch:
+                if stop_requested is not None:
                     try:
-                        torch.cuda.empty_cache()
+                        if bool(stop_requested()):
+                            stop_now = True
+                            break
                     except Exception:
                         pass
-                    slice_cap = max(1, int(slice_cap // 2))
-                    _log(
-                        "[berkeley-refresh] cuda oom; retrying with smaller microbatch cap "
-                        f"{int(slice_cap)}"
-                    )
-            do_step = ((step + 1) % grad_accum_steps == 0) or ((step + 1) == steps_per_epoch)
-            if do_step:
-                if use_scaler:
-                    scaler.unscale_(opt)
-                nn.utils.clip_grad_norm_(classifier.parameters(), 1.0)
-                if use_scaler:
-                    scaler.step(opt)
-                    scaler.update()
+                if use_cache:
+                    idx_parts: List[torch.Tensor] = []
+                    need = int(cache_batch_size)
+                    while need > 0:
+                        if cache_pos >= cache_n:
+                            cache_perm = torch.randperm(cache_n, device=cache_x.device)
+                            cache_pos = 0
+                        take = min(need, cache_n - cache_pos)
+                        idx_parts.append(cache_perm[cache_pos : cache_pos + take])
+                        cache_pos += take
+                        need -= take
+                    idx = idx_parts[0] if len(idx_parts) == 1 else torch.cat(idx_parts, dim=0)
+                    xb = None
+                    yb = None
+                    mb = None
+                    batch_meta = None
                 else:
-                    opt.step()
-                lr_ctl.step()
-                opt.zero_grad(set_to_none=True)
-            total_loss += float(step_loss_value)
-            n += int(step_seen)
-            step += 1
-            global_step += 1
-            if int(log_every) > 0 and (global_step % int(log_every) == 0):
-                elapsed = max(1e-6, time.time() - t_start)
-                ips = float(n) / elapsed
-                print(
-                    f"[berkeley-refresh] step={global_step}/{total_target_steps} "
-                    f"loss={total_loss / max(1, n):.4f} samples={n} samp_per_sec={ips:.1f}",
-                    flush=True,
-                )
-            if step_preview_callback is not None:
-                emit = False
-                if int(log_every) > 0:
-                    emit = ((int(global_step) % int(log_every) == 0) or (int(global_step) == int(total_target_steps)))
-                else:
-                    emit = (int(global_step) == int(total_target_steps))
-                if emit and preview_img_cpu is not None:
                     try:
-                        step_preview_callback(
-                            {
-                                "global_step": int(global_step),
-                                "total_steps": int(total_target_steps),
-                                "img": preview_img_cpu,
-                                "probs": preview_probs_cpu,
-                                "target_vec": preview_target_cpu,
-                                "target_mask": preview_target_mask_cpu,
-                                "detected_mask": preview_detected_mask_cpu,
-                                "loss": float(total_loss / max(1, n)),
-                                "batch_loss": float(preview_batch_loss),
-                            }
+                        xb, yb, mb, batch_meta = _unpack_masked_semantic_batch(next(loader_iter), context="berkeley refresh training")
+                    except StopIteration:
+                        loader_iter = iter(loader)
+                        xb, yb, mb, batch_meta = _unpack_masked_semantic_batch(next(loader_iter), context="berkeley refresh training")
+                if not bool(use_cache):
+                    xb, yb, mb = _expand_semantic_mask_supervision_batch(
+                        xb=xb,
+                        yb=yb,
+                        mb=mb,
+                        batch_meta=batch_meta,
+                        mode=str(semantic_mask_supervision_mode),
+                        context="berkeley refresh training",
+                    )
+                total_batch_n = int(idx.numel()) if use_cache else max(1, int(xb.shape[0]))
+                slice_cap = _auto_berkeley_refresh_batch_size(
+                    cache_x=(cache_x if use_cache else xb),
+                    cache_y=(cache_y if use_cache else yb),
+                    cache_m=(cache_m if use_cache else mb),
+                    device=device,
+                    vram_fraction=float(vram_fraction),
+                    activation_multiplier=float(activation_multiplier),
+                    max_cap=(int(max_forward_batch_cap) if int(max_forward_batch_cap) > 0 else int(total_batch_n)),
+                )
+                slice_cap = max(1, min(int(slice_cap), int(total_batch_n)))
+                if int(slice_cap) != int(logged_refresh_microbatch_cap):
+                    _log(
+                        "[berkeley-refresh] microbatch cap: "
+                        f"batch={int(total_batch_n)} cap={int(slice_cap)} source={str(refresh_source)}"
+                    )
+                    logged_refresh_microbatch_cap = int(slice_cap)
+                step_loss_value = 0.0
+                step_seen = 0
+                while True:
+                    try:
+                        step_loss_value = 0.0
+                        step_seen = 0
+                        preview_items: list = []
+                        for st in range(0, int(total_batch_n), int(slice_cap)):
+                            ed = min(int(total_batch_n), int(st + slice_cap))
+                            if use_cache:
+                                idx_part = idx[st:ed]
+                                with torch.no_grad():
+                                    xb_part = cache_x.index_select(0, idx_part).detach()
+                                    yb_part = cache_y.index_select(0, idx_part).detach()
+                                    mb_part = cache_m.index_select(0, idx_part).detach()
+                            else:
+                                xb_part = xb[st:ed]
+                                yb_part = yb[st:ed]
+                                mb_part = mb[st:ed]
+                            if xb_part.device != device:
+                                if bool(runtime_channels_last):
+                                    xb_part = xb_part.to(device=device, non_blocking=True, memory_format=torch.channels_last)
+                                else:
+                                    xb_part = xb_part.to(device, non_blocking=True)
+                            if yb_part.device != device:
+                                yb_part = yb_part.to(device, non_blocking=True)
+                            if mb_part.device != device:
+                                mb_part = mb_part.to(device, non_blocking=True)
+                            if bool(knockout_enabled):
+                                yb_part, rows_drop, labels_drop = _label_knockout_tensor_batch(
+                                    yb=yb_part,
+                                    rng=knockout_rng,
+                                    prob=float(knockout_prob),
+                                    min_keep=int(target_label_knockout_min_keep),
+                                    max_drop_frac=float(target_label_knockout_max_drop_frac),
+                                    threshold=0.5,
+                                )
+                                knockout_rows_applied += int(rows_drop)
+                                knockout_labels_dropped += int(labels_drop)
+                            if bool(runtime_channels_last) and xb_part.device == device:
+                                xb_part = xb_part.contiguous(memory_format=torch.channels_last)
+                            with _autocast_context(device=device, enabled=amp_enabled, amp_dtype_t=amp_dtype_t):
+                                out = _forward_classifier_outputs_require_mask(
+                                    classifier=classifier,
+                                    xb=xb_part,
+                                    context="berkeley refresh training",
+                                )
+                                logits = out["logits"]
+                            supervised_dim = int(yb_part.shape[1]) if int(yb_part.ndim) == 2 else int(logits.shape[1])
+                            if int(active_classes) > 0:
+                                supervised_dim = min(int(supervised_dim), int(active_classes))
+                            supervised_dim = max(1, int(supervised_dim))
+                            loss, _, _, _ = _classifier_supervision_loss(
+                                classifier=classifier,
+                                logits=logits,
+                                y_multihot=yb_part,
+                                supervised_dim=int(supervised_dim),
+                                semantic_cosine_weight=float(semantic_cosine_weight),
+                                semantic_soft_target_max=float(semantic_soft_target_max),
+                            )
+                            mask_loss, _ = _semantic_mask_bce_loss(
+                                mask_logits=out["mask_logits"],
+                                mask_targets=mb_part,
+                                context="berkeley refresh training",
+                            )
+                            loss = (loss * float(CLASSIFIER_LOSS_SCALE)) + mask_loss
+                            part_weight = float(ed - st) / float(max(1, int(total_batch_n)))
+                            loss_to_backprop = (loss * float(part_weight)) / float(grad_accum_steps)
+                            if use_scaler:
+                                scaler.scale(loss_to_backprop).backward()
+                            else:
+                                loss_to_backprop.backward()
+                            step_loss_value += float(loss.detach().item()) * float(ed - st)
+                            step_seen += int(ed - st)
+                            if step_preview_callback is not None and int(xb_part.shape[0]) > 0:
+                                _probs_sup = torch.sigmoid(logits[:, : int(supervised_dim)].detach()).to(torch.float32)
+                                _bl = float(loss.detach().to(torch.float32).item())
+                                for _i in range(int(xb_part.shape[0])):
+                                    preview_items.append({
+                                        "img": xb_part[_i].detach().to(device="cpu", dtype=torch.float32),
+                                        "probs": _probs_sup[_i].detach().to(device="cpu", dtype=torch.float32),
+                                        "target_vec": yb_part[_i, : int(supervised_dim)].detach().to(device="cpu", dtype=torch.float32),
+                                        "target_mask": mb_part[_i].detach().to(device="cpu", dtype=torch.float32),
+                                        "detected_mask": torch.sigmoid(out["mask_logits"][_i].detach()).to(device="cpu", dtype=torch.float32),
+                                        "batch_loss": _bl,
+                                    })
+                                del _probs_sup
+                            del xb_part, yb_part, mb_part, out, logits, loss, mask_loss
+                        break
+                    except torch.OutOfMemoryError:
+                        if device.type != "cuda":
+                            raise
+                        _log(
+                            "[berkeley-refresh] cuda oom state: "
+                            f"slice_cap={int(slice_cap)} batch={int(total_batch_n)} {_cuda_mem_diag(device)}"
                         )
-                    except Exception as e:
-                        _log(f"[stage-opengl] C-step callback failed: {e}")
-            del preview_img_cpu, preview_probs_cpu, preview_target_cpu, preview_target_mask_cpu, preview_detected_mask_cpu
-            if xb is not None:
-                del xb, yb, mb
-            if use_cache:
-                del idx
-            if float(max_seconds) > 0.0 and (time.time() - t_start) >= float(max_seconds):
-                classifier.eval()
-                return {
-                    "ran": True,
-                    "loss": total_loss / max(1, n),
-                    "samples": n,
-                    "steps_per_epoch": int(steps_per_epoch),
-                    "truncated_by_time": True,
-                    "stopped_early": False,
-                    "elapsed_sec": float(time.time() - t_start),
-                    "source": refresh_source,
-                    "target_knockout_rows_applied": int(knockout_rows_applied),
-                    "target_knockout_labels_dropped": int(knockout_labels_dropped),
-                }
-        if stop_now:
-            break
+                        opt.zero_grad(set_to_none=True)
+                        gc.collect()
+                        try:
+                            torch.cuda.synchronize(device)
+                        except Exception:
+                            pass
+                        try:
+                            torch.cuda.empty_cache()
+                        except Exception:
+                            pass
+                        try:
+                            torch.cuda.ipc_collect()
+                        except Exception:
+                            pass
+                        if bool(runtime_channels_last):
+                            runtime_channels_last = False
+                            classifier = classifier.to(memory_format=torch.contiguous_format)
+                            _log("[berkeley-refresh] cuda oom; retrying with contiguous tensors")
+                            continue
+                        if int(slice_cap) <= 1:
+                            raise
+                        next_slice_cap = max(1, int(slice_cap // 2))
+                        if int(next_slice_cap) > 1:
+                            next_slice_cap = 1 << (int(next_slice_cap).bit_length() - 1)
+                        slice_cap = int(next_slice_cap)
+                        _log(
+                            "[berkeley-refresh] cuda oom; retrying with smaller microbatch cap "
+                            f"{int(slice_cap)}"
+                        )
+                do_step = ((step + 1) % grad_accum_steps == 0) or ((step + 1) == steps_per_epoch)
+                if do_step:
+                    if use_scaler:
+                        scaler.unscale_(opt)
+                    nn.utils.clip_grad_norm_(classifier.parameters(), float(grad_clip))
+                    if use_scaler:
+                        scaler.step(opt)
+                        scaler.update()
+                    else:
+                        opt.step()
+                    lr_ctl.step()
+                    opt.zero_grad(set_to_none=True)
+                total_loss += float(step_loss_value)
+                n += int(step_seen)
+                step += 1
+                global_step += 1
+                if int(log_every) > 0 and (global_step % int(log_every) == 0):
+                    elapsed = max(1e-6, time.time() - t_start)
+                    ips = float(n) / elapsed
+                    print(
+                        f"[berkeley-refresh] step={global_step}/{total_target_steps} "
+                        f"loss={total_loss / max(1, n):.4f} samples={n} samp_per_sec={ips:.1f}",
+                        flush=True,
+                    )
+                if step_preview_callback is not None and len(preview_items) > 0:
+                    _avg_loss = float(total_loss / max(1, n))
+                    for _item in preview_items:
+                        try:
+                            step_preview_callback(
+                                {
+                                    "global_step": int(global_step),
+                                    "total_steps": int(total_target_steps),
+                                    "img": _item["img"],
+                                    "probs": _item["probs"],
+                                    "target_vec": _item["target_vec"],
+                                    "target_mask": _item["target_mask"],
+                                    "detected_mask": _item["detected_mask"],
+                                    "loss": _avg_loss,
+                                    "batch_loss": float(_item["batch_loss"]),
+                                }
+                            )
+                        except Exception as e:
+                            _log(f"[stage-opengl] C-step callback failed: {e}")
+                if xb is not None:
+                    del xb, yb, mb
+                if use_cache:
+                    del idx
+                if float(max_seconds) > 0.0 and (time.time() - t_start) >= float(max_seconds):
+                    classifier.eval()
+                    return {
+                        "ran": True,
+                        "loss": total_loss / max(1, n),
+                        "samples": n,
+                        "steps_per_epoch": int(steps_per_epoch),
+                        "truncated_by_time": True,
+                        "stopped_early": False,
+                        "elapsed_sec": float(time.time() - t_start),
+                        "source": refresh_source,
+                        "target_knockout_rows_applied": int(knockout_rows_applied),
+                        "target_knockout_labels_dropped": int(knockout_labels_dropped),
+                    }
+            if stop_now:
+                break
+    finally:
+        if restore_cudnn_benchmark is not None and hasattr(torch.backends, "cudnn"):
+            try:
+                torch.backends.cudnn.benchmark = bool(restore_cudnn_benchmark)
+            except Exception:
+                pass
     classifier.eval()
     return {
         "ran": bool(n > 0),
@@ -5791,6 +6708,7 @@ def _run_fake_class_refresh_epochs(
     step_preview_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
     stop_requested: Optional[Callable[[], bool]] = None,
     seed: int = 0,
+    grad_clip: float = 1.0,
 ):
     if epochs <= 0 or steps_per_epoch <= 0 or batch_size <= 0:
         return {"ran": False, "loss": 0.0, "samples": 0, "source": "fake_vector"}
@@ -5984,7 +6902,7 @@ def _run_fake_class_refresh_epochs(
             if do_step:
                 if use_scaler:
                     scaler.unscale_(opt)
-                nn.utils.clip_grad_norm_(classifier.parameters(), 1.0)
+                nn.utils.clip_grad_norm_(classifier.parameters(), float(grad_clip))
                 if use_scaler:
                     scaler.step(opt)
                     scaler.update()
@@ -6040,36 +6958,33 @@ def _run_fake_class_refresh_epochs(
                     f"samp_per_sec={ips:.1f}",
                     flush=True,
                 )
-            if step_preview_callback is not None:
-                emit = False
-                if int(log_every) > 0:
-                    emit = ((int(global_step) % int(log_every) == 0) or (int(global_step) == int(total_target_steps)))
-                else:
-                    emit = (int(global_step) == int(total_target_steps))
-                if emit and int(xb.shape[0]) > 0:
+            if step_preview_callback is not None and int(xb.shape[0]) > 0:
+                _avg_loss = float(total_loss / max(1, n))
+                _batch_loss = float(loss.detach().to(torch.float32).item())
+                for _i in range(int(xb.shape[0])):
                     try:
                         step_preview_callback(
                             {
                                 "global_step": int(global_step),
                                 "total_steps": int(total_target_steps),
-                                "img": xb[0].detach().to(torch.float32),
-                                "probs": torch.sigmoid(logits[0].detach()).to(torch.float32),
-                                "target_vec": cond[0].detach().to(torch.float32),
-                                "loss": float(total_loss / max(1, n)),
-                                "batch_loss": float(loss.detach().to(torch.float32).item()),
-                                "fake_cos": float(fake_cos_f[0].detach().item()),
+                                "img": xb[_i].detach().to(torch.float32).cpu(),
+                                "probs": torch.sigmoid(logits[_i].detach()).to(torch.float32).cpu(),
+                                "target_vec": cond[_i].detach().to(torch.float32).cpu(),
+                                "loss": _avg_loss,
+                                "batch_loss": _batch_loss,
+                                "fake_cos": float(fake_cos_f[_i].detach().item()),
                                 "disc_conf": (
-                                    float(disc_conf_f[0].detach().item())
+                                    float(disc_conf_f[_i].detach().item())
                                     if disc_conf_f is not None
                                     else 0.0
                                 ),
                                 "disc_logit": (
-                                    float(disc_logits[0].detach().to(torch.float32).item())
+                                    float(disc_logits[_i].detach().to(torch.float32).item())
                                     if disc_logits is not None
                                     else 0.0
                                 ),
                                 "disc_pass": (
-                                    bool(pass_mask[0].detach().item())
+                                    bool(pass_mask[_i].detach().item())
                                     if pass_mask is not None
                                     else False
                                 ),
@@ -8278,6 +9193,14 @@ def _build_berkeley_payload_bank(
         "cache_hit": False,
         "source_catalog": "",
         "used_source_counts": {str(k): int(v) for k, v in used_source_counts.items()},
+        "mask_cache_hits": int(rows_info.get("mask_cache_hits", 0)),
+        "mask_cache_writes": int(rows_info.get("mask_cache_writes", 0)),
+        "mask_cache_failures": int(rows_info.get("mask_cache_failures", 0)),
+        "mask_cache_seconds": float(rows_info.get("mask_cache_seconds", 0.0)),
+        "mask_cache_threads": int(rows_info.get("mask_cache_threads", 0)),
+        "row_build_threads": int(rows_info.get("row_build_threads", 0)),
+        "row_build_seconds": float(rows_info.get("row_build_seconds", 0.0)),
+        "inprocess_cache_hit": bool(rows_info.get("inprocess_cache_hit", False)),
     }
     return out_images, out_targets, info, out_terms, out_masks
 
@@ -8621,6 +9544,12 @@ def parse_args():
     p.add_argument("--compile-models", action="store_true", help="Use torch.compile for classifier/transformer models.")
     p.add_argument("--compile-mode", default="default")
     p.add_argument("--grad-accum-steps", type=int, default=1, help="Micro-batch accumulation factor.")
+    p.add_argument("--classifier-grad-clip", type=float, default=1.0, help="Gradient clip norm for classifier optimizer steps.")
+    p.add_argument("--classifier-semantic-soft-target-max", type=float, default=0.0, help="Max soft target for negative classes in classifier BCE, set by cosine similarity to active label centroid.")
+    p.add_argument("--classifier-semantic-cosine-weight", type=float, default=0.35, help="Weight for semantic cosine embedding loss in classifier supervision.")
+    p.add_argument("--generator-grad-clip", type=float, default=1.0, help="Gradient clip norm for generator optimizer steps.")
+    p.add_argument("--discriminator-grad-clip", type=float, default=1.0, help="Gradient clip norm for discriminator optimizer steps.")
+    p.add_argument("--transformer-grad-clip", type=float, default=1.0, help="Gradient clip norm for transformer optimizer steps.")
     p.add_argument("--pin-memory-wave-batches", action="store_true", help="Pin sampled wave batches before H2D copy.")
     p.add_argument("--cache-wave-cls-dataset-on-device", action="store_true", help="Cache rendered wave-classifier datasets on GPU.")
     p.add_argument("--cache-wave-streams-on-device", action="store_true", help="Cache waveform stream pools on GPU for vectorized batch sampling.")
@@ -8951,6 +9880,80 @@ def parse_args():
         default=2,
         help="How many reference flashcard rows to synthesize per active semantic term.",
     )
+    p.add_argument(
+        "--semantic-stage-cache-enabled",
+        dest="semantic_stage_cache_enabled",
+        action="store_true",
+        help=(
+            "Persist pre-generated semantic stage rows to disk and reuse them on later boots before falling back "
+            "to live synthesis/augmentation."
+        ),
+    )
+    p.add_argument("--no-semantic-stage-cache-enabled", dest="semantic_stage_cache_enabled", action="store_false")
+    p.add_argument(
+        "--semantic-stage-cache-dir",
+        default="",
+        help="Optional root directory for semantic stage caches (default: <output-dir>/semantic_stage_cache).",
+    )
+    p.add_argument(
+        "--semantic-stage-cache-max-rows",
+        type=int,
+        default=512,
+        help=(
+            "Maximum number of pre-generated rows to cache per semantic stage dataset. "
+            "0 means cache the full dataset length for that stage."
+        ),
+    )
+    p.add_argument(
+        "--semantic-stage-cache-max-mb",
+        type=int,
+        default=0,
+        help=(
+            "Hard disk cap in MB for each semantic stage cache pool. "
+            "0 disables disk-cap enforcement for that stage cache."
+        ),
+    )
+    p.add_argument(
+        "--pregestation-stage-cache-max-mb",
+        type=int,
+        default=-1,
+        help=(
+            "Hard disk cap in MB for the pregestation stage cache pool. "
+            "Negative values inherit --semantic-stage-cache-max-mb; 0 disables the pregestation disk cap."
+        ),
+    )
+    p.add_argument(
+        "--gestation-stage-cache-max-mb",
+        type=int,
+        default=-1,
+        help=(
+            "Hard disk cap in MB for each gestation stage cache pool. "
+            "Negative values inherit --semantic-stage-cache-max-mb; 0 disables the gestation disk cap."
+        ),
+    )
+    p.add_argument(
+        "--semantic-stage-cache-overflow-strategy",
+        choices=["loop", "evict"],
+        default="loop",
+        help="When the semantic stage cache hits its disk cap, either reuse bounded loop slots or evict older cache entries.",
+    )
+    p.add_argument(
+        "--semantic-stage-cache-slot-lifespan",
+        type=int,
+        default=0,
+        dest="semantic_stage_cache_slot_lifespan",
+        help=(
+            "Maximum number of times a loop-pool slot may be reused before it is treated as expired and rebuilt. "
+            "0 (default) disables expiry — slots are recycled indefinitely."
+        ),
+    )
+    p.add_argument(
+        "--semantic-stage-cache-rebuild",
+        dest="semantic_stage_cache_rebuild",
+        action="store_true",
+        help="Force rebuild of semantic stage disk caches for this run.",
+    )
+    p.add_argument("--no-semantic-stage-cache-rebuild", dest="semantic_stage_cache_rebuild", action="store_false")
     p.add_argument(
         "--gd-vocab-library-enabled",
         dest="gd_vocab_library_enabled",
@@ -9480,6 +10483,101 @@ def parse_args():
         ),
     )
     p.add_argument(
+        "--gate-pregestation-maintain-rounds",
+        type=int,
+        default=1,
+        help="Required consecutive pre-gestation gate passes before Stage 1 gestation can begin.",
+    )
+    p.add_argument(
+        "--pregestation-stage-batch-size",
+        type=int,
+        default=8,
+        help=(
+            "Batch size for Stage-0 pre-gestation formal-logic training and its matching gate loader. "
+            "Values <=0 fall back to --gate-gestation-batch-size, then --gate-berkeley-batch-size, then --classifier-batch-size."
+        ),
+    )
+    p.add_argument(
+        "--pregestation-stage-deck-passes",
+        type=int,
+        default=4,
+        help="How many shuffled passes over the Stage-0 loader to run per pre-gestation round.",
+    )
+    p.add_argument(
+        "--pregestation-stage-min-steps",
+        type=int,
+        default=128,
+        help="Minimum Stage-0 pre-gestation optimizer steps per round even if the deck is smaller.",
+    )
+    p.add_argument(
+        "--pregestation-circle-radius-temperature",
+        type=float,
+        default=1.0,
+        dest="pregestation_circle_radius_temperature",
+        help=(
+            "Temperature multiplier for the pre-gestation color-circle radius. "
+            "1.0 = default range [0.085, 0.115]; values <1 produce smaller circles, >1 larger circles."
+        ),
+    )
+    p.add_argument(
+        "--pregestation-circle-displacement-temperature",
+        type=float,
+        default=1.0,
+        dest="pregestation_circle_displacement_temperature",
+        help=(
+            "Base temperature multiplier for the offset of the color circle anchor from center. "
+            "1.0 = default 0.32 normalized-image-unit displacement; <1 pushes anchors toward center, >1 pushes farther out. "
+            "The effective temperature is further scaled by the undulating schedule controlled by "
+            "--pregestation-temp-trend, --pregestation-temp-oscillation-amplitude, and "
+            "--pregestation-temp-oscillation-period."
+        ),
+    )
+    p.add_argument(
+        "--pregestation-temp-trend",
+        type=float,
+        default=1.5,
+        dest="pregestation_temp_trend",
+        help=(
+            "Maximum additional temperature multiplier added as the pregestation gate streak approaches "
+            "the maintain threshold.  At streak=0 the trend contribution is 0; at streak=maintain_rounds "
+            "it reaches this value.  E.g. 1.5 means the base displacement is doubled when the model is "
+            "close to passing the gate.  Defaults to 1.5."
+        ),
+    )
+    p.add_argument(
+        "--pregestation-temp-oscillation-amplitude",
+        type=float,
+        default=0.4,
+        dest="pregestation_temp_oscillation_amplitude",
+        help=(
+            "Amplitude of the sine-wave oscillation overlaid on the temperature trend.  Positive peaks "
+            "raise the effective displacement temperature (harder → more diagonal samples); negative peaks "
+            "lower it (easier → pure cardinal placements).  Defaults to 0.4."
+        ),
+    )
+    p.add_argument(
+        "--pregestation-temp-oscillation-period",
+        type=int,
+        default=4,
+        dest="pregestation_temp_oscillation_period",
+        help=(
+            "Number of pregestation data rebuilds per complete sine-wave cycle.  Lower values produce "
+            "faster easy/hard alternation; higher values create longer stable phases.  Defaults to 4."
+        ),
+    )
+    p.add_argument(
+        "--pregestation-sub-rounds",
+        type=int,
+        default=1,
+        dest="pregestation_sub_rounds",
+        help=(
+            "Number of sequential sub-rounds within Stage 0 pre-gestation. "
+            "The model must pass the gate 'maintain' consecutive times per sub-round and "
+            "climb through all sub-rounds before Stage 1 gestation begins. "
+            "Default 1 = single level, backward-compatible with prior behavior."
+        ),
+    )
+    p.add_argument(
         "--gate-gestation-loss-target",
         type=float,
         default=0.18,
@@ -9773,6 +10871,8 @@ def parse_args():
         semantic_vocab_pregestation_enabled=True,
         semantic_vocab_symbol_include_pictograms=True,
         semantic_vocab_reference_flashcards=False,
+        semantic_stage_cache_enabled=True,
+        semantic_stage_cache_rebuild=False,
         gd_vocab_library_enabled=True,
         gd_vocab_library_autoload=True,
         training_preview_enabled=True,
@@ -9845,6 +10945,7 @@ def main():
         wipe_info = _hard_wipe_pipeline_caches(
             output_dir=out_dir,
             berkeley_data_root=str(args.berkeley_data_root),
+            semantic_stage_cache_dir=str(args.semantic_stage_cache_dir),
         )
         _log(
             "[hard-wipe-caches] "
@@ -9866,6 +10967,7 @@ def main():
         reset_info = _soft_reset_label_caches(
             output_dir=out_dir,
             berkeley_data_root=str(args.berkeley_data_root),
+            semantic_stage_cache_dir=str(args.semantic_stage_cache_dir),
         )
         _log(
             "[soft-reset-labels] "
@@ -9883,8 +10985,39 @@ def main():
                 "fresh semantic cache namespace enabled for this run."
             )
     out_dir.mkdir(parents=True, exist_ok=True)
+    semantic_stage_cache_root = (
+        _resolve_semantic_stage_cache_root(
+            output_dir=out_dir,
+            cache_dir=str(args.semantic_stage_cache_dir),
+            cache_nonce=str(semantic_cache_nonce),
+        )
+        if bool(args.semantic_stage_cache_enabled)
+        else None
+    )
     _log(f"Output dir: {out_dir}")
     _log(f"Device: {device}")
+    _log(f"Aux compute device: {_resolve_aux_compute_device(primary_device=device)}")
+    if semantic_stage_cache_root is not None:
+        pregestation_stage_cache_cap_mb = _resolve_semantic_stage_cache_cap_mb(
+            global_cap_mb=int(args.semantic_stage_cache_max_mb),
+            specific_cap_mb=int(args.pregestation_stage_cache_max_mb),
+        )
+        gestation_stage_cache_cap_mb = _resolve_semantic_stage_cache_cap_mb(
+            global_cap_mb=int(args.semantic_stage_cache_max_mb),
+            specific_cap_mb=int(args.gestation_stage_cache_max_mb),
+        )
+        _log(
+            "Semantic stage cache: "
+            f"enabled=1 root={str(semantic_stage_cache_root)} "
+            f"max_rows={int(args.semantic_stage_cache_max_rows)} "
+            f"default_max_mb={int(args.semantic_stage_cache_max_mb)} "
+            f"pregestation_max_mb={int(pregestation_stage_cache_cap_mb)} "
+            f"gestation_max_mb={int(gestation_stage_cache_cap_mb)} "
+            f"overflow={str(args.semantic_stage_cache_overflow_strategy)} "
+            f"rebuild={1 if bool(args.semantic_stage_cache_rebuild) else 0}"
+        )
+    else:
+        _log("Semantic stage cache: enabled=0")
     _log(
         "Perf: "
         f"amp={amp_enabled}({args.amp_dtype}), channels_last={bool(args.channels_last)}, "
@@ -9892,7 +11025,8 @@ def main():
         f"wave_stream_cache={bool(args.cache_wave_streams_on_device)}, "
         f"stage_module_offload={bool(stage_module_offload_runtime)}, "
         f"offload_empty_cache={bool(args.stage_module_offload_empty_cache)}, "
-        f"tf32={bool(args.allow_tf32)}, cudnn_benchmark={bool(args.cudnn_benchmark)}"
+        f"tf32={bool(args.allow_tf32)}, cudnn_benchmark={bool(args.cudnn_benchmark)}, "
+        f"loader_workers={int(args.berkeley_refresh_workers)}, loader_prefetch={int(args.loader_prefetch_factor)}"
     )
     _log(
         "Feature metric: "
@@ -10865,6 +11999,30 @@ def main():
             enabled=bool(args.compile_models),
             mode=str(args.compile_mode),
         )
+        gate_device = _resolve_aux_compute_device(primary_device=device)
+        if gate_device.type != "cuda":
+            gate_device = torch.device(str(device))
+        gate_classifier: Optional[nn.Module] = None
+        gate_classifier_sync_count = 0
+
+        def _prepare_gate_classifier(reason: str) -> Tuple[nn.Module, torch.device]:
+            nonlocal gate_classifier, gate_classifier_sync_count
+            gate_classifier, sync_info = _sync_gate_classifier_replica(
+                source_classifier=classifier,
+                gate_classifier=gate_classifier,
+                gate_device=gate_device,
+                channels_last=bool(args.channels_last),
+            )
+            gate_classifier_sync_count += 1
+            if bool(sync_info.get("created", False)) or int(gate_classifier_sync_count) <= 1 or int(gate_classifier_sync_count) % 25 == 0:
+                _log(
+                    "[gate-device] "
+                    f"reason={str(reason)} device={str(sync_info.get('device', gate_device))} "
+                    f"source_device={str(sync_info.get('source_device', device))} "
+                    f"created={1 if bool(sync_info.get('created', False)) else 0} "
+                    f"sync_count={int(gate_classifier_sync_count)}"
+                )
+            return gate_classifier, torch.device(str(gate_device))
 
         refresh_loader = None
         refresh_cache = None
@@ -10913,7 +12071,16 @@ def main():
                 f"reason={str(reason)} "
                 "source=disk_dataset_rows "
                 f"search_every={args.berkeley_refresh_every}, round_every={args.berkeley_refresh_round_every}, "
-                f"epochs={args.berkeley_refresh_epochs}, train={refresh_count}, full_non_validation_deck=1"
+                f"epochs={args.berkeley_refresh_epochs}, train={refresh_count}, full_non_validation_deck=1, "
+                f"row_build_threads={int(rows_info.get('row_build_threads', 0))}, "
+                f"row_build_sec={float(rows_info.get('row_build_seconds', 0.0)):.2f}, "
+                f"row_catalog_cache_hit={1 if bool(rows_info.get('inprocess_cache_hit', False)) else 0}, "
+                f"mask_cache_hits={int(rows_info.get('mask_cache_hits', 0))}, "
+                f"mask_cache_writes={int(rows_info.get('mask_cache_writes', 0))}, "
+                f"mask_cache_failures={int(rows_info.get('mask_cache_failures', 0))}, "
+                f"mask_cache_sec={float(rows_info.get('mask_cache_seconds', 0.0)):.2f}, "
+                f"mask_cache_threads={int(rows_info.get('mask_cache_threads', 0))}, "
+                f"loader_prefetch_mode={str(getattr(refresh_loader, 'prefetch_mode', 'process_or_direct'))}"
             )
             refresh_cache = None
             refresh_cache_samples = 0
@@ -10931,7 +12098,11 @@ def main():
                         "Berkeley refresh cache ready: "
                         f"samples={refresh_cache_samples}, "
                         f"batches={refresh_cache.get('num_batches', 0)}, "
-                        f"device={refresh_cache.get('device', 'cpu')}"
+                        f"device={refresh_cache.get('device', 'cpu')}, "
+                        f"requested_device={refresh_cache.get('requested_device', 'cpu')}, "
+                        f"est_mb={float(refresh_cache.get('estimated_bytes', 0)) / (1024.0 * 1024.0):.1f}, "
+                        f"staging_only={1 if bool(refresh_cache.get('staging_only', False)) else 0}, "
+                        f"cross_device_staging={1 if bool(refresh_cache.get('cross_device_staging', False)) else 0}"
                     )
             if int(args.berkeley_refresh_batch_size) <= 0:
                 if isinstance(refresh_cache, dict):
@@ -11141,6 +12312,9 @@ def main():
                             target_label_knockout_max_drop_frac=float(args.target_label_knockout_max_drop_frac),
                             target_label_knockout_seed=int(args.seed) + 61001 + int(i),
                             step_preview_callback=None,
+                            grad_clip=float(args.classifier_grad_clip),
+                            semantic_cosine_weight=float(args.classifier_semantic_cosine_weight),
+                            semantic_soft_target_max=float(args.classifier_semantic_soft_target_max),
                         )
                         refresh_rows.append({"stage": "config_search", "trial": int(i), **ref})
                         berkeley_refresh_samples_seen += int(max(0, int(ref.get("samples", 0))))
@@ -11240,6 +12414,8 @@ def main():
 
         gate_config = {
             "pregestation_loss_target": max(0.0, float(args.gate_pregestation_loss_target)),
+            "pregestation_maintain_rounds": max(1, int(args.gate_pregestation_maintain_rounds)),
+            "pregestation_sub_rounds": max(1, int(args.pregestation_sub_rounds)),
             "gestation_loss_target": max(0.0, float(args.gate_gestation_loss_target)),
             "gestation_maintain_rounds": max(1, int(args.gate_gestation_maintain_rounds)),
             "berkeley_min_score": float(args.gate_berkeley_min_score),
@@ -11361,10 +12537,53 @@ def main():
                 and bool(args.latent_berkeley_imprint_mix_targets)
             )
             or (orchestration_mode in ("staged_cgr", "staged_cgrw"))
-            or bool(total_gate_runtime_enabled)
-            or bool(gestation_gate_runtime_enabled)
         )
-        if need_payload_bank:
+
+        payload_size = int(shared_embed_image_size)
+
+        def _ensure_payload_validation_gate_dataset_ready(reason: str):
+            nonlocal payload_gate_val_dataset, payload_gate_val_labels_base, payload_gate_val_terms_base, payload_gate_val_info
+            if payload_gate_val_dataset is not None and int(len(payload_gate_val_terms_base)) > 0:
+                return
+            payload_size = int(shared_embed_image_size)
+            payload_gate_val_dataset, payload_gate_val_labels_base, payload_gate_val_terms_base, payload_gate_val_info = _build_payload_validation_gate_dataset(
+                data_root=args.berkeley_data_root,
+                image_size=int(payload_size),
+                seed=int(gate_split_seed),
+                external_val_fraction=float(gate_external_val_fraction),
+                source_root=str(args.berkeley_payload_source_root),
+                return_mask_stack=bool(semantic_single_label_mask_mode),
+            )
+            _log(
+                "[gate-val-deck] "
+                f"reason={str(reason)} "
+                f"source={str(payload_gate_val_info.get('data_source', 'disk_dataset_rows'))} "
+                f"available={int(payload_gate_val_info.get('available_rows', 0))} "
+                f"selected={int(payload_gate_val_info.get('selected_rows', 0))} "
+                f"berkeley_val={int(payload_gate_val_info.get('selected_berkeley_val', 0))} "
+                f"berkeley_train={int(payload_gate_val_info.get('selected_berkeley_train', 0))} "
+                f"refresh_nonval_total={int(payload_gate_val_info.get('refresh_rows_total', 0))} "
+                f"refresh_berkeley_train={int(payload_gate_val_info.get('refresh_rows_berkeley_train', 0))} "
+                f"refresh_berkeley_val={int(payload_gate_val_info.get('refresh_rows_berkeley_val', 0))} "
+                f"label_dim={int(payload_gate_val_info.get('label_dim', 0))} "
+                f"external_frac={float(payload_gate_val_info.get('external_val_fraction', 0.0)):.2f} "
+                f"row_build_threads={int(payload_gate_val_info.get('row_build_threads', 0))} "
+                f"row_build_sec={float(payload_gate_val_info.get('row_build_seconds', 0.0)):.2f} "
+                f"row_catalog_cache_hit={1 if bool(payload_gate_val_info.get('inprocess_cache_hit', False)) else 0} "
+                f"mask_cache_hits={int(payload_gate_val_info.get('mask_cache_hits', 0))} "
+                f"mask_cache_writes={int(payload_gate_val_info.get('mask_cache_writes', 0))} "
+                f"mask_cache_sec={float(payload_gate_val_info.get('mask_cache_seconds', 0.0)):.2f}"
+            )
+
+        def _ensure_payload_bank_base_ready(reason: str) -> bool:
+            nonlocal payload_images, payload_conditions, payload_masks, payload_bank_info
+            nonlocal payload_images_base, payload_masks_base
+            nonlocal payload_conditions_supervised_base, payload_condition_terms_supervised_base
+            nonlocal payload_conditioning_info
+            if not bool(need_payload_bank):
+                return False
+            if int(len(payload_images_base)) > 0 and int(len(payload_conditions_supervised_base)) > 0:
+                return True
             payload_size = int(shared_embed_image_size)
             payload_max_samples = int(args.berkeley_payload_max_samples)
             if payload_max_samples <= 0:
@@ -11380,40 +12599,28 @@ def main():
             )
             _log(
                 "Latent Berkeley payload bank: "
+                f"reason={str(reason)} "
                 f"available={payload_bank_info.get('available', 0)} "
                 f"used={payload_bank_info.get('used', 0)} "
                 f"train={payload_bank_info.get('used_train', 0)}/{payload_bank_info.get('available_train', 0)} "
                 f"val={payload_bank_info.get('used_val', 0)}/{payload_bank_info.get('available_val', 0)} "
                 f"ext={payload_bank_info.get('used_external', 0)}/{payload_bank_info.get('available_external', 0)} "
-                f"cap={int(payload_max_samples)} image_size={payload_size}"
+                f"cap={int(payload_max_samples)} image_size={payload_size} "
+                f"row_build_threads={int(payload_bank_info.get('row_build_threads', 0))} "
+                f"row_build_sec={float(payload_bank_info.get('row_build_seconds', 0.0)):.2f} "
+                f"row_catalog_cache_hit={1 if bool(payload_bank_info.get('inprocess_cache_hit', False)) else 0} "
+                f"mask_cache_hits={int(payload_bank_info.get('mask_cache_hits', 0))} "
+                f"mask_cache_writes={int(payload_bank_info.get('mask_cache_writes', 0))} "
+                f"mask_cache_sec={float(payload_bank_info.get('mask_cache_seconds', 0.0)):.2f}"
             )
             _log(
                 "[berkeley-payload-source] "
+                f"reason={str(reason)} "
                 f"cache_hit={1 if bool(payload_bank_info.get('cache_hit', False)) else 0} "
                 f"manifest={payload_bank_info.get('cache_manifest', '')} "
                 f"sources={payload_bank_info.get('source_catalog', '')}"
             )
-            payload_gate_val_dataset, payload_gate_val_labels_base, payload_gate_val_terms_base, payload_gate_val_info = _build_payload_validation_gate_dataset(
-                data_root=args.berkeley_data_root,
-                image_size=int(payload_size),
-                seed=int(gate_split_seed),
-                external_val_fraction=float(gate_external_val_fraction),
-                source_root=str(args.berkeley_payload_source_root),
-                return_mask_stack=bool(semantic_single_label_mask_mode),
-            )
-            _log(
-                "[gate-val-deck] "
-                f"source={str(payload_gate_val_info.get('data_source', 'disk_dataset_rows'))} "
-                f"available={int(payload_gate_val_info.get('available_rows', 0))} "
-                f"selected={int(payload_gate_val_info.get('selected_rows', 0))} "
-                f"berkeley_val={int(payload_gate_val_info.get('selected_berkeley_val', 0))} "
-                f"berkeley_train={int(payload_gate_val_info.get('selected_berkeley_train', 0))} "
-                f"refresh_nonval_total={int(payload_gate_val_info.get('refresh_rows_total', 0))} "
-                f"refresh_berkeley_train={int(payload_gate_val_info.get('refresh_rows_berkeley_train', 0))} "
-                f"label_dim={int(payload_gate_val_info.get('label_dim', 0))} "
-                f"external_frac={float(payload_gate_val_info.get('external_val_fraction', 0.0)):.2f}"
-            )
-            if need_payload_bank and len(payload_images) <= 0:
+            if len(payload_images) <= 0:
                 raise RuntimeError(
                     "Payload bank is required but no Berkeley payload images were prepared. "
                     "Check --berkeley-data-root and dataset availability."
@@ -11506,6 +12713,25 @@ def main():
                     f"{int(np.max(payload_supervised_pos_berkeley)) if int(len(payload_supervised_pos_berkeley)) > 0 else 0} "
                     f"top={top_label_txt}"
                 )
+            payload_conditioning_info = {"expanded": False, "reason": f"{str(reason)}:base_ready"}
+            return True
+
+        startup_payload_bank_allowed = bool(float(args.gate_pregestation_loss_target) <= 0.0)
+        if bool(need_payload_bank) and bool(startup_payload_bank_allowed):
+            _ensure_payload_bank_base_ready(reason="startup")
+        elif bool(need_payload_bank):
+            payload_bank_info = {
+                "available": 0,
+                "used": 0,
+                "reason": "deferred_until_pregestation_gate",
+            }
+            payload_conditioning_info = {"expanded": False, "reason": "deferred_until_pregestation_gate"}
+            _log(
+                "[berkeley-payload-bank] "
+                "reason=startup mode=deferred_until_pregestation_gate"
+            )
+
+        if bool(need_payload_bank):
             payload_conditions = []
             if int(semantic_extra_count) > 0 and bool(args.semantic_vocab_auto_symbol_pool):
                 symbol_samples_per_term_eff = max(4, int(args.semantic_vocab_symbol_samples_per_term))
@@ -11624,10 +12850,11 @@ def main():
                     f"reason={str(symbol_pool_info.get('reason', ''))} "
                     f"bootstrap_dir={str(symbol_pool_info.get('bootstrap_root_dir', ''))}"
                 )
-            if need_payload_bank and len(payload_conditions) <= 0:
+            payload_bank_base_ready = bool(int(len(payload_images_base)) > 0 and int(len(payload_conditions_supervised_base)) > 0)
+            if bool(payload_bank_base_ready) and len(payload_conditions) <= 0:
                 if len(payload_conditions_supervised_base) <= 0:
                     raise RuntimeError("Semantic payload condition bank is empty.")
-            if bool(need_payload_bank):
+            if bool(payload_bank_base_ready):
                 payload_conditions, payload_conditioning_info = _expand_payload_conditions_with_semantic_bank(
                     payload_conditions=payload_conditions_supervised_base,
                     condition_num_classes=int(condition_num_classes),
@@ -11672,7 +12899,10 @@ def main():
                     f"condition_dim={int(condition_num_classes)} "
                     f"reason={str(payload_conditioning_info.get('reason', 'unknown'))}"
                 )
-            if len(payload_conditions) != len(payload_images):
+            elif bool(need_payload_bank):
+                payload_conditions = []
+                payload_conditioning_info = {"expanded": False, "reason": "deferred_until_pregestation_gate"}
+            if bool(payload_bank_base_ready) and len(payload_conditions) != len(payload_images):
                 raise RuntimeError(
                     "Payload image/condition bank mismatch: "
                     f"images={len(payload_images)} conditions={len(payload_conditions)}"
@@ -11816,32 +13046,15 @@ def main():
                 else int(args.transformer_batch_size)
             ),
         )
+        baseline = {
+            "deferred": True,
+            "reason": "startup_deferred",
+            "eval_batch": int(baseline_eval_batch),
+        }
 
-        baseline = evaluate_feature_score_before_after(
-            transformer=transformer,
-            classifier=classifier,
-            streams=val_streams,
-            cfg=best_cfg,
-            sample_bits=sample_bits,
-            image_hw=image_hw,
-            chunk_samples=chunk_samples,
-            device=device,
-            max_batches=16,
-            batch_size=int(baseline_eval_batch),
-            score_topk=args.score_topk,
-            score_threshold=args.score_threshold,
-            score_w_topk=args.score_w_topk,
-            score_w_cov=args.score_w_cov,
-            score_w_mean=args.score_w_mean,
-            amp=amp_enabled,
-            amp_dtype=args.amp_dtype,
-            channels_last=bool(args.channels_last),
-            pin_memory=bool(args.pin_memory_wave_batches),
-            stream_cache_on_device=bool(args.cache_wave_streams_on_device),
-        )
         _log(
-            f"Transformer baseline: before={baseline['score_before']:.4f} "
-            f"after={baseline['score_after']:.4f} gain={baseline['score_gain']:.4f}"
+            "Transformer baseline: deferred until downstream training requests it; "
+            f"eval_batch={int(baseline_eval_batch)}"
         )
 
         mode = str(args.orchestration_mode).strip().lower()
@@ -12404,6 +13617,12 @@ def main():
             nonlocal regurgitated_condition_target_default
             nonlocal regurgitated_churn_last_info
             nonlocal deferred_churn_terms_pending
+            pregestation_payload_ready = bool(
+                (float(gate_config.get("pregestation_loss_target", 0.0)) <= 0.0)
+                or (pregestation_sub_round >= int(gate_config.get("pregestation_sub_rounds", 1)))
+            )
+            if bool(need_payload_bank) and int(len(payload_images_base)) <= 0 and bool(pregestation_payload_ready):
+                _ensure_payload_bank_base_ready(reason=f"{str(reason)}:cycle={int(cycle_id)}")
             active_extra_terms = _normalize_active_extra_terms_with_core(
                 active_terms=active_extra_terms,
                 core_terms=semantic_core_terms,
@@ -12740,6 +13959,13 @@ def main():
             if bool(autoload_gd):
                 _maybe_restore_gd_vocab_snapshot(reason=f"{reason}:cycle={int(cycle_id)}")
 
+        # These cell variables must be initialized before any nested function reads them.
+        pregestation_gate_streak = 0
+        pregestation_sub_round = 0         # which sub-round level (0 = not yet passed first sub-round)
+        pregestation_rebuild_count = 0     # incremented each time pregestation data is (re)built
+        gestation_gate_streak = 0
+        berkeley_gate_streak = 0
+
         _activate_semantic_vocab(
             cycle_id=0,
             cycle_local=0,
@@ -12872,14 +14098,30 @@ def main():
                 for slot_idx, slot in enumerate(slot_defs, start=1):
                     ensure_tiny_classifier_lora_slot(classifier, slot["slot_name"])
                     set_tiny_classifier_lora_state(classifier, slot_name=slot["slot_name"], lora_only=True)
+                    slot_loader_num_workers = _effective_dataloader_num_workers(
+                        num_workers=max(0, int(args.berkeley_refresh_workers)),
+                        device=device,
+                    )
                     slot_loader = DataLoader(
                         torch.utils.data.Subset(base_dataset, [int(i) for i in slot["row_indices"]]),
                         batch_size=max(1, int(getattr(refresh_loader, "batch_size", 1) or 1)),
                         shuffle=False,
-                        num_workers=0,
+                        num_workers=int(slot_loader_num_workers),
                         pin_memory=bool(getattr(refresh_loader, "pin_memory", False)),
                         drop_last=False,
                         collate_fn=getattr(refresh_loader, "collate_fn", None),
+                        **_dataloader_perf_kwargs(
+                            num_workers=int(slot_loader_num_workers),
+                            persistent_workers=bool(args.loader_persistent_workers),
+                            prefetch_factor=int(args.loader_prefetch_factor),
+                        ),
+                    )
+                    slot_loader = maybe_wrap_loader_with_threaded_prefetch(
+                        loader=slot_loader,
+                        requested_workers=max(0, int(args.berkeley_refresh_workers)),
+                        effective_workers=int(slot_loader_num_workers),
+                        device_type=str(device.type),
+                        prefetch_factor=int(args.loader_prefetch_factor),
                     )
                     slot_steps = int(args.berkeley_refresh_max_steps)
                     if int(slot_steps) <= 0:
@@ -12919,6 +14161,9 @@ def main():
                         target_label_knockout_seed=int(args.seed) + (int(cycle_id) * 10007) + (int(round_id) * 97) + 500 + int(slot_idx),
                         step_preview_callback=_make_c_step_callback(cycle_id=int(cycle_id), round_id=int(round_id)),
                         stop_requested=_poll_gui_stop,
+                        grad_clip=float(args.classifier_grad_clip),
+                        semantic_cosine_weight=float(args.classifier_semantic_cosine_weight),
+                        semantic_soft_target_max=float(args.classifier_semantic_soft_target_max),
                     )
                     refresh_rows.append(
                         {
@@ -12973,7 +14218,13 @@ def main():
         total_gate_preview_images: List[np.ndarray] = []
         total_gate_preview_targets: List[np.ndarray] = []
 
-        def _rebuild_semantic_gate_loaders(reason: str, cycle_seed: int, include_payload_val: bool = True):
+        def _rebuild_semantic_gate_loaders(
+            reason: str,
+            cycle_seed: int,
+            include_payload_val: bool = True,
+            include_gestation_stage: bool = True,
+            gate_device: Optional[torch.device] = None,
+        ):
             nonlocal pregestation_stage_loader, pregestation_stage_loader_count, pregestation_stage_info
             nonlocal gestation_stage_loader, gestation_stage_loader_count, gestation_stage_info
             nonlocal gestation_gate_loader, gestation_gate_loader_count, gestation_gate_info
@@ -12983,6 +14234,16 @@ def main():
             nonlocal gestation_gate_eval_indices
             nonlocal gestation_gate_preview_images, gestation_gate_preview_targets
             nonlocal total_gate_preview_images, total_gate_preview_targets
+            nonlocal pregestation_rebuild_count
+            gate_loader_device = gate_device if gate_device is not None else torch.device("cpu")
+            pregestation_stage_cache_cap_mb = _resolve_semantic_stage_cache_cap_mb(
+                global_cap_mb=int(args.semantic_stage_cache_max_mb),
+                specific_cap_mb=int(args.pregestation_stage_cache_max_mb),
+            )
+            gestation_stage_cache_cap_mb = _resolve_semantic_stage_cache_cap_mb(
+                global_cap_mb=int(args.semantic_stage_cache_max_mb),
+                specific_cap_mb=int(args.gestation_stage_cache_max_mb),
+            )
             if int(condition_num_classes) <= 0:
                 pregestation_stage_loader = None
                 pregestation_stage_loader_count = 0
@@ -13016,8 +14277,15 @@ def main():
                 gestation_batch = int(gate_loader_batch)
             gestation_batch = max(1, int(gestation_batch))
 
+            pregestation_batch = int(args.pregestation_stage_batch_size)
+            if pregestation_batch <= 0:
+                pregestation_batch = int(gestation_batch)
+            pregestation_batch = max(1, int(pregestation_batch))
+
             origin_label = re.sub(r"\s+", " ", str(args.semantic_vocab_bootstrap_origin_label)).strip() or "internal bootstrap root vocab"
             pregestation_images: List[np.ndarray] = []
+            pregestation_masks: List[np.ndarray] = []
+            pregestation_mask_stacks: List[np.ndarray] = []
             pregestation_targets: List[np.ndarray] = []
             pregestation_terms_rows: List[List[str]] = []
             gestation_images: List[np.ndarray] = []
@@ -13028,40 +14296,228 @@ def main():
             gestation_fallback_rebuild = False
 
             if bool(args.semantic_vocab_pregestation_enabled):
-                pre_rows, pre_term_rows, pre_info = _build_pregestation_logic_rows(
+                pregestation_rebuild_count += 1
+                # ── Undulating temperature schedule ────────────────────────────────────
+                # Temperature starts at the configured base, then oscillates up/down
+                # with a sine wave while trending toward a harder maximum as the gate
+                # streak approaches the maintain threshold.  This cycles the curriculum
+                # through easy (small d_temp → clear cardinal directions) and hard
+                # (large d_temp → diagonal ambiguity) phases, converging on all-hard
+                # once the model is near passing.
+                _streak_frac = min(
+                    1.0,
+                    float(pregestation_gate_streak) / float(max(1, int(gate_config.get("pregestation_maintain_rounds", 2)))),
+                )
+                _rebuild_phase = float(pregestation_rebuild_count - 1) / float(
+                    max(1, int(getattr(args, "pregestation_temp_oscillation_period", 4)))
+                )
+                _osc_amplitude = float(getattr(args, "pregestation_temp_oscillation_amplitude", 0.4))
+                _trend_amount = float(getattr(args, "pregestation_temp_trend", 1.5))
+                _osc = float(np.sin(2.0 * np.pi * _rebuild_phase))
+                _effective_d_temp = float(args.pregestation_circle_displacement_temperature) * max(
+                    0.1,
+                    1.0 + _trend_amount * _streak_frac + _osc_amplitude * _osc,
+                )
+                _effective_d_temp = max(0.1, float(_effective_d_temp))
+                # Quantise to 0.25 steps so distinct temperature levels map to a
+                # bounded set of cache slots rather than one slot per float value.
+                _d_temp_bucket = int(round(_effective_d_temp * 4))
+                # Map current sub-round index to a named curriculum mode.
+                _preg_mode = _PREGESTATION_SUB_ROUND_MODE_SEQUENCE[
+                    min(int(pregestation_sub_round), len(_PREGESTATION_SUB_ROUND_MODE_SEQUENCE) - 1)
+                ]
+                # ─────────────────────────────────────────────────────────────────────
+                pregestation_seed = int(cycle_seed) + 121
+                pregestation_signature = _pregestation_base_cache_signature(
                     image_size=int(shared_embed_image_size),
-                    seed=int(cycle_seed) + 121,
+                    seed=int(pregestation_seed),
                     samples_per_combo=int(args.semantic_vocab_pregestation_samples_per_combo),
                     active_terms_lc=list(semantic_term_to_idx.keys()),
+                    semantic_term_to_idx=semantic_term_to_idx,
+                    mode=_preg_mode,
+                    displacement_temperature_bucket=_d_temp_bucket,
                 )
-                for img_rgb, term_row in zip(pre_rows, pre_term_rows):
-                    semantic_terms = _semantic_terms_with_tonal_tags(
-                        terms=term_row,
-                        image=img_rgb,
+                cached_pregestation = _load_pregestation_base_cache(
+                    cache_root=semantic_stage_cache_root,
+                    signature=pregestation_signature,
+                )
+                pre_info: Dict[str, Any]
+                if cached_pregestation is not None:
+                    pregestation_images, pregestation_masks, pregestation_mask_stacks, pregestation_targets, pregestation_terms_rows, pre_info = cached_pregestation
+                else:
+                    pre_rows, pre_composites, pre_mask_stacks, pre_term_rows, pre_info = _build_pregestation_logic_rows(
                         image_size=int(shared_embed_image_size),
+                        seed=int(pregestation_seed),
+                        samples_per_combo=int(args.semantic_vocab_pregestation_samples_per_combo),
+                        active_terms_lc=list(semantic_term_to_idx.keys()),
+                        circle_radius_temperature=float(args.pregestation_circle_radius_temperature),
+                        circle_displacement_temperature=_effective_d_temp,
+                        mode=_preg_mode,
                     )
-                    semantic_terms = _normalize_vocab_terms(list(term_row) + list(semantic_terms))
-                    pregestation_images.append(np.asarray(img_rgb, dtype=np.float32))
-                    pregestation_terms_rows.append(list(semantic_terms))
-                    pregestation_targets.append(
-                        np.asarray(
-                            _semantic_condition_from_terms_runtime(
-                                terms=semantic_terms,
-                                origin_terms=["pre gestation formal logic", "color direction binding"],
-                            ),
-                            dtype=np.float32,
-                        ).reshape(-1)
+                    for img_rgb, composite_mask, mask_stack, term_row in zip(pre_rows, pre_composites, pre_mask_stacks, pre_term_rows):
+                        # Post-hoc color observation: for each color term in this row,
+                        # extract a pixel-derived color score mask from the actual rendered
+                        # image and append it to the geometric mask stack.  The composite
+                        # normalization is then recomputed from the full extended stack
+                        # (geometric + observed).  Because we always keep raw per-element
+                        # masks we never need to invert the composite — we just extend the
+                        # raw stack and let _composite_mask_stack renormalize everything.
+                        mask_stack, composite_mask = _enrich_pregestation_stack_with_observed_color_masks(
+                            image_chw01=img_rgb,
+                            elem_stack=mask_stack,
+                            term_row=term_row,
+                        )
+                        # Pregestation rows carry builder-generated ground-truth labels.
+                        # composite_mask is the pre-computed normalization of all per-element
+                        # masks — this is the single mask passed to the dataloader.
+                        # mask_stack holds all individual element masks [k, H, W] for storage.
+                        semantic_terms = _normalize_vocab_terms(list(term_row))
+                        pregestation_images.append(np.asarray(img_rgb, dtype=np.float32))
+                        pregestation_masks.append(np.asarray(composite_mask, dtype=np.float32))
+                        pregestation_mask_stacks.append(np.asarray(mask_stack, dtype=np.float32))
+                        pregestation_terms_rows.append(list(semantic_terms))
+                        pregestation_targets.append(
+                            np.asarray(
+                                _semantic_condition_from_terms_runtime(
+                                    terms=semantic_terms,
+                                    origin_terms=["pre gestation formal logic", "color direction binding"],
+                                ),
+                                dtype=np.float32,
+                            ).reshape(-1)
+                        )
+                    cache_dir = _write_pregestation_base_cache(
+                        cache_root=semantic_stage_cache_root,
+                        signature=pregestation_signature,
+                        images=pregestation_images,
+                        masks=pregestation_masks,
+                        mask_stacks=pregestation_mask_stacks,
+                        targets=pregestation_targets,
+                        term_rows=pregestation_terms_rows,
+                        info=dict(pre_info),
+                        max_bytes=max(0, int(pregestation_stage_cache_cap_mb)) * 1024 * 1024,
                     )
+                    if cache_dir is not None:
+                        pre_info = dict(pre_info)
+                        pre_info["cache_hit"] = False
+                        pre_info["cache_dir"] = str(cache_dir)
+                pre_stats = _semantic_active_target_stats(pregestation_targets, threshold=0.5)
+                _log(
+                    "[pregestation-target-stats] "
+                    f"mode={str(_preg_mode)} "
+                    f"rebuild={int(pregestation_rebuild_count)} "
+                    f"d_temp={float(_effective_d_temp):.3f} "
+                    f"diag_frac={float(pre_info.get('diagonal_fraction', 0.0)):.2f} "
+                    f"rows={int(pre_stats.get('rows', 0))} "
+                    f"min/mean/max={int(pre_stats.get('min', 0))}/"
+                    f"{float(pre_stats.get('mean', 0.0)):.2f}/"
+                    f"{int(pre_stats.get('max', 0))} "
+                    f"cache_hit={1 if bool(pre_info.get('cache_hit', False)) else 0}"
+                )
                 pregestation_stage_info = {
                     "rows": int(len(pregestation_images)),
                     "selected_rows": 0,
-                    "batch_size": int(gestation_batch),
+                    "batch_size": int(pregestation_batch),
                     "target_dim": int(max(1, int(condition_num_classes))),
                     "returns_masks": True,
                     **({str(k): v for k, v in pre_info.items()} if isinstance(pre_info, dict) else {}),
                 }
             else:
                 pregestation_stage_info = {"rows": 0, "selected_rows": 0, "reason": "disabled"}
+
+            if not bool(include_gestation_stage):
+                gestation_stage_loader = None
+                gestation_stage_loader_count = 0
+                gestation_gate_loader = None
+                gestation_gate_loader_count = 0
+                berkeley_gate_loader = None
+                berkeley_gate_loader_count = 0
+                gestation_stage_info = {
+                    "rows": 0,
+                    "selected_rows": 0,
+                    "reason": f"{str(reason)}:deferred_until_pregestation_gate",
+                }
+                gestation_gate_info = {
+                    "rows": 0,
+                    "selected_rows": 0,
+                    "reason": f"{str(reason)}:deferred_until_pregestation_gate",
+                }
+                berkeley_gate_schedule_info = {
+                    "rows": 0,
+                    "selected_rows": 0,
+                    "reason": f"{str(reason)}:deferred_until_pregestation_gate",
+                }
+                gestation_gate_samples_seen = 0
+                gestation_gate_samples_required = 0
+                total_gate_samples_seen = 0
+                total_gate_samples_required = 0
+                gestation_gate_eval_indices = None
+                gestation_gate_preview_images = []
+                gestation_gate_preview_targets = []
+                total_gate_preview_images = []
+                total_gate_preview_targets = []
+                # Build the pregestation loader even when gestation is deferred.
+                # Stage 0 must train to open Gate 0, but the loader is only built
+                # later in the full path — which is never reached on early return.
+                if int(len(pregestation_images)) > 0:
+                    _pregest_dataset = BootstrapDynamicDataset(
+                        images=pregestation_images,
+                        targets=pregestation_targets,
+                        total_rows=int(len(pregestation_images)),
+                        seed=int(args.seed) + 1203 + int(cycle_seed),
+                        augment=False,
+                        expected_target_dim=max(1, int(condition_num_classes)),
+                        semantic_term_to_idx=semantic_term_to_idx,
+                        augment_apply_terms=False,
+                        return_masks=True,
+                        return_mask_stack=bool(semantic_single_label_mask_mode),
+                        dataset_name="pregestation_stage_train",
+                        persistent_cache_dir=_semantic_stage_cache_dir(semantic_stage_cache_root, "pregestation_stage_train"),
+                        persistent_cache_max_rows=int(args.semantic_stage_cache_max_rows),
+                        persistent_cache_rebuild=bool(args.semantic_stage_cache_rebuild),
+                        persistent_cache_max_bytes=max(0, int(pregestation_stage_cache_cap_mb)) * 1024 * 1024,
+                        persistent_cache_overflow_strategy=str(args.semantic_stage_cache_overflow_strategy),
+                        persistent_cache_slot_lifespan=max(0, int(args.semantic_stage_cache_slot_lifespan)),
+                        base_masks=(pregestation_masks if len(pregestation_masks) == len(pregestation_images) else None),
+                    )
+                    # Store builder ground-truth per-element mask stacks so
+                    # return_mask_stack mode uses exact spatial extents rather
+                    # than pixel-inferred approximations.
+                    if int(len(pregestation_mask_stacks)) == int(len(pregestation_images)):
+                        for _bms_i, _bms in enumerate(pregestation_mask_stacks):
+                            _pregest_dataset.base_mask_stacks[_bms_i] = np.asarray(_bms, dtype=np.float32)
+                    _log_bootstrap_dataset_cache("pregestation_stage_train", _pregest_dataset)
+                    _pregest_manifest = StageDatasetManifest(
+                        name="pregestation_stage_train",
+                        dataset=_pregest_dataset,
+                        batch_size=int(pregestation_batch),
+                        seed=int(args.seed) + 1203,
+                        num_workers=max(0, int(args.berkeley_refresh_workers)),
+                        device_type=str(device.type),
+                        max_samples=0,
+                        ordered_indices=None,
+                        persistent_workers=bool(args.loader_persistent_workers),
+                        prefetch_factor=int(args.loader_prefetch_factor),
+                    )
+                    pregestation_stage_loader, pregestation_stage_loader_count = build_loader_from_manifest(_pregest_manifest)
+                    if pregestation_stage_loader is None or int(pregestation_stage_loader_count) <= 0:
+                        raise RuntimeError("Pre-gestation loader is empty; cannot run formal logic warmup.")
+                    pregestation_stage_info.update(
+                        {
+                            "selected_rows": int(pregestation_stage_loader_count),
+                            "manifest_name": str(_pregest_manifest.name),
+                        }
+                    )
+                _log(
+                    "[semantic-gate-loader] "
+                    f"reason={str(reason)} "
+                    f"pre_gestation={int(pregestation_stage_loader_count)}/{int(len(pregestation_images))} "
+                    "stage1_gestation_train=0/0 "
+                    "gestation=0/0 "
+                    "stage2_val=0/0 "
+                    "excluded_stage2_symbols=0 active_terms=0 bucketed=0 "
+                    "mode=deferred_until_pregestation_gate"
+                )
+                return
 
             required_gestation_terms = sorted([str(x) for x in gestation_symbol_terms], key=lambda s: s.lower())
             if len(required_gestation_terms) <= 0:
@@ -13269,7 +14725,14 @@ def main():
                 return_masks=True,
                 return_mask_stack=bool(semantic_single_label_mask_mode),
                 dataset_name="gestation_stage_train",
+                persistent_cache_dir=_semantic_stage_cache_dir(semantic_stage_cache_root, "gestation_stage_train"),
+                persistent_cache_max_rows=int(args.semantic_stage_cache_max_rows),
+                persistent_cache_rebuild=bool(args.semantic_stage_cache_rebuild),
+                persistent_cache_max_bytes=max(0, int(gestation_stage_cache_cap_mb)) * 1024 * 1024,
+                persistent_cache_overflow_strategy=str(args.semantic_stage_cache_overflow_strategy),
+                persistent_cache_slot_lifespan=max(0, int(args.semantic_stage_cache_slot_lifespan)),
             )
+            _log_bootstrap_dataset_cache("gestation_stage_train", gestation_stage_dataset)
             gestation_gate_dataset = BootstrapDynamicDataset(
                 images=gestation_eval_images,
                 targets=gestation_eval_targets,
@@ -13282,7 +14745,14 @@ def main():
                 return_masks=True,
                 return_mask_stack=bool(semantic_single_label_mask_mode),
                 dataset_name="gestation_gate_val",
+                persistent_cache_dir=_semantic_stage_cache_dir(semantic_stage_cache_root, "gestation_gate_val"),
+                persistent_cache_max_rows=int(args.semantic_stage_cache_max_rows),
+                persistent_cache_rebuild=bool(args.semantic_stage_cache_rebuild),
+                persistent_cache_max_bytes=max(0, int(gestation_stage_cache_cap_mb)) * 1024 * 1024,
+                persistent_cache_overflow_strategy=str(args.semantic_stage_cache_overflow_strategy),
+                persistent_cache_slot_lifespan=max(0, int(args.semantic_stage_cache_slot_lifespan)),
             )
+            _log_bootstrap_dataset_cache("gestation_gate_val", gestation_gate_dataset)
             gestation_gate_preview_images = []
             gestation_gate_preview_targets = []
             gest_preview_cap = min(int(len(gestation_gate_dataset)), 64)
@@ -13321,11 +14791,23 @@ def main():
                     return_masks=True,
                     return_mask_stack=bool(semantic_single_label_mask_mode),
                     dataset_name="pregestation_stage_train",
+                    persistent_cache_dir=_semantic_stage_cache_dir(semantic_stage_cache_root, "pregestation_stage_train"),
+                    persistent_cache_max_rows=int(args.semantic_stage_cache_max_rows),
+                    persistent_cache_rebuild=bool(args.semantic_stage_cache_rebuild),
+                    persistent_cache_max_bytes=max(0, int(pregestation_stage_cache_cap_mb)) * 1024 * 1024,
+                    persistent_cache_overflow_strategy=str(args.semantic_stage_cache_overflow_strategy),
+                    persistent_cache_slot_lifespan=max(0, int(args.semantic_stage_cache_slot_lifespan)),
+                    base_masks=(pregestation_masks if int(len(pregestation_masks)) == int(len(pregestation_images)) else None),
                 )
+                # Store builder ground-truth per-element mask stacks.
+                if int(len(pregestation_mask_stacks)) == int(len(pregestation_images)):
+                    for _bms_i, _bms in enumerate(pregestation_mask_stacks):
+                        pregestation_dataset.base_mask_stacks[_bms_i] = np.asarray(_bms, dtype=np.float32)
+                _log_bootstrap_dataset_cache("pregestation_stage_train", pregestation_dataset)
                 pregestation_manifest = StageDatasetManifest(
                     name="pregestation_stage_train",
                     dataset=pregestation_dataset,
-                    batch_size=int(gestation_stage_batch),
+                    batch_size=int(pregestation_batch),
                     seed=int(args.seed) + 1203,
                     num_workers=max(0, int(args.berkeley_refresh_workers)),
                     device_type=str(device.type),
@@ -13396,7 +14878,7 @@ def main():
                 batch_size=int(gestation_batch),
                 seed=int(gestation_gate_eval_seed),
                 num_workers=max(0, int(args.berkeley_refresh_workers)),
-                device_type=str(device.type),
+                device_type=str(gate_loader_device.type),
                 max_samples=int(gestation_val_max_eff),
                 ordered_indices=gestation_gate_order,
                 persistent_workers=bool(args.loader_persistent_workers),
@@ -13440,6 +14922,8 @@ def main():
             )
 
             payload_enabled = bool(include_payload_val)
+            if bool(payload_enabled):
+                _ensure_payload_validation_gate_dataset_ready(reason=f"gate_payload:{str(reason)}")
             payload_semantic_cache_hit = False
             payload_semantic_cache_path = ""
             payload_targets_sched_np: Optional[np.ndarray] = None
@@ -13942,7 +15426,7 @@ def main():
                 dataset=total_dataset,
                 batch_size=int(gate_loader_batch),
                 num_workers=max(0, int(args.berkeley_refresh_workers)),
-                device=device,
+                device=gate_loader_device,
                 seed=int(args.seed) + 2017,
                 max_samples=0,
                 ordered_indices=total_order,
@@ -13968,6 +15452,8 @@ def main():
             reason="startup",
             cycle_seed=int(args.seed),
             include_payload_val=False,
+            include_gestation_stage=bool(float(args.gate_pregestation_loss_target) <= 0.0),
+            gate_device=torch.device("cpu"),
         )
 
         def _semantic_vocab_runtime_snapshot() -> Dict[str, Any]:
@@ -14053,6 +15539,8 @@ def main():
             nonlocal generator, discriminator, wave_classifier
             if (not bool(stage_module_offload_runtime)) or (device.type != "cuda"):
                 return
+            if bool(_single_task_mode_active()):
+                return
             moved: List[str] = []
             if generator is not None and _module_device_type(generator) == "cuda":
                 generator = generator.to(torch.device("cpu"))
@@ -14076,7 +15564,15 @@ def main():
             if not bool(args.stage_module_offload_empty_cache):
                 return
             gc.collect()
+            try:
+                torch.cuda.synchronize(device)
+            except Exception:
+                pass
             torch.cuda.empty_cache()
+            try:
+                torch.cuda.ipc_collect()
+            except Exception:
+                pass
 
         def _is_cuda_oom(exc: BaseException) -> bool:
             txt = str(exc).lower()
@@ -14227,6 +15723,7 @@ def main():
                         visualize_status=bool(args.transformer_visualize_status),
                         visualize_scale=max(1, int(args.transformer_viz_scale)),
                         seed=int(seed),
+                        grad_clip=float(args.transformer_grad_clip),
                     )
                     return transformer, stage_hist, int(train_batch)
                 except RuntimeError as e:
@@ -14442,6 +15939,7 @@ def main():
                     reason="resume_restore",
                     cycle_seed=int(args.seed) + (int(len(orchestration_rows)) * 13),
                     include_payload_val=False,
+                    include_gestation_stage=bool(float(args.gate_pregestation_loss_target) <= 0.0),
                 )
 
         if resume_enabled and resume_transformer_path.exists():
@@ -14562,6 +16060,7 @@ def main():
 
         gestation_gate_streak = 0
         pregestation_gate_streak = 0
+        pregestation_sub_round = 0
         berkeley_gate_streak = 0
         wave_gate_streak = 0
         generator_gate_streak = 0
@@ -14576,6 +16075,7 @@ def main():
             if isinstance(gs, dict):
                 gestation_gate_streak = int(gs.get("gestation_streak", gestation_gate_streak))
                 pregestation_gate_streak = int(gs.get("pregestation_streak", pregestation_gate_streak))
+                pregestation_sub_round = int(gs.get("pregestation_sub_round", pregestation_sub_round))
                 berkeley_gate_streak = int(gs.get("berkeley_streak", berkeley_gate_streak))
                 wave_gate_streak = int(gs.get("wave_streak", wave_gate_streak))
                 generator_gate_streak = int(gs.get("generator_streak", generator_gate_streak))
@@ -14585,6 +16085,7 @@ def main():
             if isinstance(gs, dict):
                 gestation_gate_streak = int(gs.get("gestation_streak", gestation_gate_streak))
                 pregestation_gate_streak = int(gs.get("pregestation_streak", pregestation_gate_streak))
+                pregestation_sub_round = int(gs.get("pregestation_sub_round", pregestation_sub_round))
                 berkeley_gate_streak = int(gs.get("berkeley_streak", berkeley_gate_streak))
                 wave_gate_streak = int(gs.get("wave_streak", wave_gate_streak))
                 generator_gate_streak = int(gs.get("generator_streak", generator_gate_streak))
@@ -14646,411 +16147,623 @@ def main():
             berkeley_gate_streak = 0
             berkeley_gate_loss_history.clear()
 
-        def _evaluate_two_stage_semantic_gates(round_index: int) -> Dict[str, Any]:
-            nonlocal pregestation_gate_streak, gestation_gate_streak, berkeley_gate_streak
-            nonlocal pregestation_gate_loss_history, gestation_gate_loss_history, berkeley_gate_loss_history
-            nonlocal berkeley_loss_target_unmet
-            nonlocal gestation_gate_samples_seen, gestation_gate_samples_required
-            nonlocal total_gate_samples_seen, total_gate_samples_required
-            nonlocal refresh_loader
+        current_pregestation_gate_eval: Optional[Dict[str, Any]] = None
+        current_gestation_gate_eval: Optional[Dict[str, Any]] = None
+        current_berkeley_gate_eval: Optional[Dict[str, Any]] = None
+        current_pregestation_gate_detail: Dict[str, Any] = {
+            "pass": False,
+            "mode": "pending_async",
+            "reason": "pending_async_gate_worker",
+            "loss_target": float(gate_config.get("pregestation_loss_target", 0.0)),
+            "loss": None,
+            "refresh_samples_seen": 0,
+            "refresh_samples_required": 0,
+        }
+        current_gestation_gate_detail: Dict[str, Any] = {
+            "pass": False,
+            "mode": "blocked_by_pregestation",
+            "reason": "pregestation_gate",
+            "loss_target": float(gate_config.get("gestation_loss_target", 0.0)),
+            "loss": None,
+            "refresh_samples_seen": int(gestation_gate_samples_seen),
+            "refresh_samples_required": int(gestation_gate_samples_required),
+        }
+        current_berkeley_gate_detail: Dict[str, Any] = {
+            "pass": False,
+            "mode": "blocked_by_gestation",
+            "reason": "gestation_gate",
+            "loss_target": float(gate_config.get("berkeley_loss_target", 0.0)),
+            "loss": None,
+            "refresh_samples_seen": int(total_gate_samples_seen),
+            "refresh_samples_required": int(total_gate_samples_required),
+        }
+        current_stage2_mode = "waiting_for_gate_1" if bool(refresh_init_configured) else "not_required"
+        gate_loss_arm_state: Dict[str, bool] = {
+            "pregestation": False,
+            "gestation": False,
+            "berkeley": False,
+        }
+        pending_cycle_gate_candidate: Optional[Dict[str, Any]] = None
+        gate_async_state: Dict[str, Any] = {
+            "request": None,
+            "result": None,
+            "busy": False,
+            "last_applied_round": -1,
+        }
+        gate_async_lock = threading.Lock()
+        gate_async_wakeup = threading.Event()
 
-            gate_active_classes = int(condition_num_classes) if int(condition_num_classes) > 0 else int(score_active_classes)
-
-            pregestation_enabled = bool(float(gate_config.get("pregestation_loss_target", 0.0)) > 0.0)
-            pregestation_eval = None
-            if bool(pregestation_enabled) and pregestation_stage_loader is not None:
-                _cleanup_cuda_allocator()
-                pregestation_eval = _evaluate_berkeley_classifier_gate(
-                    classifier=classifier,
-                    loader=pregestation_stage_loader,
-                    device=device,
-                    max_steps=0,
-                    active_classes=int(gate_active_classes),
-                    amp_enabled=amp_enabled,
-                    amp_dtype=args.amp_dtype,
-                    channels_last=bool(args.channels_last),
-                    semantic_mask_supervision_mode=str(args.semantic_mask_supervision_mode),
-                )
-            if isinstance(pregestation_eval, dict):
-                try:
-                    plv = float(pregestation_eval.get("loss", float("nan")))
-                except Exception:
-                    plv = float("nan")
-                if math.isfinite(plv):
-                    pregestation_gate_loss_history.append(float(max(0.0, plv)))
-            pregestation_gate_cfg = {
-                "berkeley_min_confidence": 0.0,
-                "berkeley_min_macro_f1": 0.0,
-                "berkeley_loss_target": float(gate_config.get("pregestation_loss_target", 0.0)),
-                "berkeley_loss_min_floor": 0.0,
-            }
-            pregestation_detail = _evaluate_berkeley_confidence_loss_gate(
-                eval_stats=pregestation_eval,
-                gate_config=pregestation_gate_cfg,
-                round_index=int(round_index),
-                loss_history=pregestation_gate_loss_history,
-                refresh_samples_seen=0,
-                refresh_samples_required=0,
-            )
-            if not bool(pregestation_enabled):
-                pregestation_detail = {
-                    "pass": True,
-                    "mode": "disabled",
-                    "reason": "disabled",
-                    "loss_target": None,
-                    "loss": None,
-                    "refresh_samples_seen": 0,
-                    "refresh_samples_required": 0,
-                }
-            pregestation_pass = bool(pregestation_detail.get("pass", True))
-            if bool(pregestation_pass):
-                pregestation_gate_streak += 1
-            else:
-                pregestation_gate_streak = 0
-            pregestation_ready = bool((not bool(pregestation_enabled)) or (pregestation_gate_streak >= 1))
-
-            gestation_enabled = bool(float(gate_config.get("gestation_loss_target", 0.0)) > 0.0)
-            gestation_eval = None
-            if bool(pregestation_ready) and bool(gestation_enabled) and gestation_gate_loader is not None:
-                _cleanup_cuda_allocator()
-                gestation_eval = _evaluate_berkeley_classifier_gate(
-                    classifier=classifier,
-                    loader=gestation_gate_loader,
-                    device=device,
-                    max_steps=int(args.gate_gestation_eval_max_steps),
-                    active_classes=int(gate_active_classes),
-                    amp_enabled=amp_enabled,
-                    amp_dtype=args.amp_dtype,
-                    channels_last=bool(args.channels_last),
-                    semantic_mask_supervision_mode=str(args.semantic_mask_supervision_mode),
-                )
-            if isinstance(gestation_eval, dict):
-                seen_now = int(max(0, int(gestation_eval.get("num_samples", 0))))
-                gestation_gate_samples_seen = int(gestation_gate_samples_seen) + int(seen_now)
-                if int(gestation_gate_samples_required) > 0:
-                    gestation_gate_samples_seen = min(int(gestation_gate_samples_seen), int(gestation_gate_samples_required))
-                try:
-                    glv = float(gestation_eval.get("loss", float("nan")))
-                except Exception:
-                    glv = float("nan")
-                if math.isfinite(glv):
-                    gestation_gate_loss_history.append(float(max(0.0, glv)))
-            gestation_gate_cfg = {
-                "berkeley_min_confidence": 0.0,
-                "berkeley_min_macro_f1": 0.0,
-                "berkeley_loss_target": float(gate_config.get("gestation_loss_target", 0.0)),
-                "berkeley_loss_min_floor": 0.0,
-            }
-            gestation_detail = _evaluate_berkeley_confidence_loss_gate(
-                eval_stats=gestation_eval,
-                gate_config=gestation_gate_cfg,
-                round_index=int(round_index),
-                loss_history=gestation_gate_loss_history,
-                refresh_samples_seen=int(gestation_gate_samples_seen),
-                refresh_samples_required=int(gestation_gate_samples_required),
-            )
-            if not bool(gestation_enabled):
-                gestation_detail = {
-                    "pass": True,
-                    "mode": "disabled",
-                    "reason": "disabled",
-                    "loss_target": None,
-                    "loss": None,
-                    "refresh_samples_seen": int(gestation_gate_samples_seen),
-                    "refresh_samples_required": int(gestation_gate_samples_required),
-                }
-            gestation_pass = bool(pregestation_ready) and bool(gestation_detail.get("pass", True))
-            if bool(gestation_pass):
-                gestation_gate_streak += 1
-            else:
-                gestation_gate_streak = 0
-            gestation_ready = bool(gestation_gate_streak >= int(gate_config.get("gestation_maintain_rounds", 1)))
-
+        def _stage2_runtime_status() -> Tuple[bool, str]:
             stage2_required = bool(refresh_init_configured)
-            stage2_ready = (not bool(stage2_required)) or (refresh_loader is not None)
+            total_gate_required = bool(total_gate_runtime_enabled)
+            stage2_ready = (not bool(stage2_required)) or (
+                (refresh_loader is not None)
+                and ((not bool(total_gate_required)) or (berkeley_gate_loader is not None))
+            )
             if not bool(stage2_required):
                 stage2_mode = "not_required"
             elif bool(stage2_ready):
                 stage2_mode = "ready"
-            else:
+            elif refresh_loader is None:
                 stage2_mode = "waiting_for_gate_1"
-            if bool(gestation_ready) and bool(stage2_required) and (not bool(stage2_ready)):
-                _init_refresh_resources(
-                    reason=f"initial_stage_2:round={int(round_index)}",
-                    samples_seen_for_startup=int(berkeley_refresh_samples_seen),
-                )
-                if refresh_loader is not None:
-                    _rebuild_semantic_gate_loaders(
-                        reason=f"initial_stage_2_ready:round={int(round_index)}",
-                        cycle_seed=int(args.seed) + (int(round_index) * 421),
-                        include_payload_val=True,
-                    )
-                stage2_ready = (not bool(stage2_required)) or (refresh_loader is not None)
-                if bool(stage2_ready):
-                    stage2_mode = "ready"
-                else:
-                    stage2_mode = "refresh_loader_unavailable"
+            else:
+                stage2_mode = "stage2_gate_loader_unavailable"
+            return bool(stage2_ready), str(stage2_mode)
 
+        def _gate_target_for_stage(stage_key: str) -> float:
+            key = str(stage_key).strip().lower()
+            if key == "pregestation":
+                return max(0.0, float(gate_config.get("pregestation_loss_target", 0.0)))
+            if key == "gestation":
+                return max(0.0, float(gate_config.get("gestation_loss_target", 0.0)))
+            if key == "berkeley":
+                return max(0.0, float(gate_config.get("berkeley_loss_target", 0.0)))
+            return 0.0
+
+        def _single_task_mode_active() -> bool:
+            pre_ready_now = bool(
+                (float(gate_config.get("pregestation_loss_target", 0.0)) <= 0.0)
+                or (pregestation_sub_round >= int(gate_config.get("pregestation_sub_rounds", 1)))
+            )
+            gest_ready_now = bool(
+                pre_ready_now
+                and (
+                    (float(gate_config.get("gestation_loss_target", 0.0)) <= 0.0)
+                    or (gestation_gate_streak >= int(gate_config.get("gestation_maintain_rounds", 1)))
+                )
+            )
+            berk_ready_now = bool(
+                (not bool(total_gate_runtime_enabled))
+                or (berkeley_gate_streak >= int(gate_config.get("berkeley_maintain_rounds", 1)))
+            )
+            wave_ready_now = bool(wave_gate_streak >= int(gate_config.get("wave_maintain_rounds", 1)))
+            transformer_ready_now = bool(
+                transformer_gate_streak >= int(gate_config.get("transformer_maintain_rounds", 1))
+            )
+            if not bool(pre_ready_now):
+                return True
+            if bool(pre_ready_now) and (not bool(gest_ready_now)):
+                return True
+            if bool(gest_ready_now) and bool(refresh_loader is not None) and (not bool(berk_ready_now)):
+                return True
+            if bool(gest_ready_now) and bool(berk_ready_now) and (not bool(wave_ready_now)):
+                return True
+            if bool(gest_ready_now) and bool(berk_ready_now) and bool(wave_ready_now) and (not bool(transformer_ready_now)):
+                return True
+            return False
+
+        def _reset_gate_state_from_training(stage_key: str, avg_loss: float, reason: str):
+            nonlocal pregestation_gate_streak, pregestation_sub_round, gestation_gate_streak, berkeley_gate_streak
+            nonlocal current_pregestation_gate_eval, current_gestation_gate_eval, current_berkeley_gate_eval
+            nonlocal current_pregestation_gate_detail, current_gestation_gate_detail, current_berkeley_gate_detail
+            nonlocal berkeley_loss_target_unmet
+            target = float(_gate_target_for_stage(stage_key))
+            loss_value = (None if not math.isfinite(float(avg_loss)) else float(max(0.0, float(avg_loss))))
+            detail = {
+                "pass": False,
+                "mode": "training_loss_reset",
+                "reason": str(reason),
+                "loss_target": float(target),
+                "loss": loss_value,
+            }
+            key = str(stage_key).strip().lower()
+            gate_loss_arm_state[str(key)] = False
+            if key == "pregestation":
+                pregestation_gate_streak = 0
+                pregestation_sub_round = 0
+                current_pregestation_gate_eval = None
+                current_pregestation_gate_detail = dict(detail)
+                current_gestation_gate_detail = {
+                    "pass": False,
+                    "mode": "blocked_by_pregestation",
+                    "reason": "pregestation_gate",
+                    "loss_target": float(gate_config.get("gestation_loss_target", 0.0)),
+                    "loss": None,
+                    "refresh_samples_seen": int(gestation_gate_samples_seen),
+                    "refresh_samples_required": int(gestation_gate_samples_required),
+                }
+            elif key == "gestation":
+                gestation_gate_streak = 0
+                current_gestation_gate_eval = None
+                detail["refresh_samples_seen"] = int(gestation_gate_samples_seen)
+                detail["refresh_samples_required"] = int(gestation_gate_samples_required)
+                current_gestation_gate_detail = dict(detail)
+                current_berkeley_gate_detail = {
+                    "pass": False,
+                    "mode": "blocked_by_gestation",
+                    "reason": "gestation_gate",
+                    "loss_target": float(gate_config.get("berkeley_loss_target", 0.0)),
+                    "loss": None,
+                    "refresh_samples_seen": int(total_gate_samples_seen),
+                    "refresh_samples_required": int(total_gate_samples_required),
+                }
+            elif key == "berkeley":
+                berkeley_gate_streak = 0
+                current_berkeley_gate_eval = None
+                detail["refresh_samples_seen"] = int(total_gate_samples_seen)
+                detail["refresh_samples_required"] = int(total_gate_samples_required)
+                current_berkeley_gate_detail = dict(detail)
+                berkeley_loss_target_unmet = True
+            _log(
+                "[gates-async] training reset "
+                f"stage={str(key)} loss={(float(avg_loss) if math.isfinite(float(avg_loss)) else float('nan')):.4f} "
+                f"target={float(target):.4f} reason={str(reason)}"
+            )
+
+        def _process_pending_cycle_gate_candidate(global_round_index: int):
+            nonlocal pending_cycle_gate_candidate
+            candidate = pending_cycle_gate_candidate
+            pending_cycle_gate_candidate = None
+            if not isinstance(candidate, dict):
+                return
+            stage_key = str(candidate.get("stage", "")).strip().lower()
+            avg_loss = float(candidate.get("avg_loss", float("nan")))
+            cycle_id = int(candidate.get("cycle_id", -1))
+            target = float(_gate_target_for_stage(stage_key))
+            if not str(stage_key) or float(target) <= 0.0:
+                return
+            if (not math.isfinite(float(avg_loss))) or float(avg_loss) > float(target):
+                _reset_gate_state_from_training(
+                    stage_key=stage_key,
+                    avg_loss=float(avg_loss),
+                    reason=f"cycle_avg_above_target cycle={int(cycle_id)}",
+                )
+                return
+            gate_loss_arm_state[str(stage_key)] = True
+            trigger_target = float(target) * 0.99
+            if float(avg_loss) > float(trigger_target):
+                _log(
+                    "[gates-async] armed-no-check "
+                    f"stage={str(stage_key)} cycle={int(cycle_id)} loss={float(avg_loss):.4f} "
+                    f"target={float(target):.4f} trigger={float(trigger_target):.4f}"
+                )
+                return
+            _schedule_async_gate_check(
+                round_index=int(global_round_index),
+                reason=(
+                    f"cycle_end_loss_ok stage={str(stage_key)} cycle={int(cycle_id)} "
+                    f"loss={float(avg_loss):.4f} trigger={float(trigger_target):.4f}"
+                ),
+            )
+
+        def _gate_runtime_snapshot(round_index: int, reason: str) -> Dict[str, Any]:
+            stage2_ready_now, stage2_mode_now = _stage2_runtime_status()
+            return {
+                "round_index": int(round_index),
+                "reason": str(reason),
+                "pregestation_gate_streak": int(pregestation_gate_streak),
+                "pregestation_sub_round": int(pregestation_sub_round),
+                "gestation_gate_streak": int(gestation_gate_streak),
+                "berkeley_gate_streak": int(berkeley_gate_streak),
+                "pregestation_gate_loss_history": list(pregestation_gate_loss_history),
+                "gestation_gate_loss_history": list(gestation_gate_loss_history),
+                "berkeley_gate_loss_history": list(berkeley_gate_loss_history),
+                "gestation_gate_samples_seen": int(gestation_gate_samples_seen),
+                "gestation_gate_samples_required": int(gestation_gate_samples_required),
+                "total_gate_samples_seen": int(total_gate_samples_seen),
+                "total_gate_samples_required": int(total_gate_samples_required),
+                "berkeley_loss_target_unmet": bool(berkeley_loss_target_unmet),
+                "pregestation_eval": copy.deepcopy(current_pregestation_gate_eval),
+                "pregestation_detail": dict(current_pregestation_gate_detail),
+                "gestation_eval": copy.deepcopy(current_gestation_gate_eval),
+                "gestation_detail": dict(current_gestation_gate_detail),
+                "total_eval": copy.deepcopy(current_berkeley_gate_eval),
+                "total_detail": dict(current_berkeley_gate_detail),
+                "stage2_ready": bool(stage2_ready_now),
+                "stage2_mode": str(stage2_mode_now),
+            }
+
+        def _evaluate_lowest_pending_semantic_gate(request: Dict[str, Any]) -> Dict[str, Any]:
+            state = dict(request)
+            round_index = int(state.get("round_index", 0))
+            gate_active_classes = int(condition_num_classes) if int(condition_num_classes) > 0 else int(score_active_classes)
+            pregestation_eval = copy.deepcopy(state.get("pregestation_eval", None))
+            gestation_eval = copy.deepcopy(state.get("gestation_eval", None))
+            total_eval = copy.deepcopy(state.get("total_eval", None))
+            pregestation_detail = dict(state.get("pregestation_detail", {}))
+            gestation_detail = dict(state.get("gestation_detail", {}))
+            total_detail = dict(state.get("total_detail", {}))
+            pre_history = list(state.get("pregestation_gate_loss_history", []))
+            gest_history = list(state.get("gestation_gate_loss_history", []))
+            total_history = list(state.get("berkeley_gate_loss_history", []))
+            pre_streak = int(state.get("pregestation_gate_streak", 0))
+            pre_sub_round = int(state.get("pregestation_sub_round", 0))
+            gest_streak = int(state.get("gestation_gate_streak", 0))
+            total_streak = int(state.get("berkeley_gate_streak", 0))
+            gest_seen = int(state.get("gestation_gate_samples_seen", 0))
+            gest_required = int(state.get("gestation_gate_samples_required", 0))
+            total_seen = int(state.get("total_gate_samples_seen", 0))
+            total_required = int(state.get("total_gate_samples_required", 0))
+            loss_unmet = bool(state.get("berkeley_loss_target_unmet", berkeley_loss_target_unmet))
+            pre_enabled = bool(float(gate_config.get("pregestation_loss_target", 0.0)) > 0.0)
+            gest_enabled = bool(float(gate_config.get("gestation_loss_target", 0.0)) > 0.0)
             total_enabled = bool(
                 float(gate_config.get("berkeley_min_confidence", 0.0)) > 0.0
                 or float(gate_config.get("berkeley_min_macro_f1", 0.0)) > 0.0
                 or float(gate_config.get("berkeley_loss_target", 0.0)) > 0.0
             )
-            total_ready_before_eval = bool(berkeley_gate_streak >= int(gate_config["berkeley_maintain_rounds"]))
-            total_eval_max_steps = int(args.gate_berkeley_eval_max_steps)
-            if (not bool(total_ready_before_eval)) and berkeley_gate_loader is not None:
-                total_eval_max_steps = max(1, int(len(berkeley_gate_loader)))
-            total_eval = None
-            if bool(gestation_ready) and bool(stage2_ready) and bool(total_enabled) and berkeley_gate_loader is not None:
-                _cleanup_cuda_allocator()
-                total_eval = _evaluate_berkeley_classifier_gate(
-                    classifier=classifier,
-                    loader=berkeley_gate_loader,
-                    device=device,
-                    max_steps=int(total_eval_max_steps),
-                    active_classes=int(gate_active_classes),
-                    amp_enabled=amp_enabled,
-                    amp_dtype=args.amp_dtype,
-                    channels_last=bool(args.channels_last),
-                    semantic_mask_supervision_mode=str(args.semantic_mask_supervision_mode),
-                )
-            if isinstance(total_eval, dict):
-                seen_now = int(max(0, int(total_eval.get("num_samples", 0))))
-                total_gate_samples_seen = int(total_gate_samples_seen) + int(seen_now)
-                if int(total_gate_samples_required) > 0:
-                    total_gate_samples_seen = min(int(total_gate_samples_seen), int(total_gate_samples_required))
-                try:
-                    tlv = float(total_eval.get("loss", float("nan")))
-                except Exception:
-                    tlv = float("nan")
-                if math.isfinite(tlv):
-                    berkeley_gate_loss_history.append(float(max(0.0, tlv)))
-                    if berkeley_loss_target_value > 0.0:
-                        berkeley_loss_target_unmet = bool(float(tlv) > float(berkeley_loss_target_value))
-            if not bool(total_enabled):
-                total_detail = {
-                    "pass": True,
-                    "mode": "disabled",
-                    "reason": "disabled",
-                    "loss_target": None,
-                    "loss": None,
-                    "refresh_samples_seen": int(total_gate_samples_seen),
-                    "refresh_samples_required": int(total_gate_samples_required),
-                }
-                total_pass = True
-            elif not bool(gestation_ready):
-                total_detail = {
-                    "pass": False,
-                    "mode": "blocked_by_gestation",
-                    "reason": "gestation_gate",
-                    "loss_target": gate_config.get("berkeley_loss_target", None),
-                    "loss": None,
-                    "refresh_samples_seen": int(total_gate_samples_seen),
-                    "refresh_samples_required": int(total_gate_samples_required),
-                }
-                total_pass = False
-            elif not bool(stage2_ready):
-                total_detail = {
-                    "pass": False,
-                    "mode": "blocked_by_initial_stage_2",
-                    "reason": "initial_stage_2",
-                    "loss_target": gate_config.get("berkeley_loss_target", None),
-                    "loss": None,
-                    "refresh_samples_seen": int(total_gate_samples_seen),
-                    "refresh_samples_required": int(total_gate_samples_required),
-                }
-                total_pass = False
-            else:
-                total_detail = _evaluate_berkeley_confidence_loss_gate(
-                    eval_stats=total_eval,
-                    gate_config=gate_config,
-                    round_index=int(round_index),
-                    loss_history=berkeley_gate_loss_history,
-                    refresh_samples_seen=int(total_gate_samples_seen),
-                    refresh_samples_required=int(total_gate_samples_required),
-                )
-                total_pass = bool(total_detail.get("pass", True))
-            if bool(total_pass):
-                berkeley_gate_streak += 1
-            else:
-                berkeley_gate_streak = 0
-            total_ready = bool(berkeley_gate_streak >= int(gate_config["berkeley_maintain_rounds"]))
-            try:
-                g_loss = float(gestation_eval.get("loss", float("nan"))) if isinstance(gestation_eval, dict) else float("nan")
-            except Exception:
-                g_loss = float("nan")
-            try:
-                g_conf = (
-                    float(gestation_eval.get("mean_confidence", float("nan")))
-                    if isinstance(gestation_eval, dict)
-                    else float("nan")
-                )
-            except Exception:
-                g_conf = float("nan")
-            try:
-                g_macro_f1 = (
-                    float(gestation_eval.get("macro_f1", float("nan")))
-                    if isinstance(gestation_eval, dict)
-                    else float("nan")
-                )
-            except Exception:
-                g_macro_f1 = float("nan")
-            try:
-                g_samples = (
-                    int(max(0, int(gestation_eval.get("num_samples", 0))))
-                    if isinstance(gestation_eval, dict)
-                    else 0
-                )
-            except Exception:
-                g_samples = 0
-            try:
-                t_loss = float(total_eval.get("loss", float("nan"))) if isinstance(total_eval, dict) else float("nan")
-            except Exception:
-                t_loss = float("nan")
-            try:
-                t_conf = (
-                    float(total_eval.get("mean_confidence", float("nan")))
-                    if isinstance(total_eval, dict)
-                    else float("nan")
-                )
-            except Exception:
-                t_conf = float("nan")
-            try:
-                t_macro_f1 = (
-                    float(total_eval.get("macro_f1", float("nan")))
-                    if isinstance(total_eval, dict)
-                    else float("nan")
-                )
-            except Exception:
-                t_macro_f1 = float("nan")
-            try:
-                t_samples = (
-                    int(max(0, int(total_eval.get("num_samples", 0))))
-                    if isinstance(total_eval, dict)
-                    else 0
-                )
-            except Exception:
-                t_samples = 0
-            if not bool(gestation_ready):
-                phase_label = "s1_g1_only"
-            elif not bool(stage2_ready):
-                phase_label = "s2_only"
-            else:
-                phase_label = "s2_g2"
-            _log(
-                "[gates] "
-                f"round={int(round_index)} "
-                f"phase={str(phase_label)} "
-                    f"pregestation_pass={1 if bool(pregestation_pass) else 0} "
-                    f"pregestation_ready={1 if bool(pregestation_ready) else 0} "
-                    f"pregestation_mode={str(pregestation_detail.get('mode', ''))} "
-                    f"pregestation_reason={str(pregestation_detail.get('reason', ''))} "
-                    f"pregestation_loss={(float(pregestation_eval.get('loss', float('nan'))) if isinstance(pregestation_eval, dict) else float('nan')):.4f} "
-                    f"pregestation_target={pregestation_detail.get('loss_target', None)} "
-                f"gestation_pass={1 if bool(gestation_pass) else 0} "
-                f"gestation_ready={1 if bool(gestation_ready) else 0} "
-                f"gestation_mode={str(gestation_detail.get('mode', ''))} "
-                f"gestation_reason={str(gestation_detail.get('reason', ''))} "
-                f"gestation_loss={(g_loss if math.isfinite(g_loss) else float('nan')):.4f} "
-                f"gestation_conf={(g_conf if math.isfinite(g_conf) else float('nan')):.4f} "
-                f"gestation_macro_f1={(g_macro_f1 if math.isfinite(g_macro_f1) else float('nan')):.4f} "
-                f"gestation_target={gestation_detail.get('loss_target', None)} "
-                f"gestation_samples={int(g_samples)} "
-                f"gestation_cov={int(gestation_detail.get('refresh_samples_seen', 0))}/{int(gestation_detail.get('refresh_samples_required', 0))} "
-                f"stage2_ready={1 if bool(stage2_ready) else 0} "
-                f"stage2_mode={str(stage2_mode)} "
-                f"g2_pass={1 if bool(total_pass) else 0} "
-                f"g2_ready={1 if bool(total_ready) else 0} "
-                f"g2_mode={str(total_detail.get('mode', ''))} "
-                f"g2_reason={str(total_detail.get('reason', ''))} "
-                f"g2_loss={(t_loss if math.isfinite(t_loss) else float('nan')):.4f} "
-                f"g2_conf={(t_conf if math.isfinite(t_conf) else float('nan')):.4f} "
-                f"g2_macro_f1={(t_macro_f1 if math.isfinite(t_macro_f1) else float('nan')):.4f} "
-                f"g2_target={total_detail.get('loss_target', None)} "
-                f"g2_samples={int(t_samples)} "
-                f"g2_cov={int(total_detail.get('refresh_samples_seen', 0))}/{int(total_detail.get('refresh_samples_required', 0))}"
-            )
+            pre_sub_rounds_cfg = max(1, int(gate_config.get("pregestation_sub_rounds", 1)))
+            pre_ready = (not bool(pre_enabled)) or (int(pre_sub_round) >= int(pre_sub_rounds_cfg))
+            gest_ready = bool(pre_ready) and ((not bool(gest_enabled)) or (int(gest_streak) >= int(gate_config.get("gestation_maintain_rounds", 1))))
+            stage2_ready, stage2_mode = _stage2_runtime_status()
+            total_ready = (not bool(total_enabled)) or (int(total_streak) >= int(gate_config.get("berkeley_maintain_rounds", 1)))
+            target_gate = "idle"
+            gate_eval_model = None
+            gate_eval_device = torch.device("cpu")
+
+            def _ensure_gate_model() -> Tuple[nn.Module, torch.device]:
+                nonlocal gate_eval_model, gate_eval_device
+                if gate_eval_model is None:
+                    gate_eval_model, gate_eval_device = _prepare_gate_classifier(
+                        reason=f"semantic_gates_async:round={int(round_index)}:{str(state.get('reason', 'unknown'))}"
+                    )
+                return gate_eval_model, gate_eval_device
+
+            if bool(pre_enabled) and (not bool(pre_ready)):
+                target_gate = "pregestation"
+                if pregestation_stage_loader is not None:
+                    _cleanup_cuda_allocator()
+                    gate_eval_model, gate_eval_device = _ensure_gate_model()
+                    pregestation_eval = _evaluate_berkeley_classifier_gate(
+                        classifier=gate_eval_model,
+                        loader=pregestation_stage_loader,
+                        device=gate_eval_device,
+                        max_steps=0,
+                        active_classes=int(gate_active_classes),
+                        amp_enabled=amp_enabled,
+                        amp_dtype=args.amp_dtype,
+                        channels_last=bool(args.channels_last),
+                        semantic_mask_supervision_mode=str(args.semantic_mask_supervision_mode),
+                        semantic_cosine_weight=float(args.classifier_semantic_cosine_weight),
+                    )
+                    try:
+                        plv = float(pregestation_eval.get("loss", float("nan"))) if isinstance(pregestation_eval, dict) else float("nan")
+                    except Exception:
+                        plv = float("nan")
+                    if math.isfinite(plv):
+                        pre_history.append(float(max(0.0, plv)))
+                    pregestation_detail = _evaluate_berkeley_confidence_loss_gate(
+                        eval_stats=pregestation_eval,
+                        gate_config={
+                            "berkeley_min_confidence": 0.0,
+                            "berkeley_min_macro_f1": 0.0,
+                            "berkeley_loss_target": float(gate_config.get("pregestation_loss_target", 0.0)),
+                            "berkeley_loss_min_floor": 0.0,
+                        },
+                        round_index=int(round_index),
+                        loss_history=pre_history,
+                        refresh_samples_seen=0,
+                        refresh_samples_required=0,
+                    )
+                    pre_streak = (int(pre_streak) + 1) if bool(pregestation_detail.get("pass", False)) else 0
+                    # Sub-round advancement: when the streak clears maintain, move to next sub-round
+                    if int(pre_streak) >= int(gate_config.get("pregestation_maintain_rounds", 1)):
+                        if int(pre_sub_round) < int(pre_sub_rounds_cfg) - 1:
+                            pre_sub_round = int(pre_sub_round) + 1
+                            pre_streak = 0
+                            _log(
+                                f"[gates-async] pregestation sub-round advanced: "
+                                f"sub_round={int(pre_sub_round)}/{int(pre_sub_rounds_cfg)} round={int(round_index)}"
+                            )
+                        else:
+                            # Last sub-round: streak stays at/above maintain — marks ready
+                            pre_sub_round = int(pre_sub_rounds_cfg)
+                else:
+                    pregestation_detail = {
+                        "pass": False,
+                        "mode": "loader_unavailable",
+                        "reason": "pregestation_stage_loader",
+                        "loss_target": float(gate_config.get("pregestation_loss_target", 0.0)),
+                        "loss": None,
+                        "refresh_samples_seen": 0,
+                        "refresh_samples_required": 0,
+                    }
+                pre_ready = (not bool(pre_enabled)) or (int(pre_sub_round) >= int(pre_sub_rounds_cfg))
+                if not bool(pre_ready):
+                    gestation_detail = {
+                        "pass": False,
+                        "mode": "blocked_by_pregestation",
+                        "reason": "pregestation_gate",
+                        "loss_target": float(gate_config.get("gestation_loss_target", 0.0)),
+                        "loss": None,
+                        "refresh_samples_seen": int(gest_seen),
+                        "refresh_samples_required": int(gest_required),
+                    }
+                    total_detail = {
+                        "pass": False,
+                        "mode": "blocked_by_gestation",
+                        "reason": "gestation_gate",
+                        "loss_target": float(gate_config.get("berkeley_loss_target", 0.0)),
+                        "loss": None,
+                        "refresh_samples_seen": int(total_seen),
+                        "refresh_samples_required": int(total_required),
+                    }
+            elif bool(gest_enabled) and bool(pre_ready) and (not bool(gest_ready)):
+                target_gate = "gestation"
+                if gestation_gate_loader is not None:
+                    _cleanup_cuda_allocator()
+                    gate_eval_model, gate_eval_device = _ensure_gate_model()
+                    gestation_eval = _evaluate_berkeley_classifier_gate(
+                        classifier=gate_eval_model,
+                        loader=gestation_gate_loader,
+                        device=gate_eval_device,
+                        max_steps=int(args.gate_gestation_eval_max_steps),
+                        active_classes=int(gate_active_classes),
+                        amp_enabled=amp_enabled,
+                        amp_dtype=args.amp_dtype,
+                        channels_last=bool(args.channels_last),
+                        semantic_mask_supervision_mode=str(args.semantic_mask_supervision_mode),
+                        semantic_cosine_weight=float(args.classifier_semantic_cosine_weight),
+                    )
+                    seen_now = int(max(0, int(gestation_eval.get("num_samples", 0)))) if isinstance(gestation_eval, dict) else 0
+                    gest_seen = int(gest_seen) + int(seen_now)
+                    if int(gest_required) > 0:
+                        gest_seen = min(int(gest_seen), int(gest_required))
+                    try:
+                        glv = float(gestation_eval.get("loss", float("nan"))) if isinstance(gestation_eval, dict) else float("nan")
+                    except Exception:
+                        glv = float("nan")
+                    if math.isfinite(glv):
+                        gest_history.append(float(max(0.0, glv)))
+                    gestation_detail = _evaluate_berkeley_confidence_loss_gate(
+                        eval_stats=gestation_eval,
+                        gate_config={
+                            "berkeley_min_confidence": 0.0,
+                            "berkeley_min_macro_f1": 0.0,
+                            "berkeley_loss_target": float(gate_config.get("gestation_loss_target", 0.0)),
+                            "berkeley_loss_min_floor": 0.0,
+                        },
+                        round_index=int(round_index),
+                        loss_history=gest_history,
+                        refresh_samples_seen=int(gest_seen),
+                        refresh_samples_required=int(gest_required),
+                    )
+                    gest_streak = (int(gest_streak) + 1) if bool(gestation_detail.get("pass", False)) else 0
+                else:
+                    gestation_detail = {
+                        "pass": False,
+                        "mode": "loader_unavailable",
+                        "reason": "gestation_gate_loader",
+                        "loss_target": float(gate_config.get("gestation_loss_target", 0.0)),
+                        "loss": None,
+                        "refresh_samples_seen": int(gest_seen),
+                        "refresh_samples_required": int(gest_required),
+                    }
+                gest_ready = bool(pre_ready) and ((not bool(gest_enabled)) or (int(gest_streak) >= int(gate_config.get("gestation_maintain_rounds", 1))))
+                if not bool(gest_ready):
+                    total_detail = {
+                        "pass": False,
+                        "mode": "blocked_by_gestation",
+                        "reason": "gestation_gate",
+                        "loss_target": float(gate_config.get("berkeley_loss_target", 0.0)),
+                        "loss": None,
+                        "refresh_samples_seen": int(total_seen),
+                        "refresh_samples_required": int(total_required),
+                    }
+            elif bool(total_enabled) and bool(gest_ready) and (not bool(total_ready)):
+                target_gate = "berkeley"
+                if not bool(stage2_ready):
+                    total_detail = {
+                        "pass": False,
+                        "mode": "blocked_by_initial_stage_2",
+                        "reason": "initial_stage_2",
+                        "loss_target": float(gate_config.get("berkeley_loss_target", 0.0)),
+                        "loss": None,
+                        "refresh_samples_seen": int(total_seen),
+                        "refresh_samples_required": int(total_required),
+                    }
+                elif berkeley_gate_loader is not None:
+                    _cleanup_cuda_allocator()
+                    gate_eval_model, gate_eval_device = _ensure_gate_model()
+                    total_eval_max_steps = int(args.gate_berkeley_eval_max_steps)
+                    if int(total_required) > 0 and int(total_streak) < int(gate_config.get("berkeley_maintain_rounds", 1)):
+                        total_eval_max_steps = max(1, int(len(berkeley_gate_loader)))
+                    total_eval = _evaluate_berkeley_classifier_gate(
+                        classifier=gate_eval_model,
+                        loader=berkeley_gate_loader,
+                        device=gate_eval_device,
+                        max_steps=int(total_eval_max_steps),
+                        active_classes=int(gate_active_classes),
+                        amp_enabled=amp_enabled,
+                        amp_dtype=args.amp_dtype,
+                        channels_last=bool(args.channels_last),
+                        semantic_mask_supervision_mode=str(args.semantic_mask_supervision_mode),
+                        semantic_cosine_weight=float(args.classifier_semantic_cosine_weight),
+                    )
+                    seen_now = int(max(0, int(total_eval.get("num_samples", 0)))) if isinstance(total_eval, dict) else 0
+                    total_seen = int(total_seen) + int(seen_now)
+                    if int(total_required) > 0:
+                        total_seen = min(int(total_seen), int(total_required))
+                    try:
+                        tlv = float(total_eval.get("loss", float("nan"))) if isinstance(total_eval, dict) else float("nan")
+                    except Exception:
+                        tlv = float("nan")
+                    if math.isfinite(tlv):
+                        total_history.append(float(max(0.0, tlv)))
+                        if float(berkeley_loss_target_value) > 0.0:
+                            loss_unmet = bool(float(tlv) > float(berkeley_loss_target_value))
+                    total_detail = _evaluate_berkeley_confidence_loss_gate(
+                        eval_stats=total_eval,
+                        gate_config=gate_config,
+                        round_index=int(round_index),
+                        loss_history=total_history,
+                        refresh_samples_seen=int(total_seen),
+                        refresh_samples_required=int(total_required),
+                    )
+                    total_streak = (int(total_streak) + 1) if bool(total_detail.get("pass", False)) else 0
+                else:
+                    total_detail = {
+                        "pass": False,
+                        "mode": "loader_unavailable",
+                        "reason": "berkeley_gate_loader",
+                        "loss_target": float(gate_config.get("berkeley_loss_target", 0.0)),
+                        "loss": None,
+                        "refresh_samples_seen": int(total_seen),
+                        "refresh_samples_required": int(total_required),
+                    }
+                total_ready = (not bool(total_enabled)) or (int(total_streak) >= int(gate_config.get("berkeley_maintain_rounds", 1)))
             return {
+                "round_index": int(round_index),
+                "reason": str(state.get("reason", "unknown")),
+                "target_gate": str(target_gate),
                 "pregestation_eval": pregestation_eval,
                 "pregestation_detail": dict(pregestation_detail),
-                "pregestation_pass": bool(pregestation_pass),
-                "pregestation_ready": bool(pregestation_ready),
+                "pregestation_gate_streak": int(pre_streak),
+                "pregestation_sub_round": int(pre_sub_round),
+                "pregestation_ready": bool((not bool(pre_enabled)) or (int(pre_sub_round) >= int(pre_sub_rounds_cfg))),
+                "pregestation_gate_loss_history": list(pre_history),
                 "gestation_eval": gestation_eval,
                 "gestation_detail": dict(gestation_detail),
-                "gestation_pass": bool(gestation_pass),
-                "gestation_ready": bool(gestation_ready),
-                "initial_stage_2_ready": bool(stage2_ready),
-                "initial_stage_2_mode": str(stage2_mode),
+                "gestation_gate_streak": int(gest_streak),
+                "gestation_ready": bool(bool((not bool(pre_enabled)) or (int(pre_sub_round) >= int(pre_sub_rounds_cfg))) and ((not bool(gest_enabled)) or (int(gest_streak) >= int(gate_config.get("gestation_maintain_rounds", 1))))),
+                "gestation_gate_loss_history": list(gest_history),
+                "gestation_gate_samples_seen": int(gest_seen),
+                "gestation_gate_samples_required": int(gest_required),
+                "stage2_ready": bool(stage2_ready),
+                "stage2_mode": str(stage2_mode),
                 "total_eval": total_eval,
                 "total_detail": dict(total_detail),
-                "total_pass": bool(total_pass),
-                "total_ready": bool(total_ready),
+                "berkeley_gate_streak": int(total_streak),
+                "total_ready": bool((not bool(total_enabled)) or (int(total_streak) >= int(gate_config.get("berkeley_maintain_rounds", 1)))),
+                "berkeley_gate_loss_history": list(total_history),
+                "total_gate_samples_seen": int(total_seen),
+                "total_gate_samples_required": int(total_required),
+                "berkeley_loss_target_unmet": bool(loss_unmet),
             }
 
-        initial_gate_eval = _evaluate_two_stage_semantic_gates(round_index=max(0, int(len(orchestration_rows))))
-        initial_pregestation_eval = initial_gate_eval.get("pregestation_eval", None)
-        initial_pregestation_detail = dict(initial_gate_eval.get("pregestation_detail", {}))
-        initial_pregestation_pass = bool(initial_gate_eval.get("pregestation_pass", True))
-        initial_gestation_eval = initial_gate_eval.get("gestation_eval", None)
-        initial_gestation_detail = dict(initial_gate_eval.get("gestation_detail", {}))
-        initial_gestation_pass = bool(initial_gate_eval.get("gestation_pass", True))
-        initial_stage_2_ready = bool(initial_gate_eval.get("initial_stage_2_ready", (refresh_loader is not None)))
-        initial_stage_2_mode = str(
-            initial_gate_eval.get(
-                "initial_stage_2_mode",
-                ("ready" if bool(initial_stage_2_ready) else "waiting_for_gate_1"),
+        def _gate_async_worker_loop():
+            while True:
+                gate_async_wakeup.wait(timeout=0.25)
+                with gate_async_lock:
+                    request = gate_async_state.get("request", None)
+                    if request is None:
+                        gate_async_state["busy"] = False
+                        gate_async_wakeup.clear()
+                        continue
+                    gate_async_state["request"] = None
+                    gate_async_state["busy"] = True
+                    if gate_async_state.get("request", None) is None:
+                        gate_async_wakeup.clear()
+                result = _evaluate_lowest_pending_semantic_gate(request)
+                with gate_async_lock:
+                    gate_async_state["result"] = result
+                    gate_async_state["busy"] = False
+                    if gate_async_state.get("request", None) is not None:
+                        gate_async_wakeup.set()
+
+        gate_async_worker = threading.Thread(
+            target=_gate_async_worker_loop,
+            name="semantic-gate-worker",
+            daemon=True,
+        )
+        gate_async_worker.start()
+
+        def _schedule_async_gate_check(round_index: int, reason: str) -> bool:
+            snapshot = _gate_runtime_snapshot(round_index=int(round_index), reason=str(reason))
+            with gate_async_lock:
+                pending = gate_async_state.get("request", None)
+                if isinstance(pending, dict) and int(pending.get("round_index", -1)) >= int(round_index):
+                    return False
+                gate_async_state["request"] = snapshot
+                gate_async_wakeup.set()
+            return True
+
+        def _apply_async_gate_notice(max_round_index: int, note: str = "") -> bool:
+            nonlocal pregestation_gate_streak, pregestation_sub_round, gestation_gate_streak, berkeley_gate_streak
+            nonlocal pregestation_gate_loss_history, gestation_gate_loss_history, berkeley_gate_loss_history
+            nonlocal gestation_gate_samples_seen, gestation_gate_samples_required
+            nonlocal total_gate_samples_seen, total_gate_samples_required
+            nonlocal berkeley_loss_target_unmet
+            nonlocal current_pregestation_gate_eval, current_gestation_gate_eval, current_berkeley_gate_eval
+            nonlocal current_pregestation_gate_detail, current_gestation_gate_detail, current_berkeley_gate_detail
+            nonlocal current_stage2_mode
+            with gate_async_lock:
+                result = gate_async_state.get("result", None)
+                if not isinstance(result, dict):
+                    return False
+                result_round = int(result.get("round_index", -1))
+                if int(result_round) > int(max_round_index):
+                    return False
+                if int(result_round) <= int(gate_async_state.get("last_applied_round", -1)):
+                    gate_async_state["result"] = None
+                    return False
+                gate_async_state["result"] = None
+                gate_async_state["last_applied_round"] = int(result_round)
+            pregestation_gate_streak = int(result.get("pregestation_gate_streak", pregestation_gate_streak))
+            pregestation_sub_round = int(result.get("pregestation_sub_round", pregestation_sub_round))
+            gestation_gate_streak = int(result.get("gestation_gate_streak", gestation_gate_streak))
+            berkeley_gate_streak = int(result.get("berkeley_gate_streak", berkeley_gate_streak))
+            pregestation_gate_loss_history = list(result.get("pregestation_gate_loss_history", pregestation_gate_loss_history))
+            gestation_gate_loss_history = list(result.get("gestation_gate_loss_history", gestation_gate_loss_history))
+            berkeley_gate_loss_history = list(result.get("berkeley_gate_loss_history", berkeley_gate_loss_history))
+            gestation_gate_samples_seen = int(result.get("gestation_gate_samples_seen", gestation_gate_samples_seen))
+            gestation_gate_samples_required = int(result.get("gestation_gate_samples_required", gestation_gate_samples_required))
+            total_gate_samples_seen = int(result.get("total_gate_samples_seen", total_gate_samples_seen))
+            total_gate_samples_required = int(result.get("total_gate_samples_required", total_gate_samples_required))
+            berkeley_loss_target_unmet = bool(result.get("berkeley_loss_target_unmet", berkeley_loss_target_unmet))
+            current_pregestation_gate_eval = copy.deepcopy(result.get("pregestation_eval", current_pregestation_gate_eval))
+            current_gestation_gate_eval = copy.deepcopy(result.get("gestation_eval", current_gestation_gate_eval))
+            current_berkeley_gate_eval = copy.deepcopy(result.get("total_eval", current_berkeley_gate_eval))
+            current_pregestation_gate_detail = dict(result.get("pregestation_detail", current_pregestation_gate_detail))
+            current_gestation_gate_detail = dict(result.get("gestation_detail", current_gestation_gate_detail))
+            current_berkeley_gate_detail = dict(result.get("total_detail", current_berkeley_gate_detail))
+            current_stage2_mode = str(result.get("stage2_mode", current_stage2_mode))
+            gate_history.append(
+                {
+                    "round": int(result.get("round_index", -1)),
+                    "source": "async_cpu_gate_worker",
+                    "reason": str(result.get("reason", "")),
+                    "target_gate": str(result.get("target_gate", "idle")),
+                    "pregestation_gate_detail": dict(current_pregestation_gate_detail),
+                    "gestation_gate_detail": dict(current_gestation_gate_detail),
+                    "berkeley_gate_detail": dict(current_berkeley_gate_detail),
+                }
             )
-        )
-        initial_berkeley_eval = initial_gate_eval.get("total_eval", None)
-        initial_berkeley_gate_detail = dict(initial_gate_eval.get("total_detail", {}))
-        initial_berkeley_gate_pass = bool(initial_gate_eval.get("total_pass", True))
+            suffix = f" note={str(note)}" if str(note).strip() else ""
+            _log(
+                "[gates-async] "
+                f"applied_round={int(result.get('round_index', -1))} "
+                f"target={str(result.get('target_gate', 'idle'))} "
+                f"pregestation_streak={int(pregestation_gate_streak)}/{int(gate_config.get('pregestation_maintain_rounds', 1))} "
+                f"pregestation_sub_round={int(pregestation_sub_round)}/{int(gate_config.get('pregestation_sub_rounds', 1))} "
+                f"gestation_streak={int(gestation_gate_streak)}/{int(gate_config.get('gestation_maintain_rounds', 1))} "
+                f"berkeley_streak={int(berkeley_gate_streak)}/{int(gate_config.get('berkeley_maintain_rounds', 1))} "
+                f"stage2_mode={str(current_stage2_mode)}"
+                f"{suffix}"
+            )
+            return True
+
+        initial_stage_2_ready, initial_stage_2_mode = _stage2_runtime_status()
         _log(
-            "Initial Stage 0 -> Gate 0: "
-            f"pass={1 if initial_pregestation_pass else 0} "
-            f"mode={initial_pregestation_detail.get('mode', 'hard_loss_full_refresh')} "
-            f"reason={initial_pregestation_detail.get('reason', 'pass')} "
-            f"loss={(float(initial_pregestation_eval.get('loss', float('nan'))) if isinstance(initial_pregestation_eval, dict) else float('nan')):.4f} "
-            f"target={initial_pregestation_detail.get('loss_target', None)}"
-        )
-        _log(
-            "Initial Stage 1 -> Gate 1: "
-            f"pass={1 if initial_gestation_pass else 0} "
-            f"mode={initial_gestation_detail.get('mode', 'hard_loss_full_refresh')} "
-            f"reason={initial_gestation_detail.get('reason', 'pass')} "
-            f"conf={(float(initial_gestation_eval.get('mean_confidence', float('nan'))) if isinstance(initial_gestation_eval, dict) else float('nan')):.4f} "
-            f"macro_f1={(float(initial_gestation_eval.get('macro_f1', float('nan'))) if isinstance(initial_gestation_eval, dict) else float('nan')):.4f} "
-            f"loss={(float(initial_gestation_eval.get('loss', float('nan'))) if isinstance(initial_gestation_eval, dict) else float('nan')):.4f} "
-            f"target={initial_gestation_detail.get('loss_target', None)} "
-            f"samples={int(initial_gestation_eval.get('num_samples', 0)) if isinstance(initial_gestation_eval, dict) else 0} "
-            f"coverage={int(initial_gestation_detail.get('refresh_samples_seen', 0))}/"
-            f"{int(initial_gestation_detail.get('refresh_samples_required', 0))}"
+            "Gate runtime: async_cpu_worker=1 startup_eval=0 applies_on_next_round=1 "
+            f"stage2_ready={1 if bool(initial_stage_2_ready) else 0} "
+            f"stage2_mode={str(initial_stage_2_mode)}"
         )
         _log(
-            "Stage 0 trains on pre-gestation formal logic rows and must satisfy Gate 0; "
-            "Stage 1 trains on gestation-only rows; Gate 1 evaluates gestation validation rows."
+            "Stage 0 trains on pre-gestation formal logic rows; the CPU gate worker lazily checks only the "
+            "lowest unresolved gate and training consumes that notice on the next round boundary."
         )
-        _log(
-            "Initial Stage 2: "
-            f"ready={1 if bool(initial_stage_2_ready) else 0} "
-            f"mode={initial_stage_2_mode}"
-        )
-        conf_init = None if (initial_berkeley_eval is None) else initial_berkeley_eval.get("mean_confidence", None)
-        f1_init = None if (initial_berkeley_eval is None) else initial_berkeley_eval.get("macro_f1", None)
-        loss_init = None if (initial_berkeley_eval is None) else initial_berkeley_eval.get("loss", None)
-        _log(
-            "Gate 2: "
-            f"pass={1 if initial_berkeley_gate_pass else 0} "
-            f"mode={initial_berkeley_gate_detail.get('mode', 'hard_loss_full_refresh')} "
-            f"reason={initial_berkeley_gate_detail.get('reason', 'pass')} "
-            f"conf={(float(conf_init) if conf_init is not None else float('nan')):.4f} "
-            f"macro_f1={(float(f1_init) if f1_init is not None else float('nan')):.4f} "
-            f"loss={(float(loss_init) if loss_init is not None else float('nan')):.4f} "
-            f"loss_target={initial_berkeley_gate_detail.get('loss_target', None)} "
-            f"coverage={int(initial_berkeley_gate_detail.get('refresh_samples_seen', 0))}/"
-            f"{int(initial_berkeley_gate_detail.get('refresh_samples_required', 0))} "
-            f"stage2_validation_rows={int(berkeley_gate_schedule_info.get('selected_rows', 0))}"
-        )
-        _log("Pipeline order: Stage 0 -> Stage 1 -> Gate 1 -> Stage 2 -> Gate 2")
+        _log("Pipeline order: Stage 0 -> Gate 0(async) -> Stage 1 -> Gate 1(async) -> Stage 2 -> Gate 2(async)")
         initial_wave_gate_pass = (
             (float(cls_val.get("mean_entropy", 0.0)) >= gate_config["wave_min_entropy"])
             and (float(cls_val["score"]) >= gate_config["berkeley_min_score"])
@@ -15071,6 +16784,19 @@ def main():
         stage_preview_cursor: Dict[str, int] = {}
         gui_stop_requested = False
         gui_stop_logged = False
+        _loss_logger_start = time.perf_counter()
+        _loss_logger = _LossFileLogger(
+            path=out_dir / "loss_log.bin",
+            start_time=_loss_logger_start,
+        )
+        try:
+            _existing_recs = _LossFileLogger.load(out_dir / "loss_log.bin")
+            for _rec in _existing_recs:
+                stage_opengl_viewer.update_loss(int(_rec["stage"]), float(_rec["loss"]))
+            if len(_existing_recs) > 0:
+                _log(f"[loss-logger] loaded {len(_existing_recs)} existing records into graph")
+        except Exception as _e:
+            _log(f"[loss-logger] could not pre-load existing records: {_e}")
 
         def _poll_gui_stop(note: str = "") -> bool:
             nonlocal gui_stop_requested, gui_stop_logged
@@ -15339,6 +17065,7 @@ def main():
             target_line_override: Optional[str] = None,
             target_extra_rows: Optional[Sequence[str]] = None,
             extra_out_rows: Optional[Sequence[str]] = None,
+            frame_losses: Optional[Dict[int, float]] = None,
         ):
             if _poll_gui_stop(note=f"{stage_key}-emit"):
                 return
@@ -15382,6 +17109,7 @@ def main():
                 caption=f"[{stage_key}] cycle={int(cycle_id)} round={int(round_id)} {step_txt} top={top_txt}",
                 panel_titles=[f"{stage_key} target", f"{stage_key} input", f"{stage_key} out"],
                 panel_rows=[target_rows, in_rows, out_rows],
+                frame_losses=frame_losses,
             )
             _log(f"[stage-opengl] {stage_key} {step_txt} top={top_txt}")
 
@@ -15405,16 +17133,22 @@ def main():
                         threshold=0.5,
                     )
                     loss_rows: List[str] = []
+                    _loss_val = float("nan")
                     if "loss" in payload:
                         try:
-                            loss_rows.append(f"loss={float(payload.get('loss', 0.0)):.4f}")
+                            _loss_val = float(payload.get('loss', 0.0))
+                            loss_rows.append(f"loss={_loss_val:.4f}")
                         except Exception:
                             pass
                     if "batch_loss" in payload:
                         try:
-                            loss_rows.append(f"batch={float(payload.get('batch_loss', 0.0)):.4f}")
+                            _bl = float(payload.get('batch_loss', 0.0))
+                            loss_rows.append(f"batch={_bl:.4f}")
+                            if not math.isfinite(_loss_val):
+                                _loss_val = _bl
                         except Exception:
                             pass
+                    _loss_logger.log(int(round_id), LOSS_STAGE_CLASSIFIER, _loss_val)
                     p = probs.detach().to(torch.float32).cpu().numpy().astype(np.float32, copy=False).reshape(-1)
                     out_lines = _format_top_label_lines(
                         _top_labels_from_probs(p, class_names=class_names, topk=max(1, min(len(class_names), int(p.shape[0])))),
@@ -15433,6 +17167,7 @@ def main():
                             list(diff_rows),
                             [target_line, "alpha=mask_channel"] + (out_lines if len(out_lines) > 0 else ["n/a"]),
                         ],
+                        frame_losses={LOSS_STAGE_CLASSIFIER: _loss_val},
                     )
                     _log(f"[stage-opengl] C {step_txt} top={top_txt}")
                 except Exception as e:
@@ -15470,6 +17205,8 @@ def main():
                             threshold=0.5,
                         )
                     target_rows: List[str] = []
+                    _g_loss_val = float("nan")
+                    _d_loss_val = float("nan")
                     for k, lbl in (
                         ("g_loss", "g"),
                         ("d_loss", "d"),
@@ -15478,9 +17215,16 @@ def main():
                     ):
                         if k in payload:
                             try:
-                                target_rows.append(f"{lbl}={float(payload.get(k, 0.0)):.4f}")
+                                _v = float(payload.get(k, 0.0))
+                                target_rows.append(f"{lbl}={_v:.4f}")
+                                if k == "g_loss":
+                                    _g_loss_val = _v
+                                elif k == "d_loss":
+                                    _d_loss_val = _v
                             except Exception:
                                 pass
+                    _loss_logger.log(int(round_id), LOSS_STAGE_GENERATOR, _g_loss_val, aux=_d_loss_val)
+                    _loss_logger.log(int(round_id), LOSS_STAGE_DISCRIMINATOR, _d_loss_val, aux=_g_loss_val)
                     deskew_rows: List[str] = []
                     deskew_preview = payload.get("deskew_preview", None)
                     if isinstance(deskew_preview, dict):
@@ -15528,6 +17272,10 @@ def main():
                             + list(deskew_rows)
                             + (out_lines if len(out_lines) > 0 else ["n/a"]),
                         ],
+                        frame_losses={
+                            LOSS_STAGE_GENERATOR: _g_loss_val,
+                            LOSS_STAGE_DISCRIMINATOR: _d_loss_val,
+                        },
                     )
                     _log(f"[stage-opengl] {stage_local} {step_txt} top={top_txt}")
                 except Exception as e:
@@ -15570,6 +17318,7 @@ def main():
                             threshold=0.5,
                         )
                     loss_rows: List[str] = []
+                    _r_loss_val = float("nan")
                     for k, lbl in (
                         ("loss", "loss"),
                         ("denoise_l1", "denoise"),
@@ -15580,9 +17329,13 @@ def main():
                     ):
                         if k in payload:
                             try:
-                                loss_rows.append(f"{lbl}={float(payload.get(k, 0.0)):.4f}")
+                                _v = float(payload.get(k, 0.0))
+                                loss_rows.append(f"{lbl}={_v:.4f}")
+                                if k == "loss":
+                                    _r_loss_val = _v
                             except Exception:
                                 pass
+                    _loss_logger.log(int(round_id), LOSS_STAGE_TRANSFORMER, _r_loss_val)
                     deskew_rows: List[str] = []
                     deskew_preview = payload.get("deskew_preview", None)
                     if isinstance(deskew_preview, dict):
@@ -15625,6 +17378,7 @@ def main():
                         target_line_override=target_line,
                         target_extra_rows=loss_rows,
                         extra_out_rows=deskew_rows,
+                        frame_losses={LOSS_STAGE_TRANSFORMER: _r_loss_val},
                     )
                 except Exception as e:
                     _log(f"[stage-opengl] {stage_local} live preview failed: {e}")
@@ -15646,16 +17400,22 @@ def main():
                     else:
                         target_line = "target:none"
                     loss_rows: List[str] = []
+                    _w_loss_val = float("nan")
                     if "train_loss" in payload:
                         try:
-                            loss_rows.append(f"loss={float(payload.get('train_loss', 0.0)):.4f}")
+                            _w_loss_val = float(payload.get('train_loss', 0.0))
+                            loss_rows.append(f"loss={_w_loss_val:.4f}")
                         except Exception:
                             pass
                     if "batch_loss" in payload:
                         try:
-                            loss_rows.append(f"batch={float(payload.get('batch_loss', 0.0)):.4f}")
+                            _bl = float(payload.get('batch_loss', 0.0))
+                            loss_rows.append(f"batch={_bl:.4f}")
+                            if not math.isfinite(_w_loss_val):
+                                _w_loss_val = _bl
                         except Exception:
                             pass
+                    _loss_logger.log(int(round_id), LOSS_STAGE_WAVE_CLASSIFIER, _w_loss_val)
                     p = probs.detach().to(torch.float32).cpu().numpy().astype(np.float32, copy=False).reshape(-1)
                     _stage_gl_emit_standard(
                         stage_key="W",
@@ -15670,6 +17430,7 @@ def main():
                         label_names=split_class_names,
                         target_line_override=target_line,
                         target_extra_rows=loss_rows,
+                        frame_losses={LOSS_STAGE_WAVE_CLASSIFIER: _w_loss_val},
                     )
                 except Exception as e:
                     _log(f"[stage-opengl] W live preview failed: {e}")
@@ -16435,6 +18196,7 @@ def main():
                     step_preview_callback=None,
                     stop_requested=_poll_gui_stop,
                     seed=int(args.seed + 19000 + (int(global_round) * 17)),
+                    grad_clip=float(args.classifier_grad_clip),
                 )
                 refresh_rows.append({"stage": f"{str(stage_tag)}_fake_feedback", "cycle": cycle_id, "round": round_id, **fb})
                 _log(
@@ -16671,6 +18433,7 @@ def main():
                         semantic_mix_blend_min=float(args.wave_cls_semantic_mix_blend_min),
                         semantic_mix_blend_max=float(args.wave_cls_semantic_mix_blend_max),
                         semantic_mix_class_index=int(split_mix_class_index),
+                        grad_clip=float(args.classifier_grad_clip),
                     )
                     for row in round_wave_hist:
                         rr = dict(row)
@@ -16789,16 +18552,40 @@ def main():
                     allow_churn=True,
                     autoload_gd=True,
                 )
+                _process_pending_cycle_gate_candidate(global_round_index=int(global_round))
                 _rebuild_semantic_gate_loaders(
                     reason=f"cycle_start:{int(cycle_id)}",
                     cycle_seed=int(args.seed) + (int(cycle_id) * 421) + int(global_round),
                     include_payload_val=bool(gestation_gate_streak >= gate_config["gestation_maintain_rounds"]),
+                    include_gestation_stage=bool(
+                        (float(gate_config.get("pregestation_loss_target", 0.0)) <= 0.0)
+                        or (pregestation_sub_round >= int(gate_config.get("pregestation_sub_rounds", 1)))
+                    ),
+                    gate_device=torch.device("cpu"),
                 )
+                cycle_pregestation_losses: List[float] = []
+                cycle_gestation_losses: List[float] = []
+                cycle_berkeley_losses: List[float] = []
                 for round_id in range(1, rounds_per_cycle + 1):
                     if _poll_gui_stop(note=f"cycle={int(cycle_id)} round={int(round_id)} start"):
                         stop_orchestration = True
                         break
                     global_round += 1
+                    applied_async_gate_notice = _apply_async_gate_notice(
+                        max_round_index=int(global_round) - 1,
+                        note=f"cycle={int(cycle_id)} round={int(round_id)} start",
+                    )
+                    if bool(applied_async_gate_notice):
+                        _rebuild_semantic_gate_loaders(
+                            reason=f"async_gate_notice:{int(cycle_id)}:{int(round_id)}",
+                            cycle_seed=int(args.seed) + (int(cycle_id) * 421) + int(global_round),
+                            include_payload_val=bool(gestation_gate_streak >= gate_config["gestation_maintain_rounds"]),
+                            include_gestation_stage=bool(
+                                (float(gate_config.get("pregestation_loss_target", 0.0)) <= 0.0)
+                                or (pregestation_sub_round >= int(gate_config.get("pregestation_sub_rounds", 1)))
+                            ),
+                            gate_device=torch.device("cpu"),
+                        )
                     gate_override_active = bool(_stage_gate_override_enabled())
                     _log(f"[cycle {cycle_id}/{cycle_offset + cycles} round {round_id}/{rounds_per_cycle}]")
                     _offload_inactive_stage_models(
@@ -16806,7 +18593,7 @@ def main():
                     )
                     pregestation_ready_before_stage1 = bool(
                         (float(gate_config.get("pregestation_loss_target", 0.0)) <= 0.0)
-                        or (pregestation_gate_streak >= 1)
+                        or (pregestation_sub_round >= int(gate_config.get("pregestation_sub_rounds", 1)))
                     )
                     gestation_ready_before_stage1 = bool(
                         pregestation_ready_before_stage1
@@ -16814,7 +18601,13 @@ def main():
                     )
                     did_pregestation_stage0_round = False
                     if (not bool(pregestation_ready_before_stage1)) and (pregestation_stage_loader is not None):
-                        pregestation_stage_steps = max(1, int(len(pregestation_stage_loader)))
+                        pregestation_stage_steps = max(
+                            1,
+                            max(
+                                int(args.pregestation_stage_min_steps),
+                                int(len(pregestation_stage_loader)) * max(1, int(args.pregestation_stage_deck_passes)),
+                            ),
+                        )
                         ref_stage0 = _run_berkeley_refresh_epochs(
                             classifier=classifier,
                             loader=pregestation_stage_loader,
@@ -16849,6 +18642,9 @@ def main():
                             target_label_knockout_seed=int(args.seed) + (int(cycle_id) * 10007) + (int(round_id) * 97),
                             step_preview_callback=_make_c_step_callback(cycle_id=int(cycle_id), round_id=int(round_id)),
                             stop_requested=_poll_gui_stop,
+                            grad_clip=float(args.classifier_grad_clip),
+                            semantic_cosine_weight=float(args.classifier_semantic_cosine_weight),
+                            semantic_soft_target_max=float(args.classifier_semantic_soft_target_max),
                         )
                         refresh_rows.append({"stage": "stage0_pregestation", "cycle": cycle_id, "round": round_id, **ref_stage0})
                         _log(
@@ -16857,6 +18653,10 @@ def main():
                             f"steps={int(ref_stage0.get('steps_per_epoch', 0))} "
                             f"elapsed={ref_stage0.get('elapsed_sec', 0.0):.1f}s"
                         )
+                        try:
+                            cycle_pregestation_losses.append(float(ref_stage0.get("loss", float("nan"))))
+                        except Exception:
+                            pass
                         did_pregestation_stage0_round = True
                     did_gestation_stage1_round = False
                     if bool(pregestation_ready_before_stage1) and (not bool(gestation_ready_before_stage1)) and (gestation_stage_loader is not None):
@@ -16895,6 +18695,9 @@ def main():
                             target_label_knockout_seed=int(args.seed) + (int(cycle_id) * 10007) + (int(round_id) * 97) + 1,
                             step_preview_callback=_make_c_step_callback(cycle_id=int(cycle_id), round_id=int(round_id)),
                             stop_requested=_poll_gui_stop,
+                            grad_clip=float(args.classifier_grad_clip),
+                            semantic_cosine_weight=float(args.classifier_semantic_cosine_weight),
+                            semantic_soft_target_max=float(args.classifier_semantic_soft_target_max),
                         )
                         refresh_rows.append({"stage": "stage1_gestation", "cycle": cycle_id, "round": round_id, **ref_stage1})
                         _log(
@@ -16903,6 +18706,10 @@ def main():
                             f"steps={int(ref_stage1.get('steps_per_epoch', 0))} "
                             f"elapsed={ref_stage1.get('elapsed_sec', 0.0):.1f}s"
                         )
+                        try:
+                            cycle_gestation_losses.append(float(ref_stage1.get("loss", float("nan"))))
+                        except Exception:
+                            pass
                         did_gestation_stage1_round = True
                         _save_training_segment_snapshot(
                             enabled=bool(args.checkpoint_after_training_segment),
@@ -16943,6 +18750,14 @@ def main():
                             reason=f"gestation_unlocked:cycle={int(cycle_id)} round={int(round_id)}",
                             samples_seen_for_startup=int(berkeley_refresh_samples_seen),
                         )
+                        if refresh_loader is not None:
+                            _rebuild_semantic_gate_loaders(
+                                reason=f"stage2_refresh_ready:{int(cycle_id)}:{int(round_id)}",
+                                cycle_seed=int(args.seed) + (int(cycle_id) * 421) + int(global_round),
+                                include_payload_val=True,
+                                include_gestation_stage=True,
+                                gate_device=torch.device("cpu"),
+                            )
 
                     refresh_only_loss_mode = bool(berkeley_loss_target_value > 0.0 and bool(berkeley_loss_target_unmet))
                     did_refresh_round = False
@@ -17058,6 +18873,9 @@ def main():
                             target_label_knockout_seed=int(args.seed) + (int(cycle_id) * 10007) + (int(round_id) * 97) + 2,
                             step_preview_callback=_make_c_step_callback(cycle_id=int(cycle_id), round_id=int(round_id)),
                             stop_requested=_poll_gui_stop,
+                            grad_clip=float(args.classifier_grad_clip),
+                            semantic_cosine_weight=float(args.classifier_semantic_cosine_weight),
+                            semantic_soft_target_max=float(args.classifier_semantic_soft_target_max),
                         )
                         refresh_rows.append({"stage": "orchestration", "cycle": cycle_id, "round": round_id, **ref})
                         berkeley_refresh_samples_seen += int(max(0, int(ref.get("samples", 0))))
@@ -17068,6 +18886,10 @@ def main():
                             f"startup_seen={berkeley_refresh_samples_seen}/{berkeley_refresh_required_samples} "
                             f"elapsed={ref.get('elapsed_sec', 0.0):.1f}s"
                         )
+                        try:
+                            cycle_berkeley_losses.append(float(ref.get("loss", float("nan"))))
+                        except Exception:
+                            pass
                         did_refresh_round = True
                         ref_loss = float(ref.get("loss", float("nan")))
                         if berkeley_loss_target_value > 0.0:
@@ -17260,26 +19082,31 @@ def main():
                         channels_last=bool(args.channels_last),
                         active_classes=int(score_active_classes),
                     )
-                    two_stage_gate_eval = _evaluate_two_stage_semantic_gates(round_index=int(global_round))
-                    pregestation_round_eval = two_stage_gate_eval.get("pregestation_eval", None)
-                    pregestation_gate_eval = dict(two_stage_gate_eval.get("pregestation_detail", {}))
-                    pregestation_pass = bool(two_stage_gate_eval.get("pregestation_pass", True))
-                    pregestation_ready = bool(two_stage_gate_eval.get("pregestation_ready", True))
-                    gestation_round_eval = two_stage_gate_eval.get("gestation_eval", None)
-                    gestation_gate_eval = dict(two_stage_gate_eval.get("gestation_detail", {}))
-                    gestation_pass = bool(two_stage_gate_eval.get("gestation_pass", True))
-                    gestation_ready = bool(two_stage_gate_eval.get("gestation_ready", True))
-                    stage2_mode = str(
-                        two_stage_gate_eval.get(
-                            "initial_stage_2_mode",
-                            ("ready" if bool(two_stage_gate_eval.get("initial_stage_2_ready", False)) else "waiting_for_gate_1"),
+                    stage2_ready_now, stage2_mode = _stage2_runtime_status()
+                    pregestation_round_eval = copy.deepcopy(current_pregestation_gate_eval)
+                    pregestation_gate_eval = dict(current_pregestation_gate_detail)
+                    pregestation_pass = bool(pregestation_gate_eval.get("pass", False))
+                    pregestation_ready = bool(
+                        (float(gate_config.get("pregestation_loss_target", 0.0)) <= 0.0)
+                        or (pregestation_sub_round >= int(gate_config.get("pregestation_sub_rounds", 1)))
+                    )
+                    gestation_round_eval = copy.deepcopy(current_gestation_gate_eval)
+                    gestation_gate_eval = dict(current_gestation_gate_detail)
+                    gestation_pass = bool(gestation_gate_eval.get("pass", False))
+                    gestation_ready = bool(
+                        pregestation_ready
+                        and (
+                            (float(gate_config.get("gestation_loss_target", 0.0)) <= 0.0)
+                            or (gestation_gate_streak >= int(gate_config.get("gestation_maintain_rounds", 1)))
                         )
                     )
-                    berkeley_round_eval = two_stage_gate_eval.get("total_eval", None)
-                    berkeley_gate_eval = dict(two_stage_gate_eval.get("total_detail", {}))
-                    berkeley_pass = bool(two_stage_gate_eval.get("total_pass", True))
-                    berkeley_ready = bool(two_stage_gate_eval.get("total_ready", True))
-
+                    berkeley_round_eval = copy.deepcopy(current_berkeley_gate_eval)
+                    berkeley_gate_eval = dict(current_berkeley_gate_detail)
+                    berkeley_pass = bool(berkeley_gate_eval.get("pass", False))
+                    berkeley_ready = bool(
+                        (not bool(total_gate_runtime_enabled))
+                        or (berkeley_gate_streak >= int(gate_config.get("berkeley_maintain_rounds", 1)))
+                    )
                     wave_pass = (
                         (float(berkeley_round_metric.get("mean_entropy", 0.0)) >= gate_config["wave_min_entropy"])
                         and (float(berkeley_round_metric["score"]) >= gate_config["berkeley_min_score"])
@@ -17304,7 +19131,7 @@ def main():
                         "gestation_gate_pass": bool(gestation_pass),
                         "gestation_streak": int(gestation_gate_streak),
                         "gestation_ready": bool(gestation_ready),
-                        "initial_stage_2_ready": bool(two_stage_gate_eval.get("initial_stage_2_ready", False)),
+                        "initial_stage_2_ready": bool(stage2_ready_now),
                         "initial_stage_2_mode": str(stage2_mode),
                         "berkeley_classifier_eval": berkeley_round_eval,
                         "berkeley_gate_detail": dict(berkeley_gate_eval),
@@ -17336,28 +19163,29 @@ def main():
                         "generator_wave_weight": float(feedback_generator_wave_weight),
                         "transformer_score_target_weight": float(feedback_transformer_score_weight),
                     }
-                    _run_transformer_round_preview(
-                        stage="S1",
-                        cycle_id=int(cycle_id),
-                        round_id=int(round_id),
-                        global_round=int(global_round),
-                        extra={
-                            "gestation_classifier_eval": round_row.get("gestation_classifier_eval", None),
-                            "gestation_gate_detail": round_row.get("gestation_gate_detail", None),
-                            "gestation_gate_pass": round_row.get("gestation_gate_pass", None),
-                        },
-                    )
-                    _run_transformer_round_preview(
-                        stage="G1",
-                        cycle_id=int(cycle_id),
-                        round_id=int(round_id),
-                        global_round=int(global_round),
-                        extra={
-                            "gestation_classifier_eval": round_row.get("gestation_classifier_eval", None),
-                            "gestation_gate_detail": round_row.get("gestation_gate_detail", None),
-                            "gestation_gate_pass": round_row.get("gestation_gate_pass", None),
-                        },
-                    )
+                    if (not bool(gestation_gate_runtime_enabled)) or bool(gestation_pass):
+                        _run_transformer_round_preview(
+                            stage="S1",
+                            cycle_id=int(cycle_id),
+                            round_id=int(round_id),
+                            global_round=int(global_round),
+                            extra={
+                                "gestation_classifier_eval": round_row.get("gestation_classifier_eval", None),
+                                "gestation_gate_detail": round_row.get("gestation_gate_detail", None),
+                                "gestation_gate_pass": round_row.get("gestation_gate_pass", None),
+                            },
+                        )
+                        _run_transformer_round_preview(
+                            stage="G1",
+                            cycle_id=int(cycle_id),
+                            round_id=int(round_id),
+                            global_round=int(global_round),
+                            extra={
+                                "gestation_classifier_eval": round_row.get("gestation_classifier_eval", None),
+                                "gestation_gate_detail": round_row.get("gestation_gate_detail", None),
+                                "gestation_gate_pass": round_row.get("gestation_gate_pass", None),
+                            },
+                        )
                     if bool(gestation_ready):
                         _run_transformer_round_preview(
                             stage="S2",
@@ -17369,7 +19197,7 @@ def main():
                                 "initial_stage_2_mode": round_row.get("initial_stage_2_mode", ""),
                             },
                         )
-                    if bool(gestation_ready) and bool(two_stage_gate_eval.get("initial_stage_2_ready", False)):
+                    if bool(gestation_ready) and bool(stage2_ready_now):
                         _run_transformer_round_preview(
                             stage="G2",
                             cycle_id=int(cycle_id),
@@ -17394,7 +19222,7 @@ def main():
                             f"gest_reason={gestation_gate_eval.get('reason', 'pass')}, "
                             f"gest_cov={int(gestation_gate_eval.get('refresh_samples_seen', 0))}/"
                             f"{int(gestation_gate_eval.get('refresh_samples_required', 0))}, "
-                            f"stage2_ready={1 if bool(two_stage_gate_eval.get('initial_stage_2_ready', False)) else 0}, "
+                            f"stage2_ready={1 if bool(stage2_ready_now) else 0}, "
                             f"stage2_mode={stage2_mode}, "
                             f"total_mode={berkeley_gate_eval.get('mode', 'hard_loss_full_refresh')}, "
                             f"total_reason={berkeley_gate_eval.get('reason', 'pass')}, "
@@ -17448,7 +19276,7 @@ def main():
                             }
                         )
                         stage_c_lora_info = {"enabled": bool(args.stage_c_lora_enabled), "ran": False, "reason": "stage2_not_ready"}
-                        if bool(gestation_ready) and bool(two_stage_gate_eval.get("initial_stage_2_ready", False)):
+                        if bool(gestation_ready) and bool(stage2_ready_now):
                             stage_c_lora_info = _run_stage_c_lora_round(
                                 cycle_id=int(cycle_id),
                                 round_id=int(round_id),
@@ -17457,7 +19285,7 @@ def main():
                             )
                         round_row["stage_c_lora"] = dict(stage_c_lora_info)
                         orchestration_rows.append(round_row)
-                        if bool(gestation_ready) and bool(two_stage_gate_eval.get("initial_stage_2_ready", False)):
+                        if bool(gestation_ready) and bool(stage2_ready_now):
                             _run_transformer_round_preview(
                                 stage="C",
                                 cycle_id=int(cycle_id),
@@ -17545,6 +19373,8 @@ def main():
                             grad_accum_steps=max(1, int(args.generator_grad_accum_steps)),
                             classifier_forward_batch_cap=max(0, int(args.generator_classifier_batch_cap)),
                             seed=args.seed + 15400 + global_round,
+                            grad_clip_g=float(args.generator_grad_clip),
+                            grad_clip_d=float(args.discriminator_grad_clip),
                         )
                         for row in joint_gen_hist:
                             rr = dict(row)
@@ -17812,6 +19642,8 @@ def main():
                             grad_accum_steps=max(1, int(args.generator_grad_accum_steps)),
                             classifier_forward_batch_cap=max(0, int(args.generator_classifier_batch_cap)),
                             seed=args.seed + 15000 + global_round,
+                            grad_clip_g=float(args.generator_grad_clip),
+                            grad_clip_d=float(args.discriminator_grad_clip),
                         )
                         for row in round_gen_hist:
                             rr = dict(row)
@@ -18125,6 +19957,25 @@ def main():
                     if _poll_gui_stop(note=f"cycle={int(cycle_id)} round={int(round_id)} stage=R"):
                         stop_orchestration = True
                         break
+                if not bool(stop_orchestration):
+                    if int(len(cycle_pregestation_losses)) > 0:
+                        pending_cycle_gate_candidate = {
+                            "stage": "pregestation",
+                            "avg_loss": float(np.mean(np.asarray(cycle_pregestation_losses, dtype=np.float32))),
+                            "cycle_id": int(cycle_id),
+                        }
+                    elif int(len(cycle_gestation_losses)) > 0:
+                        pending_cycle_gate_candidate = {
+                            "stage": "gestation",
+                            "avg_loss": float(np.mean(np.asarray(cycle_gestation_losses, dtype=np.float32))),
+                            "cycle_id": int(cycle_id),
+                        }
+                    elif int(len(cycle_berkeley_losses)) > 0:
+                        pending_cycle_gate_candidate = {
+                            "stage": "berkeley",
+                            "avg_loss": float(np.mean(np.asarray(cycle_berkeley_losses, dtype=np.float32))),
+                            "cycle_id": int(cycle_id),
+                        }
                 if stop_orchestration:
                     break
         else:
@@ -18251,16 +20102,40 @@ def main():
                     allow_churn=True,
                     autoload_gd=True,
                 )
+                _process_pending_cycle_gate_candidate(global_round_index=int(global_round))
                 _rebuild_semantic_gate_loaders(
                     reason=f"cycle_start:{int(cycle_id)}",
                     cycle_seed=int(args.seed) + (int(cycle_id) * 421) + int(global_round),
                     include_payload_val=bool(gestation_gate_streak >= gate_config["gestation_maintain_rounds"]),
+                    include_gestation_stage=bool(
+                        (float(gate_config.get("pregestation_loss_target", 0.0)) <= 0.0)
+                        or (pregestation_sub_round >= int(gate_config.get("pregestation_sub_rounds", 1)))
+                    ),
+                    gate_device=torch.device("cpu"),
                 )
+                cycle_pregestation_losses: List[float] = []
+                cycle_gestation_losses: List[float] = []
+                cycle_berkeley_losses: List[float] = []
                 for round_id in range(1, rounds_per_cycle + 1):
                     if _poll_gui_stop(note=f"cycle={int(cycle_id)} round={int(round_id)} start"):
                         stop_orchestration = True
                         break
                     global_round += 1
+                    applied_async_gate_notice = _apply_async_gate_notice(
+                        max_round_index=int(global_round) - 1,
+                        note=f"cycle={int(cycle_id)} round={int(round_id)} start",
+                    )
+                    if bool(applied_async_gate_notice):
+                        _rebuild_semantic_gate_loaders(
+                            reason=f"async_gate_notice:{int(cycle_id)}:{int(round_id)}",
+                            cycle_seed=int(args.seed) + (int(cycle_id) * 421) + int(global_round),
+                            include_payload_val=bool(gestation_gate_streak >= gate_config["gestation_maintain_rounds"]),
+                            include_gestation_stage=bool(
+                                (float(gate_config.get("pregestation_loss_target", 0.0)) <= 0.0)
+                                or (pregestation_sub_round >= int(gate_config.get("pregestation_sub_rounds", 1)))
+                            ),
+                            gate_device=torch.device("cpu"),
+                        )
                     gate_override_active = bool(_stage_gate_override_enabled())
                     _log(f"[cycle {cycle_id}/{cycle_offset + cycles} round {round_id}/{rounds_per_cycle}]")
                     _offload_inactive_stage_models(
@@ -18268,7 +20143,7 @@ def main():
                     )
                     pregestation_ready_before_stage1 = bool(
                         (float(gate_config.get("pregestation_loss_target", 0.0)) <= 0.0)
-                        or (pregestation_gate_streak >= 1)
+                        or (pregestation_sub_round >= int(gate_config.get("pregestation_sub_rounds", 1)))
                     )
                     gestation_ready_before_stage1 = bool(
                         pregestation_ready_before_stage1
@@ -18276,7 +20151,13 @@ def main():
                     )
                     did_pregestation_stage0_round = False
                     if (not bool(pregestation_ready_before_stage1)) and (pregestation_stage_loader is not None):
-                        pregestation_stage_steps = max(1, int(len(pregestation_stage_loader)))
+                        pregestation_stage_steps = max(
+                            1,
+                            max(
+                                int(args.pregestation_stage_min_steps),
+                                int(len(pregestation_stage_loader)) * max(1, int(args.pregestation_stage_deck_passes)),
+                            ),
+                        )
                         ref_stage0 = _run_berkeley_refresh_epochs(
                             classifier=classifier,
                             loader=pregestation_stage_loader,
@@ -18311,6 +20192,9 @@ def main():
                             target_label_knockout_seed=int(args.seed) + (int(cycle_id) * 10007) + (int(round_id) * 97),
                             step_preview_callback=_make_c_step_callback(cycle_id=int(cycle_id), round_id=int(round_id)),
                             stop_requested=_poll_gui_stop,
+                            grad_clip=float(args.classifier_grad_clip),
+                            semantic_cosine_weight=float(args.classifier_semantic_cosine_weight),
+                            semantic_soft_target_max=float(args.classifier_semantic_soft_target_max),
                         )
                         refresh_rows.append({"stage": "stage0_pregestation", "cycle": cycle_id, "round": round_id, **ref_stage0})
                         _log(
@@ -18319,6 +20203,10 @@ def main():
                             f"steps={int(ref_stage0.get('steps_per_epoch', 0))} "
                             f"elapsed={ref_stage0.get('elapsed_sec', 0.0):.1f}s"
                         )
+                        try:
+                            cycle_pregestation_losses.append(float(ref_stage0.get("loss", float("nan"))))
+                        except Exception:
+                            pass
                         did_pregestation_stage0_round = True
                     did_gestation_stage1_round = False
                     if bool(pregestation_ready_before_stage1) and (not bool(gestation_ready_before_stage1)) and (gestation_stage_loader is not None):
@@ -18357,6 +20245,9 @@ def main():
                             target_label_knockout_seed=int(args.seed) + (int(cycle_id) * 10007) + (int(round_id) * 97) + 1,
                             step_preview_callback=_make_c_step_callback(cycle_id=int(cycle_id), round_id=int(round_id)),
                             stop_requested=_poll_gui_stop,
+                            grad_clip=float(args.classifier_grad_clip),
+                            semantic_cosine_weight=float(args.classifier_semantic_cosine_weight),
+                            semantic_soft_target_max=float(args.classifier_semantic_soft_target_max),
                         )
                         refresh_rows.append({"stage": "stage1_gestation", "cycle": cycle_id, "round": round_id, **ref_stage1})
                         _log(
@@ -18365,6 +20256,10 @@ def main():
                             f"steps={int(ref_stage1.get('steps_per_epoch', 0))} "
                             f"elapsed={ref_stage1.get('elapsed_sec', 0.0):.1f}s"
                         )
+                        try:
+                            cycle_gestation_losses.append(float(ref_stage1.get("loss", float("nan"))))
+                        except Exception:
+                            pass
                         did_gestation_stage1_round = True
                         _save_training_segment_snapshot(
                             enabled=bool(args.checkpoint_after_training_segment),
@@ -18406,6 +20301,14 @@ def main():
                             reason=f"gestation_unlocked:cycle={int(cycle_id)} round={int(round_id)}",
                             samples_seen_for_startup=int(berkeley_refresh_samples_seen),
                         )
+                        if refresh_loader is not None:
+                            _rebuild_semantic_gate_loaders(
+                                reason=f"stage2_refresh_ready:{int(cycle_id)}:{int(round_id)}",
+                                cycle_seed=int(args.seed) + (int(cycle_id) * 421) + int(global_round),
+                                include_payload_val=True,
+                                include_gestation_stage=True,
+                                gate_device=torch.device("cpu"),
+                            )
 
                     refresh_only_loss_mode = bool(berkeley_loss_target_value > 0.0 and bool(berkeley_loss_target_unmet))
                     did_refresh_round = False
@@ -18521,6 +20424,9 @@ def main():
                             target_label_knockout_seed=int(args.seed) + (int(cycle_id) * 10007) + (int(round_id) * 97) + 2,
                             step_preview_callback=_make_c_step_callback(cycle_id=int(cycle_id), round_id=int(round_id)),
                             stop_requested=_poll_gui_stop,
+                            grad_clip=float(args.classifier_grad_clip),
+                            semantic_cosine_weight=float(args.classifier_semantic_cosine_weight),
+                            semantic_soft_target_max=float(args.classifier_semantic_soft_target_max),
                         )
                         refresh_rows.append({"stage": "orchestration", "cycle": cycle_id, "round": round_id, **ref})
                         berkeley_refresh_samples_seen += int(max(0, int(ref.get("samples", 0))))
@@ -18531,6 +20437,10 @@ def main():
                             f"startup_seen={berkeley_refresh_samples_seen}/{berkeley_refresh_required_samples} "
                             f"elapsed={ref.get('elapsed_sec', 0.0):.1f}s"
                         )
+                        try:
+                            cycle_berkeley_losses.append(float(ref.get("loss", float("nan"))))
+                        except Exception:
+                            pass
                         did_refresh_round = True
                         ref_loss = float(ref.get("loss", float("nan")))
                         if berkeley_loss_target_value > 0.0:
@@ -18722,26 +20632,31 @@ def main():
                         channels_last=bool(args.channels_last),
                         active_classes=int(score_active_classes),
                     )
-                    two_stage_gate_eval = _evaluate_two_stage_semantic_gates(round_index=int(global_round))
-                    pregestation_round_eval = two_stage_gate_eval.get("pregestation_eval", None)
-                    pregestation_gate_eval = dict(two_stage_gate_eval.get("pregestation_detail", {}))
-                    pregestation_pass = bool(two_stage_gate_eval.get("pregestation_pass", True))
-                    pregestation_ready = bool(two_stage_gate_eval.get("pregestation_ready", True))
-                    gestation_round_eval = two_stage_gate_eval.get("gestation_eval", None)
-                    gestation_gate_eval = dict(two_stage_gate_eval.get("gestation_detail", {}))
-                    gestation_pass = bool(two_stage_gate_eval.get("gestation_pass", True))
-                    gestation_ready = bool(two_stage_gate_eval.get("gestation_ready", True))
-                    stage2_mode = str(
-                        two_stage_gate_eval.get(
-                            "initial_stage_2_mode",
-                            ("ready" if bool(two_stage_gate_eval.get("initial_stage_2_ready", False)) else "waiting_for_gate_1"),
+                    stage2_ready_now, stage2_mode = _stage2_runtime_status()
+                    pregestation_round_eval = copy.deepcopy(current_pregestation_gate_eval)
+                    pregestation_gate_eval = dict(current_pregestation_gate_detail)
+                    pregestation_pass = bool(pregestation_gate_eval.get("pass", False))
+                    pregestation_ready = bool(
+                        (float(gate_config.get("pregestation_loss_target", 0.0)) <= 0.0)
+                        or (pregestation_sub_round >= int(gate_config.get("pregestation_sub_rounds", 1)))
+                    )
+                    gestation_round_eval = copy.deepcopy(current_gestation_gate_eval)
+                    gestation_gate_eval = dict(current_gestation_gate_detail)
+                    gestation_pass = bool(gestation_gate_eval.get("pass", False))
+                    gestation_ready = bool(
+                        pregestation_ready
+                        and (
+                            (float(gate_config.get("gestation_loss_target", 0.0)) <= 0.0)
+                            or (gestation_gate_streak >= int(gate_config.get("gestation_maintain_rounds", 1)))
                         )
                     )
-                    berkeley_round_eval = two_stage_gate_eval.get("total_eval", None)
-                    berkeley_gate_eval = dict(two_stage_gate_eval.get("total_detail", {}))
-                    berkeley_pass = bool(two_stage_gate_eval.get("total_pass", True))
-                    berkeley_ready = bool(two_stage_gate_eval.get("total_ready", True))
-
+                    berkeley_round_eval = copy.deepcopy(current_berkeley_gate_eval)
+                    berkeley_gate_eval = dict(current_berkeley_gate_detail)
+                    berkeley_pass = bool(berkeley_gate_eval.get("pass", False))
+                    berkeley_ready = bool(
+                        (not bool(total_gate_runtime_enabled))
+                        or (berkeley_gate_streak >= int(gate_config.get("berkeley_maintain_rounds", 1)))
+                    )
                     wave_pass = (
                         (float(berkeley_round_metric.get("mean_entropy", 0.0)) >= gate_config["wave_min_entropy"])
                         and (float(berkeley_round_metric["score"]) >= gate_config["berkeley_min_score"])
@@ -18766,7 +20681,7 @@ def main():
                         "gestation_gate_pass": bool(gestation_pass),
                         "gestation_streak": int(gestation_gate_streak),
                         "gestation_ready": bool(gestation_ready),
-                        "initial_stage_2_ready": bool(two_stage_gate_eval.get("initial_stage_2_ready", False)),
+                        "initial_stage_2_ready": bool(stage2_ready_now),
                         "initial_stage_2_mode": str(stage2_mode),
                         "berkeley_classifier_eval": berkeley_round_eval,
                         "berkeley_gate_detail": dict(berkeley_gate_eval),
@@ -18792,28 +20707,29 @@ def main():
                     round_row["feedback_weights"] = {
                         "transformer_score_target_weight": float(feedback_transformer_score_weight),
                     }
-                    _run_transformer_round_preview(
-                        stage="S1",
-                        cycle_id=int(cycle_id),
-                        round_id=int(round_id),
-                        global_round=int(global_round),
-                        extra={
-                            "gestation_classifier_eval": round_row.get("gestation_classifier_eval", None),
-                            "gestation_gate_detail": round_row.get("gestation_gate_detail", None),
-                            "gestation_gate_pass": round_row.get("gestation_gate_pass", None),
-                        },
-                    )
-                    _run_transformer_round_preview(
-                        stage="G1",
-                        cycle_id=int(cycle_id),
-                        round_id=int(round_id),
-                        global_round=int(global_round),
-                        extra={
-                            "gestation_classifier_eval": round_row.get("gestation_classifier_eval", None),
-                            "gestation_gate_detail": round_row.get("gestation_gate_detail", None),
-                            "gestation_gate_pass": round_row.get("gestation_gate_pass", None),
-                        },
-                    )
+                    if (not bool(gestation_gate_runtime_enabled)) or bool(gestation_pass):
+                        _run_transformer_round_preview(
+                            stage="S1",
+                            cycle_id=int(cycle_id),
+                            round_id=int(round_id),
+                            global_round=int(global_round),
+                            extra={
+                                "gestation_classifier_eval": round_row.get("gestation_classifier_eval", None),
+                                "gestation_gate_detail": round_row.get("gestation_gate_detail", None),
+                                "gestation_gate_pass": round_row.get("gestation_gate_pass", None),
+                            },
+                        )
+                        _run_transformer_round_preview(
+                            stage="G1",
+                            cycle_id=int(cycle_id),
+                            round_id=int(round_id),
+                            global_round=int(global_round),
+                            extra={
+                                "gestation_classifier_eval": round_row.get("gestation_classifier_eval", None),
+                                "gestation_gate_detail": round_row.get("gestation_gate_detail", None),
+                                "gestation_gate_pass": round_row.get("gestation_gate_pass", None),
+                            },
+                        )
                     if bool(gestation_ready):
                         _run_transformer_round_preview(
                             stage="S2",
@@ -18825,7 +20741,7 @@ def main():
                                 "initial_stage_2_mode": round_row.get("initial_stage_2_mode", ""),
                             },
                         )
-                    if bool(gestation_ready) and bool(two_stage_gate_eval.get("initial_stage_2_ready", False)):
+                    if bool(gestation_ready) and bool(stage2_ready_now):
                         _run_transformer_round_preview(
                             stage="G2",
                             cycle_id=int(cycle_id),
@@ -18849,7 +20765,7 @@ def main():
                             f"gest_reason={gestation_gate_eval.get('reason', 'pass')}, "
                             f"gest_cov={int(gestation_gate_eval.get('refresh_samples_seen', 0))}/"
                             f"{int(gestation_gate_eval.get('refresh_samples_required', 0))}, "
-                            f"stage2_ready={1 if bool(two_stage_gate_eval.get('initial_stage_2_ready', False)) else 0}, "
+                            f"stage2_ready={1 if bool(stage2_ready_now) else 0}, "
                             f"stage2_mode={stage2_mode}, "
                             f"total_mode={berkeley_gate_eval.get('mode', 'hard_loss_full_refresh')}, "
                             f"total_reason={berkeley_gate_eval.get('reason', 'pass')}, "
@@ -18903,7 +20819,7 @@ def main():
                             }
                         )
                         stage_c_lora_info = {"enabled": bool(args.stage_c_lora_enabled), "ran": False, "reason": "stage2_not_ready"}
-                        if bool(gestation_ready) and bool(two_stage_gate_eval.get("initial_stage_2_ready", False)):
+                        if bool(gestation_ready) and bool(stage2_ready_now):
                             stage_c_lora_info = _run_stage_c_lora_round(
                                 cycle_id=int(cycle_id),
                                 round_id=int(round_id),
@@ -18912,7 +20828,7 @@ def main():
                             )
                         round_row["stage_c_lora"] = dict(stage_c_lora_info)
                         orchestration_rows.append(round_row)
-                        if bool(gestation_ready) and bool(two_stage_gate_eval.get("initial_stage_2_ready", False)):
+                        if bool(gestation_ready) and bool(stage2_ready_now):
                             _run_transformer_round_preview(
                                 stage="C",
                                 cycle_id=int(cycle_id),
@@ -19312,6 +21228,7 @@ def main():
                             semantic_mix_blend_min=float(args.wave_cls_semantic_mix_blend_min),
                             semantic_mix_blend_max=float(args.wave_cls_semantic_mix_blend_max),
                             semantic_mix_class_index=int(split_mix_class_index),
+                            grad_clip=float(args.classifier_grad_clip),
                         )
                         for row in round_wave_hist:
                             rr = dict(row)
@@ -19509,6 +21426,25 @@ def main():
                     if _poll_gui_stop(note=f"cycle={int(cycle_id)} round={int(round_id)} stage=W"):
                         stop_orchestration = True
                         break
+                if not bool(stop_orchestration):
+                    if int(len(cycle_pregestation_losses)) > 0:
+                        pending_cycle_gate_candidate = {
+                            "stage": "pregestation",
+                            "avg_loss": float(np.mean(np.asarray(cycle_pregestation_losses, dtype=np.float32))),
+                            "cycle_id": int(cycle_id),
+                        }
+                    elif int(len(cycle_gestation_losses)) > 0:
+                        pending_cycle_gate_candidate = {
+                            "stage": "gestation",
+                            "avg_loss": float(np.mean(np.asarray(cycle_gestation_losses, dtype=np.float32))),
+                            "cycle_id": int(cycle_id),
+                        }
+                    elif int(len(cycle_berkeley_losses)) > 0:
+                        pending_cycle_gate_candidate = {
+                            "stage": "berkeley",
+                            "avg_loss": float(np.mean(np.asarray(cycle_berkeley_losses, dtype=np.float32))),
+                            "cycle_id": int(cycle_id),
+                        }
                 if stop_orchestration:
                     break
 
@@ -19923,6 +21859,10 @@ def main():
             stage_opengl_viewer.close()
         except Exception:
             pass
+        try:
+            _loss_logger.close()
+        except Exception:
+            pass
         _log(f"Finished. Summary: {summary_path}")
         if bool(gui_stop_requested):
             _log(f"GUI stop requested; exiting with code {int(GUI_STOP_EXIT_CODE)}.")
@@ -20075,6 +22015,7 @@ def main():
                     channels_last=bool(args.channels_last),
                     grad_accum_steps=grad_accum_steps,
                     seed=args.seed + i,
+                    grad_clip=float(args.classifier_grad_clip),
                 )
                 val_stats = evaluate_classifier(
                     model,
@@ -20148,6 +22089,7 @@ def main():
                         channels_last=bool(args.channels_last),
                         grad_accum_steps=grad_accum_steps,
                         seed=args.seed + 999 + j,
+                        grad_clip=float(args.classifier_grad_clip),
                     )
                     val_stats = evaluate_classifier(
                         model,
@@ -20265,6 +22207,7 @@ def main():
         channels_last=bool(args.channels_last),
         grad_accum_steps=grad_accum_steps,
         seed=args.seed + 5000,
+        grad_clip=float(args.classifier_grad_clip),
     )
     classifier_hist.extend(run_classifier_hist)
     _save_training_segment_snapshot(
@@ -20505,6 +22448,7 @@ def main():
         visualize_status=bool(args.transformer_visualize_status),
         visualize_scale=max(1, int(args.transformer_viz_scale)),
         seed=args.seed + 9000,
+        grad_clip=float(args.transformer_grad_clip),
     )
     transformer_hist.extend(run_transformer_hist)
     _save_training_segment_snapshot(

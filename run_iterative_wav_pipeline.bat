@@ -63,13 +63,22 @@ set "ENFORCE_RENDER_BIT_HIGH=11"
 set "ENFORCE_RENDER_MAX_POINTS=262144"
 
 REM Gate settings (downstream will be skipped until these are maintained)
-set "GATE_GESTATION_LOSS_TARGET=1.5"
+set "GATE_PREGESTATION_LOSS_TARGET=1.6"
+set "GATE_PREGESTATION_MAINTAIN=2"
+set "PREGESTATION_SUB_ROUNDS=2"
+set "PREGESTATION_TEMP_TREND=1.5"
+set "PREGESTATION_TEMP_OSCILLATION_AMPLITUDE=0.4"
+set "PREGESTATION_TEMP_OSCILLATION_PERIOD=4"
+set "PREGESTATION_STAGE_BATCH_SIZE=32"
+set "PREGESTATION_STAGE_DECK_PASSES=4"
+set "PREGESTATION_STAGE_MIN_STEPS=12000"
+set "GATE_GESTATION_LOSS_TARGET=1.6"
 set "GATE_GESTATION_MAINTAIN=2"
 set "GATE_GESTATION_BATCH_SIZE=64"
 set "GATE_TOTAL_TOKEN_SCHEDULE=1"
 set "GATE_TOTAL_TOKEN_SCHEDULE_THRESHOLD=0.55"
 set "GATE_BERKELEY_MIN=0.8"
-set "GATE_BERKELEY_LOSS_TARGET=1.5"
+set "GATE_BERKELEY_LOSS_TARGET=1.6"
 set "GATE_BERKELEY_MAINTAIN=2"
 set "GATE_BERKELEY_BATCH_SIZE=64"
 set "GATE_TRANS_AFTER_MIN=0.265"
@@ -115,7 +124,7 @@ set "BERKELEY_REFRESH_BATCH_SIZE=0"
 set "BERKELEY_REFRESH_LOADER_BATCH_SIZE=64"
 set "BERKELEY_REFRESH_CACHE_BATCHES=0"
 set "BERKELEY_REFRESH_CACHE_DEVICE=cpu"
-set "BERKELEY_REFRESH_WORKERS=1"
+set "BERKELEY_REFRESH_WORKERS=4"
 set "BERKELEY_PAYLOAD_MAX_SAMPLES=2048"
 set "BERKELEY_PAYLOAD_SOURCE_ROOT="
 set "BERKELEY_PAYLOAD_CACHE_REBUILD=0"
@@ -185,12 +194,22 @@ set "SEMANTIC_VOCAB_UNKNOWN_LABEL_ROWS_PER_CYCLE=0"
 set "SEMANTIC_VOCAB_BOOTSTRAP_ORIGIN_LABEL=internal bootstrap root vocab"
 set "SEMANTIC_VOCAB_AUTO_SYMBOL_POOL=1"
 set "SEMANTIC_VOCAB_SYMBOL_POOL_ROOT=toys_to_survive_development\data\semantic_symbol_pool"
+set "SEMANTIC_VOCAB_PREGESTATION_SAMPLES_PER_COMBO=32"
 set "SEMANTIC_VOCAB_SYMBOL_SAMPLES_PER_TERM=1"
 set "SEMANTIC_VOCAB_GESTATION_TRAIN_TARGET_SAMPLES=8000"
 set "SEMANTIC_VOCAB_GESTATION_VAL_TARGET_SAMPLES=1600"
 set "SEMANTIC_VOCAB_SYMBOL_INCLUDE_PICTOGRAMS=0"
 set "SEMANTIC_VOCAB_REFERENCE_FLASHCARDS=1"
 set "SEMANTIC_VOCAB_REFERENCE_FLASHCARDS_PER_TERM=2"
+set "SEMANTIC_STAGE_CACHE_ENABLED=1"
+set "SEMANTIC_STAGE_CACHE_SLOT_LIFESPAN=0"
+set "SEMANTIC_STAGE_CACHE_DIR="
+set "SEMANTIC_STAGE_CACHE_MAX_ROWS=512"
+set "SEMANTIC_STAGE_CACHE_MAX_MB=4096"
+set "PREGESTATION_STAGE_CACHE_MAX_MB=2048"
+set "GESTATION_STAGE_CACHE_MAX_MB=4096"
+set "SEMANTIC_STAGE_CACHE_OVERFLOW_STRATEGY=evict"
+set "SEMANTIC_STAGE_CACHE_REBUILD=0"
 set "GD_VOCAB_LIBRARY_ENABLED=1"
 set "GD_VOCAB_LIBRARY_AUTOLOAD=1"
 set "GD_VOCAB_LIBRARY_DIR="
@@ -215,6 +234,12 @@ set "DISC_BASE_CH=128"
 set "DISC_DEPTH=6"
 set "DISC_MAX_CH=768"
 set "DISC_STEPS_PER_GEN_STEP=2"
+set "CLS_SEMANTIC_SOFT_MAX=0.1"
+set "CLS_SEMANTIC_COSINE_W=0.1"
+set "CLS_GRAD_CLIP=1.0"
+set "GEN_GRAD_CLIP=1.0"
+set "DISC_GRAD_CLIP=1.0"
+set "TRANS_GRAD_CLIP=1.0"
 set "FAKE_SENTINEL_LABEL=GAN image"
 set "GEN_FAKE_FEEDBACK_EPOCHS=1"
 set "GEN_FAKE_FEEDBACK_STEPS_PER_ROUND=48"
@@ -231,6 +256,9 @@ set "ENDLESS_MAX_RUNS=0"
 set "ENDLESS_SEED_STRIDE=9973"
 set "ENDLESS_SLEEP_SECONDS=2"
 set "GUI_STOP_EXIT_CODE=42"
+set "WEIGHT_BACKUP_ENABLED=1"
+set "WEIGHT_BACKUP_SUBDIR=_weight_backup"
+set "WEIGHT_BACKUP_MAX_KEEP=10"
 REM Optional runtime overrides applied before each endless run.
 REM Example file contents:
 REM   set "GATE_BERKELEY_LOSS_TARGET=0.25"
@@ -276,6 +304,7 @@ if "%SEMANTIC_VOCAB_AUTO_SYMBOL_POOL%"=="1" (
   set "SEMANTIC_VOCAB_ARG=%SEMANTIC_VOCAB_ARG% --no-semantic-vocab-auto-symbol-pool"
 )
 if not "%SEMANTIC_VOCAB_SYMBOL_POOL_ROOT%"=="" set "SEMANTIC_VOCAB_ARG=%SEMANTIC_VOCAB_ARG% --semantic-vocab-symbol-pool-root ""%SEMANTIC_VOCAB_SYMBOL_POOL_ROOT%"""
+if not "%SEMANTIC_VOCAB_PREGESTATION_SAMPLES_PER_COMBO%"=="" set "SEMANTIC_VOCAB_ARG=%SEMANTIC_VOCAB_ARG% --semantic-vocab-pregestation-samples-per-combo %SEMANTIC_VOCAB_PREGESTATION_SAMPLES_PER_COMBO%"
 if not "%SEMANTIC_VOCAB_SYMBOL_SAMPLES_PER_TERM%"=="" set "SEMANTIC_VOCAB_ARG=%SEMANTIC_VOCAB_ARG% --semantic-vocab-symbol-samples-per-term %SEMANTIC_VOCAB_SYMBOL_SAMPLES_PER_TERM%"
 if not "%SEMANTIC_VOCAB_GESTATION_TRAIN_TARGET_SAMPLES%"=="" set "SEMANTIC_VOCAB_ARG=%SEMANTIC_VOCAB_ARG% --semantic-vocab-gestation-train-target-samples %SEMANTIC_VOCAB_GESTATION_TRAIN_TARGET_SAMPLES%"
 if not "%SEMANTIC_VOCAB_GESTATION_VAL_TARGET_SAMPLES%"=="" set "SEMANTIC_VOCAB_ARG=%SEMANTIC_VOCAB_ARG% --semantic-vocab-gestation-val-target-samples %SEMANTIC_VOCAB_GESTATION_VAL_TARGET_SAMPLES%"
@@ -290,6 +319,24 @@ if "%SEMANTIC_VOCAB_REFERENCE_FLASHCARDS%"=="1" (
   set "SEMANTIC_VOCAB_ARG=%SEMANTIC_VOCAB_ARG% --no-semantic-vocab-reference-flashcards"
 )
 if not "%SEMANTIC_VOCAB_REFERENCE_FLASHCARDS_PER_TERM%"=="" set "SEMANTIC_VOCAB_ARG=%SEMANTIC_VOCAB_ARG% --semantic-vocab-reference-flashcards-per-term %SEMANTIC_VOCAB_REFERENCE_FLASHCARDS_PER_TERM%"
+set "SEMANTIC_STAGE_CACHE_ARG="
+if "%SEMANTIC_STAGE_CACHE_ENABLED%"=="1" (
+  set "SEMANTIC_STAGE_CACHE_ARG=%SEMANTIC_STAGE_CACHE_ARG% --semantic-stage-cache-enabled"
+) else (
+  set "SEMANTIC_STAGE_CACHE_ARG=%SEMANTIC_STAGE_CACHE_ARG% --no-semantic-stage-cache-enabled"
+)
+if not "%SEMANTIC_STAGE_CACHE_DIR%"=="" set "SEMANTIC_STAGE_CACHE_ARG=%SEMANTIC_STAGE_CACHE_ARG% --semantic-stage-cache-dir ""%SEMANTIC_STAGE_CACHE_DIR%"""
+if not "%SEMANTIC_STAGE_CACHE_MAX_ROWS%"=="" set "SEMANTIC_STAGE_CACHE_ARG=%SEMANTIC_STAGE_CACHE_ARG% --semantic-stage-cache-max-rows %SEMANTIC_STAGE_CACHE_MAX_ROWS%"
+if not "%SEMANTIC_STAGE_CACHE_MAX_MB%"=="" set "SEMANTIC_STAGE_CACHE_ARG=%SEMANTIC_STAGE_CACHE_ARG% --semantic-stage-cache-max-mb %SEMANTIC_STAGE_CACHE_MAX_MB%"
+if not "%SEMANTIC_STAGE_CACHE_SLOT_LIFESPAN%"=="" set "SEMANTIC_STAGE_CACHE_ARG=%SEMANTIC_STAGE_CACHE_ARG% --semantic-stage-cache-slot-lifespan %SEMANTIC_STAGE_CACHE_SLOT_LIFESPAN%"
+if not "%PREGESTATION_STAGE_CACHE_MAX_MB%"=="" set "SEMANTIC_STAGE_CACHE_ARG=%SEMANTIC_STAGE_CACHE_ARG% --pregestation-stage-cache-max-mb %PREGESTATION_STAGE_CACHE_MAX_MB%"
+if not "%GESTATION_STAGE_CACHE_MAX_MB%"=="" set "SEMANTIC_STAGE_CACHE_ARG=%SEMANTIC_STAGE_CACHE_ARG% --gestation-stage-cache-max-mb %GESTATION_STAGE_CACHE_MAX_MB%"
+if not "%SEMANTIC_STAGE_CACHE_OVERFLOW_STRATEGY%"=="" set "SEMANTIC_STAGE_CACHE_ARG=%SEMANTIC_STAGE_CACHE_ARG% --semantic-stage-cache-overflow-strategy %SEMANTIC_STAGE_CACHE_OVERFLOW_STRATEGY%"
+if "%SEMANTIC_STAGE_CACHE_REBUILD%"=="1" (
+  set "SEMANTIC_STAGE_CACHE_ARG=%SEMANTIC_STAGE_CACHE_ARG% --semantic-stage-cache-rebuild"
+) else (
+  set "SEMANTIC_STAGE_CACHE_ARG=%SEMANTIC_STAGE_CACHE_ARG% --no-semantic-stage-cache-rebuild"
+)
 set "GD_VOCAB_ARG="
 if "%GD_VOCAB_LIBRARY_ENABLED%"=="1" (
   set "GD_VOCAB_ARG=%GD_VOCAB_ARG% --gd-vocab-library-enabled"
@@ -353,6 +400,7 @@ if /I "%ORCH_MODE%"=="staged_cgrw" (
 )
 
 set /a RUN_INDEX=0
+call :backup_weights startup
 
 :run_loop
 set /a RUN_INDEX+=1
@@ -360,6 +408,7 @@ set /a RUN_SEED=%BASE_SEED% + ((RUN_INDEX - 1) * %ENDLESS_SEED_STRIDE%)
 call :apply_runtime_overrides
 echo.
 echo [launcher] run !RUN_INDEX! seed=!RUN_SEED! endless=%ENDLESS_MODE%
+echo [launcher] gate_pregestation_loss_target=!GATE_PREGESTATION_LOSS_TARGET! maintain=!GATE_PREGESTATION_MAINTAIN!
 echo [launcher] gate_gestation_loss_target=!GATE_GESTATION_LOSS_TARGET!
 echo [launcher] gate_berkeley_loss_target=!GATE_BERKELEY_LOSS_TARGET!
 set "RUN_EXTRA_ARG="
@@ -386,6 +435,7 @@ if not "!RUN_RC!"=="0" (
 
 if "%ENDLESS_MODE%"=="1" (
   if not "%ENDLESS_MAX_RUNS%"=="0" if !RUN_INDEX! GEQ %ENDLESS_MAX_RUNS% goto all_done
+  call :backup_weights run_!RUN_INDEX!
   if %ENDLESS_SLEEP_SECONDS% GTR 0 timeout /t %ENDLESS_SLEEP_SECONDS% /nobreak >nul
   goto run_loop
 )
@@ -415,10 +465,10 @@ set "RUN_EXTRA_ARG=%~2"
   --device cuda:0 ^
   --amp ^
   --amp-dtype bfloat16 ^
-  --channels-last ^
+  --no-cudnn-benchmark ^
   --grad-accum-steps %GLOBAL_GRAD_ACCUM_STEPS% ^
   --no-loader-persistent-workers ^
-  --loader-prefetch-factor 2 ^
+  --loader-prefetch-factor 4 ^
   --max-files %MAX_FILES% ^
   --image-size %IMAGE_SIZE% ^
   --berkeley-image-size %IMAGE_SIZE% ^
@@ -490,6 +540,12 @@ set "RUN_EXTRA_ARG=%~2"
   --discriminator-depth %DISC_DEPTH% ^
   --discriminator-max-ch %DISC_MAX_CH% ^
   --discriminator-steps-per-generator-step %DISC_STEPS_PER_GEN_STEP% ^
+  --classifier-semantic-soft-target-max %CLS_SEMANTIC_SOFT_MAX% ^
+  --classifier-semantic-cosine-weight %CLS_SEMANTIC_COSINE_W% ^
+  --classifier-grad-clip %CLS_GRAD_CLIP% ^
+  --generator-grad-clip %GEN_GRAD_CLIP% ^
+  --discriminator-grad-clip %DISC_GRAD_CLIP% ^
+  --transformer-grad-clip %TRANS_GRAD_CLIP% ^
   --generator-loss-adv-weight %GEN_LOSS_ADV_W% ^
   --generator-loss-cls-weight %GEN_LOSS_CLS_W% ^
   --generator-loss-wave-weight %GEN_LOSS_WAVE_W% ^
@@ -562,6 +618,15 @@ set "RUN_EXTRA_ARG=%~2"
   --lr-sine-frequency %LR_SINE_FREQUENCY% ^
   --lr-sine-tail-fraction %LR_SINE_TAIL_FRACTION% ^
   --lr-sine-min-scale %LR_SINE_MIN_SCALE% ^
+  --gate-pregestation-loss-target %GATE_PREGESTATION_LOSS_TARGET% ^
+  --gate-pregestation-maintain-rounds %GATE_PREGESTATION_MAINTAIN% ^
+  --pregestation-sub-rounds %PREGESTATION_SUB_ROUNDS% ^
+  --pregestation-temp-trend %PREGESTATION_TEMP_TREND% ^
+  --pregestation-temp-oscillation-amplitude %PREGESTATION_TEMP_OSCILLATION_AMPLITUDE% ^
+  --pregestation-temp-oscillation-period %PREGESTATION_TEMP_OSCILLATION_PERIOD% ^
+  --pregestation-stage-batch-size %PREGESTATION_STAGE_BATCH_SIZE% ^
+  --pregestation-stage-deck-passes %PREGESTATION_STAGE_DECK_PASSES% ^
+  --pregestation-stage-min-steps %PREGESTATION_STAGE_MIN_STEPS% ^
   --gate-gestation-loss-target %GATE_GESTATION_LOSS_TARGET% ^
   --gate-gestation-batch-size %GATE_GESTATION_BATCH_SIZE% ^
   --gate-gestation-maintain-rounds %GATE_GESTATION_MAINTAIN% ^
@@ -613,6 +678,7 @@ set "RUN_EXTRA_ARG=%~2"
   %CLASSIFIER_SUBSET_REFRESH_ARG% ^
   --semantic-vocab-bootstrap-origin-label "%SEMANTIC_VOCAB_BOOTSTRAP_ORIGIN_LABEL%" ^
   %SEMANTIC_VOCAB_ARG% ^
+  %SEMANTIC_STAGE_CACHE_ARG% ^
   %GD_VOCAB_ARG% ^
   %WAVE_ZERO_SHOT_ARG% ^
   %LABEL_QUERY_ARG% ^
@@ -620,6 +686,32 @@ set "RUN_EXTRA_ARG=%~2"
   %RUN_EXTRA_ARG%
 set "RUN_PIPE_RC=%ERRORLEVEL%"
 exit /b %RUN_PIPE_RC%
+
+:backup_weights
+if not "%WEIGHT_BACKUP_ENABLED%"=="1" exit /b 0
+set "_BK_ROOT=%OUTPUT_DIR%\%WEIGHT_BACKUP_SUBDIR%"
+if not exist "%_BK_ROOT%" mkdir "%_BK_ROOT%" 2>nul
+REM Build a timestamp tag: YYYYMMDD_HHMMSS
+for /f "tokens=1-3 delims=/ " %%a in ("%DATE%") do set "_BK_Y=%%c" & set "_BK_M=%%a" & set "_BK_D=%%b"
+for /f "tokens=1-3 delims=:. " %%a in ("%TIME: =0%") do set "_BK_H=%%a" & set "_BK_MIN=%%b" & set "_BK_S=%%c"
+set "_BK_TAG=%_BK_Y%%_BK_M%%_BK_D%_%_BK_H%%_BK_MIN%%_BK_S%"
+set "_BK_DST=%_BK_ROOT%\%_BK_TAG%"
+if not exist "%_BK_DST%" mkdir "%_BK_DST%" 2>nul
+robocopy "%OUTPUT_DIR%" "%_BK_DST%" *.pt /XO /R:1 /W:0 /NDL /NFL /NJH /NJS /NP >nul 2>&1
+echo [launcher] weight backup [%~1]: %_BK_DST%
+REM Prune oldest snapshot directories when over WEIGHT_BACKUP_MAX_KEEP.
+set /a "_BK_COUNT=0"
+for /d %%D in ("%_BK_ROOT%\*") do set /a "_BK_COUNT+=1"
+if !_BK_COUNT! GTR %WEIGHT_BACKUP_MAX_KEEP% (
+  set /a "_BK_PRUNE=!_BK_COUNT! - %WEIGHT_BACKUP_MAX_KEEP%"
+  for /f "tokens=*" %%D in ('dir /b /ad /o:d "%_BK_ROOT%"') do (
+    if !_BK_PRUNE! GTR 0 (
+      rmdir /s /q "%_BK_ROOT%\%%D" 2>nul
+      set /a "_BK_PRUNE-=1"
+    )
+  )
+)
+exit /b 0
 
 :all_done
 echo.

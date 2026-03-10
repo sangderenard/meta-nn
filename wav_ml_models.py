@@ -5,6 +5,7 @@ import time
 from collections import deque
 from contextlib import nullcontext
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -13,6 +14,105 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from wav_ml_core import COLOR_MODE_MAP, COLOR_MODES, RenderConfig, normalize_bit_window, render_mono_wave_to_tensor
+
+# ---------------------------------------------------------------------------
+# Loss logging constants and binary record format
+# ---------------------------------------------------------------------------
+LOSS_STAGE_CLASSIFIER = 0
+LOSS_STAGE_GENERATOR = 1
+LOSS_STAGE_DISCRIMINATOR = 2
+LOSS_STAGE_TRANSFORMER = 3
+LOSS_STAGE_WAVE_CLASSIFIER = 4
+
+_LOSS_STAGE_NAMES: Dict[int, str] = {
+    LOSS_STAGE_CLASSIFIER: "cls",
+    LOSS_STAGE_GENERATOR: "gen",
+    LOSS_STAGE_DISCRIMINATOR: "disc",
+    LOSS_STAGE_TRANSFORMER: "trans",
+    LOSS_STAGE_WAVE_CLASSIFIER: "wcls",
+}
+
+_LOSS_STAGE_COLORS: Dict[int, tuple] = {
+    LOSS_STAGE_CLASSIFIER:     (80,  200, 220),  # cyan
+    LOSS_STAGE_GENERATOR:      (80,  200, 100),  # green
+    LOSS_STAGE_DISCRIMINATOR:  (240, 140,  40),  # orange
+    LOSS_STAGE_TRANSFORMER:    (240, 220,  60),  # yellow
+    LOSS_STAGE_WAVE_CLASSIFIER:(220,  80, 220),  # magenta
+}
+
+# 20 bytes per record: step(i4) round(i2) stage(u1) pad(u1) loss(f4) aux(f4) ts(f4)
+LOSS_RECORD_DTYPE = np.dtype([
+    ("step",  "<i4"),
+    ("round", "<i2"),
+    ("stage", "<u1"),
+    ("_pad",  "<u1"),
+    ("loss",  "<f4"),
+    ("aux",   "<f4"),
+    ("ts",    "<f4"),
+])
+
+
+class _LossFileLogger:
+    """Appends fixed-size binary loss records to a file for later analysis."""
+
+    _FLUSH_EVERY = 200
+
+    def __init__(self, path, start_time: float):
+        self._path = Path(path)
+        self._start_time = float(start_time)
+        self._file = None
+        try:
+            existing_bytes = int(self._path.stat().st_size) if self._path.exists() else 0
+            self._counter = int(existing_bytes // LOSS_RECORD_DTYPE.itemsize)
+            self._file = open(self._path, "ab")
+        except Exception as e:
+            self._counter = 0
+            print(f"[loss-logger] could not open {path}: {e}", flush=True)
+
+    def log(self, round_idx: int, stage_id: int, loss: float, aux: float = 0.0):
+        if self._file is None:
+            return
+        self._counter += 1
+        ts = float(time.perf_counter()) - self._start_time
+        rec = np.zeros(1, dtype=LOSS_RECORD_DTYPE)
+        rec["step"][0]  = max(-(2**31), min(2**31 - 1, int(self._counter)))
+        rec["round"][0] = max(-32768,   min(32767,     int(round_idx)))
+        rec["stage"][0] = int(stage_id) & 0xFF
+        rec["loss"][0]  = float(loss) if math.isfinite(float(loss)) else float("nan")
+        rec["aux"][0]   = float(aux)  if math.isfinite(float(aux))  else float("nan")
+        rec["ts"][0]    = min(float(ts), 3.4e38)
+        try:
+            self._file.write(rec.tobytes())
+            if self._counter % self._FLUSH_EVERY == 0:
+                self._file.flush()
+        except Exception:
+            pass
+
+    def flush(self):
+        if self._file is not None:
+            try:
+                self._file.flush()
+            except Exception:
+                pass
+
+    def close(self):
+        if self._file is not None:
+            try:
+                self._file.flush()
+                self._file.close()
+            except Exception:
+                pass
+            self._file = None
+
+    @staticmethod
+    def load(path) -> np.ndarray:
+        """Load all records from a loss_log.bin file into a structured numpy array."""
+        p = Path(path)
+        if not p.exists() or p.stat().st_size == 0:
+            return np.zeros(0, dtype=LOSS_RECORD_DTYPE)
+        data = p.read_bytes()
+        n = len(data) // LOSS_RECORD_DTYPE.itemsize
+        return np.frombuffer(data[: n * LOSS_RECORD_DTYPE.itemsize], dtype=LOSS_RECORD_DTYPE).copy()
 
 
 def set_seed(seed: int):
@@ -175,6 +275,7 @@ class _TransformerStatusOpenGLViewer:
         image_hw: Tuple[int, int],
         scale: int = 3,
         cycle_slots: int = 0,
+        graph_h: int = 120,
     ):
         self.enabled = bool(enabled)
         self.image_h = max(8, int(image_hw[0]))
@@ -185,8 +286,9 @@ class _TransformerStatusOpenGLViewer:
         self.panel_h = max(8, min(256, int(self.image_h)))
         self.num_panels = 3
         self.top_bar_h = 56
+        self.graph_h = max(0, int(graph_h))
         self.window_w = int(self.panel_w * self.num_panels)
-        self.window_h = int(self.top_bar_h + (self.panel_h * 2))
+        self.window_h = int(self.top_bar_h + (self.panel_h * 2) + self.graph_h)
 
         self._ready = False
         self._failed = False
@@ -196,8 +298,16 @@ class _TransformerStatusOpenGLViewer:
         self._stop_requested = False
 
         self._last_present_t = 0.0
-        self._min_present_dt = 1.0 / 30.0
-        self._pending_frame = None
+        self._max_idle_present_dt = 0.25
+        self._frame_buffer: deque = deque(maxlen=1024)
+        # Dynamic frame rate: slews between slow (empty buffer) and fast (full buffer)
+        self._anim_frame_dt: float = 0.5          # current inter-frame interval, seconds
+        self._anim_dt_slow: float = 0.5           # floor rate when buffer is empty  (2 fps)
+        self._anim_dt_fast: float = 1.0 / 120.0  # ceiling rate when buffer is full (120 fps)
+        self._anim_slew_tau: float = 0.25         # time constant for slew, seconds
+        self._last_anim_t: float = 0.0
+        self._last_slew_t: float = 0.0
+        self._has_presented_frame = False
         self._top_bar_dirty = True
         self._panel_text_dirty = True
 
@@ -215,6 +325,13 @@ class _TransformerStatusOpenGLViewer:
         self._gate_override = False
         self._control_boxes: List[Tuple[str, int, Tuple[int, int, int, int]]] = []
         self.set_cycle_roster(total_cycles=int(cycle_slots))
+
+        self._loss_graph_data: Dict[int, deque] = {}
+        self._graph_dirty = False
+        self._graph_rgb: Optional[np.ndarray] = (
+            np.full((self.graph_h, self.window_w, 3), 14, dtype=np.uint8)
+            if self.graph_h > 0 else None
+        )
 
     def set_cycle_roster(self, total_cycles: int, selected: Optional[Sequence[bool]] = None):
         n = max(0, int(total_cycles))
@@ -262,19 +379,20 @@ class _TransformerStatusOpenGLViewer:
             GL.glBlendFunc(GL.GL_SRC_ALPHA, GL.GL_ONE_MINUS_SRC_ALPHA)
             GL.glClearColor(0.06, 0.06, 0.08, 1.0)
 
-            tex = GL.glGenTextures(7)
+            tex = GL.glGenTextures(8)
             if isinstance(tex, int):
                 tex = [int(tex)]
-                while len(tex) < 7:
+                while len(tex) < 8:
                     tex.append(int(GL.glGenTextures(1)))
             else:
                 tex = [int(t) for t in list(tex)]
-                while len(tex) < 7:
+                while len(tex) < 8:
                     tex.append(int(GL.glGenTextures(1)))
             self._textures = {
                 "img": [int(tex[0]), int(tex[1]), int(tex[2])],
                 "text": [int(tex[3]), int(tex[4]), int(tex[5])],
                 "bar": int(tex[6]),
+                "graph": int(tex[7]),
             }
             for tid in (
                 self._textures["img"]
@@ -462,16 +580,20 @@ class _TransformerStatusOpenGLViewer:
         if (not self._ready) or (not self.enabled) or self._stop_requested:
             return
         now = time.perf_counter()
-        has_pending = isinstance(self._pending_frame, dict)
-        dirty = bool(has_pending or self._top_bar_dirty or self._panel_text_dirty)
-        if not dirty:
-            return
-        if (not force) and has_pending and (now - self._last_present_t) < self._min_present_dt:
-            return
 
-        if has_pending:
-            frame = self._pending_frame
-            self._pending_frame = None
+        # Slew the frame rate: buffer fill drives target dt, exponential smoothing applies it
+        _buf_cap = self._frame_buffer.maxlen or 1
+        fill = float(len(self._frame_buffer)) / float(_buf_cap)
+        # quadratic ease: bias toward fast end as buffer fills
+        target_dt = self._anim_dt_fast + (self._anim_dt_slow - self._anim_dt_fast) * ((1.0 - fill) ** 2)
+        _slew_elapsed = max(1e-4, now - self._last_slew_t)
+        self._last_slew_t = now
+        alpha = 1.0 - math.exp(-_slew_elapsed / max(1e-4, self._anim_slew_tau))
+        self._anim_frame_dt += alpha * (target_dt - self._anim_frame_dt)
+
+        # Advance animation: pop one frame per tick, add its losses to graph
+        if (now - self._last_anim_t) >= self._anim_frame_dt and len(self._frame_buffer) > 0:
+            frame = self._frame_buffer.popleft()
             imgs = frame.get("images", None)
             if isinstance(imgs, list) and len(imgs) == 3:
                 for i, tid in enumerate(self._textures["img"]):
@@ -481,6 +603,16 @@ class _TransformerStatusOpenGLViewer:
             self._panel_rows = [list(r) for r in frame.get("rows", self._panel_rows)]
             self._panel_text_dirty = True
             self._top_bar_dirty = True
+            for sid, lv in frame.get("losses", {}).items():
+                self.update_loss(int(sid), float(lv))
+            self._last_anim_t = now
+
+        dirty = bool(self._top_bar_dirty or self._panel_text_dirty or self._graph_dirty)
+        idle_refresh_due = bool(
+            self._has_presented_frame and ((now - self._last_present_t) >= float(self._max_idle_present_dt))
+        )
+        if (not dirty) and (not force) and (not idle_refresh_due):
+            return
 
         if self._panel_text_dirty:
             for i in range(3):
@@ -494,6 +626,11 @@ class _TransformerStatusOpenGLViewer:
             self._top_bar_rgb = self._render_top_bar()
             self._upload_texture(int(self._textures["bar"]), self._top_bar_rgb)
             self._top_bar_dirty = False
+
+        if self.graph_h > 0 and self._graph_dirty:
+            self._graph_rgb = self._render_loss_graph()
+            self._upload_texture(int(self._textures["graph"]), self._graph_rgb)
+            self._graph_dirty = False
 
         gl = self._gl
         gl.glClear(gl.GL_COLOR_BUFFER_BIT)
@@ -523,10 +660,21 @@ class _TransformerStatusOpenGLViewer:
                 self.top_bar_h + (2 * self.panel_h),
             )
 
+        if self.graph_h > 0 and self._graph_rgb is not None:
+            graph_y0 = int(self.top_bar_h + (2 * self.panel_h))
+            self._draw_texture_px(
+                int(self._textures["graph"]),
+                0,
+                graph_y0,
+                self.window_w,
+                graph_y0 + self.graph_h,
+            )
+
         gate_mode = "manual" if self._gate_override else "auto"
         self._pygame.display.set_caption(f"Stage Status Viewer | gate={gate_mode} | {self._caption}")
         self._pygame.display.flip()
         self._last_present_t = now
+        self._has_presented_frame = True
 
     def _handle_click(self, x: int, y: int) -> bool:
         xi = int(x)
@@ -576,6 +724,117 @@ class _TransformerStatusOpenGLViewer:
     def stop_requested(self) -> bool:
         return bool(self._stop_requested)
 
+    def update_loss(self, stage_id: int, loss: float, aux: float = 0.0):
+        """Record a per-step loss value and mark the graph dirty for redraw."""
+        if self.graph_h <= 0:
+            return
+        sid = int(stage_id)
+        if sid not in self._loss_graph_data:
+            self._loss_graph_data[sid] = deque(maxlen=5_000_000)
+        v = float(loss)
+        self._loss_graph_data[sid].append(v if math.isfinite(v) else float("nan"))
+        self._graph_dirty = True
+
+    def _render_loss_graph(self) -> np.ndarray:
+        try:
+            from PIL import Image, ImageDraw, ImageFont
+        except Exception:
+            return np.full((self.graph_h, self.window_w, 3), 14, dtype=np.uint8)
+
+        W = int(self.window_w)
+        H = int(self.graph_h)
+        im = Image.new("RGB", (W, H), (14, 18, 22))
+        draw = ImageDraw.Draw(im)
+        font = ImageFont.load_default()
+
+        # Plot margins
+        mx0, mx1 = 52, W - 6
+        my0, my1 = 14, H - 6
+        plot_w = max(1, mx1 - mx0)
+        plot_h = max(1, my1 - my0)
+
+        # Compute global Y range from all finite values
+        all_finite: List[float] = []
+        for dq in self._loss_graph_data.values():
+            all_finite.extend(v for v in dq if math.isfinite(v) and v >= 0.0)
+
+        if len(all_finite) < 2:
+            draw.text((mx0, my0 + plot_h // 2 - 4), "no data yet", fill=(80, 88, 100), font=font)
+            return np.asarray(im, dtype=np.uint8)
+
+        raw_min = min(all_finite)
+        raw_max = max(all_finite)
+        span = raw_max - raw_min
+        y_min = max(0.0, raw_min - span * 0.05)
+        y_max = raw_max + span * 0.05
+        if y_max <= y_min + 1e-9:
+            y_max = y_min + 1.0
+
+        def _y_px(v: float) -> int:
+            frac = (float(v) - y_min) / (y_max - y_min)
+            return int(my1 - frac * plot_h)
+
+        # Horizontal gridlines + Y axis labels
+        for frac, alpha in ((0.0, 1), (0.25, 0), (0.5, 0), (0.75, 0), (1.0, 1)):
+            gy = int(my1 - frac * plot_h)
+            draw.line([(mx0, gy), (mx1, gy)], fill=(34, 40, 50) if alpha == 0 else (55, 62, 74))
+            lv = y_min + frac * (y_max - y_min)
+            draw.text((2, gy - 5), f"{lv:.3f}", fill=(110, 120, 136), font=font)
+
+        # Plot each series
+        for sid in sorted(self._loss_graph_data.keys()):
+            dq = self._loss_graph_data[sid]
+            if len(dq) == 0:
+                continue
+            vals = list(dq)
+            n = len(vals)
+            color = _LOSS_STAGE_COLORS.get(sid, (200, 200, 200))
+
+            # Downsample to plot_w buckets via mean to avoid overdraw
+            if n > plot_w:
+                bucket = n / float(plot_w)
+                downsampled: List[float] = []
+                for bi in range(plot_w):
+                    i0 = int(bi * bucket)
+                    i1 = max(i0 + 1, int((bi + 1) * bucket))
+                    chunk = [vals[i] for i in range(i0, min(i1, n)) if math.isfinite(vals[i])]
+                    downsampled.append(sum(chunk) / len(chunk) if chunk else float("nan"))
+                vals = downsampled
+                n = plot_w
+
+            pts: List[Optional[Tuple[int, int]]] = []
+            for i, v in enumerate(vals):
+                if not math.isfinite(v):
+                    pts.append(None)
+                    continue
+                xp = int(mx0 + (float(i) / float(max(1, n - 1))) * float(plot_w))
+                yp = max(my0, min(my1, _y_px(v)))
+                pts.append((xp, yp))
+
+            prev = None
+            for pt in pts:
+                if pt is not None and prev is not None:
+                    draw.line([prev, pt], fill=color, width=1)
+                prev = pt if pt is not None else None
+
+        # Legend (horizontal, top of graph)
+        lx = mx0
+        for sid in sorted(_LOSS_STAGE_COLORS.keys()):
+            if sid not in self._loss_graph_data or len(self._loss_graph_data[sid]) == 0:
+                continue
+            color = _LOSS_STAGE_COLORS[sid]
+            name = _LOSS_STAGE_NAMES.get(sid, f"s{sid}")
+            dq = self._loss_graph_data[sid]
+            last_v = next((v for v in reversed(dq) if math.isfinite(v)), float("nan"))
+            label = f"{name}={last_v:.4f}" if math.isfinite(last_v) else name
+            draw.rectangle([(lx, 2), (lx + 7, 9)], fill=color)
+            draw.text((lx + 10, 1), label, fill=color, font=font)
+            lx += max(56, len(label) * 6 + 18)
+            if lx > W - 60:
+                break
+
+        return np.asarray(im, dtype=np.uint8)
+
     def update(
         self,
         clean_img: torch.Tensor,
@@ -584,6 +843,7 @@ class _TransformerStatusOpenGLViewer:
         caption: str,
         panel_titles: Optional[Sequence[str]] = None,
         panel_rows: Optional[Sequence[Sequence[str]]] = None,
+        frame_losses: Optional[Dict[int, float]] = None,
     ):
         if not self.enabled:
             return
@@ -594,16 +854,18 @@ class _TransformerStatusOpenGLViewer:
         if self._stop_requested or (not self._ready):
             return
 
+        # Store losses in the frame so the graph advances in sync with each popped image
         clean_rgb = self._resize_rgb_to_panel(_tensor_to_rgb_u8_image(clean_img))
         in_rgb = self._resize_rgb_to_panel(_tensor_to_rgb_u8_image(input_img))
         out_rgb = self._resize_rgb_to_panel(_tensor_to_rgb_u8_image(output_img))
         titles, rows = self._normalize_panel_text(panel_titles=panel_titles, panel_rows=panel_rows)
-        self._pending_frame = {
+        self._frame_buffer.append({
             "images": [clean_rgb, in_rgb, out_rgb],
             "caption": str(caption),
             "titles": titles,
             "rows": rows,
-        }
+            "losses": dict(frame_losses) if frame_losses is not None else {},
+        })
         self._present(force=False)
 
     def close(self):
@@ -614,6 +876,7 @@ class _TransformerStatusOpenGLViewer:
                         list(self._textures.get("img", []))
                         + list(self._textures.get("text", []))
                         + [self._textures.get("bar", 0)]
+                        + [self._textures.get("graph", 0)]
                     )
                     tex_ids = [int(t) for t in tex_ids if int(t) > 0]
                     if len(tex_ids) > 0:
@@ -2046,6 +2309,8 @@ def train_conditional_generator_discriminator(
     grad_accum_steps: int = 1,
     classifier_forward_batch_cap: int = 0,
     seed: int = 0,
+    grad_clip_g: float = 1.0,
+    grad_clip_d: float = 1.0,
 ) -> Tuple[nn.Module, nn.Module, List[Dict[str, float]]]:
     if len(payload_images) <= 0 or len(payload_conditions) <= 0 or len(payload_masks) <= 0:
         raise RuntimeError("Generator/discriminator training requires non-empty payload bank.")
@@ -2243,6 +2508,9 @@ def train_conditional_generator_discriminator(
                         d_loss_back.backward()
                     d_sub_loss += float(d_loss.detach().item()) * (float(ed - st) / float(max(1, int(real_d.shape[0]))))
                 if use_scaler:
+                    scaler_d.unscale_(d_opt)
+                nn.utils.clip_grad_norm_(discriminator.parameters(), float(grad_clip_d))
+                if use_scaler:
                     scaler_d.step(d_opt)
                     scaler_d.update()
                 else:
@@ -2261,7 +2529,7 @@ def train_conditional_generator_discriminator(
             disc_mask_fake_pass_step = 0.0
             mask_iou_step = 0.0
             mask_dice_step = 0.0
-            preview_payload = None
+            preview_items = []
             g_ranges = _chunk_ranges(total=int(real.shape[0]), chunks=grad_accum_steps)
             for st, ed in g_ranges:
                 cond_g = cond[st:ed]
@@ -2442,16 +2710,20 @@ def train_conditional_generator_discriminator(
                 disc_mask_fake_pass_step += float(disc_mask_fake_pass) * w
                 mask_iou_step += float(mask_iou.detach().item()) * w
                 mask_dice_step += float(mask_dice.detach().item()) * w
-                if preview_payload is None:
-                    preview_payload = {
-                        "target_img": real_g[0].detach().to(torch.float32),
-                        "fake_img": fake2[0].detach().to(torch.float32),
-                        "target_mask": real_mask_g[0].detach().to(torch.float32),
-                        "fake_mask": fake_mask_probs[0].detach().to(torch.float32),
-                        "probs": probs[0].detach().to(torch.float32),
-                        "target_condition": cond_g[0].detach().to(torch.float32).cpu(),
-                        "target_prob": float(target_prob[0].detach().to(torch.float32).item()),
-                    }
+                if step_preview_callback is not None:
+                    for _i in range(int(real_g.shape[0])):
+                        preview_items.append({
+                            "target_img": real_g[_i].detach().to(torch.float32).cpu(),
+                            "fake_img": fake2[_i].detach().to(torch.float32).cpu(),
+                            "target_mask": real_mask_g[_i].detach().to(torch.float32).cpu(),
+                            "fake_mask": fake_mask_probs[_i].detach().to(torch.float32).cpu(),
+                            "probs": probs[_i].detach().to(torch.float32).cpu(),
+                            "target_condition": cond_g[_i].detach().to(torch.float32).cpu(),
+                            "target_prob": float(target_prob[_i].detach().to(torch.float32).item()),
+                        })
+            if use_scaler:
+                scaler_g.unscale_(g_opt)
+            nn.utils.clip_grad_norm_(generator.parameters(), float(grad_clip_g))
             if use_scaler:
                 scaler_g.step(g_opt)
                 scaler_g.update()
@@ -2473,32 +2745,33 @@ def train_conditional_generator_discriminator(
             run_mask_dice += float(mask_dice_step)
             steps_done = int(step_idx)
 
-            if step_preview_callback is not None:
-                emit = False
-                if int(log_every_steps) > 0:
-                    emit = ((int(step_idx) % int(log_every_steps) == 0) or (int(step_idx) == int(n_steps)))
-                else:
-                    emit = (int(step_idx) == int(n_steps))
-                if emit and isinstance(preview_payload, dict):
+            if step_preview_callback is not None and len(preview_items) > 0:
+                _g_ls = float(g_loss_step)
+                _d_ls = float(d_loss_step)
+                _adv_ls = float(adv_loss_step)
+                _msk_ls = float(mask_loss_step)
+                _out_ls = float(outside_loss_step)
+                _wav_ls = float(wave_loss_step)
+                for _item in preview_items:
                     try:
                         step_preview_callback(
                             {
                                 "epoch": int(epoch),
                                 "step": int(step_idx),
                                 "steps_per_epoch": int(n_steps),
-                                "target_img": preview_payload["target_img"],
-                                "fake_img": preview_payload["fake_img"],
-                                "target_mask": preview_payload["target_mask"],
-                                "fake_mask": preview_payload["fake_mask"],
-                                "probs": preview_payload["probs"],
-                                "target_condition": preview_payload["target_condition"],
-                                "target_prob": float(preview_payload["target_prob"]),
-                                "g_loss": float(g_loss_step),
-                                "d_loss": float(d_loss_step),
-                                "adv_loss": float(adv_loss_step),
-                                "mask_loss": float(mask_loss_step),
-                                "outside_loss": float(outside_loss_step),
-                                "wave_loss": float(wave_loss_step),
+                                "target_img": _item["target_img"],
+                                "fake_img": _item["fake_img"],
+                                "target_mask": _item["target_mask"],
+                                "fake_mask": _item["fake_mask"],
+                                "probs": _item["probs"],
+                                "target_condition": _item["target_condition"],
+                                "target_prob": float(_item["target_prob"]),
+                                "g_loss": float(_g_ls),
+                                "d_loss": float(_d_ls),
+                                "adv_loss": float(_adv_ls),
+                                "mask_loss": float(_msk_ls),
+                                "outside_loss": float(_out_ls),
+                                "wave_loss": float(_wav_ls),
                                 "target_prob_avg": float(run_tgt / float(max(1, int(step_idx)))),
                                 "g_loss_avg": float(run_g / float(max(1, int(step_idx)))),
                                 "d_loss_avg": float(run_d / float(max(1, int(step_idx)))),
@@ -2506,6 +2779,7 @@ def train_conditional_generator_discriminator(
                         )
                     except Exception:
                         pass
+            preview_items = []
 
             if int(log_every_steps) > 0 and ((int(step_idx) % int(log_every_steps) == 0) or (int(step_idx) == int(n_steps))):
                 _g = float(run_g / float(step_idx))
@@ -2631,6 +2905,7 @@ def train_classifier(
     semantic_mix_blend_min: float = 0.10,
     semantic_mix_blend_max: float = 0.35,
     semantic_mix_class_index: int = -1,
+    grad_clip: float = 1.0,
 ) -> Tuple[nn.Module, List[Dict[str, float]]]:
     rng = np.random.default_rng(seed)
     model = model.to(device)
@@ -2761,7 +3036,7 @@ def train_classifier(
             if do_step:
                 if use_scaler:
                     scaler.unscale_(opt)
-                nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                nn.utils.clip_grad_norm_(model.parameters(), float(grad_clip))
                 if use_scaler:
                     scaler.step(opt)
                     scaler.update()
@@ -2771,25 +3046,22 @@ def train_classifier(
                 opt.zero_grad(set_to_none=True)
             total_loss += float(loss.item()) * int(xb.shape[0])
             n_seen += int(xb.shape[0])
-            if step_preview_callback is not None:
-                emit = False
-                if int(log_every_steps) > 0:
-                    emit = ((int(step_idx) % int(log_every_steps) == 0) or (int(step_idx) == int(num_batches)))
-                else:
-                    emit = (int(step_idx) == int(num_batches))
-                if emit and int(xb.shape[0]) > 0:
+            if step_preview_callback is not None and int(xb.shape[0]) > 0:
+                _batch_loss = float(loss.detach().to(torch.float32).item())
+                _train_loss = float(total_loss / float(max(1, n_seen)))
+                for _i in range(int(xb.shape[0])):
                     try:
-                        probs0 = torch.softmax(logits[0].detach().to(torch.float32), dim=0)
+                        _probs_i = torch.softmax(logits[_i].detach().to(torch.float32), dim=0)
                         step_preview_callback(
                             {
                                 "epoch": int(epoch),
                                 "step": int(step_idx),
                                 "steps_per_epoch": int(num_batches),
-                                "img": xb[0].detach().to(torch.float32),
-                                "probs": probs0.detach().to(torch.float32),
-                                "target_class": int(yb[0].detach().item()),
-                                "batch_loss": float(loss.detach().to(torch.float32).item()),
-                                "train_loss": float(total_loss / float(max(1, n_seen))),
+                                "img": xb[_i].detach().to(torch.float32).cpu(),
+                                "probs": _probs_i.detach().to(torch.float32).cpu(),
+                                "target_class": int(yb[_i].detach().item()),
+                                "batch_loss": _batch_loss,
+                                "train_loss": _train_loss,
                             }
                         )
                     except Exception:
@@ -3836,6 +4108,7 @@ def train_transformer_feature_metric(
     cache_eval_batches: bool = True,
     visualize_status: bool = False,
     visualize_scale: int = 3,
+    grad_clip: float = 1.0,
 ) -> Tuple[nn.Module, List[Dict[str, float]]]:
     rng = np.random.default_rng(seed)
     transformer = transformer.to(device)
@@ -4050,11 +4323,6 @@ def train_transformer_feature_metric(
         running_deskew_post_abs = torch.zeros((), dtype=torch.float32, device=device)
         running_deskew_conf = torch.zeros((), dtype=torch.float32, device=device)
         running_degrade = 0.0
-        last_xclean_preview = None
-        last_xb_preview = None
-        last_xh_preview = None
-        last_target_condition_preview = None
-        last_deskew_preview = None
         t_sample = 0.0
         t_forward = 0.0
         t_backward = 0.0
@@ -4458,54 +4726,52 @@ def train_transformer_feature_metric(
                 + aux_bundle_loss
             )
             if (step_preview_callback is not None) and int(xb.shape[0]) > 0:
-                preview_idx = int(rng.integers(0, int(xb.shape[0])))
-                if y_target is not None:
-                    # Select a batch row that has at least one supervised target bit.
-                    if int(y_target.ndim) == 2:
-                        target_rows = torch.nonzero((y_target > 0).any(dim=1), as_tuple=False).squeeze(1)
-                    else:
-                        target_rows = torch.nonzero(y_target > 0, as_tuple=False).reshape(-1)
-                    if int(target_rows.numel()) > 0:
-                        pick = int(rng.integers(0, int(target_rows.numel())))
-                        pick = max(0, min(int(target_rows.numel()) - 1, pick))
-                        preview_idx = int(target_rows[pick].item())
-                preview_idx = max(0, min(int(xb.shape[0]) - 1, int(preview_idx)))
-                last_xclean_preview = x_clean[preview_idx : preview_idx + 1].detach()
-                last_xb_preview = xb[preview_idx : preview_idx + 1].detach()
-                last_xh_preview = xh[preview_idx : preview_idx + 1].detach()
-                if target_cond is not None and int(preview_idx) < int(target_cond.shape[0]):
-                    last_target_condition_preview = target_cond[preview_idx].detach().to(torch.float32)
-                else:
-                    last_target_condition_preview = None
-                last_deskew_preview = None
-                try:
-                    if torch.is_tensor(target_skew_step) and int(preview_idx) < int(target_skew_step.shape[0]):
-                        target_v = float(target_skew_step[preview_idx].detach().to(torch.float32).item())
-                    else:
-                        target_v = 0.0
-                    pred_v = float(
-                        deskew_pred_skew_t[preview_idx].detach().to(torch.float32).item()
-                    ) if torch.is_tensor(deskew_pred_skew_t) and int(preview_idx) < int(deskew_pred_skew_t.shape[0]) else 0.0
-                    applied_v = float(
-                        deskew_applied_skew_t[preview_idx].detach().to(torch.float32).item()
-                    ) if torch.is_tensor(deskew_applied_skew_t) and int(preview_idx) < int(deskew_applied_skew_t.shape[0]) else 0.0
-                    conf_v = float(
-                        torch.clamp(deskew_confidence_t[preview_idx].detach().to(torch.float32), 0.0, 1.0).item()
-                    ) if torch.is_tensor(deskew_confidence_t) and int(preview_idx) < int(deskew_confidence_t.shape[0]) else 0.0
-                    post_v = float(
-                        deskew_post_residual_t[preview_idx].detach().to(torch.float32).item()
-                    ) if torch.is_tensor(deskew_post_residual_t) and int(preview_idx) < int(deskew_post_residual_t.shape[0]) else 0.0
-                    remain_v = float(target_v + applied_v)
-                    last_deskew_preview = {
-                        "target_skew": float(target_v),
-                        "pred_skew": float(pred_v),
-                        "applied_skew": float(applied_v),
-                        "remaining_skew": float(remain_v),
-                        "post_residual_skew": float(post_v),
-                        "confidence": float(conf_v),
-                    }
-                except Exception:
-                    last_deskew_preview = None
+                _B = int(xb.shape[0])
+                _avg_loss = float(loss.detach().to(torch.float32).item())
+                _avg_score_after = float(score_after.detach().to(torch.float32).item())
+                _avg_score_gap = float(score_gap.detach().to(torch.float32).item())
+                for _pi in range(_B):
+                    try:
+                        _tc = target_cond[_pi].detach().to(torch.float32).cpu() if (target_cond is not None and _pi < int(target_cond.shape[0])) else None
+                        _deskew = None
+                        try:
+                            _tv = float(target_skew_step[_pi].detach().to(torch.float32).item()) if (torch.is_tensor(target_skew_step) and _pi < int(target_skew_step.shape[0])) else 0.0
+                            _pv = float(deskew_pred_skew_t[_pi].detach().to(torch.float32).item()) if (torch.is_tensor(deskew_pred_skew_t) and _pi < int(deskew_pred_skew_t.shape[0])) else 0.0
+                            _av = float(deskew_applied_skew_t[_pi].detach().to(torch.float32).item()) if (torch.is_tensor(deskew_applied_skew_t) and _pi < int(deskew_applied_skew_t.shape[0])) else 0.0
+                            _cv = float(torch.clamp(deskew_confidence_t[_pi].detach().to(torch.float32), 0.0, 1.0).item()) if (torch.is_tensor(deskew_confidence_t) and _pi < int(deskew_confidence_t.shape[0])) else 0.0
+                            _pov = float(deskew_post_residual_t[_pi].detach().to(torch.float32).item()) if (torch.is_tensor(deskew_post_residual_t) and _pi < int(deskew_post_residual_t.shape[0])) else 0.0
+                            _deskew = {"target_skew": _tv, "pred_skew": _pv, "applied_skew": _av, "remaining_skew": float(_tv + _av), "post_residual_skew": _pov, "confidence": _cv}
+                        except Exception:
+                            _deskew = None
+                        step_preview_callback(
+                            {
+                                "epoch": int(epoch),
+                                "step": int(step_idx),
+                                "steps_per_epoch": int(num_steps),
+                                "x_clean": x_clean[_pi : _pi + 1].detach().to(torch.float32).cpu(),
+                                "x_in": xb[_pi : _pi + 1].detach().to(torch.float32).cpu(),
+                                "x_out": xh[_pi : _pi + 1].detach().to(torch.float32).cpu(),
+                                "target_condition": _tc,
+                                "score_after": _avg_score_after,
+                                "score_gap": _avg_score_gap,
+                                "loss": _avg_loss,
+                                "denoise_l1": float(denoise_l1.detach().to(torch.float32).item()),
+                                "high_bits_l1": float(hi_bit_l1.detach().to(torch.float32).item()),
+                                "low_bits_l1": float(lo_bit_l1.detach().to(torch.float32).item()),
+                                "entropy_excess": float(entropy_pen.detach().to(torch.float32).item()),
+                                "score_target": float(score_target.detach().to(torch.float32).item()),
+                                "degrade_strength": float(degrade_strength),
+                                "deskew_target_abs": float(deskew_target_abs.detach().to(torch.float32).item()),
+                                "deskew_pred_abs": float(deskew_pred_abs.detach().to(torch.float32).item()),
+                                "deskew_applied_abs": float(deskew_applied_abs.detach().to(torch.float32).item()),
+                                "deskew_remaining_abs": float(deskew_remaining_abs.detach().to(torch.float32).item()),
+                                "deskew_post_abs": float(deskew_post_abs.detach().to(torch.float32).item()),
+                                "deskew_confidence_mean": float(deskew_conf.detach().to(torch.float32).item()),
+                                "deskew_preview": _deskew,
+                            }
+                        )
+                    except Exception:
+                        pass
             step_t2 = time.perf_counter()
             loss_to_backprop = loss / float(grad_accum_steps)
             if use_scaler:
@@ -4517,7 +4783,7 @@ def train_transformer_feature_metric(
             if do_step:
                 if use_scaler:
                     scaler.unscale_(opt)
-                nn.utils.clip_grad_norm_(transformer.parameters(), 1.0)
+                nn.utils.clip_grad_norm_(transformer.parameters(), float(grad_clip))
                 if use_scaler:
                     scaler.step(opt)
                     scaler.update()
@@ -4578,46 +4844,6 @@ def train_transformer_feature_metric(
                 avg_deskew_post_abs = float((running_deskew_post_abs / float(steps_done)).item())
                 avg_deskew_conf = float((running_deskew_conf / float(steps_done)).item())
                 avg_deg = float(running_degrade / float(steps_done))
-                if (
-                    (step_preview_callback is not None)
-                    and (last_xclean_preview is not None)
-                    and (last_xb_preview is not None)
-                    and (last_xh_preview is not None)
-                ):
-                    try:
-                        step_preview_callback(
-                            {
-                                "epoch": int(epoch),
-                                "step": int(steps_done),
-                                "steps_per_epoch": int(num_steps),
-                                "x_clean": last_xclean_preview.detach().to(torch.float32),
-                                "x_in": last_xb_preview.detach().to(torch.float32),
-                                "x_out": last_xh_preview.detach().to(torch.float32),
-                                "target_condition": (
-                                    last_target_condition_preview.detach().to(torch.float32)
-                                    if last_target_condition_preview is not None
-                                    else None
-                                ),
-                                "score_after": float(avg_score_after),
-                                "score_gap": float(avg_score_gap),
-                                "loss": float(avg_loss),
-                                "denoise_l1": float(avg_denoise),
-                                "high_bits_l1": float(avg_hi_bits),
-                                "low_bits_l1": float(avg_lo_bits),
-                                "entropy_excess": float(avg_ent),
-                                "score_target": float(avg_score_tgt),
-                                "degrade_strength": float(avg_deg),
-                                "deskew_target_abs": float(avg_deskew_target_abs),
-                                "deskew_pred_abs": float(avg_deskew_pred_abs),
-                                "deskew_applied_abs": float(avg_deskew_applied_abs),
-                                "deskew_remaining_abs": float(avg_deskew_remaining_abs),
-                                "deskew_post_abs": float(avg_deskew_post_abs),
-                                "deskew_confidence_mean": float(avg_deskew_conf),
-                                "deskew_preview": dict(last_deskew_preview) if isinstance(last_deskew_preview, dict) else None,
-                            }
-                        )
-                    except Exception:
-                        pass
                 print(
                     f"[transformer-train] epoch={epoch}/{epochs} step={steps_done}/{num_steps} "
                     f"loss={avg_loss:.4f} denoise_l1={avg_denoise:.4f} "
