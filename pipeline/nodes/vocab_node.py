@@ -1659,7 +1659,7 @@ def _build_auto_symbol_term_pool(
         "reason": "",
     }
     max_k = max(1, int(max_samples_per_term))
-    root = Path(str(data_root).strip() or "toys_to_survive_development/data/semantic_symbol_pool")
+    root = Path(str(data_root).strip() or "data/semantic_symbol_pool")
     root.mkdir(parents=True, exist_ok=True)
     rng = np.random.default_rng(int(seed))
     try:
@@ -2004,7 +2004,7 @@ def _build_internal_bootstrap_symbol_pool(
     # Keep multiple exemplars per term so gestation/gate coverage does not collapse to one image per primitive.
     cap = max(4, int(max_samples_per_term))
     rng = np.random.default_rng(int(seed))
-    root = Path(str(data_root).strip() or "toys_to_survive_development/data/semantic_symbol_pool")
+    root = Path(str(data_root).strip() or "data/semantic_symbol_pool")
     out_dir = root / "internal_bootstrap_root_vocab"
     out_dir.mkdir(parents=True, exist_ok=True)
 

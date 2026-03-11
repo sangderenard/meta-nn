@@ -1159,7 +1159,7 @@ def _save_generator_supervision_preview(
 
 def _hard_wipe_pipeline_caches(output_dir: Path, data_root: str, semantic_stage_cache_dir: str = "") -> Dict[str, Any]:
     out_dir = Path(output_dir)
-    data_root_path = Path(str(data_root).strip() or "toys_to_survive_development/data/berkeley_sbd")
+    data_root_path = Path(str(data_root).strip() or "data/berkeley_sbd")
     targets: List[Path] = [
         out_dir / "accepted_wave_library",
         out_dir / "latent_wave_pool",
@@ -1213,7 +1213,7 @@ def _hard_wipe_pipeline_caches(output_dir: Path, data_root: str, semantic_stage_
 
 
 def _soft_reset_label_caches(output_dir: Path, data_root: str, semantic_stage_cache_dir: str = "") -> Dict[str, Any]:
-    data_root_path = Path(str(data_root).strip() or "toys_to_survive_development/data/berkeley_sbd")
+    data_root_path = Path(str(data_root).strip() or "data/berkeley_sbd")
     targets: List[Path] = []
     semantic_stage_root = (
         Path(str(semantic_stage_cache_dir).strip())

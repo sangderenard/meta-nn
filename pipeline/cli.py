@@ -40,7 +40,7 @@ def parse_args():
         default="",
         help="Directory to recursively scan for .wav files. If omitted, latent fallback pool is generated.",
     )
-    p.add_argument("--output-dir", default="toys_to_survive_development/wav_pipeline_runs/latest")
+    p.add_argument("--output-dir", default="wav_pipeline_runs/latest")
     p.add_argument(
         "--hard-wipe-caches",
         "--hard-wipe-cache",
@@ -407,7 +407,7 @@ def parse_args():
     p.add_argument("--no-semantic-vocab-auto-symbol-pool", dest="semantic_vocab_auto_symbol_pool", action="store_false")
     p.add_argument(
         "--semantic-vocab-symbol-pool-root",
-        default="toys_to_survive_development/data/semantic_symbol_pool",
+        default="data/semantic_symbol_pool",
         help="Local cache directory for auto-downloaded symbol datasets used by semantic churn.",
     )
     p.add_argument(
@@ -571,7 +571,7 @@ def parse_args():
         help="Attempt to load matching hashed G/D snapshot when active semantic vocabulary changes.",
     )
     p.add_argument("--no-gd-vocab-library-autoload", dest="gd_vocab_library_autoload", action="store_false")
-    p.add_argument("--berkeley-data-root", default="toys_to_survive_development/data/berkeley_sbd")
+    p.add_argument("--berkeley-data-root", default="data/berkeley_sbd")
     p.add_argument(
         "--berkeley-image-size",
         type=int,
@@ -1511,6 +1511,3 @@ def _resolve_shared_embed_image_size(args) -> int:
     if berkeley_size > 0:
         return max(1, berkeley_size)
     return image_size
-
-
-

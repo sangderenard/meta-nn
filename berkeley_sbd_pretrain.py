@@ -18,18 +18,7 @@ from torchvision.datasets import SBDataset
 from torchvision.transforms import functional as TF
 from torchvision.transforms import InterpolationMode
 
-try:
-    from wav_ml_models import (
-        SinusoidalLRController,
-        SinusoidalLROptions,
-        TinyConvClassifier,
-        configure_torch_runtime,
-        maybe_compile_module,
-        set_seed,
-    )
-except ModuleNotFoundError:
-    # Allows running as module: python -m toys_to_survive_development.berkeley_sbd_pretrain
-    from toys_to_survive_development.wav_ml_models import (
+from wav_ml_models import (
         SinusoidalLRController,
         SinusoidalLROptions,
         TinyConvClassifier,
@@ -536,8 +525,8 @@ def parse_args():
     p = argparse.ArgumentParser(
         description="Auto-download Berkeley SBD and pretrain a multi-label classifier with symmetry+noise augmentations."
     )
-    p.add_argument("--data-root", default="toys_to_survive_development/data/berkeley_sbd")
-    p.add_argument("--output-dir", default="toys_to_survive_development/wav_pipeline_runs/berkeley_pretrain")
+    p.add_argument("--data-root", default="data/berkeley_sbd")
+    p.add_argument("--output-dir", default="wav_pipeline_runs/berkeley_pretrain")
     p.add_argument("--auto-install-scipy", action="store_true")
     p.add_argument("--model", choices=["tiny", "resnet18"], default="tiny")
     p.add_argument("--image-size", type=int, default=160)

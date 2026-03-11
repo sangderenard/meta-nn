@@ -1,7 +1,7 @@
 """
 Smoke test: graph export → JSON round-trip → rebuild → topology verification.
 
-Run from the toys_to_survive_development directory:
+Run from the repository root:
     python pipeline/test_smoke_plan_roundtrip.py
 
 Checks:
@@ -14,6 +14,8 @@ Checks:
   7. execution-layer node and edge annotations survive export
   8. Mermaid layer rendering supports dense, minimal, and reaction views
   9. edge reaction defaults merge runtime overrides during execution
+ 10. execution topology is rebuilt from plan node/edge records
+ 11. editable Mermaid changes can rewrite the execution plan
 """
 from __future__ import annotations
 
@@ -62,7 +64,13 @@ from pipeline.nodes.gate_nodes import (
 from pipeline.plan_protocol import plan_from_pipeline_graph, TrainingGraphPlan
 from pipeline.graph import PipelineGraph, PipelineNode
 from pipeline.context import PipelineContext
-from pipeline.graph_layers import build_graph_layers, render_mermaid_flowchart, update_readme_flowcharts
+from pipeline.graph_layers import (
+    apply_mermaid_execution_edit,
+    build_graph_layers,
+    render_mermaid_flowchart,
+    render_plan_mermaid_flowchart,
+    update_readme_flowcharts,
+)
 
 # ── helpers ───────────────────────────────────────────────────────────────────
 
@@ -286,6 +294,52 @@ old
         _assert("linkStyle 0" in updated, "README sync preserves styled edge output")
 
 
+def test_plan_topology_is_authoritative(plan: TrainingGraphPlan, edge_count: int):
+    print("\n--- test_plan_topology_is_authoritative ---")
+    edited = TrainingGraphPlan.from_dict(plan.to_dict())
+    removed_edge = next(
+        (edge for edge in edited.edges if edge.source_node_id == "sync_gate_replica" and edge.target_node_id == "checkpoint_save"),
+        None,
+    )
+    _assert(removed_edge is not None, "plan includes sync_gate_replica -> checkpoint_save edge")
+    edited.edges = [edge for edge in edited.edges if edge.edge_id != removed_edge.edge_id]
+
+    rebuilt = build_training_graph_from_plan(edited)
+    rebuilt_edge_ids = {edge.edge_id for edge in rebuilt.edges}
+    _assert(len(rebuilt.edges) == edge_count - 1, "rebuilt graph reflects removed plan edge")
+    _assert(removed_edge.edge_id not in rebuilt_edge_ids, "removed plan edge is absent from rebuilt graph")
+
+
+def test_editable_mermaid_execution_roundtrip(plan: TrainingGraphPlan):
+    print("\n--- test_editable_mermaid_execution_roundtrip ---")
+    editable = render_plan_mermaid_flowchart(plan, layer_id="execution", view="dense", editable=True)
+    target_edge = next(
+        (edge for edge in plan.edges if edge.source_node_id == "sync_gate_replica" and edge.target_node_id == "checkpoint_save"),
+        None,
+    )
+    _assert(target_edge is not None, "execution plan exposes sync_gate_replica -> checkpoint_save edge")
+    original_snippet = (
+        f"    %% edge_id:{target_edge.edge_id}\n"
+        '    sync_gate_replica -- "end_of_round" --> checkpoint_save'
+    )
+    replacement_snippet = (
+        f"    %% edge_id:{target_edge.edge_id}\n"
+        '    sync_gate_replica -- "end_of_round" --> build_flashcard_rows'
+    )
+    _assert(original_snippet in editable, "editable Mermaid includes stable edge_id comments")
+
+    updated_plan = apply_mermaid_execution_edit(plan, editable.replace(original_snippet, replacement_snippet, 1))
+    updated_edge = next((edge for edge in updated_plan.edges if edge.edge_id == target_edge.edge_id), None)
+    _assert(updated_edge is not None, "Mermaid edit preserved the edge record")
+    _assert(updated_edge.target_node_id == "build_flashcard_rows", "Mermaid edit rewired the plan edge target")
+    _assert(updated_plan.revision == plan.revision + 1, "Mermaid edit increments plan revision")
+
+    rebuilt = build_training_graph_from_plan(updated_plan)
+    rebuilt_edge = next((edge for edge in rebuilt.edges if edge.edge_id == target_edge.edge_id), None)
+    _assert(rebuilt_edge is not None, "rewired edge exists in rebuilt graph")
+    _assert(rebuilt_edge.target_id == "build_flashcard_rows", "rebuilt graph honors Mermaid-edited topology")
+
+
 def test_edge_reaction_merge():
     print("\n--- test_edge_reaction_merge ---")
     graph = PipelineGraph(name="edge_merge")
@@ -329,6 +383,8 @@ def main():
     test_run_from_plan_namespace(reloaded_plan)
     test_plan_validation_guardrails(reloaded_plan)
     test_layer_rendering_and_readme_sync(graph)
+    test_plan_topology_is_authoritative(reloaded_plan, edge_count)
+    test_editable_mermaid_execution_roundtrip(reloaded_plan)
     test_edge_reaction_merge()
     print("\n=== All checks passed ===")
 

@@ -1,12 +1,12 @@
 @echo off
 setlocal EnableExtensions EnableDelayedExpansion
 
-REM Run from repo root: c:\dev\Powershell\nodus
+REM Run from this repo root.
 set "PYTHON=python"
-set "LEGACY_SCRIPT=toys_to_survive_development\wav_config_transformer_pipeline.py"
-set "GRAPH_SCRIPT=toys_to_survive_development\wav_pipeline_graph.py"
+set "LEGACY_SCRIPT=wav_config_transformer_pipeline.py"
+set "GRAPH_SCRIPT=wav_pipeline_graph.py"
 set "SCRIPT=%GRAPH_SCRIPT%"
-set "GUI_SCRIPT=toys_to_survive_development\wav_ml_gui_main.py"
+set "GUI_SCRIPT=wav_ml_gui_main.py"
 set "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True"
 set "HF_HUB_OFFLINE=1"
 set "TRANSFORMERS_OFFLINE=1"
@@ -32,7 +32,7 @@ if "%SOFT_RESET_LABELS%"=="1" (
 REM Force classifier init from scratch for this iterative launcher (no Berkeley pretrain checkpoint).
 
 REM Stable output dir for iterative resume
-set "OUTPUT_DIR=toys_to_survive_development\wav_pipeline_runs\iterative_rgb256"
+set "OUTPUT_DIR=wav_pipeline_runs\iterative_rgb256"
 set "AUTO_RESUME=1"
 set "CKPT_AFTER_SEGMENT=1"
 set "CHECKPOINT_EVERY_ROUND=1"
@@ -198,7 +198,7 @@ set "SEMANTIC_VOCAB_TEXT_CONDITION_TOPK=0"
 set "SEMANTIC_VOCAB_UNKNOWN_LABEL_ROWS_PER_CYCLE=0"
 set "SEMANTIC_VOCAB_BOOTSTRAP_ORIGIN_LABEL=internal bootstrap root vocab"
 set "SEMANTIC_VOCAB_AUTO_SYMBOL_POOL=1"
-set "SEMANTIC_VOCAB_SYMBOL_POOL_ROOT=toys_to_survive_development\data\semantic_symbol_pool"
+set "SEMANTIC_VOCAB_SYMBOL_POOL_ROOT=data\semantic_symbol_pool"
 set "SEMANTIC_VOCAB_PREGESTATION_SAMPLES_PER_COMBO=32"
 set "SEMANTIC_VOCAB_SYMBOL_SAMPLES_PER_TERM=1"
 set "SEMANTIC_VOCAB_GESTATION_TRAIN_TARGET_SAMPLES=8000"
@@ -268,7 +268,7 @@ REM Optional runtime overrides applied before each endless run.
 REM Example file contents:
 REM   set "GATE_BERKELEY_LOSS_TARGET=0.25"
 REM   set "GATE_BERKELEY_MIN=0.8"
-set "RUNTIME_OVERRIDES_FILE=toys_to_survive_development\run_iterative_wav_pipeline.overrides.bat"
+set "RUNTIME_OVERRIDES_FILE=run_iterative_wav_pipeline.overrides.bat"
 
 set "WAV_ARG="
 if not "%WAV_ROOT%"=="" set "WAV_ARG=--wav-root ""%WAV_ROOT%"""

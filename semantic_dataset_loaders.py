@@ -229,7 +229,7 @@ def _clone_semantic_disk_rows(rows: Sequence[SemanticDiskRow]) -> List[SemanticD
 def _semantic_disk_rows_cache_key(data_root: str, class_names: Sequence[str], source_root: str = "") -> str:
     norm_classes = [re.sub(r"\s+", " ", str(name)).strip().lower() for name in class_names]
     payload = {
-        "data_root": str(Path(str(data_root).strip() or "toys_to_survive_development/data/berkeley_sbd").resolve()),
+        "data_root": str(Path(str(data_root).strip() or "data/berkeley_sbd").resolve()),
         "source_root": str(Path(str(source_root).strip()).resolve()) if str(source_root).strip() else "",
         "class_names": norm_classes,
     }
@@ -2589,7 +2589,7 @@ def collect_semantic_disk_rows(
     class_names: Sequence[str],
     source_root: str = "",
 ) -> Tuple[List[SemanticDiskRow], Dict[str, Any]]:
-    root = Path(str(data_root).strip() or "toys_to_survive_development/data/berkeley_sbd")
+    root = Path(str(data_root).strip() or "data/berkeley_sbd")
     cache_key = _semantic_disk_rows_cache_key(
         data_root=str(root),
         class_names=class_names,

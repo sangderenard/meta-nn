@@ -53,7 +53,7 @@
     },
     "berkeley_payload": {
       "auto_install_scipy": false,
-      "berkeley_data_root": "toys_to_survive_development/data/berkeley_sbd",
+      "berkeley_data_root": "data/berkeley_sbd",
       "build_batch_size": 128,
       "build_num_workers": 2,
       "cache_mb": 2048,
@@ -260,7 +260,7 @@
       "symbol_bootstrap_origin_label": "internal bootstrap root vocab",
       "symbol_include_pictograms": true,
       "symbol_pool_mode": "synthetic",
-      "symbol_pool_root": "toys_to_survive_development/data/semantic_symbol_pool",
+      "symbol_pool_root": "data/semantic_symbol_pool",
       "symbol_pool_samples_per_term": 1,
       "total_slots": 50
     },
@@ -1315,6 +1315,6 @@
     "orchestration_cycles": 3,
     "orchestration_mode": "sequential",
     "orchestration_rounds": 2,
-    "output_dir": "c:\\dev\\Powershell\\nodus\\toys_to_survive_development\\_tmp_graph_smoke"
+    "output_dir": "C:\\dev\\Powershell\\meta-nn\\_tmp_graph_smoke"
   }
 }

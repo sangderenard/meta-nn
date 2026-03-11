@@ -676,7 +676,7 @@ class DataNode(PipelineNode):
             str(self.payload_cfg.berkeley_data_root).strip()
             or getattr(ctx, "berkeley_data_root", "") or ""
         )
-        _broot = _BPath(data_root or "toys_to_survive_development/data/berkeley_sbd")
+        _broot = _BPath(data_root or "data/berkeley_sbd")
         convert_sbd_mat_to_npz(_broot)
 
         out_images, out_targets, _info, _out_terms, out_masks = _build_berkeley_payload_bank(
@@ -1974,7 +1974,7 @@ def _build_payload_validation_gate_rows(
     seed: int,
     external_val_fraction: float = 0.20,
 ) -> Tuple[List[int], List[List[str]], Dict[str, Any]]:
-    root = Path(str(data_root).strip() or "toys_to_survive_development/data/berkeley_sbd")
+    root = Path(str(data_root).strip() or "data/berkeley_sbd")
     size = max(8, int(image_size))
     cache_dir = root / "cache" / f"payload_bank_rgb{int(size)}_v2"
     manifest_path = cache_dir / "manifest.json"
@@ -2137,7 +2137,7 @@ def _build_payload_validation_gate_dataset(
         "refresh_rows_berkeley_val": int(refresh_rows_berkeley_val),
         "external_val_fraction": float(external_val_fraction),
         "source_stats": source_stats,
-        "cache_dir": str(Path(str(data_root).strip() or "toys_to_survive_development/data/berkeley_sbd") / "cache"),
+        "cache_dir": str(Path(str(data_root).strip() or "data/berkeley_sbd") / "cache"),
         "data_source": "disk_dataset_rows",
         "source_root": str(source_root),
         "mask_cache_hits": int(rows_info.get("mask_cache_hits", 0)),
@@ -2561,7 +2561,7 @@ def _build_berkeley_payload_bank(
 ):
     _ = bool(auto_install_scipy)
     _ = bool(force_cache_rebuild)
-    root = Path(str(data_root).strip() or "toys_to_survive_development/data/berkeley_sbd")
+    root = Path(str(data_root).strip() or "data/berkeley_sbd")
     size = max(8, int(image_size))
     rows, rows_info = collect_semantic_disk_rows(
         data_root=str(data_root),

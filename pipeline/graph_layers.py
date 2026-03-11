@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
 from pipeline.graph import PipelineGraph
+from pipeline.plan_protocol import GraphEdgeRecord, GraphNodeRecord, TrainingGraphPlan
 
 README_EXECUTION_START = "<!-- BEGIN:GENERATED_EXECUTION_LAYER -->"
 README_EXECUTION_END = "<!-- END:GENERATED_EXECUTION_LAYER -->"
@@ -120,6 +121,122 @@ def build_graph_layers(graph: PipelineGraph) -> Dict[str, Dict[str, Any]]:
     }
 
 
+def build_execution_layer_from_records(
+    nodes: Iterable[GraphNodeRecord],
+    edges: Iterable[GraphEdgeRecord],
+) -> Dict[str, Any]:
+    layer_nodes: List[Dict[str, Any]] = []
+    layer_edges: List[Dict[str, Any]] = []
+
+    for node in nodes:
+        metadata = dict(node.metadata or {})
+        faculty = str(node.faculty or node.group_id or "other")
+        layer_nodes.append(
+            _layer_node(
+                node.node_id,
+                _execution_record_label(node),
+                object_type=str(node.object_type or "object"),
+                faculty=faculty,
+                archetype=str(node.archetype or node.kind or "node"),
+                shape=str(metadata.get("shape", "process") or "process"),
+                metadata={
+                    **metadata,
+                    "node_id": str(node.node_id),
+                    "class_name": str(node.kind or ""),
+                    "description": str(metadata.get("description", "") or ""),
+                },
+            )
+        )
+
+    for edge in edges:
+        metadata = dict(edge.metadata or {})
+        edge_label = str(metadata.get("label", edge.kind) or edge.kind or "")
+        readme_label = str(metadata.get("readme_label", edge_label) or edge_label)
+        layer_edges.append(
+            _layer_edge(
+                str(edge.source_node_id),
+                str(edge.target_node_id),
+                label=edge_label,
+                readme_label=readme_label,
+                reaction_name=str(edge.reaction_name or ""),
+                target_function=str(edge.target_function or ""),
+                metadata={
+                    **metadata,
+                    "edge_id": str(edge.edge_id),
+                    "condition_id": str(edge.condition_id or ""),
+                    "layer": str(edge.layer or "execution"),
+                },
+            )
+        )
+
+    return {
+        "layer_id": "execution",
+        "label": "Execution layer",
+        "description": "The executable training graph used by the current worker runtime.",
+        "status": "active",
+        "mermaid_direction": "TD",
+        "nodes": layer_nodes,
+        "edges": layer_edges,
+    }
+
+
+def build_graph_layers_from_plan(plan: TrainingGraphPlan) -> Dict[str, Dict[str, Any]]:
+    layers = dict(getattr(plan, "graph_layers", {}) or {})
+    execution_nodes = [
+        node
+        for node in list(getattr(plan, "nodes", []) or [])
+        if bool(getattr(node, "enabled", True))
+        and str(getattr(node, "layer", "execution") or "execution") == "execution"
+    ]
+    execution_edges = [
+        edge
+        for edge in list(getattr(plan, "edges", []) or [])
+        if bool(getattr(edge, "enabled", True))
+        and str(getattr(edge, "layer", "execution") or "execution") == "execution"
+    ]
+    if execution_nodes:
+        layers["execution"] = build_execution_layer_from_records(execution_nodes, execution_edges)
+    layers.setdefault("inference", _build_inference_layer())
+    layers.setdefault(
+        "provenance",
+        {
+            "layer_id": "provenance",
+            "label": "Provenance layer",
+            "description": "Reserved layer for ownership, storage residency, and lineage edges.",
+            "status": "planned",
+            "mermaid_direction": "TD",
+            "nodes": [],
+            "edges": [],
+        },
+    )
+    layers.setdefault(
+        "stack_view",
+        {
+            "layer_id": "stack_view",
+            "label": "Operations stack view",
+            "description": "Reserved layer for Nodus-style stack rendering, sub-node ports, and dependency-timed ticks.",
+            "status": "planned",
+            "mermaid_direction": "LR",
+            "nodes": [],
+            "edges": [],
+        },
+    )
+    return layers
+
+
+def render_plan_mermaid_flowchart(
+    plan: TrainingGraphPlan,
+    layer_id: str = "execution",
+    *,
+    view: str = "dense",
+    editable: bool = False,
+) -> str:
+    layers = build_graph_layers_from_plan(plan)
+    if layer_id not in layers:
+        raise KeyError(f"Unknown graph layer {layer_id!r}")
+    return render_mermaid_flowchart(layers[layer_id], view=view, emit_identity_comments=editable)
+
+
 def _build_execution_layer(graph: PipelineGraph) -> Dict[str, Any]:
     from pipeline.orchestrator import _node_archetype, _node_faculty
 
@@ -218,7 +335,12 @@ def _build_inference_layer() -> Dict[str, Any]:
     }
 
 
-def render_mermaid_flowchart(layer: Dict[str, Any], *, view: str = "dense") -> str:
+def render_mermaid_flowchart(
+    layer: Dict[str, Any],
+    *,
+    view: str = "dense",
+    emit_identity_comments: bool = False,
+) -> str:
     layer_id = str(layer.get("layer_id", "") or "execution")
     direction = str(layer.get("mermaid_direction", "TD") or "TD")
     nodes = list(layer.get("nodes", []) or [])
@@ -235,9 +357,9 @@ def render_mermaid_flowchart(layer: Dict[str, Any], *, view: str = "dense") -> s
         alias_map[node_id] = _mermaid_alias(node_id, ordinal=ordinal, used=used_aliases)
 
     if view == "dense":
-        lines.extend(_render_dense_nodes(layer_id, nodes, alias_map))
+        lines.extend(_render_dense_nodes(layer_id, nodes, alias_map, emit_identity_comments=emit_identity_comments))
     else:
-        lines.extend(_render_plain_nodes(nodes, alias_map))
+        lines.extend(_render_plain_nodes(nodes, alias_map, emit_identity_comments=emit_identity_comments))
 
     if nodes and edges:
         lines.append("")
@@ -247,6 +369,9 @@ def render_mermaid_flowchart(layer: Dict[str, Any], *, view: str = "dense") -> s
         target_id = str(edge.get("target_node_id", ""))
         if source_id not in alias_map or target_id not in alias_map:
             continue
+        edge_id = str(dict(edge.get("metadata", {}) or {}).get("edge_id", "") or "").strip()
+        if emit_identity_comments and edge_id:
+            lines.append(f"    %% edge_id:{edge_id}")
         edge_label = _edge_label(edge, view=view)
         if edge_label:
             lines.append(
@@ -309,6 +434,187 @@ def update_readme_flowcharts(readme_path: Path, *, graph: Optional[PipelineGraph
     }
 
 
+def parse_mermaid_flowchart(body: str) -> Dict[str, Any]:
+    direction = "TD"
+    nodes: List[Dict[str, Any]] = []
+    edges: List[Dict[str, Any]] = []
+    alias_to_node_id: Dict[str, str] = {}
+    current_faculty = "other"
+    pending_node_id = ""
+    pending_edge_id = ""
+
+    for raw_line in str(body or "").splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if line.startswith("%%{"):
+            continue
+        if line.startswith("%% node_id:"):
+            pending_node_id = line.split(":", 1)[1].strip()
+            continue
+        if line.startswith("%% edge_id:"):
+            pending_edge_id = line.split(":", 1)[1].strip()
+            continue
+        if line.startswith("flowchart "):
+            direction = line.split(None, 1)[1].strip() or "TD"
+            continue
+        if line.startswith("subgraph "):
+            match = re.match(r"subgraph\s+([^\[]+)(?:\[(.*)\])?$", line)
+            token = str(match.group(1) if match else "other").strip()
+            current_faculty = token[len("group_"):] if token.startswith("group_") else _sanitize_mermaid_token(token or "other")
+            continue
+        if line == "end":
+            current_faculty = "other"
+            continue
+        if line.startswith("classDef ") or line.startswith("class ") or line.startswith("linkStyle "):
+            continue
+
+        edge_match = re.match(
+            r'(?P<source>[A-Za-z_][A-Za-z0-9_]*)\s+--\s+"(?P<label>.*?)"\s+-->\s+(?P<target>[A-Za-z_][A-Za-z0-9_]*)$',
+            line,
+        )
+        if edge_match is None:
+            edge_match = re.match(
+                r'(?P<source>[A-Za-z_][A-Za-z0-9_]*)\s+-->\s+(?P<target>[A-Za-z_][A-Za-z0-9_]*)$',
+                line,
+            )
+        if edge_match is not None:
+            source_alias = str(edge_match.group("source"))
+            target_alias = str(edge_match.group("target"))
+            label = _base_edge_label(str(edge_match.groupdict().get("label", "") or ""))
+            edges.append(
+                {
+                    "edge_id": pending_edge_id,
+                    "source_node_id": alias_to_node_id.get(source_alias, source_alias),
+                    "target_node_id": alias_to_node_id.get(target_alias, target_alias),
+                    "label": label,
+                    "readme_label": label,
+                    "metadata": {"edge_id": pending_edge_id} if pending_edge_id else {},
+                }
+            )
+            pending_edge_id = ""
+            continue
+
+        node_match = re.match(r'(?P<alias>[A-Za-z_][A-Za-z0-9_]*)\[\["(?P<label>.*)"\]\]$', line)
+        shape = "bus"
+        if node_match is None:
+            node_match = re.match(r'(?P<alias>[A-Za-z_][A-Za-z0-9_]*)\["(?P<label>.*)"\]$', line)
+            shape = "process"
+        if node_match is None:
+            continue
+
+        alias = str(node_match.group("alias"))
+        node_id = str(pending_node_id or alias_to_node_id.get(alias) or alias)
+        alias_to_node_id[alias] = node_id
+        nodes.append(
+            {
+                "node_id": node_id,
+                "label": _base_node_label(str(node_match.group("label") or node_id)),
+                "faculty": current_faculty or "other",
+                "shape": shape,
+                "metadata": {"node_id": node_id},
+            }
+        )
+        pending_node_id = ""
+
+    return {
+        "layer_id": "execution",
+        "mermaid_direction": direction,
+        "nodes": nodes,
+        "edges": edges,
+    }
+
+
+def apply_mermaid_execution_edit(plan: TrainingGraphPlan, mermaid_text: str) -> TrainingGraphPlan:
+    parsed = parse_mermaid_flowchart(mermaid_text)
+    original = TrainingGraphPlan.from_dict(plan.to_dict())
+    exec_nodes = [
+        node
+        for node in list(original.nodes or [])
+        if str(getattr(node, "layer", "execution") or "execution") == "execution"
+    ]
+    exec_edges = [
+        edge
+        for edge in list(original.edges or [])
+        if str(getattr(edge, "layer", "execution") or "execution") == "execution"
+    ]
+    other_nodes = [node for node in list(original.nodes or []) if node not in exec_nodes]
+    other_edges = [edge for edge in list(original.edges or []) if edge not in exec_edges]
+    node_map = {node.node_id: node for node in exec_nodes}
+    edge_map = {edge.edge_id: edge for edge in exec_edges}
+
+    updated_nodes: List[GraphNodeRecord] = []
+    active_node_ids: List[str] = []
+    for parsed_node in list(parsed.get("nodes", []) or []):
+        node_id = str(parsed_node.get("node_id", "") or "").strip()
+        if node_id not in node_map:
+            raise ValueError(f"Editable Mermaid references unknown execution node {node_id!r}")
+        base = node_map[node_id]
+        metadata = dict(base.metadata or {})
+        metadata["shape"] = str(parsed_node.get("shape", metadata.get("shape", "process")) or metadata.get("shape", "process"))
+        faculty = str(parsed_node.get("faculty", base.faculty or base.group_id or "other") or base.faculty or base.group_id or "other")
+        updated_nodes.append(
+            GraphNodeRecord(
+                node_id=base.node_id,
+                kind=base.kind,
+                label=_base_node_label(str(parsed_node.get("label", base.label) or base.label)),
+                icon=base.icon,
+                config_id=base.config_id,
+                group_id=faculty,
+                object_type=base.object_type,
+                faculty=faculty,
+                archetype=base.archetype,
+                layer=base.layer,
+                enabled=True,
+                metadata=metadata,
+            )
+        )
+        active_node_ids.append(base.node_id)
+
+    updated_edges: List[GraphEdgeRecord] = []
+    for parsed_edge in list(parsed.get("edges", []) or []):
+        edge_id = str(parsed_edge.get("edge_id", "") or dict(parsed_edge.get("metadata", {}) or {}).get("edge_id", "") or "").strip()
+        if edge_id not in edge_map:
+            raise ValueError(
+                "Editable Mermaid must preserve %% edge_id comments for execution edges; "
+                f"could not resolve {edge_id or '<missing>'!r}"
+            )
+        source_id = str(parsed_edge.get("source_node_id", "") or "").strip()
+        target_id = str(parsed_edge.get("target_node_id", "") or "").strip()
+        if source_id not in active_node_ids or target_id not in active_node_ids:
+            raise ValueError(f"Edge {edge_id!r} references a node removed from the execution layer")
+        base = edge_map[edge_id]
+        metadata = dict(base.metadata or {})
+        edge_label = _base_edge_label(str(parsed_edge.get("label", metadata.get("label", base.kind)) or metadata.get("label", base.kind) or base.kind))
+        metadata["label"] = edge_label
+        metadata["readme_label"] = edge_label
+        updated_edges.append(
+            GraphEdgeRecord(
+                edge_id=base.edge_id,
+                kind=edge_label or base.kind,
+                source_node_id=source_id,
+                target_node_id=target_id,
+                condition_id=base.condition_id,
+                layer=base.layer,
+                target_function=base.target_function,
+                reaction_name=base.reaction_name,
+                reaction_defaults=dict(base.reaction_defaults or {}),
+                enabled=True,
+                metadata=metadata,
+            )
+        )
+
+    original.nodes = other_nodes + updated_nodes
+    original.edges = other_edges + updated_edges
+    original.entry_node_ids = _root_node_ids_from_records(original.nodes, original.edges)
+    layers = dict(original.graph_layers or {})
+    layers["execution"] = build_execution_layer_from_records(updated_nodes, updated_edges)
+    original.graph_layers = layers
+    original.revision = int(getattr(original, "revision", 0) or 0) + 1
+    original.validate()
+    return original
+
+
 def build_default_graph() -> PipelineGraph:
     from pipeline.orchestrator import _build_configs_from_args, build_pipeline_graph
 
@@ -339,7 +645,13 @@ def build_default_graph() -> PipelineGraph:
     )
 
 
-def _render_dense_nodes(layer_id: str, nodes: List[Dict[str, Any]], alias_map: Dict[str, str]) -> List[str]:
+def _render_dense_nodes(
+    layer_id: str,
+    nodes: List[Dict[str, Any]],
+    alias_map: Dict[str, str],
+    *,
+    emit_identity_comments: bool = False,
+) -> List[str]:
     lines: List[str] = []
     grouped: Dict[str, List[Dict[str, Any]]] = {}
     for node in nodes:
@@ -353,15 +665,24 @@ def _render_dense_nodes(layer_id: str, nodes: List[Dict[str, Any]], alias_map: D
         lines.append(f"    subgraph group_{_sanitize_mermaid_token(faculty)}[{_escape_mermaid(_faculty_label(faculty))}]")
         for node in lane_nodes:
             label = _dense_node_label(node)
+            if emit_identity_comments:
+                lines.append(f"        %% node_id:{str(node.get('node_id', 'node'))}")
             lines.append(f"        {alias_map[str(node['node_id'])]}{_mermaid_node_shape(label, shape=str(node.get('shape', 'process')))}")
         lines.append("    end")
     return lines
 
 
-def _render_plain_nodes(nodes: List[Dict[str, Any]], alias_map: Dict[str, str]) -> List[str]:
+def _render_plain_nodes(
+    nodes: List[Dict[str, Any]],
+    alias_map: Dict[str, str],
+    *,
+    emit_identity_comments: bool = False,
+) -> List[str]:
     lines: List[str] = []
     for node in nodes:
         node_id = str(node.get("node_id", "node"))
+        if emit_identity_comments:
+            lines.append(f"    %% node_id:{node_id}")
         lines.append(f"    {alias_map[node_id]}{_mermaid_node_shape(str(node.get('label', node_id)), shape=str(node.get('shape', 'process')))}")
     return lines
 
@@ -427,6 +748,16 @@ def _faculty_order(layer_id: str, faculties: Iterable[str]) -> List[str]:
 
 def _faculty_label(faculty: str) -> str:
     return faculty.replace("_", " ").title()
+
+
+def _execution_record_label(node: GraphNodeRecord) -> str:
+    special = {
+        "data_node": "Data Authority",
+        "stage_c_lora": "LoRA Round",
+    }
+    if node.node_id in special:
+        return special[node.node_id]
+    return str(node.label or _faculty_label(str(node.node_id).replace("_", " "))).strip() or str(node.node_id)
 
 
 def _execution_node_label(node_id: str, node: Any) -> str:
@@ -503,6 +834,28 @@ def _edge_style(layer_id: str, edge: Dict[str, Any]) -> Dict[str, str]:
     if label == "if_gan_mode":
         return {"stroke": "#577590", "width": "3px", "opacity": "0.85", "dasharray": "8 3"}
     return {"stroke": "#6B7280", "width": "2px", "opacity": "0.75", "dasharray": "0"}
+
+
+def _base_node_label(label: str) -> str:
+    return str(label or "").split("<br/>", 1)[0].strip()
+
+
+def _base_edge_label(label: str) -> str:
+    return str(label or "").split(" | ", 1)[0].strip()
+
+
+def _root_node_ids_from_records(
+    nodes: Iterable[GraphNodeRecord],
+    edges: Iterable[GraphEdgeRecord],
+) -> List[str]:
+    node_ids = [str(node.node_id) for node in nodes]
+    enabled_edges = [edge for edge in edges if bool(getattr(edge, "enabled", True))]
+    in_degree = {node_id: 0 for node_id in node_ids}
+    for edge in enabled_edges:
+        target_id = str(edge.target_node_id)
+        if target_id in in_degree:
+            in_degree[target_id] += 1
+    return sorted(node_id for node_id, degree in in_degree.items() if degree == 0)
 
 
 def _replace_marked_block(text: str, start_marker: str, end_marker: str, body: str) -> str:

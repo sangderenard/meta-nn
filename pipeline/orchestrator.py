@@ -711,29 +711,74 @@ def _validate_training_graph_plan(plan) -> None:
     )
 
 
+def _execution_plan_nodes(plan) -> list[Any]:
+    nodes = [
+        node
+        for node in list(getattr(plan, "nodes", []) or [])
+        if bool(getattr(node, "enabled", True))
+        and str(getattr(node, "layer", "execution") or "execution") == "execution"
+    ]
+    return nodes if nodes else [node for node in list(getattr(plan, "nodes", []) or []) if bool(getattr(node, "enabled", True))]
+
+
+def _execution_plan_edges(plan) -> list[Any]:
+    edges = [
+        edge
+        for edge in list(getattr(plan, "edges", []) or [])
+        if bool(getattr(edge, "enabled", True))
+        and str(getattr(edge, "layer", "execution") or "execution") == "execution"
+    ]
+    return edges if edges else [edge for edge in list(getattr(plan, "edges", []) or []) if bool(getattr(edge, "enabled", True))]
+
+
+def _condition_for_plan_edge(condition_id: str):
+    registry = {
+        _CONDITION_ID_GENERATOR_MODE: _generator_exists,
+        _CONDITION_ID_PREGESTATION_GATE: _gate_pregestation_passed,
+        _CONDITION_ID_EARLY_GATES: _early_gates_passed,
+        _CONDITION_ID_ALL_GATES: _all_gates_passed,
+        _CONDITION_ID_WAVE_STAGE_READY: _wave_stage_ready,
+    }
+    resolved_id = str(condition_id or "").strip()
+    if not resolved_id:
+        return None
+    if resolved_id not in registry:
+        raise ValueError(f"Unsupported plan edge condition_id {resolved_id!r}")
+    return registry[resolved_id]
+
+
+def _resolve_plan_edge_callback(graph: PipelineGraph, edge_record):
+    reaction_name = str(getattr(edge_record, "reaction_name", "") or "").strip()
+    target_function = str(getattr(edge_record, "target_function", "") or "").strip()
+    if reaction_name != "data.provide":
+        return None
+    method_name = target_function.rsplit(".", 1)[-1].strip()
+    source_id = str(getattr(edge_record, "source_node_id", "") or "").strip()
+    if not method_name or not source_id:
+        raise ValueError(f"Plan edge {getattr(edge_record, 'edge_id', '<unknown>')!r} is missing data callback metadata")
+    source_node = graph.nodes.get(source_id)
+    if source_node is None:
+        raise ValueError(f"Plan edge references unknown callback source node {source_id!r}")
+    callback = getattr(source_node, method_name, None)
+    if callback is None:
+        raise ValueError(
+            f"Plan edge {getattr(edge_record, 'edge_id', '<unknown>')!r} expects callback {target_function!r} "
+            f"but node {source_id!r} does not provide it"
+        )
+    return callback
+
+
+def _plan_edge_label(edge_record) -> str:
+    metadata = dict(getattr(edge_record, "metadata", {}) or {})
+    return str(metadata.get("label", getattr(edge_record, "kind", "")) or getattr(edge_record, "kind", "") or "")
+
+
 def build_training_graph_from_plan(plan) -> PipelineGraph:
     """Materialize an executable PipelineGraph from a saved TrainingGraphPlan.
 
-    This is the reverse of build_training_graph_plan(): it takes the durable
-    JSON-serializable plan (loaded from training_graph_plan.json or received
-    over the worker↔GUI IPC channel) and produces an executable PipelineGraph
-    that can be passed directly to run().
-
-    The reconstructed graph is functionally identical to one built directly via
-    build_pipeline_graph() with the same configs — both have the same 30 nodes,
-    33 edges, and runtime condition callables.  The plan is only the source of
-    the hyperparameter values; the node objects and edge callables are always
-    created fresh.
-
-    Parameters
-    ----------
-    plan : TrainingGraphPlan
-        A plan instance (loaded from disk or received via IPC).
-
-    Returns
-    -------
-    PipelineGraph
-        A fully wired, executable PipelineGraph ready for run().
+    The plan's execution node/edge records are the authoritative topology.
+    Config blobs still reconstruct the node objects, but the saved execution
+    layer decides which nodes exist and how they are connected.
     """
     blobs = dict(plan.config_blobs or {})
     cfg: dict = {}
@@ -741,10 +786,8 @@ def build_training_graph_from_plan(plan) -> PipelineGraph:
     for key, cls in _CONFIG_CLASS_REGISTRY.items():
         blob = blobs.get(key)
         if isinstance(blob, dict) and blob and not (set(blob.keys()) == {"value"}):
-            # Non-empty dict that isn't a scalar wrapper → reconstruct the dataclass
             cfg[key] = _reconstruct_config(cls, blob)
         else:
-            # Key not present in plan (e.g. older plan file) → use defaults
             cfg[key] = cls()
 
     _validate_training_graph_plan(plan)
@@ -756,7 +799,7 @@ def build_training_graph_from_plan(plan) -> PipelineGraph:
         default=4,
     )
 
-    return build_pipeline_graph(
+    base_graph = build_pipeline_graph(
         classifier_cfg=cfg["classifier"],
         transformer_cfg=cfg["transformer"],
         generator_cfg=cfg["generator"],
@@ -775,6 +818,47 @@ def build_training_graph_from_plan(plan) -> PipelineGraph:
         save_every_n_rounds=save_every,
         berkeley_refresh_every_n_rounds=berkeley_refresh,
     )
+
+    available_nodes = base_graph.nodes
+    selected_nodes = _execution_plan_nodes(plan)
+    selected_edges = _execution_plan_edges(plan)
+    graph_name = str(getattr(plan, "name", "") or getattr(base_graph, "name", "wav_ml_pipeline"))
+    graph = PipelineGraph(name=graph_name)
+
+    selected_node_ids: set[str] = set()
+    for node_record in selected_nodes:
+        node_id = str(getattr(node_record, "node_id", "") or "").strip()
+        node = available_nodes.get(node_id)
+        if node is None:
+            raise ValueError(f"Plan references unsupported execution node {node_id!r}")
+        graph.add_node(node)
+        selected_node_ids.add(node_id)
+
+    for edge_record in selected_edges:
+        source_id = str(getattr(edge_record, "source_node_id", "") or "").strip()
+        target_id = str(getattr(edge_record, "target_node_id", "") or "").strip()
+        if source_id not in selected_node_ids or target_id not in selected_node_ids:
+            raise ValueError(
+                f"Plan edge {getattr(edge_record, 'edge_id', '<unknown>')!r} references nodes outside the execution node set"
+            )
+        edge_metadata = dict(getattr(edge_record, "metadata", {}) or {})
+        graph.add_edge(
+            source_id,
+            target_id,
+            condition=_condition_for_plan_edge(str(getattr(edge_record, "condition_id", "") or "")),
+            label=_plan_edge_label(edge_record),
+            condition_id=str(getattr(edge_record, "condition_id", "") or ""),
+            on_traverse=_resolve_plan_edge_callback(graph, edge_record),
+            edge_id=str(getattr(edge_record, "edge_id", "") or ""),
+            layer=str(getattr(edge_record, "layer", "execution") or "execution"),
+            target_function=str(getattr(edge_record, "target_function", "") or ""),
+            reaction_name=str(getattr(edge_record, "reaction_name", "") or ""),
+            reaction_defaults=dict(getattr(edge_record, "reaction_defaults", {}) or {}),
+            reaction_metadata=edge_metadata,
+            metadata=edge_metadata,
+        )
+
+    return graph
 
 
 def _gate_status_blob(ctx: PipelineContext) -> dict:
