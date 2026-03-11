@@ -420,7 +420,15 @@ class PipelineGraph:
         condition_resolver: Optional[Callable[[str, "PipelineContext"], bool]] = None,  # noqa: F821
         verbose: bool = True,
     ) -> Dict[str, str]:
-        """Execute the graph using node order and guards from *execution_program*."""
+        """Execute the graph using control-flow steps and transitions from *execution_program*."""
+        if _program_has_control_flow(execution_program):
+            return self._execute_program_flow(
+                ctx,
+                execution_program,
+                condition_resolver=condition_resolver,
+                verbose=verbose,
+            )
+
         program_steps = _program_steps_by_node(execution_program)
         sequence = self.build_sequence_from_program(execution_program)
         return self._execute_node_sequence(
@@ -430,6 +438,218 @@ class PipelineGraph:
             program_steps=program_steps,
             condition_resolver=condition_resolver,
         )
+
+    def _execute_program_flow(
+        self,
+        ctx: "PipelineContext",  # noqa: F821
+        execution_program: Optional[Dict[str, Any]],
+        *,
+        condition_resolver: Optional[Callable[[str, "PipelineContext"], bool]] = None,  # noqa: F821
+        verbose: bool,
+    ) -> Dict[str, str]:
+        program_model = _program_flow_model(execution_program)
+        step_map = dict(program_model.get("step_map", {}) or {})
+        transitions_by_from = dict(program_model.get("transitions_by_from", {}) or {})
+        transitions_to_step = dict(program_model.get("transitions_to_step", {}) or {})
+        entry_step_id = str(program_model.get("entry_step_id", "") or "")
+        max_visits = int(program_model.get("max_visits", 0) or 0)
+
+        statuses: Dict[str, str] = {}
+        node_trace: List[Dict[str, Any]] = []
+        program_trace: List[Dict[str, Any]] = []
+
+        if not entry_step_id or entry_step_id not in step_map:
+            setattr(ctx, "last_execution_trace", node_trace)
+            setattr(ctx, "last_program_trace", program_trace)
+            return statuses
+
+        current_step_id = entry_step_id
+        visit_count = 0
+        while current_step_id:
+            visit_count += 1
+            if max_visits > 0 and visit_count > max_visits:
+                limit_entry = {
+                    "tick": int(len(program_trace) + 1),
+                    "entry_kind": "halt",
+                    "reason": "max_program_visits_exceeded",
+                    "step_id": str(current_step_id),
+                    "max_visits": int(max_visits),
+                    "status": "halted:max_visits",
+                }
+                program_trace.append(limit_entry)
+                setattr(ctx, "last_execution_trace", node_trace)
+                setattr(ctx, "last_program_trace", program_trace)
+                if getattr(ctx, "raise_on_node_failure", True):
+                    raise RuntimeError(f"Program traversal exceeded max_visits={max_visits}")
+                _log(f"[graph] HALT program traversal exceeded max_visits={max_visits}")
+                break
+
+            step = dict(step_map.get(current_step_id, {}) or {})
+            if not step:
+                program_trace.append(
+                    {
+                        "tick": int(len(program_trace) + 1),
+                        "entry_kind": "step",
+                        "step_id": str(current_step_id),
+                        "kind": "missing",
+                        "status": "missing",
+                    }
+                )
+                break
+
+            step_kind = str(step.get("kind", "node") or "node")
+            step_label = str(step.get("label", current_step_id) or current_step_id)
+            call_ref = str(step.get("call_ref", "") or "")
+            frame_keys = list(step.get("frame_keys", []) or [])
+
+            if step_kind == "decision":
+                target_node_id = str(dict(step.get("config", {}) or {}).get("target_node_id", "") or "")
+                guard_condition_ids = [
+                    str(condition_id or "").strip()
+                    for condition_id in list(step.get("guard_condition_ids", []) or [])
+                    if str(condition_id or "").strip()
+                ]
+                incoming = [edge for edge in self._edges if target_node_id and edge.target_id == target_node_id]
+                guard_results = {
+                    condition_id: _evaluate_program_guard(
+                        condition_id,
+                        ctx,
+                        incoming,
+                        condition_resolver=condition_resolver,
+                    )
+                    for condition_id in guard_condition_ids
+                }
+                chosen_branch = "pass" if all(guard_results.values()) else "hold"
+                decision_entry = {
+                    "tick": int(len(program_trace) + 1),
+                    "entry_kind": "step",
+                    "step_id": str(current_step_id),
+                    "kind": "decision",
+                    "label": step_label,
+                    "call_ref": call_ref,
+                    "target_node_id": target_node_id,
+                    "guard_condition_ids": list(guard_condition_ids),
+                    "guard_results": dict(guard_results),
+                    "frame_keys": list(frame_keys),
+                    "status": chosen_branch,
+                }
+                program_trace.append(decision_entry)
+                transition = _select_program_transition(
+                    list(transitions_by_from.get(current_step_id, []) or []),
+                    preferred_branch=chosen_branch,
+                )
+                if transition is None:
+                    break
+                program_trace.append(_program_transition_trace(transition, tick=len(program_trace) + 1))
+                current_step_id = str(transition.get("to_step_id", "") or "")
+                continue
+
+            if step_kind == "hold":
+                program_trace.append(
+                    {
+                        "tick": int(len(program_trace) + 1),
+                        "entry_kind": "step",
+                        "step_id": str(current_step_id),
+                        "kind": "hold",
+                        "label": step_label,
+                        "call_ref": call_ref,
+                        "frame_keys": list(frame_keys),
+                        "status": "hold",
+                    }
+                )
+                break
+
+            if step_kind == "node":
+                node_id = str(step.get("node_id", "") or "")
+                step_spec = dict(step)
+                if _program_step_has_decision_predecessor(current_step_id, transitions_to_step, step_map):
+                    step_spec["guard_condition_ids"] = []
+                try:
+                    single_statuses = self._execute_node_sequence(
+                        ctx,
+                        [node_id],
+                        verbose=verbose,
+                        program_steps={node_id: step_spec},
+                        condition_resolver=condition_resolver,
+                    )
+                except Exception:
+                    node_entries = list(getattr(ctx, "last_execution_trace", []) or [])
+                    node_trace.extend(dict(entry) for entry in node_entries)
+                    if node_entries:
+                        node_entry = dict(node_entries[-1])
+                        program_trace.append(
+                            {
+                                "tick": int(len(program_trace) + 1),
+                                "entry_kind": "step",
+                                "step_id": str(current_step_id),
+                                "kind": "node",
+                                "node_id": str(node_entry.get("node_id", node_id) or node_id),
+                                "label": step_label,
+                                "call_ref": str(node_entry.get("call_ref", call_ref) or call_ref),
+                                "frame_keys": list(node_entry.get("frame_keys", []) or []),
+                                "guard_condition_ids": list(node_entry.get("guard_condition_ids", []) or []),
+                                "guard_results": dict(node_entry.get("guard_results", {}) or {}),
+                                "status": str(node_entry.get("status", "failed") or "failed"),
+                            }
+                        )
+                    setattr(ctx, "last_execution_trace", node_trace)
+                    setattr(ctx, "last_program_trace", program_trace)
+                    raise
+
+                node_entries = list(getattr(ctx, "last_execution_trace", []) or [])
+                node_trace.extend(dict(entry) for entry in node_entries)
+                node_entry = dict(node_entries[-1]) if node_entries else {
+                    "node_id": node_id,
+                    "status": str(single_statuses.get(node_id, "missing") or "missing"),
+                    "frame_keys": list(frame_keys),
+                    "guard_condition_ids": list(step_spec.get("guard_condition_ids", []) or []),
+                    "guard_results": {},
+                    "call_ref": call_ref,
+                }
+                statuses[node_id] = str(single_statuses.get(node_id, node_entry.get("status", "missing")) or "missing")
+                program_trace.append(
+                    {
+                        "tick": int(len(program_trace) + 1),
+                        "entry_kind": "step",
+                        "step_id": str(current_step_id),
+                        "kind": "node",
+                        "node_id": str(node_entry.get("node_id", node_id) or node_id),
+                        "label": step_label,
+                        "call_ref": str(node_entry.get("call_ref", call_ref) or call_ref),
+                        "frame_keys": list(node_entry.get("frame_keys", []) or []),
+                        "guard_condition_ids": list(node_entry.get("guard_condition_ids", []) or []),
+                        "guard_results": dict(node_entry.get("guard_results", {}) or {}),
+                        "status": str(node_entry.get("status", statuses[node_id]) or statuses[node_id]),
+                    }
+                )
+                transition = _select_program_transition(list(transitions_by_from.get(current_step_id, []) or []))
+                if transition is None:
+                    break
+                program_trace.append(_program_transition_trace(transition, tick=len(program_trace) + 1))
+                current_step_id = str(transition.get("to_step_id", "") or "")
+                continue
+
+            program_trace.append(
+                {
+                    "tick": int(len(program_trace) + 1),
+                    "entry_kind": "step",
+                    "step_id": str(current_step_id),
+                    "kind": step_kind,
+                    "label": step_label,
+                    "call_ref": call_ref,
+                    "frame_keys": list(frame_keys),
+                    "status": "visited",
+                }
+            )
+            transition = _select_program_transition(list(transitions_by_from.get(current_step_id, []) or []))
+            if transition is None:
+                break
+            program_trace.append(_program_transition_trace(transition, tick=len(program_trace) + 1))
+            current_step_id = str(transition.get("to_step_id", "") or "")
+
+        setattr(ctx, "last_execution_trace", node_trace)
+        setattr(ctx, "last_program_trace", program_trace)
+        return statuses
 
     def execute_sequence(
         self,
@@ -665,6 +885,7 @@ class PipelineGraph:
                 _log(f"[graph] FAIL {step_index:02d} {node_id!r}: {exc}")
 
         setattr(ctx, "last_execution_trace", trace)
+        setattr(ctx, "last_program_trace", [])
         return statuses
 
     # ------------------------------------------------------------------
@@ -710,6 +931,108 @@ def _gate_status_snapshot(ctx: "PipelineContext") -> Dict[str, bool]:  # noqa: F
         gate = getattr(ctx, gate_name, None)
         snapshot[gate_name] = bool(getattr(gate, "passed", False))
     return snapshot
+
+
+def _program_has_control_flow(execution_program: Optional[Dict[str, Any]]) -> bool:
+    if not isinstance(execution_program, dict):
+        return False
+    steps = list(execution_program.get("steps", []) or [])
+    transitions = list(execution_program.get("transitions", []) or [])
+    if not steps:
+        return False
+    return bool(transitions) or any(str(step.get("kind", "node") or "node") != "node" for step in steps)
+
+
+def _program_ordered_steps(execution_program: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    if not isinstance(execution_program, dict):
+        return []
+    steps = [dict(step) for step in list(execution_program.get("steps", []) or []) if isinstance(step, dict)]
+    return sorted(steps, key=lambda step: (float(step.get("display_order", step.get("ordinal", 0)) or 0), str(step.get("step_id", ""))))
+
+
+def _program_flow_model(execution_program: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    ordered_steps = _program_ordered_steps(execution_program)
+    step_map = {
+        str(step.get("step_id", "") or ""): dict(step)
+        for step in ordered_steps
+        if str(step.get("step_id", "") or "").strip()
+    }
+    transitions_by_from: Dict[str, List[Dict[str, Any]]] = {}
+    transitions_to_step: Dict[str, List[Dict[str, Any]]] = {}
+    for transition in list((execution_program or {}).get("transitions", []) or []):
+        if not isinstance(transition, dict):
+            continue
+        from_step_id = str(transition.get("from_step_id", "") or "").strip()
+        to_step_id = str(transition.get("to_step_id", "") or "").strip()
+        if not from_step_id or not to_step_id:
+            continue
+        blob = dict(transition)
+        transitions_by_from.setdefault(from_step_id, []).append(blob)
+        transitions_to_step.setdefault(to_step_id, []).append(blob)
+    for transition_list in transitions_by_from.values():
+        transition_list.sort(key=lambda item: (float(item.get("ordinal", 0) or 0), str(item.get("transition_id", ""))))
+    entry_step_id = str((execution_program or {}).get("entry_step_id", "") or "").strip()
+    if not entry_step_id and ordered_steps:
+        entry_step_id = str(ordered_steps[0].get("step_id", "") or "")
+    max_visits = int((execution_program or {}).get("max_visits_per_round", 0) or 0)
+    if max_visits <= 0:
+        max_visits = max(32, len(ordered_steps) * 8, sum(len(items) for items in transitions_by_from.values()) * 4)
+    return {
+        "ordered_steps": ordered_steps,
+        "step_map": step_map,
+        "transitions_by_from": transitions_by_from,
+        "transitions_to_step": transitions_to_step,
+        "entry_step_id": entry_step_id,
+        "max_visits": int(max_visits),
+    }
+
+
+def _select_program_transition(
+    transitions: List[Dict[str, Any]],
+    *,
+    preferred_branch: str = "",
+) -> Optional[Dict[str, Any]]:
+    ordered = [dict(item) for item in list(transitions or [])]
+    if not ordered:
+        return None
+    branch = str(preferred_branch or "").strip()
+    if branch:
+        for transition in ordered:
+            if str(transition.get("branch", "") or "").strip() == branch:
+                return transition
+    if len(ordered) == 1:
+        return ordered[0]
+    for transition in ordered:
+        if not str(transition.get("branch", "") or "").strip():
+            return transition
+    return ordered[0]
+
+
+def _program_transition_trace(transition: Dict[str, Any], *, tick: int) -> Dict[str, Any]:
+    return {
+        "tick": int(tick),
+        "entry_kind": "transition",
+        "transition_id": str(transition.get("transition_id", "") or ""),
+        "from_step_id": str(transition.get("from_step_id", "") or ""),
+        "to_step_id": str(transition.get("to_step_id", "") or ""),
+        "label": str(transition.get("label", "") or ""),
+        "kind": str(transition.get("kind", "sequence") or "sequence"),
+        "branch": str(transition.get("branch", "") or ""),
+        "call_ref": str(transition.get("call_ref", "") or ""),
+        "status": "traversed",
+    }
+
+
+def _program_step_has_decision_predecessor(
+    step_id: str,
+    transitions_to_step: Dict[str, List[Dict[str, Any]]],
+    step_map: Dict[str, Dict[str, Any]],
+) -> bool:
+    for transition in list(transitions_to_step.get(str(step_id or ""), []) or []):
+        source_step = dict(step_map.get(str(transition.get("from_step_id", "") or ""), {}) or {})
+        if str(source_step.get("kind", "") or "") == "decision":
+            return True
+    return False
 
 
 def _program_steps_by_node(execution_program: Optional[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:

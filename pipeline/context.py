@@ -207,6 +207,7 @@ class PipelineContext:
     vocab_rotation_cycle: int = 0
     last_node_statuses: Dict[str, str] = field(default_factory=dict)
     last_execution_trace: List[Dict[str, Any]] = field(default_factory=list)
+    last_program_trace: List[Dict[str, Any]] = field(default_factory=list)
     edge_reaction_overrides: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     graph_layers: Dict[str, Dict[str, Any]] = field(default_factory=dict)
 

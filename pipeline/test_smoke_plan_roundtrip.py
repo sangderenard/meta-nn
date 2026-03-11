@@ -20,6 +20,8 @@ Checks:
  13. edge callbacks can provision node preconditions before should_run()
  14. execution_program ordering can override raw graph order
  15. execution_program guards can directly control runtime execution
+ 16. execution_program decision and hold steps are traversed explicitly
+ 17. execution_program traversal can revisit cyclic paths before halting
 """
 from __future__ import annotations
 
@@ -531,6 +533,144 @@ def test_execution_program_guards_drive_runtime():
     _assert("program_guard_token" in list(allowed_trace.get("frame_keys", []) or []), "allowed program guard trace keeps symbolic frame token")
 
 
+def test_execution_program_flow_visits_decision_and_hold():
+    print("\n--- test_execution_program_flow_visits_decision_and_hold ---")
+    graph = PipelineGraph(name="program_decision_hold")
+    graph.add_node(_DummyNode("source"))
+
+    class _TargetNode(PipelineNode):
+        @property
+        def node_id(self) -> str:
+            return "target"
+
+        def should_run(self, ctx) -> bool:
+            return True
+
+        def execute(self, ctx) -> None:
+            ctx.last_node_statuses[self.node_id] = "ran"
+
+    def _provide(ctx, *, token: str = ""):
+        ctx.label_embedding_info["decision_hold_token"] = token
+
+    graph.add_node(_TargetNode())
+    graph.add_edge(
+        "source",
+        "target",
+        on_traverse=_provide,
+        target_function="dummy.provide_decision_hold",
+        reaction_name="data.provide",
+        reaction_defaults={"token": "ready", "resources": ["decision_hold_token"]},
+    )
+
+    execution_program = {
+        "entry_step_id": "step_source",
+        "steps": [
+            {"step_id": "step_source", "kind": "node", "node_id": "source", "call_ref": "DummyNode.execute", "display_order": 10},
+            {
+                "step_id": "decision_target",
+                "kind": "decision",
+                "label": "Target ready?",
+                "call_ref": "scheduler.guard",
+                "config": {"target_node_id": "target"},
+                "guard_condition_ids": ["program.target.ready"],
+                "display_order": 15,
+            },
+            {"step_id": "step_target", "kind": "node", "node_id": "target", "call_ref": "TargetNode.execute", "display_order": 20},
+            {"step_id": "program_hold", "kind": "hold", "label": "Hold / next round", "call_ref": "scheduler.hold", "display_order": 30},
+        ],
+        "transitions": [
+            {"transition_id": "t_source_decision", "from_step_id": "step_source", "to_step_id": "decision_target", "ordinal": 1, "label": "1", "kind": "sequence", "call_ref": "scheduler.advance"},
+            {"transition_id": "t_decision_pass", "from_step_id": "decision_target", "to_step_id": "step_target", "ordinal": 2, "label": "2.1", "kind": "branch", "branch": "pass", "call_ref": "scheduler.guard.pass"},
+            {"transition_id": "t_decision_hold", "from_step_id": "decision_target", "to_step_id": "program_hold", "ordinal": 2, "label": "2.0", "kind": "branch", "branch": "hold", "call_ref": "scheduler.guard.hold"},
+        ],
+    }
+
+    blocked_ctx = PipelineContext()
+    blocked_statuses = graph.execute_program(
+        blocked_ctx,
+        execution_program,
+        condition_resolver=lambda condition_id, ctx: False,
+        verbose=False,
+    )
+    blocked_branches = [entry for entry in blocked_ctx.last_program_trace if entry.get("entry_kind") == "transition"]
+    blocked_steps = [entry for entry in blocked_ctx.last_program_trace if entry.get("entry_kind") == "step"]
+
+    _assert(blocked_statuses.get("source") == "ran", "decision/hold flow runs source step")
+    _assert(blocked_statuses.get("target") is None, "hold branch prevents target execution")
+    _assert(any(entry.get("kind") == "decision" for entry in blocked_steps), "program trace records explicit decision step")
+    _assert(any(entry.get("kind") == "hold" for entry in blocked_steps), "program trace records hold step")
+    _assert(any(entry.get("branch") == "hold" for entry in blocked_branches), "program trace records hold transition traversal")
+    _assert(blocked_ctx.label_embedding_info.get("decision_hold_token") is None, "hold branch suppresses target provisioning")
+
+    allowed_ctx = PipelineContext()
+    allowed_statuses = graph.execute_program(
+        allowed_ctx,
+        execution_program,
+        condition_resolver=lambda condition_id, ctx: True,
+        verbose=False,
+    )
+    allowed_branches = [entry for entry in allowed_ctx.last_program_trace if entry.get("entry_kind") == "transition"]
+
+    _assert(allowed_statuses.get("target") == "ran", "pass branch reaches target node")
+    _assert(any(entry.get("branch") == "pass" for entry in allowed_branches), "program trace records pass transition traversal")
+    _assert(allowed_ctx.label_embedding_info.get("decision_hold_token") == "ready", "pass branch preserves target provisioning")
+
+
+
+def test_execution_program_flow_supports_cycles():
+    print("\n--- test_execution_program_flow_supports_cycles ---")
+    graph = PipelineGraph(name="program_cycle")
+
+    class _LoopNode(PipelineNode):
+        @property
+        def node_id(self) -> str:
+            return "loop"
+
+        def execute(self, ctx) -> None:
+            ctx.label_embedding_info["loop_count"] = int(ctx.label_embedding_info.get("loop_count", 0)) + 1
+            ctx.last_node_statuses[self.node_id] = "ran"
+
+    graph.add_node(_LoopNode())
+    execution_program = {
+        "entry_step_id": "step_loop",
+        "steps": [
+            {"step_id": "step_loop", "kind": "node", "node_id": "loop", "call_ref": "LoopNode.execute", "display_order": 10},
+            {
+                "step_id": "decision_loop",
+                "kind": "decision",
+                "label": "Loop again?",
+                "call_ref": "scheduler.guard",
+                "config": {"target_node_id": "loop"},
+                "guard_condition_ids": ["program.loop.repeat"],
+                "display_order": 15,
+            },
+            {"step_id": "program_hold", "kind": "hold", "label": "Hold / next round", "call_ref": "scheduler.hold", "display_order": 20},
+        ],
+        "transitions": [
+            {"transition_id": "t_loop_decision", "from_step_id": "step_loop", "to_step_id": "decision_loop", "ordinal": 1, "label": "1", "kind": "sequence", "call_ref": "scheduler.advance"},
+            {"transition_id": "t_decision_repeat", "from_step_id": "decision_loop", "to_step_id": "step_loop", "ordinal": 2, "label": "2.1", "kind": "branch", "branch": "pass", "call_ref": "scheduler.guard.pass"},
+            {"transition_id": "t_decision_hold", "from_step_id": "decision_loop", "to_step_id": "program_hold", "ordinal": 2, "label": "2.0", "kind": "branch", "branch": "hold", "call_ref": "scheduler.guard.hold"},
+        ],
+    }
+
+    ctx = PipelineContext()
+    statuses = graph.execute_program(
+        ctx,
+        execution_program,
+        condition_resolver=lambda condition_id, runtime_ctx: int(runtime_ctx.label_embedding_info.get("loop_count", 0)) < 2,
+        verbose=False,
+    )
+    loop_runs = [entry for entry in ctx.last_execution_trace if entry.get("node_id") == "loop" and entry.get("status") == "ran"]
+    loop_decisions = [entry for entry in ctx.last_program_trace if entry.get("kind") == "decision"]
+    loop_transitions = [entry for entry in ctx.last_program_trace if entry.get("entry_kind") == "transition"]
+
+    _assert(statuses.get("loop") == "ran", "cyclic program records loop node execution")
+    _assert(len(loop_runs) == 2, "cyclic program can revisit the same node step")
+    _assert(any(entry.get("branch") == "pass" for entry in loop_transitions), "cyclic program traverses repeat branch")
+    _assert(any(entry.get("branch") == "hold" for entry in loop_transitions), "cyclic program eventually traverses hold branch")
+    _assert(loop_decisions[-1].get("status") == "hold", "cyclic decision eventually terminates into hold")
+
+
 # ── main ──────────────────────────────────────────────────────────────────────
 
 def main():
@@ -548,6 +688,8 @@ def main():
     test_edge_reaction_merge()
     test_execution_program_drives_order()
     test_execution_program_guards_drive_runtime()
+    test_execution_program_flow_visits_decision_and_hold()
+    test_execution_program_flow_supports_cycles()
     print("\n=== All checks passed ===")
 
 

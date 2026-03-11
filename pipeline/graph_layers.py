@@ -527,12 +527,16 @@ def _build_execution_program_from_specs(
         previous_step_id = step_id
         transition_ordinal += 1
 
+    ordered_steps = sorted(steps, key=lambda step: (float(step.get("display_order", 0)), str(step.get("step_id", ""))))
+    entry_step_id = str(ordered_steps[0].get("step_id", "") or "") if ordered_steps else ""
     return {
         "program_id": "training_execution_program",
         "label": "Training execution program",
         "version": 1,
+        "entry_step_id": entry_step_id,
+        "halt_step_ids": [hold_step_id],
         "sequence_node_ids": [str(node_id) for node_id in sequence],
-        "steps": sorted(steps, key=lambda step: (float(step.get("display_order", 0)), str(step.get("step_id", "")))),
+        "steps": ordered_steps,
         "transitions": list(transitions),
     }
 
