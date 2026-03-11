@@ -13,6 +13,268 @@ Run `python update_readme_graphs.py` after changing graph layers.
 ### Training Execution Layer
 
 <!-- BEGIN:GENERATED_EXECUTION_LAYER -->
+**Training Composite Execution Overlay**
+
+```mermaid
+%%{init: {'theme':'base','flowchart':{'curve':'basis','htmlLabels':true}}}%%
+flowchart TD
+    subgraph group_bootstrap[Bootstrap]
+        wave_pool["Wave Pool<br/>object / bootstrap / seed"]
+    end
+    subgraph group_build[Build]
+        build_classifier["Build Classifier<br/>object / build / builder"]
+        config_search["Config Search<br/>object / build / node"]
+        build_transformer["Build Transformer<br/>object / build / builder"]
+        build_gan["Build GAN<br/>object / build / builder"]
+        build_wave_classifier["Build Wave Classifier<br/>object / build / builder"]
+    end
+    subgraph group_vocab[Vocab]
+        init_vocab["Init Vocab<br/>object / vocab / seed"]
+        vocab_churn["Vocab Churn<br/>object / vocab / seed"]
+        build_symbol_pool["Build Symbol Pool<br/>object / vocab / builder"]
+        build_label_embedding["Build Label Embedding<br/>object / vocab / builder"]
+        build_flashcard_rows["Build Flashcard Rows<br/>object / vocab / builder"]
+    end
+    subgraph group_data[Data]
+        data_node["Data Authority<br/>object / data / storage_authority"]
+    end
+    subgraph group_train[Train]
+        stage_0_pregestation["Pregestation Train<br/>object / train / stage"]
+        stage_1_gestation["Gestation Train<br/>object / train / stage"]
+        stage_2_berkeley["Berkeley Refresh Train<br/>object / train / stage"]
+        stage_r_transformer["Transformer Train<br/>object / train / stage"]
+        stage_g_generator["Generator Train<br/>object / train / stage"]
+        stage_w_wave_classifier["Wave Classifier Train<br/>object / train / stage"]
+        stage_c_lora["LoRA Round<br/>object / train / stage"]
+        stage_fake_feedback["Fake Class Feedback<br/>object / train / stage"]
+    end
+    subgraph group_gates[Gates]
+        gate_0_pregestation_eval["Pregestation Eval<br/>object / gates / gate"]
+        gate_1_gestation_eval["Gestation Eval<br/>object / gates / gate"]
+        gate_berkeley["Berkeley Gate<br/>object / gates / gate"]
+        gate_transformer["Transformer Gate<br/>object / gates / gate"]
+        gate_generator["Generator Gate<br/>object / gates / gate"]
+        gate_wave["Wave Gate<br/>object / gates / gate"]
+        decision_004_stage_w_wave_classifier{"Wave stage ready?<br/>control / gates / decision"}
+        decision_007_gate_wave{"Wave stage ready?<br/>control / gates / decision"}
+        decision_010_build_gan{"GAN mode?<br/>control / gates / decision"}
+        decision_016_stage_1_gestation{"Gate 0 passed?<br/>control / gates / decision"}
+        decision_017_gate_1_gestation_eval{"Gate 0 passed?<br/>control / gates / decision"}
+        decision_018_stage_2_berkeley{"Gate 1 passed?<br/>control / gates / decision"}
+        decision_019_gate_berkeley{"Gate 1 passed?<br/>control / gates / decision"}
+        decision_020_stage_r_transformer{"Gate 1 passed?<br/>control / gates / decision"}
+        decision_021_stage_c_lora{"Gate 2 passed?<br/>control / gates / decision"}
+        decision_022_gate_transformer{"Gate 1 passed?<br/>control / gates / decision"}
+        decision_023_stage_fake_feedback{"Gate 2 passed?<br/>control / gates / decision"}
+        decision_024_stage_g_generator{"Gate 2 passed?<br/>control / gates / decision"}
+        decision_026_gate_generator{"Gate 2 passed?<br/>control / gates / decision"}
+    end
+    subgraph group_housekeeping[Housekeeping]
+        sync_gate_replica["Sync Gate Replica<br/>object / housekeeping / housekeeping"]
+        checkpoint_save["Checkpoint Save<br/>object / housekeeping / housekeeping"]
+        program_hold(["Hold / next round<br/>control / housekeeping / hold"])
+    end
+
+    wave_pool -- "startup" --> init_vocab
+    init_vocab -- "startup" --> build_classifier
+    build_classifier -- "startup" --> config_search
+    config_search -- "startup" --> build_transformer
+    build_transformer -- "if_gan_mode" --> build_gan
+    wave_pool -- "startup" --> build_wave_classifier
+    build_classifier -- "per_round" --> vocab_churn
+    vocab_churn -- "per_round" --> build_symbol_pool
+    build_symbol_pool -- "per_round" --> build_label_embedding
+    build_label_embedding -- "per_round" --> data_node
+    data_node -- "provides:pregestation_loader" --> stage_0_pregestation
+    data_node -- "provides:pregestation_eval_loader" --> gate_0_pregestation_eval
+    data_node -- "provides:gestation_loader" --> stage_1_gestation
+    data_node -- "provides:gestation_eval_loader" --> gate_1_gestation_eval
+    data_node -- "provides:berkeley_refresh_loader" --> stage_2_berkeley
+    data_node -- "provides:gate_val_loader+payload_val_loader" --> gate_berkeley
+    data_node -- "provides:payload_bank" --> stage_g_generator
+    data_node -- "provides:payload_images" --> build_flashcard_rows
+    stage_0_pregestation -- "after_stage0" --> gate_0_pregestation_eval
+    gate_0_pregestation_eval -- "after_gate0" --> stage_1_gestation
+    stage_1_gestation -- "after_stage1" --> gate_1_gestation_eval
+    gate_1_gestation_eval -- "after_gate1" --> stage_2_berkeley
+    stage_2_berkeley -- "after_gate1" --> gate_berkeley
+    gate_berkeley -- "after_gate1" --> stage_r_transformer
+    stage_r_transformer -- "after_gate1" --> gate_transformer
+    gate_transformer -- "after_all_gates" --> stage_g_generator
+    stage_g_generator -- "after_all_gates" --> gate_generator
+    gate_berkeley -- "after_all_gates" --> stage_c_lora
+    stage_c_lora -- "after_all_gates" --> stage_fake_feedback
+    build_wave_classifier -- "after_transformer_gate" --> stage_w_wave_classifier
+    stage_w_wave_classifier -- "after_transformer_gate" --> gate_wave
+    gate_wave -- "end_of_round" --> sync_gate_replica
+    gate_transformer -- "end_of_round" --> sync_gate_replica
+    gate_berkeley -- "end_of_round" --> sync_gate_replica
+    sync_gate_replica -- "end_of_round" --> checkpoint_save
+    wave_pool -- "1" --> init_vocab
+    init_vocab -- "2" --> build_wave_classifier
+    build_wave_classifier -- "3" --> build_classifier
+    build_classifier -- "4" --> decision_004_stage_w_wave_classifier
+    decision_004_stage_w_wave_classifier -- "4.1" --> stage_w_wave_classifier
+    decision_004_stage_w_wave_classifier -- "4.0" --> program_hold
+    stage_w_wave_classifier -- "5" --> config_search
+    config_search -- "6" --> vocab_churn
+    vocab_churn -- "7" --> decision_007_gate_wave
+    decision_007_gate_wave -- "7.1" --> gate_wave
+    decision_007_gate_wave -- "7.0" --> program_hold
+    gate_wave -- "8" --> build_transformer
+    build_transformer -- "9" --> build_symbol_pool
+    build_symbol_pool -- "10" --> decision_010_build_gan
+    decision_010_build_gan -- "10.1" --> build_gan
+    decision_010_build_gan -- "10.0" --> program_hold
+    build_gan -- "11" --> build_label_embedding
+    build_label_embedding -- "12" --> data_node
+    data_node -- "13" --> stage_0_pregestation
+    stage_0_pregestation -- "14" --> build_flashcard_rows
+    build_flashcard_rows -- "15" --> gate_0_pregestation_eval
+    gate_0_pregestation_eval -- "16" --> decision_016_stage_1_gestation
+    decision_016_stage_1_gestation -- "16.1" --> stage_1_gestation
+    decision_016_stage_1_gestation -- "16.0" --> program_hold
+    stage_1_gestation -- "17" --> decision_017_gate_1_gestation_eval
+    decision_017_gate_1_gestation_eval -- "17.1" --> gate_1_gestation_eval
+    decision_017_gate_1_gestation_eval -- "17.0" --> program_hold
+    gate_1_gestation_eval -- "18" --> decision_018_stage_2_berkeley
+    decision_018_stage_2_berkeley -- "18.1" --> stage_2_berkeley
+    decision_018_stage_2_berkeley -- "18.0" --> program_hold
+    stage_2_berkeley -- "19" --> decision_019_gate_berkeley
+    decision_019_gate_berkeley -- "19.1" --> gate_berkeley
+    decision_019_gate_berkeley -- "19.0" --> program_hold
+    gate_berkeley -- "20" --> decision_020_stage_r_transformer
+    decision_020_stage_r_transformer -- "20.1" --> stage_r_transformer
+    decision_020_stage_r_transformer -- "20.0" --> program_hold
+    stage_r_transformer -- "21" --> decision_021_stage_c_lora
+    decision_021_stage_c_lora -- "21.1" --> stage_c_lora
+    decision_021_stage_c_lora -- "21.0" --> program_hold
+    stage_c_lora -- "22" --> decision_022_gate_transformer
+    decision_022_gate_transformer -- "22.1" --> gate_transformer
+    decision_022_gate_transformer -- "22.0" --> program_hold
+    gate_transformer -- "23" --> decision_023_stage_fake_feedback
+    decision_023_stage_fake_feedback -- "23.1" --> stage_fake_feedback
+    decision_023_stage_fake_feedback -- "23.0" --> program_hold
+    stage_fake_feedback -- "24" --> decision_024_stage_g_generator
+    decision_024_stage_g_generator -- "24.1" --> stage_g_generator
+    decision_024_stage_g_generator -- "24.0" --> program_hold
+    stage_g_generator -- "25" --> sync_gate_replica
+    sync_gate_replica -- "26" --> decision_026_gate_generator
+    decision_026_gate_generator -- "26.1" --> gate_generator
+    decision_026_gate_generator -- "26.0" --> program_hold
+    gate_generator -- "27" --> checkpoint_save
+
+    classDef faculty_bootstrap fill:#E9F1F7,stroke:#4B6B88,color:#102A43,stroke-width:2px;
+    classDef faculty_build fill:#F8EFE5,stroke:#B07219,color:#40210F,stroke-width:2px;
+    classDef faculty_vocab fill:#FFF7CC,stroke:#9A7D0A,color:#3D3100,stroke-width:2px;
+    classDef faculty_data fill:#DFF6F5,stroke:#127475,color:#053B3C,stroke-width:2px;
+    classDef faculty_train fill:#FFE8D6,stroke:#C05621,color:#4A1D05,stroke-width:2px;
+    classDef faculty_gates fill:#FDE2E4,stroke:#C0392B,color:#4A0F13,stroke-width:2px;
+    classDef faculty_housekeeping fill:#E8F5E9,stroke:#2E7D32,color:#102A12,stroke-width:2px;
+    classDef faculty_io fill:#DDEBFF,stroke:#2563EB,color:#0F172A,stroke-width:2px;
+    classDef faculty_inference fill:#F4F1DE,stroke:#3D405B,color:#1B1F2A,stroke-width:2px;
+    classDef faculty_buffer fill:#E0FBFC,stroke:#006D77,color:#00313A,stroke-width:2px;
+    classDef faculty_gate fill:#FDE2E4,stroke:#C0392B,color:#4A0F13,stroke-width:2px;
+    classDef faculty_other fill:#F3F4F6,stroke:#6B7280,color:#111827,stroke-width:2px;
+    class wave_pool faculty_bootstrap;
+    class init_vocab,vocab_churn,build_symbol_pool,build_label_embedding,build_flashcard_rows faculty_vocab;
+    class build_classifier,config_search,build_transformer,build_gan,build_wave_classifier faculty_build;
+    class data_node faculty_data;
+    class stage_0_pregestation,stage_1_gestation,stage_2_berkeley,stage_r_transformer,stage_g_generator,stage_w_wave_classifier,stage_c_lora,stage_fake_feedback faculty_train;
+    class gate_0_pregestation_eval,gate_1_gestation_eval,gate_berkeley,gate_transformer,gate_generator,gate_wave,decision_004_stage_w_wave_classifier,decision_007_gate_wave,decision_010_build_gan,decision_016_stage_1_gestation,decision_017_gate_1_gestation_eval,decision_018_stage_2_berkeley,decision_019_gate_berkeley,decision_020_stage_r_transformer,decision_021_stage_c_lora,decision_022_gate_transformer,decision_023_stage_fake_feedback,decision_024_stage_g_generator,decision_026_gate_generator faculty_gates;
+    class sync_gate_replica,checkpoint_save,program_hold faculty_housekeeping;
+    linkStyle 0 stroke:#2A9D8F,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
+    linkStyle 1 stroke:#2A9D8F,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
+    linkStyle 2 stroke:#2A9D8F,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
+    linkStyle 3 stroke:#2A9D8F,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
+    linkStyle 4 stroke:#577590,stroke-width:3px,opacity:0.85,stroke-dasharray:8 3;
+    linkStyle 5 stroke:#2A9D8F,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
+    linkStyle 6 stroke:#E9C46A,stroke-width:3px,opacity:0.9,stroke-dasharray:2 2;
+    linkStyle 7 stroke:#E9C46A,stroke-width:3px,opacity:0.9,stroke-dasharray:2 2;
+    linkStyle 8 stroke:#E9C46A,stroke-width:3px,opacity:0.9,stroke-dasharray:2 2;
+    linkStyle 9 stroke:#E9C46A,stroke-width:3px,opacity:0.9,stroke-dasharray:2 2;
+    linkStyle 10 stroke:#1D70A2,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
+    linkStyle 11 stroke:#1D70A2,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
+    linkStyle 12 stroke:#1D70A2,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
+    linkStyle 13 stroke:#1D70A2,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
+    linkStyle 14 stroke:#1D70A2,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
+    linkStyle 15 stroke:#1D70A2,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
+    linkStyle 16 stroke:#1D70A2,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
+    linkStyle 17 stroke:#1D70A2,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
+    linkStyle 18 stroke:#F4A261,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
+    linkStyle 19 stroke:#F4A261,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
+    linkStyle 20 stroke:#F4A261,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
+    linkStyle 21 stroke:#F4A261,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
+    linkStyle 22 stroke:#F4A261,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
+    linkStyle 23 stroke:#F4A261,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
+    linkStyle 24 stroke:#F4A261,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
+    linkStyle 25 stroke:#E76F51,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
+    linkStyle 26 stroke:#E76F51,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
+    linkStyle 27 stroke:#E76F51,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
+    linkStyle 28 stroke:#E76F51,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
+    linkStyle 29 stroke:#B56576,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
+    linkStyle 30 stroke:#B56576,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
+    linkStyle 31 stroke:#2B9348,stroke-width:3px,opacity:0.9,stroke-dasharray:4 2;
+    linkStyle 32 stroke:#2B9348,stroke-width:3px,opacity:0.9,stroke-dasharray:4 2;
+    linkStyle 33 stroke:#2B9348,stroke-width:3px,opacity:0.9,stroke-dasharray:4 2;
+    linkStyle 34 stroke:#2B9348,stroke-width:3px,opacity:0.9,stroke-dasharray:4 2;
+    linkStyle 35 stroke:#111111,stroke-width:3px,opacity:0.98,stroke-dasharray:0;
+    linkStyle 36 stroke:#111111,stroke-width:3px,opacity:0.98,stroke-dasharray:0;
+    linkStyle 37 stroke:#111111,stroke-width:3px,opacity:0.98,stroke-dasharray:0;
+    linkStyle 38 stroke:#111111,stroke-width:3px,opacity:0.98,stroke-dasharray:0;
+    linkStyle 39 stroke:#111111,stroke-width:3px,opacity:0.98,stroke-dasharray:0;
+    linkStyle 40 stroke:#111111,stroke-width:2px,opacity:0.95,stroke-dasharray:6 3;
+    linkStyle 41 stroke:#111111,stroke-width:3px,opacity:0.98,stroke-dasharray:0;
+    linkStyle 42 stroke:#111111,stroke-width:3px,opacity:0.98,stroke-dasharray:0;
+    linkStyle 43 stroke:#111111,stroke-width:3px,opacity:0.98,stroke-dasharray:0;
+    linkStyle 44 stroke:#111111,stroke-width:3px,opacity:0.98,stroke-dasharray:0;
+    linkStyle 45 stroke:#111111,stroke-width:2px,opacity:0.95,stroke-dasharray:6 3;
+    linkStyle 46 stroke:#111111,stroke-width:3px,opacity:0.98,stroke-dasharray:0;
+    linkStyle 47 stroke:#111111,stroke-width:3px,opacity:0.98,stroke-dasharray:0;
+    linkStyle 48 stroke:#111111,stroke-width:3px,opacity:0.98,stroke-dasharray:0;
+    linkStyle 49 stroke:#111111,stroke-width:3px,opacity:0.98,stroke-dasharray:0;
+    linkStyle 50 stroke:#111111,stroke-width:2px,opacity:0.95,stroke-dasharray:6 3;
+    linkStyle 51 stroke:#111111,stroke-width:3px,opacity:0.98,stroke-dasharray:0;
+    linkStyle 52 stroke:#111111,stroke-width:3px,opacity:0.98,stroke-dasharray:0;
+    linkStyle 53 stroke:#111111,stroke-width:3px,opacity:0.98,stroke-dasharray:0;
+    linkStyle 54 stroke:#111111,stroke-width:3px,opacity:0.98,stroke-dasharray:0;
+    linkStyle 55 stroke:#111111,stroke-width:3px,opacity:0.98,stroke-dasharray:0;
+    linkStyle 56 stroke:#111111,stroke-width:3px,opacity:0.98,stroke-dasharray:0;
+    linkStyle 57 stroke:#111111,stroke-width:3px,opacity:0.98,stroke-dasharray:0;
+    linkStyle 58 stroke:#111111,stroke-width:2px,opacity:0.95,stroke-dasharray:6 3;
+    linkStyle 59 stroke:#111111,stroke-width:3px,opacity:0.98,stroke-dasharray:0;
+    linkStyle 60 stroke:#111111,stroke-width:3px,opacity:0.98,stroke-dasharray:0;
+    linkStyle 61 stroke:#111111,stroke-width:2px,opacity:0.95,stroke-dasharray:6 3;
+    linkStyle 62 stroke:#111111,stroke-width:3px,opacity:0.98,stroke-dasharray:0;
+    linkStyle 63 stroke:#111111,stroke-width:3px,opacity:0.98,stroke-dasharray:0;
+    linkStyle 64 stroke:#111111,stroke-width:2px,opacity:0.95,stroke-dasharray:6 3;
+    linkStyle 65 stroke:#111111,stroke-width:3px,opacity:0.98,stroke-dasharray:0;
+    linkStyle 66 stroke:#111111,stroke-width:3px,opacity:0.98,stroke-dasharray:0;
+    linkStyle 67 stroke:#111111,stroke-width:2px,opacity:0.95,stroke-dasharray:6 3;
+    linkStyle 68 stroke:#111111,stroke-width:3px,opacity:0.98,stroke-dasharray:0;
+    linkStyle 69 stroke:#111111,stroke-width:3px,opacity:0.98,stroke-dasharray:0;
+    linkStyle 70 stroke:#111111,stroke-width:2px,opacity:0.95,stroke-dasharray:6 3;
+    linkStyle 71 stroke:#111111,stroke-width:3px,opacity:0.98,stroke-dasharray:0;
+    linkStyle 72 stroke:#111111,stroke-width:3px,opacity:0.98,stroke-dasharray:0;
+    linkStyle 73 stroke:#111111,stroke-width:2px,opacity:0.95,stroke-dasharray:6 3;
+    linkStyle 74 stroke:#111111,stroke-width:3px,opacity:0.98,stroke-dasharray:0;
+    linkStyle 75 stroke:#111111,stroke-width:3px,opacity:0.98,stroke-dasharray:0;
+    linkStyle 76 stroke:#111111,stroke-width:2px,opacity:0.95,stroke-dasharray:6 3;
+    linkStyle 77 stroke:#111111,stroke-width:3px,opacity:0.98,stroke-dasharray:0;
+    linkStyle 78 stroke:#111111,stroke-width:3px,opacity:0.98,stroke-dasharray:0;
+    linkStyle 79 stroke:#111111,stroke-width:2px,opacity:0.95,stroke-dasharray:6 3;
+    linkStyle 80 stroke:#111111,stroke-width:3px,opacity:0.98,stroke-dasharray:0;
+    linkStyle 81 stroke:#111111,stroke-width:3px,opacity:0.98,stroke-dasharray:0;
+    linkStyle 82 stroke:#111111,stroke-width:2px,opacity:0.95,stroke-dasharray:6 3;
+    linkStyle 83 stroke:#111111,stroke-width:3px,opacity:0.98,stroke-dasharray:0;
+    linkStyle 84 stroke:#111111,stroke-width:3px,opacity:0.98,stroke-dasharray:0;
+    linkStyle 85 stroke:#111111,stroke-width:3px,opacity:0.98,stroke-dasharray:0;
+    linkStyle 86 stroke:#111111,stroke-width:2px,opacity:0.95,stroke-dasharray:6 3;
+    linkStyle 87 stroke:#111111,stroke-width:3px,opacity:0.98,stroke-dasharray:0;
+```
+
+The colored edges retain topology and data/reaction structure. The black numbered edges show scheduler order, while diamond nodes expose the explicit guard checks that gate later stages.
+
 **Execution layer Dense Infographic**
 
 ```mermaid
@@ -49,6 +311,8 @@ flowchart TD
         stage_fake_feedback["Fake Class Feedback<br/>object / train / stage"]
     end
     subgraph group_gates[Gates]
+        gate_0_pregestation_eval["Pregestation Eval<br/>object / gates / gate"]
+        gate_1_gestation_eval["Gestation Eval<br/>object / gates / gate"]
         gate_berkeley["Berkeley Gate<br/>object / gates / gate"]
         gate_transformer["Transformer Gate<br/>object / gates / gate"]
         gate_generator["Generator Gate<br/>object / gates / gate"]
@@ -70,11 +334,17 @@ flowchart TD
     build_symbol_pool -- "per_round" --> build_label_embedding
     build_label_embedding -- "per_round" --> data_node
     data_node -- "provides:pregestation_loader" --> stage_0_pregestation
+    data_node -- "provides:pregestation_eval_loader" --> gate_0_pregestation_eval
     data_node -- "provides:gestation_loader" --> stage_1_gestation
+    data_node -- "provides:gestation_eval_loader" --> gate_1_gestation_eval
     data_node -- "provides:berkeley_refresh_loader" --> stage_2_berkeley
     data_node -- "provides:gate_val_loader+payload_val_loader" --> gate_berkeley
     data_node -- "provides:payload_bank" --> stage_g_generator
     data_node -- "provides:payload_images" --> build_flashcard_rows
+    stage_0_pregestation -- "after_stage0" --> gate_0_pregestation_eval
+    gate_0_pregestation_eval -- "after_gate0" --> stage_1_gestation
+    stage_1_gestation -- "after_stage1" --> gate_1_gestation_eval
+    gate_1_gestation_eval -- "after_gate1" --> stage_2_berkeley
     stage_2_berkeley -- "after_gate1" --> gate_berkeley
     gate_berkeley -- "after_gate1" --> stage_r_transformer
     stage_r_transformer -- "after_gate1" --> gate_transformer
@@ -106,7 +376,7 @@ flowchart TD
     class build_classifier,config_search,build_transformer,build_gan,build_wave_classifier faculty_build;
     class data_node faculty_data;
     class stage_0_pregestation,stage_1_gestation,stage_2_berkeley,stage_r_transformer,stage_g_generator,stage_w_wave_classifier,stage_c_lora,stage_fake_feedback faculty_train;
-    class gate_berkeley,gate_transformer,gate_generator,gate_wave faculty_gates;
+    class gate_0_pregestation_eval,gate_1_gestation_eval,gate_berkeley,gate_transformer,gate_generator,gate_wave faculty_gates;
     class sync_gate_replica,checkpoint_save faculty_housekeeping;
     linkStyle 0 stroke:#2A9D8F,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
     linkStyle 1 stroke:#2A9D8F,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
@@ -124,19 +394,25 @@ flowchart TD
     linkStyle 13 stroke:#1D70A2,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
     linkStyle 14 stroke:#1D70A2,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
     linkStyle 15 stroke:#1D70A2,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
-    linkStyle 16 stroke:#F4A261,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
-    linkStyle 17 stroke:#F4A261,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
+    linkStyle 16 stroke:#1D70A2,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
+    linkStyle 17 stroke:#1D70A2,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
     linkStyle 18 stroke:#F4A261,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
-    linkStyle 19 stroke:#E76F51,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
-    linkStyle 20 stroke:#E76F51,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
-    linkStyle 21 stroke:#E76F51,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
-    linkStyle 22 stroke:#E76F51,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
-    linkStyle 23 stroke:#B56576,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
-    linkStyle 24 stroke:#B56576,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
-    linkStyle 25 stroke:#2B9348,stroke-width:3px,opacity:0.9,stroke-dasharray:4 2;
-    linkStyle 26 stroke:#2B9348,stroke-width:3px,opacity:0.9,stroke-dasharray:4 2;
-    linkStyle 27 stroke:#2B9348,stroke-width:3px,opacity:0.9,stroke-dasharray:4 2;
-    linkStyle 28 stroke:#2B9348,stroke-width:3px,opacity:0.9,stroke-dasharray:4 2;
+    linkStyle 19 stroke:#F4A261,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
+    linkStyle 20 stroke:#F4A261,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
+    linkStyle 21 stroke:#F4A261,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
+    linkStyle 22 stroke:#F4A261,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
+    linkStyle 23 stroke:#F4A261,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
+    linkStyle 24 stroke:#F4A261,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
+    linkStyle 25 stroke:#E76F51,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
+    linkStyle 26 stroke:#E76F51,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
+    linkStyle 27 stroke:#E76F51,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
+    linkStyle 28 stroke:#E76F51,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
+    linkStyle 29 stroke:#B56576,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
+    linkStyle 30 stroke:#B56576,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
+    linkStyle 31 stroke:#2B9348,stroke-width:3px,opacity:0.9,stroke-dasharray:4 2;
+    linkStyle 32 stroke:#2B9348,stroke-width:3px,opacity:0.9,stroke-dasharray:4 2;
+    linkStyle 33 stroke:#2B9348,stroke-width:3px,opacity:0.9,stroke-dasharray:4 2;
+    linkStyle 34 stroke:#2B9348,stroke-width:3px,opacity:0.9,stroke-dasharray:4 2;
 ```
 
 Node colors group bootstrap, build, vocab, data, train, gate, and housekeeping faculties. Edge colors separate startup, per-round, data-provision, gated progression, and end-of-round reactions.
@@ -170,6 +446,8 @@ flowchart TD
     stage_w_wave_classifier["Wave Classifier Train"]
     stage_c_lora["LoRA Round"]
     stage_fake_feedback["Fake Class Feedback"]
+    gate_0_pregestation_eval["Pregestation Eval"]
+    gate_1_gestation_eval["Gestation Eval"]
     gate_berkeley["Berkeley Gate"]
     gate_transformer["Transformer Gate"]
     gate_generator["Generator Gate"]
@@ -188,11 +466,17 @@ flowchart TD
     build_symbol_pool --> build_label_embedding
     build_label_embedding --> data_node
     data_node --> stage_0_pregestation
+    data_node --> gate_0_pregestation_eval
     data_node --> stage_1_gestation
+    data_node --> gate_1_gestation_eval
     data_node --> stage_2_berkeley
     data_node --> gate_berkeley
     data_node --> stage_g_generator
     data_node --> build_flashcard_rows
+    stage_0_pregestation --> gate_0_pregestation_eval
+    gate_0_pregestation_eval --> stage_1_gestation
+    stage_1_gestation --> gate_1_gestation_eval
+    gate_1_gestation_eval --> stage_2_berkeley
     stage_2_berkeley --> gate_berkeley
     gate_berkeley --> stage_r_transformer
     stage_r_transformer --> gate_transformer
@@ -239,6 +523,8 @@ flowchart TD
     stage_w_wave_classifier["Wave Classifier Train"]
     stage_c_lora["LoRA Round"]
     stage_fake_feedback["Fake Class Feedback"]
+    gate_0_pregestation_eval["Pregestation Eval"]
+    gate_1_gestation_eval["Gestation Eval"]
     gate_berkeley["Berkeley Gate"]
     gate_transformer["Transformer Gate"]
     gate_generator["Generator Gate"]
@@ -257,11 +543,17 @@ flowchart TD
     build_symbol_pool -- "per_round | schedule.round" --> build_label_embedding
     build_label_embedding -- "per_round | schedule.round" --> data_node
     data_node -- "provides:pregestation_loader | data.provide" --> stage_0_pregestation
+    data_node -- "provides:pregestation_eval_loader | data.provide" --> gate_0_pregestation_eval
     data_node -- "provides:gestation_loader | data.provide" --> stage_1_gestation
+    data_node -- "provides:gestation_eval_loader | data.provide" --> gate_1_gestation_eval
     data_node -- "provides:berkeley_refresh_loader | data.provide" --> stage_2_berkeley
     data_node -- "provides:gate_val_loader+payload_val_loader | data.provide" --> gate_berkeley
     data_node -- "provides:payload_bank | data.provide" --> stage_g_generator
     data_node -- "provides:payload_images | data.provide" --> build_flashcard_rows
+    stage_0_pregestation -- "after_stage0 | schedule.transition" --> gate_0_pregestation_eval
+    gate_0_pregestation_eval -- "after_gate0 | schedule.transition" --> stage_1_gestation
+    stage_1_gestation -- "after_stage1 | schedule.transition" --> gate_1_gestation_eval
+    gate_1_gestation_eval -- "after_gate1 | schedule.transition" --> stage_2_berkeley
     stage_2_berkeley -- "after_gate1 | schedule.transition" --> gate_berkeley
     gate_berkeley -- "after_gate1 | schedule.transition" --> stage_r_transformer
     stage_r_transformer -- "after_gate1 | schedule.transition" --> gate_transformer
@@ -292,19 +584,25 @@ flowchart TD
     linkStyle 13 stroke:#1D70A2,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
     linkStyle 14 stroke:#1D70A2,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
     linkStyle 15 stroke:#1D70A2,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
-    linkStyle 16 stroke:#F4A261,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
-    linkStyle 17 stroke:#F4A261,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
+    linkStyle 16 stroke:#1D70A2,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
+    linkStyle 17 stroke:#1D70A2,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
     linkStyle 18 stroke:#F4A261,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
-    linkStyle 19 stroke:#E76F51,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
-    linkStyle 20 stroke:#E76F51,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
-    linkStyle 21 stroke:#E76F51,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
-    linkStyle 22 stroke:#E76F51,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
-    linkStyle 23 stroke:#B56576,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
-    linkStyle 24 stroke:#B56576,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
-    linkStyle 25 stroke:#2B9348,stroke-width:3px,opacity:0.9,stroke-dasharray:4 2;
-    linkStyle 26 stroke:#2B9348,stroke-width:3px,opacity:0.9,stroke-dasharray:4 2;
-    linkStyle 27 stroke:#2B9348,stroke-width:3px,opacity:0.9,stroke-dasharray:4 2;
-    linkStyle 28 stroke:#2B9348,stroke-width:3px,opacity:0.9,stroke-dasharray:4 2;
+    linkStyle 19 stroke:#F4A261,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
+    linkStyle 20 stroke:#F4A261,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
+    linkStyle 21 stroke:#F4A261,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
+    linkStyle 22 stroke:#F4A261,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
+    linkStyle 23 stroke:#F4A261,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
+    linkStyle 24 stroke:#F4A261,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
+    linkStyle 25 stroke:#E76F51,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
+    linkStyle 26 stroke:#E76F51,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
+    linkStyle 27 stroke:#E76F51,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
+    linkStyle 28 stroke:#E76F51,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
+    linkStyle 29 stroke:#B56576,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
+    linkStyle 30 stroke:#B56576,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
+    linkStyle 31 stroke:#2B9348,stroke-width:3px,opacity:0.9,stroke-dasharray:4 2;
+    linkStyle 32 stroke:#2B9348,stroke-width:3px,opacity:0.9,stroke-dasharray:4 2;
+    linkStyle 33 stroke:#2B9348,stroke-width:3px,opacity:0.9,stroke-dasharray:4 2;
+    linkStyle 34 stroke:#2B9348,stroke-width:3px,opacity:0.9,stroke-dasharray:4 2;
 ```
 
 </details>

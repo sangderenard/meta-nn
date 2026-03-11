@@ -11,7 +11,9 @@ Data ownership
 --------------
   WavePoolNode → ctx.wav_records, ctx.float_streams, ctx.stream_paths
   DataNode     → ctx.pregestation_loader / ctx.pregestation_dataset
+               → ctx.pregestation_eval_loader / ctx.pregestation_eval_dataset
                → ctx.gestation_loader   / ctx.gestation_dataset
+               → ctx.gestation_eval_loader / ctx.gestation_eval_dataset
                → ctx.berkeley_refresh_loader / ctx.berkeley_gate_val_loader / ctx.berkeley_cache
                → ctx.payload_bank / ctx.payload_masks / ctx.payload_conditions / ctx.payload_bank_ready
                → ctx.payload_validation_loader / ctx.payload_validation_dataset
@@ -363,7 +365,9 @@ class DataNode(PipelineNode):
 
     Manages:
         ctx.pregestation_loader / ctx.pregestation_dataset
+        ctx.pregestation_eval_loader / ctx.pregestation_eval_dataset
         ctx.gestation_loader   / ctx.gestation_dataset
+        ctx.gestation_eval_loader / ctx.gestation_eval_dataset
         ctx.berkeley_refresh_loader / ctx.berkeley_gate_val_loader / ctx.berkeley_cache
         ctx.payload_bank / ctx.payload_conditions / ctx.payload_masks / ctx.payload_bank_ready
         ctx.payload_validation_loader / ctx.payload_validation_dataset
@@ -397,7 +401,7 @@ class DataNode(PipelineNode):
         self.possessions["pregestation"] = DataPossession(
             name="pregestation",
             tier="ram",
-            ctx_attrs=["pregestation_loader", "pregestation_dataset", "pregestation_logic_rows"],
+            ctx_attrs=["pregestation_loader", "pregestation_dataset", "pregestation_eval_loader", "pregestation_eval_dataset", "pregestation_logic_rows"],
             expiry_fn=lambda ctx: hash(tuple(ctx.class_names)) != self._preg_vocab_hash,
             size_fn=lambda: self._estimate_possession_bytes("pregestation"),
             pass_cap=self.preg_cfg.cache_mb * 1024 * 1024,
@@ -405,7 +409,7 @@ class DataNode(PipelineNode):
         self.possessions["gestation"] = DataPossession(
             name="gestation",
             tier="ram",
-            ctx_attrs=["gestation_loader", "gestation_dataset"],
+            ctx_attrs=["gestation_loader", "gestation_dataset", "gestation_eval_loader", "gestation_eval_dataset"],
             expiry_fn=lambda ctx: hash(tuple(ctx.class_names)) != self._gest_vocab_hash,
             size_fn=lambda: self._estimate_possession_bytes("gestation"),
             pass_cap=self.gest_cfg.cache_mb * 1024 * 1024,
@@ -542,26 +546,38 @@ class DataNode(PipelineNode):
             for i, ms in enumerate(all_mask_stacks):
                 dataset.base_mask_stacks[i] = np.asarray(ms, dtype=np.float32)
 
-        manifest = StageDatasetManifest(
+        train_idx, val_idx = _orphan_free_split(
+            targets=all_targets, seed=self.preg_cfg.seed,
+            val_fraction=0.15, min_val=1,
+        )
+        train_manifest = StageDatasetManifest(
             name="pregestation", dataset=dataset,
             batch_size=max(1, int(self.preg_cfg.batch_size)),
             seed=int(self.preg_cfg.seed),
             num_workers=max(0, int(self.preg_cfg.num_workers)),
             device_type=str(getattr(ctx.device, "type", "cpu")),
+            ordered_indices=train_idx,
         )
-        loader, _count = build_loader_from_manifest(manifest=manifest)
+        loader, _count = build_loader_from_manifest(manifest=train_manifest)
+        eval_manifest = StageDatasetManifest(
+            name="pregestation_eval", dataset=dataset,
+            batch_size=max(1, int(self.preg_cfg.batch_size)),
+            seed=int(self.preg_cfg.seed),
+            num_workers=max(0, int(self.preg_cfg.num_workers)),
+            device_type=str(getattr(ctx.device, "type", "cpu")),
+            ordered_indices=val_idx,
+        )
+        eval_loader, _eval_count = build_loader_from_manifest(manifest=eval_manifest)
         ctx.pregestation_dataset = dataset
         ctx.pregestation_loader = loader
+        ctx.pregestation_eval_dataset = dataset
+        ctx.pregestation_eval_loader = eval_loader
         self._preg_vocab_hash = current_hash
 
         # N-pass tracking + orphan-free validation reserve
         poss = self.possessions["pregestation"]
         poss.pass_ages.append(0)
         poss.pass_row_counts.append(len(all_images))
-        train_idx, val_idx = _orphan_free_split(
-            targets=all_targets, seed=self.preg_cfg.seed,
-            val_fraction=0.15, min_val=1,
-        )
         poss.train_indices = train_idx
         poss.val_indices = val_idx
         poss.mark_built()
@@ -595,31 +611,49 @@ class DataNode(PipelineNode):
             semantic_term_to_idx=ctx.semantic_term_to_idx, augment_apply_terms=False,
             return_masks=False, return_mask_stack=False, dataset_name="gestation",
         )
-        manifest = StageDatasetManifest(
+        train_idx, val_idx = _orphan_free_split(
+            targets=targets, seed=int(getattr(ctx.args, "seed", 0) or 0),
+            val_fraction=0.15, min_val=1,
+        )
+        train_manifest = StageDatasetManifest(
             name="gestation", dataset=dataset,
             batch_size=max(1, int(self.gest_cfg.batch_size)),
             seed=int(getattr(ctx.args, "seed", 0) or 0),
             num_workers=max(0, int(self.gest_cfg.num_workers)),
             device_type=str(getattr(ctx.device, "type", "cpu")),
+            ordered_indices=train_idx,
         )
-        loader, _count = build_loader_from_manifest(manifest=manifest)
+        loader, _count = build_loader_from_manifest(manifest=train_manifest)
+        eval_manifest = StageDatasetManifest(
+            name="gestation_eval", dataset=dataset,
+            batch_size=max(1, int(self.gest_cfg.batch_size)),
+            seed=int(getattr(ctx.args, "seed", 0) or 0),
+            num_workers=max(0, int(self.gest_cfg.num_workers)),
+            device_type=str(getattr(ctx.device, "type", "cpu")),
+            ordered_indices=val_idx,
+        )
+        eval_loader, _eval_count = build_loader_from_manifest(manifest=eval_manifest)
         ctx.gestation_dataset = dataset
         ctx.gestation_loader = loader
+        ctx.gestation_eval_dataset = dataset
+        ctx.gestation_eval_loader = eval_loader
         self._gest_vocab_hash = current_hash
 
         # N-pass tracking + orphan-free validation reserve
         poss = self.possessions["gestation"]
         poss.pass_ages.append(0)
         poss.pass_row_counts.append(len(images))
-        train_idx, val_idx = _orphan_free_split(
-            targets=targets, seed=int(getattr(ctx.args, "seed", 0) or 0),
-            val_fraction=0.15, min_val=1,
-        )
         poss.train_indices = train_idx
         poss.val_indices = val_idx
         poss.mark_built()
         _log(f"[data-node] gestation: {len(images)} images "
              f"(train={len(train_idx)} val={len(val_idx)}) batch_size={self.gest_cfg.batch_size}")
+
+    def provide_pregestation_eval(self, ctx: PipelineContext) -> None:
+        self.provide_pregestation(ctx)
+
+    def provide_gestation_eval(self, ctx: PipelineContext) -> None:
+        self.provide_gestation(ctx)
 
     def provide_berkeley_data(self, ctx: PipelineContext) -> None:
         needs_build = ctx.berkeley_refresh_loader is None

@@ -16,6 +16,10 @@ Checks:
   9. edge reaction defaults merge runtime overrides during execution
  10. execution topology is rebuilt from plan node/edge records
  11. editable Mermaid changes can rewrite the execution plan
+ 12. execution program and overlay layers are exported from the plan IR
+ 13. edge callbacks can provision node preconditions before should_run()
+ 14. execution_program ordering can override raw graph order
+ 15. execution_program guards can directly control runtime execution
 """
 from __future__ import annotations
 
@@ -66,6 +70,7 @@ from pipeline.graph import PipelineGraph, PipelineNode
 from pipeline.context import PipelineContext
 from pipeline.graph_layers import (
     apply_mermaid_execution_edit,
+    build_execution_program,
     build_graph_layers,
     render_mermaid_flowchart,
     render_plan_mermaid_flowchart,
@@ -130,6 +135,7 @@ def test_plan_export(graph, node_count):
             "capabilities": ["plan_apply", "run_control"],
         },
         graph_layers=build_graph_layers(graph),
+        execution_program=build_execution_program(graph),
     )
     _assert(isinstance(plan, TrainingGraphPlan), "plan_from_pipeline_graph returns TrainingGraphPlan")
     _assert(len(plan.nodes) == node_count, f"plan has {len(plan.nodes)} nodes (expected {node_count})")
@@ -137,12 +143,20 @@ def test_plan_export(graph, node_count):
     caps = (plan.worker_hints or {}).get("capabilities", [])
     _assert("plan_apply" in caps, "worker_hints.capabilities includes 'plan_apply'")
     _assert("execution" in (plan.graph_layers or {}), "plan graph_layers includes execution layer")
+    _assert("execution_overlay" in (plan.graph_layers or {}), "plan graph_layers includes execution overlay layer")
     _assert("inference" in (plan.graph_layers or {}), "plan graph_layers includes inference layer")
+    _assert(bool(plan.execution_program), "plan includes execution program")
+    decision_steps = [step for step in (plan.execution_program or {}).get("steps", []) if step.get("kind") == "decision"]
+    _assert(len(decision_steps) > 0, "execution program includes decision steps")
     data_node = next((node for node in plan.nodes if node.node_id == "data_node"), None)
     _assert(data_node is not None, "plan includes data_node record")
     _assert(data_node.object_type == "object", "data_node object_type exported")
     _assert(bool(data_node.faculty), "data_node faculty exported")
     _assert(bool(data_node.archetype), "data_node archetype exported")
+    gate0_node = next((node for node in plan.nodes if node.node_id == "gate_0_pregestation_eval"), None)
+    gate1_node = next((node for node in plan.nodes if node.node_id == "gate_1_gestation_eval"), None)
+    _assert(gate0_node is not None, "plan includes Gate 0 eval node")
+    _assert(gate1_node is not None, "plan includes Gate 1 eval node")
     data_edge = next(
         (edge for edge in plan.edges if edge.source_node_id == "data_node" and edge.target_node_id == "stage_0_pregestation"),
         None,
@@ -259,6 +273,7 @@ def test_layer_rendering_and_readme_sync(graph):
     inference_minimal = render_mermaid_flowchart(layers["inference"], view="minimal")
     inference_reaction = render_mermaid_flowchart(layers["inference"], view="reaction")
     execution_dense = render_mermaid_flowchart(layers["execution"])
+    execution_overlay = render_mermaid_flowchart(layers["execution_overlay"])
     _assert("Input Bus" in inference_dense, "inference dense Mermaid includes Input Bus")
     _assert("Discriminator" in inference_dense, "inference dense Mermaid includes Discriminator")
     _assert("subgraph group_io" in inference_dense, "dense inference view groups nodes by faculty")
@@ -268,6 +283,9 @@ def test_layer_rendering_and_readme_sync(graph):
     _assert("classDef faculty_train" in execution_dense, "dense execution view emits faculty class definitions")
     _assert("subgraph group_build" in execution_dense, "dense execution view groups build faculty nodes")
     _assert("Data Authority" in execution_dense, "dense execution view emits readable execution labels")
+    _assert("Gate 0 passed?" in execution_overlay, "execution overlay includes Gate 0 decision")
+    _assert("Hold / next round" in execution_overlay, "execution overlay includes hold sink")
+    _assert("stroke:#111111" in execution_overlay, "execution overlay emits black control edges")
 
     with tempfile.TemporaryDirectory() as td:
         readme_path = Path(td) / "README.md"
@@ -286,6 +304,8 @@ old
         )
         update_readme_flowcharts(readme_path, graph=graph)
         updated = readme_path.read_text(encoding="utf-8")
+        _assert("Training Composite Execution Overlay" in updated, "README sync writes execution overlay heading")
+        _assert("Gate 0 passed?" in updated, "README sync writes execution overlay decisions")
         _assert("Wave Pool" in updated, "README sync writes execution Mermaid")
         _assert("Input Bus" in updated, "README sync writes inference Mermaid")
         _assert("Dense Infographic" in updated, "README sync writes dense infographic heading")
@@ -340,6 +360,44 @@ def test_editable_mermaid_execution_roundtrip(plan: TrainingGraphPlan):
     _assert(rebuilt_edge.target_id == "build_flashcard_rows", "rebuilt graph honors Mermaid-edited topology")
 
 
+def test_edge_callbacks_run_before_should_run():
+    print("\n--- test_edge_callbacks_run_before_should_run ---")
+    graph = PipelineGraph(name="provision_before_should_run")
+    graph.add_node(_DummyNode("source"))
+
+    class _ProvisionedNode(PipelineNode):
+        @property
+        def node_id(self) -> str:
+            return "target"
+
+        def should_run(self, ctx) -> bool:
+            return bool(ctx.label_embedding_info.get("ready"))
+
+        def execute(self, ctx) -> None:
+            ctx.last_node_statuses[self.node_id] = "ran"
+
+    def _provide(ctx, *, ready: bool = False):
+        ctx.label_embedding_info["ready"] = bool(ready)
+
+    graph.add_node(_ProvisionedNode())
+    graph.add_edge(
+        "source",
+        "target",
+        on_traverse=_provide,
+        target_function="dummy.provide_ready",
+        reaction_name="data.provide",
+        reaction_defaults={"ready": True, "resources": ["ready_flag"]},
+    )
+
+    ctx = PipelineContext()
+    statuses = graph.execute_sequence(ctx, verbose=False)
+    target_trace = next((entry for entry in ctx.last_execution_trace if entry.get("node_id") == "target"), {})
+
+    _assert(statuses.get("target") == "ran", "edge callback can satisfy should_run preconditions")
+    _assert("ready_flag" in list(target_trace.get("frame_keys", []) or []), "provision-order trace records ready flag")
+
+
+
 def test_edge_reaction_merge():
     print("\n--- test_edge_reaction_merge ---")
     graph = PipelineGraph(name="edge_merge")
@@ -358,7 +416,7 @@ def test_edge_reaction_merge():
         on_traverse=_provide,
         target_function="dummy.provide",
         reaction_name="data.provide",
-        reaction_defaults={"resource": "alpha", "mode": "default"},
+        reaction_defaults={"resource": "alpha", "mode": "default", "resources": ["alpha_resource"]},
     )
 
     ctx = PipelineContext()
@@ -366,10 +424,111 @@ def test_edge_reaction_merge():
     ctx.edge_reaction_overrides[edge_id] = {"mode": "override"}
     statuses = graph.execute_sequence(ctx, verbose=False)
     merged = dict(ctx.label_embedding_info.get("edge_merge", {}))
+    target_trace = next((entry for entry in ctx.last_execution_trace if entry.get("node_id") == "target"), {})
 
     _assert(statuses.get("target") == "ran", "target node executed with edge reaction")
     _assert(merged.get("resource") == "alpha", "edge default resource preserved")
     _assert(merged.get("mode") == "override", "edge runtime override merged")
+    _assert(len(ctx.last_execution_trace) == 2, "execution trace records both steps")
+    _assert("alpha_resource" in list(target_trace.get("frame_keys", []) or []), "execution trace records edge-provided frame hints")
+
+
+def test_execution_program_drives_order():
+    print("\n--- test_execution_program_drives_order ---")
+    graph = PipelineGraph(name="program_order")
+    graph.add_node(_DummyNode("first"))
+    graph.add_node(_DummyNode("second"))
+
+    execution_program = {
+        "sequence_node_ids": ["second", "first"],
+        "steps": [
+            {"step_id": "step_001_second", "kind": "node", "node_id": "second", "call_ref": "DummyNode.execute"},
+            {"step_id": "step_002_first", "kind": "node", "node_id": "first", "call_ref": "DummyNode.execute"},
+        ],
+        "transitions": [],
+    }
+
+    ctx = PipelineContext()
+    statuses = graph.execute_program(ctx, execution_program, verbose=False)
+    ordered_nodes = [entry.get("node_id") for entry in ctx.last_execution_trace if entry.get("status") == "ran"]
+
+    _assert(statuses.get("second") == "ran", "program-ordered second node executed")
+    _assert(statuses.get("first") == "ran", "program-ordered first node executed")
+    _assert(ordered_nodes == ["second", "first"], "execution_program sequence drives runtime node order")
+    _assert(all(entry.get("execution_mode") == "program" for entry in ctx.last_execution_trace), "program execution marks trace rows as program-driven")
+
+
+
+def test_execution_program_guards_drive_runtime():
+    print("\n--- test_execution_program_guards_drive_runtime ---")
+    graph = PipelineGraph(name="program_guard")
+    graph.add_node(_DummyNode("source"))
+
+    class _GuardedNode(PipelineNode):
+        @property
+        def node_id(self) -> str:
+            return "target"
+
+        def should_run(self, ctx) -> bool:
+            return True
+
+        def execute(self, ctx) -> None:
+            ctx.last_node_statuses[self.node_id] = "ran"
+
+    def _provide(ctx, *, token: str = ""):
+        ctx.label_embedding_info["program_guard_token"] = token
+
+    graph.add_node(_GuardedNode())
+    graph.add_edge(
+        "source",
+        "target",
+        on_traverse=_provide,
+        target_function="dummy.provide_program_guard",
+        reaction_name="data.provide",
+        reaction_defaults={"token": "available", "resources": ["program_guard_token"]},
+    )
+
+    execution_program = {
+        "sequence_node_ids": ["source", "target"],
+        "steps": [
+            {"step_id": "step_001_source", "kind": "node", "node_id": "source", "call_ref": "DummyNode.execute"},
+            {
+                "step_id": "step_002_target",
+                "kind": "node",
+                "node_id": "target",
+                "call_ref": "GuardedNode.execute",
+                "guard_condition_ids": ["program.guard.enabled"],
+                "frame_keys": ["program_guard_token"],
+            },
+        ],
+        "transitions": [],
+    }
+
+    blocked_ctx = PipelineContext()
+    blocked_statuses = graph.execute_program(
+        blocked_ctx,
+        execution_program,
+        condition_resolver=lambda condition_id, ctx: False,
+        verbose=False,
+    )
+    blocked_trace = next((entry for entry in blocked_ctx.last_execution_trace if entry.get("node_id") == "target"), {})
+
+    _assert(blocked_statuses.get("target") == "skipped:guard", "program guard can skip a node before execution")
+    _assert(blocked_trace.get("guard_results", {}).get("program.guard.enabled") is False, "trace records failed program guard")
+    _assert(blocked_ctx.label_embedding_info.get("program_guard_token") is None, "blocked program guard suppresses edge provisioning")
+
+    allowed_ctx = PipelineContext()
+    allowed_statuses = graph.execute_program(
+        allowed_ctx,
+        execution_program,
+        condition_resolver=lambda condition_id, ctx: True,
+        verbose=False,
+    )
+    allowed_trace = next((entry for entry in allowed_ctx.last_execution_trace if entry.get("node_id") == "target"), {})
+
+    _assert(allowed_statuses.get("target") == "ran", "program guard can allow node execution")
+    _assert(allowed_ctx.label_embedding_info.get("program_guard_token") == "available", "allowed program guard preserves edge provisioning")
+    _assert("program_guard_token" in list(allowed_trace.get("frame_keys", []) or []), "allowed program guard trace keeps symbolic frame token")
 
 
 # ── main ──────────────────────────────────────────────────────────────────────
@@ -385,7 +544,10 @@ def main():
     test_layer_rendering_and_readme_sync(graph)
     test_plan_topology_is_authoritative(reloaded_plan, edge_count)
     test_editable_mermaid_execution_roundtrip(reloaded_plan)
+    test_edge_callbacks_run_before_should_run()
     test_edge_reaction_merge()
+    test_execution_program_drives_order()
+    test_execution_program_guards_drive_runtime()
     print("\n=== All checks passed ===")
 
 

@@ -159,10 +159,14 @@ class PipelineContext:
     # Stage 0 – pre-gestation (synthetic geometric logic images)
     pregestation_loader: Optional[Any] = None
     pregestation_dataset: Optional[Any] = None
+    pregestation_eval_loader: Optional[Any] = None
+    pregestation_eval_dataset: Optional[Any] = None
 
     # Stage 1 – gestation (bootstrap primitive symbol images)
     gestation_loader: Optional[Any] = None
     gestation_dataset: Optional[Any] = None
+    gestation_eval_loader: Optional[Any] = None
+    gestation_eval_dataset: Optional[Any] = None
 
     # Stage 2 – Berkeley SBD full refresh
     berkeley_refresh_loader: Optional[Any] = None
@@ -202,6 +206,7 @@ class PipelineContext:
     total_rounds_completed: int = 0
     vocab_rotation_cycle: int = 0
     last_node_statuses: Dict[str, str] = field(default_factory=dict)
+    last_execution_trace: List[Dict[str, Any]] = field(default_factory=list)
     edge_reaction_overrides: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     graph_layers: Dict[str, Dict[str, Any]] = field(default_factory=dict)
 

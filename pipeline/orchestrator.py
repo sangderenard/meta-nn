@@ -67,7 +67,10 @@ import torch
 
 from pipeline.context import PipelineContext
 from pipeline.graph import EdgeReactionSpec, PipelineGraph
-from pipeline.graph_layers import build_graph_layers as _materialize_graph_layers
+from pipeline.graph_layers import (
+    build_execution_program as _materialize_execution_program,
+    build_graph_layers as _materialize_graph_layers,
+)
 from pipeline.plan_protocol import (
     DEFAULT_PLAN_FILENAME,
     DEFAULT_RUNTIME_SNAPSHOT_FILENAME,
@@ -131,6 +134,8 @@ from pipeline.nodes.data_nodes import (
 from pipeline.nodes.gate_nodes import (
     BerkeleyGateConfig,
     BerkeleyGateNode,
+    PregestationEvalNode,
+    GestationEvalNode,
     TransformerGateConfig,
     TransformerGateNode,
     GeneratorGateConfig,
@@ -354,6 +359,10 @@ def _build_graph_layers(graph: PipelineGraph) -> dict:
     return _materialize_graph_layers(graph)
 
 
+def _build_execution_program(graph: PipelineGraph) -> dict:
+    return _materialize_execution_program(graph)
+
+
 def _node_group_id(node_id: str) -> str:
     if node_id in {"wave_pool"}:
         return "bootstrap"
@@ -412,7 +421,9 @@ def _edge_schedule_reaction_name(label: str) -> str:
 def _edge_provided_resources(method_name: str, label: str) -> list[str]:
     mapping = {
         "provide_pregestation": ["pregestation_loader", "pregestation_dataset"],
+        "provide_pregestation_eval": ["pregestation_eval_loader", "pregestation_eval_dataset"],
         "provide_gestation": ["gestation_loader", "gestation_dataset"],
+        "provide_gestation_eval": ["gestation_eval_loader", "gestation_eval_dataset"],
         "provide_berkeley_data": ["berkeley_refresh_loader", "berkeley_gate_val_loader", "berkeley_cache"],
         "provide_payload": ["payload_bank", "payload_conditions", "payload_masks", "payload_bank_ready"],
         "provide_gate_data": [
@@ -531,6 +542,8 @@ def _node_config_id(node_id: str) -> str:
         "stage_g_generator": "generator",
         "build_wave_classifier": "wave",
         "stage_w_wave_classifier": "wave",
+        "gate_0_pregestation_eval": "classifier",
+        "gate_1_gestation_eval": "classifier",
         "gate_berkeley": "berkeley_gate",
         "gate_transformer": "transformer_gate",
         "gate_generator": "generator_gate",
@@ -640,6 +653,7 @@ def build_training_graph_plan(args, output_dir: Path, *, graph: Optional[Pipelin
         metadata=metadata,
         node_metadata=_build_plan_node_metadata(graph),
         graph_layers=_build_graph_layers(graph),
+        execution_program=_build_execution_program(graph),
     )
 
 
@@ -1131,6 +1145,8 @@ def build_pipeline_graph(
     g.add_node(FakeClassFeedbackNode(classifier_cfg))
 
     # Gate checks
+    g.add_node(PregestationEvalNode(classifier_cfg))
+    g.add_node(GestationEvalNode(classifier_cfg))
     g.add_node(BerkeleyGateNode(berkeley_gate_cfg))
     g.add_node(TransformerGateNode(transformer_gate_cfg))
     g.add_node(GeneratorGateNode(generator_gate_cfg))
@@ -1169,12 +1185,19 @@ def build_pipeline_graph(
     g.add_edge("data_node", "stage_0_pregestation",
                label="provides:pregestation_loader",
                on_traverse=_data_node.provide_pregestation)
+    g.add_edge("data_node", "gate_0_pregestation_eval",
+               label="provides:pregestation_eval_loader",
+               on_traverse=_data_node.provide_pregestation_eval)
 
     # Gestation: data_node provides ctx.gestation_loader to stage 1 (after gate 0)
     g.add_edge("data_node", "stage_1_gestation",
                condition=_gate_pregestation_passed, label="provides:gestation_loader",
                condition_id=_CONDITION_ID_PREGESTATION_GATE,
                on_traverse=_data_node.provide_gestation)
+    g.add_edge("data_node", "gate_1_gestation_eval",
+               condition=_gate_pregestation_passed, label="provides:gestation_eval_loader",
+               condition_id=_CONDITION_ID_PREGESTATION_GATE,
+               on_traverse=_data_node.provide_gestation_eval)
 
     # Berkeley refresh: data_node provides ctx.berkeley_refresh_loader to stage 2 (after early gates)
     g.add_edge("data_node", "stage_2_berkeley",
@@ -1198,6 +1221,16 @@ def build_pipeline_graph(
     g.add_edge("data_node", "build_flashcard_rows",
                label="provides:payload_images",
                on_traverse=_data_node.provide_payload)
+
+    # == Stage 0 / 1 gate evals =====================================
+
+    g.add_edge("stage_0_pregestation", "gate_0_pregestation_eval", label="after_stage0")
+    g.add_edge("gate_0_pregestation_eval", "stage_1_gestation",
+               condition=_gate_pregestation_passed, label="after_gate0", condition_id=_CONDITION_ID_PREGESTATION_GATE)
+    g.add_edge("stage_1_gestation", "gate_1_gestation_eval",
+               condition=_gate_pregestation_passed, label="after_stage1", condition_id=_CONDITION_ID_PREGESTATION_GATE)
+    g.add_edge("gate_1_gestation_eval", "stage_2_berkeley",
+               condition=_early_gates_passed, label="after_gate1", condition_id=_CONDITION_ID_EARLY_GATES)
 
     # == Stage 2 → gate_berkeley ====================================
 
@@ -1241,6 +1274,35 @@ def build_pipeline_graph(
 
     _apply_execution_layer_metadata(g)
     return g
+
+
+def _runtime_execution_program(plan) -> dict:
+    return dict(getattr(plan, "execution_program", {}) or {}) if plan is not None else {}
+
+
+def _program_condition_resolver(condition_id: str, ctx: PipelineContext) -> bool:
+    condition = _condition_for_plan_edge(condition_id)
+    if condition is None:
+        return True
+    return bool(condition(ctx))
+
+
+def _runtime_node_sequence(graph: PipelineGraph, plan) -> list[str]:
+    execution_program = _runtime_execution_program(plan)
+    if execution_program:
+        return graph.build_sequence_from_program(execution_program)
+    return graph.build_sequence()
+
+
+def _execute_runtime_pass(graph: PipelineGraph, ctx: PipelineContext, *, sequence: Optional[list[str]] = None) -> dict[str, str]:
+    execution_program = _runtime_execution_program(getattr(ctx, "graph_plan", None))
+    if execution_program:
+        return graph.execute_program(
+            ctx,
+            execution_program,
+            condition_resolver=_program_condition_resolver,
+        )
+    return graph.execute_sequence(ctx, sequence=sequence)
 
 
 # ---------------------------------------------------------------------------
@@ -1351,13 +1413,13 @@ def run(args, output_dir: Path, initial_plan=None) -> None:
 
     _log(graph.summary())
 
-    # Build a fixed execution sequence once (topological order)
-    sequence = graph.build_sequence()
+    # Build a fixed runtime sequence once from the persisted execution program.
+    sequence = _runtime_node_sequence(graph, ctx.graph_plan)
 
     # -- One-time initialisation pass (no loop) ---------------------------
     # The first pass runs init_vocab, build_classifier, wave_pool, etc.
     # Subsequent passes will hit the `_done` guards on one-shot nodes.
-    statuses = graph.execute_sequence(ctx, sequence=sequence)
+    statuses = _execute_runtime_pass(graph, ctx, sequence=sequence)
     ctx.last_node_statuses = dict(statuses)
     _log_statuses("init", statuses)
     _save_runtime_snapshot(
@@ -1396,8 +1458,8 @@ def run(args, output_dir: Path, initial_plan=None) -> None:
                 )
                 try:
                     new_graph = build_training_graph_from_plan(apply_payload.plan)
-                    sequence = new_graph.build_sequence()
                     graph = new_graph
+                    sequence = _runtime_node_sequence(new_graph, apply_payload.plan)
                     ctx.graph_plan = apply_payload.plan
                     ctx.plan_id = str(apply_payload.plan.plan_id)
                     ctx.graph_layers = dict(getattr(apply_payload.plan, "graph_layers", {}) or {})
@@ -1444,7 +1506,7 @@ def run(args, output_dir: Path, initial_plan=None) -> None:
                  f"  total={ctx.total_rounds_completed}")
             _log(f"{'=' * 60}")
 
-            statuses = graph.execute_sequence(ctx, sequence=sequence)
+            statuses = _execute_runtime_pass(graph, ctx, sequence=sequence)
             ctx.last_node_statuses = dict(statuses)
             _log_statuses(f"c{cycle_idx}r{round_idx}", statuses)
             _save_runtime_snapshot(

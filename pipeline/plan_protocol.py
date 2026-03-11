@@ -19,7 +19,7 @@ if TYPE_CHECKING:
     from pipeline.graph import PipelineGraph
 
 
-PLAN_SCHEMA_VERSION = 2
+PLAN_SCHEMA_VERSION = 3
 IPC_PROTOCOL_VERSION = 1
 
 DEFAULT_PLAN_FILENAME = "training_graph_plan.json"
@@ -232,6 +232,7 @@ class TrainingGraphPlan:
     condition_blobs: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     worker_hints: Dict[str, Any] = field(default_factory=dict)
     graph_layers: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    execution_program: Dict[str, Any] = field(default_factory=dict)
     layout: GraphLayoutRecord = field(default_factory=GraphLayoutRecord)
     metadata: Dict[str, Any] = field(default_factory=dict)
 
@@ -302,6 +303,7 @@ class TrainingGraphPlan:
             "condition_blobs": _jsonable(self.condition_blobs),
             "worker_hints": _jsonable(self.worker_hints),
             "graph_layers": _jsonable(self.graph_layers),
+            "execution_program": _jsonable(self.execution_program),
             "layout": self.layout.to_dict(),
             "metadata": _jsonable(self.metadata),
         }
@@ -328,6 +330,7 @@ class TrainingGraphPlan:
             condition_blobs=dict(data.get("condition_blobs", {})),
             worker_hints=dict(data.get("worker_hints", {})),
             graph_layers=dict(data.get("graph_layers", {})),
+            execution_program=dict(data.get("execution_program", {})),
             layout=GraphLayoutRecord.from_dict(dict(data.get("layout", {}))),
             metadata=dict(data.get("metadata", {})),
         )
@@ -782,11 +785,20 @@ def plan_from_pipeline_graph(
     metadata: Optional[Dict[str, Any]] = None,
     node_metadata: Optional[Dict[str, Dict[str, Any]]] = None,
     graph_layers: Optional[Dict[str, Any]] = None,
+    execution_program: Optional[Dict[str, Any]] = None,
 ) -> TrainingGraphPlan:
     raw_nodes = getattr(graph, "nodes", None)
     raw_nodes = raw_nodes if isinstance(raw_nodes, dict) else getattr(graph, "_nodes", {})
     raw_edges = getattr(graph, "edges", None)
     raw_edges = raw_edges if isinstance(raw_edges, list) else getattr(graph, "_edges", [])
+
+    if execution_program is None:
+        try:
+            from pipeline.graph_layers import build_execution_program as _build_execution_program
+
+            execution_program = _build_execution_program(graph)
+        except Exception:
+            execution_program = {}
 
     node_records: List[GraphNodeRecord] = []
     node_meta_map = dict(node_metadata or {})
@@ -872,6 +884,7 @@ def plan_from_pipeline_graph(
     serialized_configs = serialize_config_blobs(dict(config_blobs or {}))
     serialized_conditions = serialize_config_blobs(dict(condition_blobs or {}))
     serialized_layers = _jsonable(dict(graph_layers or {}))
+    serialized_execution_program = _jsonable(dict(execution_program or {}))
     plan_name = str(name or getattr(graph, "name", "Training Graph"))
     plan_digest = _stable_digest(
         {
@@ -881,6 +894,7 @@ def plan_from_pipeline_graph(
             "configs": serialized_configs,
             "conditions": serialized_conditions,
             "layers": serialized_layers,
+            "execution_program": serialized_execution_program,
         }
     )
     plan_id = f"{str(getattr(graph, 'name', 'graph')).strip() or 'graph'}:{plan_digest}"
@@ -896,6 +910,7 @@ def plan_from_pipeline_graph(
         condition_blobs=serialized_conditions,
         worker_hints=_jsonable(dict(worker_hints or {})),
         graph_layers=serialized_layers,
+        execution_program=serialized_execution_program,
         layout=build_layout_from_records(node_records, edge_records),
         metadata=_jsonable(dict(metadata or {})),
     )

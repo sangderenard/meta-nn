@@ -380,6 +380,57 @@ class PipelineGraph:
     # Execution
     # ------------------------------------------------------------------
 
+    def build_sequence_from_program(self, execution_program: Optional[Dict[str, Any]]) -> List[str]:
+        """Return node order from the persisted execution program when present."""
+        if not isinstance(execution_program, dict) or not execution_program:
+            return self.build_sequence()
+
+        ordered: List[str] = []
+        seen: Set[str] = set()
+        for node_id in list(execution_program.get("sequence_node_ids", []) or []):
+            resolved_id = str(node_id or "").strip()
+            if not resolved_id or resolved_id in seen or resolved_id not in self._nodes:
+                continue
+            ordered.append(resolved_id)
+            seen.add(resolved_id)
+        if ordered:
+            return ordered
+
+        step_rows: List[tuple[float, str]] = []
+        for step in list(execution_program.get("steps", []) or []):
+            if str(step.get("kind", "node") or "node") != "node":
+                continue
+            node_id = str(step.get("node_id", "") or "").strip()
+            if not node_id or node_id in seen or node_id not in self._nodes:
+                continue
+            ordinal = float(step.get("display_order", step.get("ordinal", 0)) or 0)
+            step_rows.append((ordinal, node_id))
+            seen.add(node_id)
+        if step_rows:
+            step_rows.sort(key=lambda item: (item[0], item[1]))
+            return [node_id for _, node_id in step_rows]
+
+        return self.build_sequence()
+
+    def execute_program(
+        self,
+        ctx: "PipelineContext",  # noqa: F821
+        execution_program: Optional[Dict[str, Any]],
+        *,
+        condition_resolver: Optional[Callable[[str, "PipelineContext"], bool]] = None,  # noqa: F821
+        verbose: bool = True,
+    ) -> Dict[str, str]:
+        """Execute the graph using node order and guards from *execution_program*."""
+        program_steps = _program_steps_by_node(execution_program)
+        sequence = self.build_sequence_from_program(execution_program)
+        return self._execute_node_sequence(
+            ctx,
+            sequence,
+            verbose=verbose,
+            program_steps=program_steps,
+            condition_resolver=condition_resolver,
+        )
+
     def execute_sequence(
         self,
         ctx: "PipelineContext",  # noqa: F821
@@ -387,65 +438,233 @@ class PipelineGraph:
         *,
         verbose: bool = True,
     ) -> Dict[str, str]:
-        """Execute nodes in *sequence* order, honouring edges and skip logic.
-
-        Returns a status dict: ``{node_id: "ran" | "skipped:<reason>" | "failed:<msg>"}``.
-
-        Nodes are skipped when:
-        * All incoming edges are inactive (condition returned False), **or**
-        * The node's :meth:`~PipelineNode.should_run` returns False.
-
-        Nodes with *no* incoming edges are always candidates to run (their
-        ``should_run`` is still consulted).
-        """
+        """Execute nodes in *sequence* order, honouring edges and skip logic."""
         if sequence is None:
             sequence = self.build_sequence()
+        return self._execute_node_sequence(ctx, list(sequence), verbose=verbose)
 
+    def _execute_node_sequence(
+        self,
+        ctx: "PipelineContext",  # noqa: F821
+        sequence: List[str],
+        *,
+        verbose: bool,
+        program_steps: Optional[Dict[str, Dict[str, Any]]] = None,
+        condition_resolver: Optional[Callable[[str, "PipelineContext"], bool]] = None,  # noqa: F821
+    ) -> Dict[str, str]:
         statuses: Dict[str, str] = {}
+        trace: List[Dict[str, Any]] = []
         raw_edge_overrides = getattr(ctx, "edge_reaction_overrides", {})
         edge_overrides = raw_edge_overrides if isinstance(raw_edge_overrides, dict) else {}
+        step_specs = dict(program_steps or {})
 
-        for node_id in sequence:
+        for step_index, node_id in enumerate(sequence, start=1):
             node = self._nodes.get(node_id)
+            step_spec = dict(step_specs.get(node_id, {}) or {})
+            program_step_id = str(step_spec.get("step_id", "") or "")
+            execution_mode = "program" if step_spec else "topology"
+            program_frame_keys = list(step_spec.get("frame_keys", []) or [])
+            call_ref = str(step_spec.get("call_ref", f"{type(node).__name__}.execute" if node is not None else "node.execute") or "node.execute")
             if node is None:
                 statuses[node_id] = "missing"
+                trace.append(
+                    {
+                        "step": int(step_index),
+                        "node_id": str(node_id),
+                        "status": "missing",
+                        "incoming_edge_ids": [],
+                        "active_edge_ids": [],
+                        "guard_condition_ids": [],
+                        "frame_keys": list(program_frame_keys),
+                        "program_step_id": program_step_id,
+                        "execution_mode": execution_mode,
+                    }
+                )
                 continue
 
-            # -- edge gate -------------------------------------------------
             incoming = [e for e in self._edges if e.target_id == node_id]
-            active_incoming = [e for e in incoming if e.is_active(ctx)]
+            incoming_edge_ids = [str(e.edge_id) for e in incoming]
+            inferred_guard_ids = sorted({str(e.condition_id) for e in incoming if str(e.condition_id or '').strip()})
+            configured_guard_ids = [
+                str(condition_id or '').strip()
+                for condition_id in list(step_spec.get("guard_condition_ids", []) or [])
+                if str(condition_id or '').strip()
+            ]
+            guard_condition_ids = configured_guard_ids or inferred_guard_ids
+            guard_results: Dict[str, bool] = {}
+
+            if configured_guard_ids:
+                for condition_id in guard_condition_ids:
+                    guard_results[condition_id] = _evaluate_program_guard(
+                        condition_id,
+                        ctx,
+                        incoming,
+                        condition_resolver=condition_resolver,
+                    )
+                if not all(guard_results.values()):
+                    frame_keys = _execution_frame_keys(
+                        ctx,
+                        node_id,
+                        [],
+                        {},
+                        program_frame_keys=program_frame_keys,
+                    )
+                    statuses[node_id] = "skipped:guard"
+                    trace.append(
+                        {
+                            "step": int(step_index),
+                            "node_id": str(node_id),
+                            "status": "skipped:guard",
+                            "incoming_edge_ids": incoming_edge_ids,
+                            "active_edge_ids": [],
+                            "guard_condition_ids": guard_condition_ids,
+                            "guard_results": dict(guard_results),
+                            "frame_keys": list(frame_keys),
+                            "call_ref": call_ref,
+                            "program_step_id": program_step_id,
+                            "execution_mode": execution_mode,
+                            "gates": _gate_status_snapshot(ctx),
+                        }
+                    )
+                    if verbose:
+                        guard_summary = ", ".join(
+                            f"{condition_id}={'1' if passed else '0'}"
+                            for condition_id, passed in guard_results.items()
+                        )
+                        _log(f"[graph] SKIP {step_index:02d} {node_id!r} (program guard blocked: {guard_summary})")
+                    continue
+
+            if configured_guard_ids:
+                active_incoming = []
+                for edge in incoming:
+                    edge_condition_id = str(edge.condition_id or "").strip()
+                    if edge_condition_id:
+                        if guard_results.get(edge_condition_id, False):
+                            active_incoming.append(edge)
+                        continue
+                    if edge.is_active(ctx):
+                        active_incoming.append(edge)
+            else:
+                active_incoming = [e for e in incoming if e.is_active(ctx)]
+                for condition_id in guard_condition_ids:
+                    guard_results[condition_id] = any(
+                        str(edge.condition_id or "").strip() == condition_id and edge in active_incoming
+                        for edge in incoming
+                    )
+
+            active_edge_ids = [str(e.edge_id) for e in active_incoming]
             if incoming and not active_incoming:
                 statuses[node_id] = "skipped:edge"
+                trace.append(
+                    {
+                        "step": int(step_index),
+                        "node_id": str(node_id),
+                        "status": "skipped:edge",
+                        "incoming_edge_ids": incoming_edge_ids,
+                        "active_edge_ids": [],
+                        "guard_condition_ids": guard_condition_ids,
+                        "guard_results": dict(guard_results),
+                        "frame_keys": [],
+                        "call_ref": call_ref,
+                        "program_step_id": program_step_id,
+                        "execution_mode": execution_mode,
+                        "gates": _gate_status_snapshot(ctx),
+                    }
+                )
                 if verbose:
-                    _log(f"[graph] SKIP {node_id!r} (all incoming edges inactive)")
+                    _log(f"[graph] SKIP {step_index:02d} {node_id!r} (all incoming edges inactive)")
                 continue
 
-            # -- node gate -------------------------------------------------
-            if not node.should_run(ctx):
-                statuses[node_id] = "skipped:node"
-                if verbose:
-                    _log(f"[graph] SKIP {node_id!r} (should_run=False)")
-                continue
-
-            # -- on_traverse callbacks (data provision by edge list) -------
+            active_edge_configs: Dict[str, Dict[str, Any]] = {}
             for edge in active_incoming:
                 incoming_cfg = edge_overrides.get(edge.edge_id)
                 if incoming_cfg is None:
                     incoming_cfg = edge_overrides.get(f"{edge.source_id}->{edge.target_id}")
-                edge.invoke(ctx, incoming_cfg if isinstance(incoming_cfg, dict) else None)
+                override_cfg = incoming_cfg if isinstance(incoming_cfg, dict) else None
+                active_edge_configs[edge.edge_id] = edge.merged_reaction_config(override_cfg)
 
-            # -- execute ---------------------------------------------------
+            for edge in active_incoming:
+                edge.invoke(ctx, active_edge_configs.get(edge.edge_id))
+
+            frame_keys = _execution_frame_keys(
+                ctx,
+                node_id,
+                active_incoming,
+                active_edge_configs,
+                program_frame_keys=program_frame_keys,
+            )
+            frame_suffix = f" frame={_format_frame_keys(frame_keys)}" if frame_keys else ""
+
+            if not node.should_run(ctx):
+                statuses[node_id] = "skipped:node"
+                trace.append(
+                    {
+                        "step": int(step_index),
+                        "node_id": str(node_id),
+                        "status": "skipped:node",
+                        "incoming_edge_ids": incoming_edge_ids,
+                        "active_edge_ids": active_edge_ids,
+                        "guard_condition_ids": guard_condition_ids,
+                        "guard_results": dict(guard_results),
+                        "frame_keys": list(frame_keys),
+                        "reaction_names": [str(e.reaction.reaction_name or '') for e in active_incoming],
+                        "call_ref": call_ref,
+                        "program_step_id": program_step_id,
+                        "execution_mode": execution_mode,
+                        "gates": _gate_status_snapshot(ctx),
+                    }
+                )
+                if verbose:
+                    _log(f"[graph] SKIP {step_index:02d} {node_id!r} (should_run=False){frame_suffix}")
+                continue
+
             if verbose:
-                _log(f"[graph] RUN  {node_id!r}  ({node.description})")
+                _log(f"[graph] RUN  {step_index:02d} {node_id!r}  ({node.description}){frame_suffix}")
             try:
                 node.execute(ctx)
                 statuses[node_id] = "ran"
+                trace.append(
+                    {
+                        "step": int(step_index),
+                        "node_id": str(node_id),
+                        "status": "ran",
+                        "incoming_edge_ids": incoming_edge_ids,
+                        "active_edge_ids": active_edge_ids,
+                        "guard_condition_ids": guard_condition_ids,
+                        "guard_results": dict(guard_results),
+                        "frame_keys": list(frame_keys),
+                        "reaction_names": [str(e.reaction.reaction_name or '') for e in active_incoming],
+                        "call_ref": call_ref,
+                        "program_step_id": program_step_id,
+                        "execution_mode": execution_mode,
+                        "gates": _gate_status_snapshot(ctx),
+                    }
+                )
             except Exception as exc:
                 statuses[node_id] = f"failed:{exc}"
+                trace.append(
+                    {
+                        "step": int(step_index),
+                        "node_id": str(node_id),
+                        "status": f"failed:{exc}",
+                        "incoming_edge_ids": incoming_edge_ids,
+                        "active_edge_ids": active_edge_ids,
+                        "guard_condition_ids": guard_condition_ids,
+                        "guard_results": dict(guard_results),
+                        "frame_keys": list(frame_keys),
+                        "reaction_names": [str(e.reaction.reaction_name or '') for e in active_incoming],
+                        "call_ref": call_ref,
+                        "program_step_id": program_step_id,
+                        "execution_mode": execution_mode,
+                        "gates": _gate_status_snapshot(ctx),
+                    }
+                )
                 if getattr(ctx, "raise_on_node_failure", True):
+                    setattr(ctx, "last_execution_trace", trace)
                     raise
-                _log(f"[graph] FAIL {node_id!r}: {exc}")
+                _log(f"[graph] FAIL {step_index:02d} {node_id!r}: {exc}")
 
+        setattr(ctx, "last_execution_trace", trace)
         return statuses
 
     # ------------------------------------------------------------------
@@ -475,6 +694,129 @@ class PipelineGraph:
 
 def _log(msg: str) -> None:
     print(msg, flush=True)
+
+
+def _gate_status_snapshot(ctx: "PipelineContext") -> Dict[str, bool]:  # noqa: F821
+    gate_names = [
+        "gate_pregestation",
+        "gate_gestation",
+        "gate_berkeley",
+        "gate_transformer",
+        "gate_generator",
+        "gate_wave",
+    ]
+    snapshot: Dict[str, bool] = {}
+    for gate_name in gate_names:
+        gate = getattr(ctx, gate_name, None)
+        snapshot[gate_name] = bool(getattr(gate, "passed", False))
+    return snapshot
+
+
+def _program_steps_by_node(execution_program: Optional[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    steps: Dict[str, Dict[str, Any]] = {}
+    if not isinstance(execution_program, dict):
+        return steps
+    for step in list(execution_program.get("steps", []) or []):
+        if str(step.get("kind", "node") or "node") != "node":
+            continue
+        node_id = str(step.get("node_id", "") or "").strip()
+        if not node_id or node_id in steps:
+            continue
+        steps[node_id] = dict(step)
+    return steps
+
+
+def _evaluate_program_guard(
+    condition_id: str,
+    ctx: "PipelineContext",  # noqa: F821
+    incoming: List[PipelineEdge],
+    *,
+    condition_resolver: Optional[Callable[[str, "PipelineContext"], bool]] = None,  # noqa: F821
+) -> bool:
+    resolved_id = str(condition_id or "").strip()
+    if not resolved_id:
+        return True
+    if callable(condition_resolver):
+        return bool(condition_resolver(resolved_id, ctx))
+    matching = [edge for edge in incoming if str(edge.condition_id or "").strip() == resolved_id]
+    if not matching:
+        return False
+    return any(edge.is_active(ctx) for edge in matching)
+
+
+def _node_frame_hints(node_id: str) -> List[str]:
+    if node_id == "data_node":
+        return ["class_names", "semantic_term_to_idx", "symbol_pool", "label_embedding_bank"]
+    if "pregestation" in node_id or node_id == "stage_0_pregestation":
+        return ["classifier", "gate_classifier", "pregestation_loader", "pregestation_eval_loader", "gate_pregestation"]
+    if "gestation" in node_id or node_id == "stage_1_gestation":
+        return ["classifier", "gate_classifier", "gestation_loader", "gestation_eval_loader", "gate_pregestation", "gate_gestation"]
+    if "berkeley" in node_id or node_id == "stage_c_lora" or node_id == "stage_fake_feedback":
+        return ["classifier", "gate_classifier", "berkeley_refresh_loader", "payload_validation_loader", "payload_bank", "gate_gestation", "gate_berkeley"]
+    if "transformer" in node_id or node_id == "config_search":
+        return ["transformer", "classifier", "payload_bank", "gate_berkeley", "gate_transformer"]
+    if "generator" in node_id or "gan" in node_id:
+        return ["generator", "discriminator", "payload_bank", "payload_conditions", "gate_transformer", "gate_generator"]
+    if "wave" in node_id:
+        return ["wave_classifier", "transformer", "gate_transformer", "gate_wave"]
+    if node_id in {"sync_gate_replica", "checkpoint_save"}:
+        return ["classifier", "gate_classifier", "gate_berkeley", "gate_transformer", "gate_generator", "gate_wave"]
+    return []
+
+
+def _symbolic_attr_token(ctx: "PipelineContext", attr: str) -> str:  # noqa: F821
+    value = getattr(ctx, attr, None)
+    if attr.startswith("gate_"):
+        if value is None:
+            return ""
+        return f"{attr}={'1' if bool(getattr(value, 'passed', False)) else '0'}"
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return attr if value else ""
+    if isinstance(value, str):
+        return attr if value.strip() else ""
+    if isinstance(value, (list, tuple, dict, set)):
+        return attr if len(value) > 0 else ""
+    return attr
+
+
+def _execution_frame_keys(
+    ctx: "PipelineContext",  # noqa: F821
+    node_id: str,
+    active_incoming: List[PipelineEdge],
+    active_edge_configs: Dict[str, Dict[str, Any]],
+    *,
+    program_frame_keys: Optional[List[str]] = None,
+) -> List[str]:
+    keys: List[str] = []
+
+    def _push(token: str) -> None:
+        token = str(token or "").strip()
+        if token and token not in keys:
+            keys.append(token)
+
+    for token in list(program_frame_keys or []):
+        _push(str(token))
+
+    for edge in active_incoming:
+        config = dict(active_edge_configs.get(edge.edge_id, {}) or {})
+        for resource in list(config.get("resources", []) or []):
+            _push(str(resource))
+        if str(edge.condition_id or "").strip():
+            _push(str(edge.condition_id))
+
+    for attr in _node_frame_hints(node_id):
+        _push(_symbolic_attr_token(ctx, attr))
+
+    return keys[:8]
+
+
+def _format_frame_keys(frame_keys: List[str], *, limit: int = 6) -> str:
+    clipped = list(frame_keys[:limit])
+    if len(frame_keys) > limit:
+        clipped.append(f"+{len(frame_keys) - limit}")
+    return ", ".join(clipped)
 
 
 def _invoke_edge_callback(

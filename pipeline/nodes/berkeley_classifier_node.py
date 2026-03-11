@@ -238,8 +238,8 @@ class PregestationTrainNode(PipelineNode):
 
     This is the very first stage; the classifier learns basic colour/direction/shape
     semantics from programmatically generated images before seeing any real data.
-    Gate 0 passes when loss drops below stage0_loss_target for the required
-    consecutive rounds.
+    Gate progression is evaluated by a separate passive Gate-0 eval node
+    against the validation split.
     """
 
     node_id = "stage_0_pregestation"
@@ -271,15 +271,8 @@ class PregestationTrainNode(PipelineNode):
         )
 
         loss = float(result.get("loss", float("inf")))
-        ctx.gate_pregestation.required_consecutive = self.cfg.stage0_required_consecutive
-        ctx.gate_pregestation.record(
-            round_id=ctx.round_id,
-            metric=loss,
-            threshold=self.cfg.stage0_loss_target,
-            above=False,
-        )
         ctx.log_metric("stage0", "loss", loss)
-        _log(f"[stage0] loss={loss:.4f} gate={'PASS' if ctx.gate_pregestation.passed else 'hold'}")
+        _log(f"[stage0] loss={loss:.4f}")
 
 
 # ---------------------------------------------------------------------------
@@ -293,7 +286,8 @@ class GestationTrainNode(GatedNode):
     noise profile terms, basic colours, directions, and geometric structures
     before exposure to Berkeley SBD.
 
-    Gate 1 passes when loss drops below stage1_loss_target.
+    Gate progression is evaluated by a separate passive Gate-1 eval node
+    against the gestation validation split.
     """
 
     node_id = "stage_1_gestation"
@@ -322,15 +316,8 @@ class GestationTrainNode(GatedNode):
         )
 
         loss = float(result.get("loss", float("inf")))
-        ctx.gate_gestation.required_consecutive = self.cfg.stage1_required_consecutive
-        ctx.gate_gestation.record(
-            round_id=ctx.round_id,
-            metric=loss,
-            threshold=self.cfg.stage1_loss_target,
-            above=False,
-        )
         ctx.log_metric("stage1", "loss", loss)
-        _log(f"[stage1] loss={loss:.4f} gate={'PASS' if ctx.gate_gestation.passed else 'hold'}")
+        _log(f"[stage1] loss={loss:.4f}")
 
 
 # ---------------------------------------------------------------------------

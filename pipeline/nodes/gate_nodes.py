@@ -11,6 +11,8 @@ and their conditions can be composed with other node conditions naturally.
 
 Gates in this pipeline
 -----------------------
+  PregestationEvalNode  — Gate 0: pregestation validation loss on held-out logic rows
+  GestationEvalNode     — Gate 1: gestation validation loss on held-out symbol rows
   BerkeleyGateNode      — Gate 2: Berkeley confidence + macro-F1 after Stage 2 training
   TransformerGateNode   — Gate R: transformer feature score + entropy
   GeneratorGateNode     — Gate G: generator feature score quality
@@ -33,6 +35,129 @@ import torch
 # Module-level constants (originally in wav_config_transformer_pipeline)
 CLASSIFIER_LOSS_SCALE = 1.0
 CLASSIFIER_SEMANTIC_COSINE_WEIGHT = 0.35
+
+
+def _gate_eval_model(ctx: PipelineContext, *, channels_last: bool = False) -> tuple[nn.Module, torch.device]:
+    model = getattr(ctx, "classifier", None)
+    if model is not None:
+        try:
+            from pipeline.nodes.berkeley_classifier_node import _sync_gate_classifier_replica
+
+            ctx.gate_classifier, _info = _sync_gate_classifier_replica(
+                source_classifier=model,
+                gate_classifier=ctx.gate_classifier,
+                gate_device=torch.device("cpu"),
+                channels_last=bool(channels_last),
+            )
+        except Exception:
+            pass
+    gate_model = getattr(ctx, "gate_classifier", None) or model
+    if gate_model is None:
+        raise RuntimeError("Gate evaluation requires classifier or gate_classifier")
+    try:
+        gate_device = next(gate_model.parameters()).device
+    except StopIteration:
+        gate_device = torch.device("cpu")
+    return gate_model, gate_device
+
+
+def _evaluate_loss_gate(
+    *,
+    ctx: PipelineContext,
+    loader: Any,
+    max_steps: int = 0,
+    channels_last: bool = False,
+    semantic_cosine_weight: float = CLASSIFIER_SEMANTIC_COSINE_WEIGHT,
+) -> Dict[str, Any]:
+    gate_model, gate_device = _gate_eval_model(ctx, channels_last=channels_last)
+    return _evaluate_berkeley_classifier_gate(
+        classifier=gate_model,
+        loader=loader,
+        device=gate_device,
+        max_steps=max(0, int(max_steps)),
+        active_classes=max(0, int(len(ctx.class_names))),
+        amp_enabled=False,
+        amp_dtype=str(getattr(ctx.args, "amp_dtype", "float16") or "float16"),
+        channels_last=bool(channels_last),
+        semantic_mask_supervision_mode=str(getattr(ctx.args, "semantic_mask_supervision_mode", "multihot_mix") or "multihot_mix"),
+        semantic_cosine_weight=float(semantic_cosine_weight),
+    )
+
+
+class PregestationEvalNode(PipelineNode):
+    """Gate 0: Evaluate held-out Stage-0 logic rows on the frozen classifier replica."""
+
+    node_id = "gate_0_pregestation_eval"
+    description = "Gate 0 Eval: pre-gestation validation loss"
+
+    def __init__(self, cfg: Any) -> None:
+        self.cfg = cfg
+
+    def should_run(self, ctx: PipelineContext) -> bool:
+        return ctx.pregestation_eval_loader is not None and (ctx.classifier is not None or ctx.gate_classifier is not None)
+
+    def execute(self, ctx: PipelineContext) -> None:
+        result = _evaluate_loss_gate(
+            ctx=ctx,
+            loader=ctx.pregestation_eval_loader,
+            max_steps=0,
+            channels_last=bool(getattr(self.cfg, "channels_last", False)),
+            semantic_cosine_weight=float(getattr(self.cfg, "semantic_cosine_weight", CLASSIFIER_SEMANTIC_COSINE_WEIGHT)),
+        )
+        loss = float(result.get("loss", float("inf")))
+        ctx.gate_pregestation.required_consecutive = int(getattr(self.cfg, "stage0_required_consecutive", 1))
+        ctx.gate_pregestation.record(
+            round_id=ctx.round_id,
+            metric=loss,
+            threshold=float(getattr(self.cfg, "stage0_loss_target", 0.0)),
+            above=False,
+        )
+        ctx.log_metric("gate0", "loss", loss)
+        _log(
+            f"[gate0] loss={loss:.4f}/{float(getattr(self.cfg, 'stage0_loss_target', 0.0)):.4f} "
+            f"consecutive={ctx.gate_pregestation.consecutive_passes}/{int(getattr(self.cfg, 'stage0_required_consecutive', 1))} "
+            f"{'PASS' if ctx.gate_pregestation.passed else 'hold'}"
+        )
+
+
+class GestationEvalNode(GatedNode):
+    """Gate 1: Evaluate held-out gestation rows on the frozen classifier replica."""
+
+    node_id = "gate_1_gestation_eval"
+    description = "Gate 1 Eval: gestation validation loss"
+    required_gates = ["gate_pregestation"]
+
+    def __init__(self, cfg: Any) -> None:
+        self.cfg = cfg
+
+    def should_run(self, ctx: PipelineContext) -> bool:
+        if not super().should_run(ctx):
+            return False
+        return ctx.gestation_eval_loader is not None and (ctx.classifier is not None or ctx.gate_classifier is not None)
+
+    def execute(self, ctx: PipelineContext) -> None:
+        max_steps = int(getattr(ctx.args, "gate_gestation_eval_max_steps", 0) or 0)
+        result = _evaluate_loss_gate(
+            ctx=ctx,
+            loader=ctx.gestation_eval_loader,
+            max_steps=max_steps,
+            channels_last=bool(getattr(self.cfg, "channels_last", False)),
+            semantic_cosine_weight=float(getattr(self.cfg, "semantic_cosine_weight", CLASSIFIER_SEMANTIC_COSINE_WEIGHT)),
+        )
+        loss = float(result.get("loss", float("inf")))
+        ctx.gate_gestation.required_consecutive = int(getattr(self.cfg, "stage1_required_consecutive", 1))
+        ctx.gate_gestation.record(
+            round_id=ctx.round_id,
+            metric=loss,
+            threshold=float(getattr(self.cfg, "stage1_loss_target", 0.0)),
+            above=False,
+        )
+        ctx.log_metric("gate1", "loss", loss)
+        _log(
+            f"[gate1] loss={loss:.4f}/{float(getattr(self.cfg, 'stage1_loss_target', 0.0)):.4f} "
+            f"consecutive={ctx.gate_gestation.consecutive_passes}/{int(getattr(self.cfg, 'stage1_required_consecutive', 1))} "
+            f"{'PASS' if ctx.gate_gestation.passed else 'hold'}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -70,7 +195,7 @@ class BerkeleyGateNode(GatedNode):
     """
 
     node_id = "gate_berkeley"
-    description = "Gate 2: Berkeley classifier confidence + macro-F1 evaluation"
+    description = "Gate 2 Eval: Berkeley classifier confidence + macro-F1"
     required_gates = ["gate_pregestation", "gate_gestation"]
 
     def __init__(self, cfg: BerkeleyGateConfig) -> None:
@@ -81,16 +206,22 @@ class BerkeleyGateNode(GatedNode):
             return False
         return (
             ctx.payload_validation_loader is not None
-            and ctx.gate_classifier is not None
+            and (ctx.classifier is not None or ctx.gate_classifier is not None)
         )
 
     def execute(self, ctx: PipelineContext) -> None:
+        gate_model, gate_device = _gate_eval_model(ctx, channels_last=False)
         result = _evaluate_berkeley_classifier_gate(
-            classifier=ctx.gate_classifier,
+            classifier=gate_model,
             loader=ctx.payload_validation_loader,
-            device=ctx.device,
-            class_names=ctx.class_names,
-            args=ctx.args,
+            device=gate_device,
+            max_steps=int(getattr(ctx.args, "gate_berkeley_eval_max_steps", 0) or 0),
+            active_classes=max(0, int(len(ctx.class_names))),
+            amp_enabled=False,
+            amp_dtype=str(getattr(ctx.args, "amp_dtype", "float16") or "float16"),
+            channels_last=False,
+            semantic_mask_supervision_mode=str(getattr(ctx.args, "semantic_mask_supervision_mode", "multihot_mix") or "multihot_mix"),
+            semantic_cosine_weight=float(CLASSIFIER_SEMANTIC_COSINE_WEIGHT),
         )
 
         confidence = float(result.get("mean_confidence", 0.0))
@@ -159,7 +290,7 @@ class TransformerGateNode(GatedNode):
     """
 
     node_id = "gate_transformer"
-    description = "Gate R: transformer feature score + entropy evaluation"
+    description = "Gate R Eval: transformer feature score + entropy"
     required_gates = ["gate_pregestation", "gate_gestation"]
 
     def __init__(self, cfg: TransformerGateConfig) -> None:
@@ -233,7 +364,7 @@ class GeneratorGateNode(GatedNode):
     """
 
     node_id = "gate_generator"
-    description = "Gate G: generator feature score evaluation"
+    description = "Gate G Eval: generator feature score"
     required_gates = ["gate_pregestation", "gate_gestation", "gate_berkeley"]
 
     def __init__(self, cfg: GeneratorGateConfig) -> None:
@@ -296,7 +427,7 @@ class WaveGateNode(GatedNode):
     """
 
     node_id = "gate_wave"
-    description = "Gate W: wave entropy + feature score feedback evaluation"
+    description = "Gate W Eval: wave entropy + feature score feedback"
     required_gates = ["gate_pregestation", "gate_gestation", "gate_transformer"]
 
     def __init__(self, cfg: WaveGateConfig) -> None:
