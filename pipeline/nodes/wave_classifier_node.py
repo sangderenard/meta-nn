@@ -39,16 +39,26 @@ Zero-shot evaluation owned here
 """
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+import hashlib
+import json
+from pathlib import Path
+import re
+import time
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import torch
+import torch.nn as nn
 
 from pipeline.context import PipelineContext
 from pipeline.graph import PipelineNode
 from pipeline.nodes.base import GatedNode, make_grad_scaler
-import json
+from pipeline.nodes.label_embedding_node import _normalize_l2_rows_np
+from pipeline.nodes.vocab_node import _semantic_expand_inferred_tags, _semantic_noise_terms_from_spectrum_sample
+from pipeline.wave_io import _decode_record_to_mono, _save_mono_wav
 import numpy as np
+from wav_ml_core import RenderConfig, WaveRecord, read_wav_record, render_mono_wave_to_tensor
 
 
 # ---------------------------------------------------------------------------
@@ -304,13 +314,23 @@ class WaveClassifierTrainNode(GatedNode):
 # ---------------------------------------------------------------------------
 
 def _count_wave_labels(ctx: PipelineContext, cfg: WaveClassifierConfig) -> int:
-    if cfg.label_mode == "hash" or cfg.label_mode == "spectral":
-        return cfg.n_label_buckets
-    # folder mode: count unique parent directories
-    paths = [str(r.path) if hasattr(r, "path") else str(r) for r in ctx.wav_records]
-    labels = _build_labels(paths, mode="folder")
-    n = len(set(labels)) if labels else 2
-    return max(2, n)
+    records = list(getattr(ctx, "wav_records", []) or [])
+    if len(records) <= 0:
+        return max(2, int(cfg.n_label_buckets))
+    if str(cfg.label_mode).strip().lower() in {"hash", "spectral"}:
+        return max(2, int(cfg.n_label_buckets))
+    data_root = _resolve_wave_data_root(ctx, records)
+    labels, class_names, _ = _build_labels(
+        records=records,
+        data_root=data_root,
+        label_mode=str(cfg.label_mode).strip().lower() or "folder",
+        pseudo_classes=max(2, int(cfg.n_label_buckets)),
+    )
+    if int(len(class_names)) > 0:
+        return max(2, int(len(class_names)))
+    if labels is None:
+        return 2
+    return max(2, int(np.unique(np.asarray(labels, dtype=np.int64)).size))
 
 
 def _rebuild_wave_classifier(
@@ -381,6 +401,275 @@ def _log(msg: str) -> None:
 # =========================================================================
 
 
+def _resolve_wave_data_root(ctx: PipelineContext, records: Sequence[WaveRecord]) -> str:
+    wav_dir = str(getattr(ctx.args, "wav_root", "") or getattr(ctx.args, "wav_dir", "") or "").strip()
+    if wav_dir:
+        return wav_dir
+    latent_dir = getattr(ctx, "latent_wav_pool_dir", None)
+    if latent_dir is not None:
+        return str(latent_dir)
+    if len(records) > 0:
+        try:
+            first = Path(_record_path(records[0])).resolve()
+            return str(first.parent.parent if first.parent != first.anchor else first.parent)
+        except Exception:
+            pass
+    return "."
+
+
+def _record_path(record: Any) -> str:
+    if hasattr(record, "path"):
+        return str(record.path)
+    return str(record)
+
+
+def _ensure_wave_record(record: Any) -> WaveRecord:
+    if isinstance(record, WaveRecord):
+        return record
+    if hasattr(record, "path") and hasattr(record, "frames") and hasattr(record, "framerate"):
+        return record  # duck-typed WaveRecord
+    return read_wav_record(str(record))
+
+
+def _sample_stream_chunks_with_labels(
+    streams: Sequence[np.ndarray],
+    labels: Sequence[int],
+    metas: Sequence[Dict],
+    batch_size: int,
+    chunk_samples: int,
+    rng: np.random.Generator,
+):
+    xb = np.zeros((batch_size, chunk_samples), dtype=np.float32)
+    yb = np.zeros((batch_size,), dtype=np.int64)
+    picked = []
+    eligible = [int(i) for i, s in enumerate(streams) if int(np.asarray(s).size) >= int(chunk_samples)]
+    if len(eligible) <= 0:
+        raise RuntimeError(
+            f"No streams are long enough for chunk_samples={int(chunk_samples)} "
+            f"(stream_count={len(streams)})."
+        )
+    for i in range(batch_size):
+        j = int(eligible[int(rng.integers(0, len(eligible)))])
+        s = streams[j]
+        yb[i] = int(labels[j])
+        meta_row = dict(metas[j]) if isinstance(metas[j], dict) else {}
+        meta_row["_stream_index"] = int(j)
+        picked.append(meta_row)
+        start = int(rng.integers(0, int(s.size) - int(chunk_samples) + 1))
+        xb[i, :] = np.asarray(s[start : start + int(chunk_samples)], dtype=np.float32)
+    return xb, yb, picked
+
+
+def _spectral_encoding_unit_coords(x: np.ndarray, sr: int, bins: int = 128) -> np.ndarray:
+    _ = sr
+    b = max(8, int(bins))
+    if x.size < 64:
+        return np.zeros((int(b),), dtype=np.float64)
+    n = min(4096, x.size)
+    n = int(2 ** np.floor(np.log2(max(64, n))))
+    y = x[:n].astype(np.float64, copy=False)
+    y = y * np.hanning(n)
+    spec = np.abs(np.fft.rfft(y))
+    if not np.all(np.isfinite(spec)):
+        return np.zeros((int(b),), dtype=np.float64)
+    if float(np.sum(spec)) <= 1e-12:
+        return np.zeros((int(b),), dtype=np.float64)
+    spec = np.log1p(spec)
+    src = np.linspace(0.0, 1.0, int(spec.size), dtype=np.float64)
+    dst = np.linspace(0.0, 1.0, int(b), dtype=np.float64)
+    coords = np.interp(dst, src, spec).astype(np.float64, copy=False)
+    coords = coords - float(np.mean(coords))
+    nrm = float(np.linalg.norm(coords))
+    if nrm <= 1e-12:
+        return np.zeros((int(b),), dtype=np.float64)
+    return (coords / nrm).astype(np.float64, copy=False)
+
+
+def _cosine_medoid_projection_scores(coords: np.ndarray) -> np.ndarray:
+    arr = np.asarray(coords, dtype=np.float64)
+    if int(arr.ndim) != 2 or int(arr.shape[0]) <= 0 or int(arr.shape[1]) <= 0:
+        return np.zeros((0,), dtype=np.float64)
+    norms = np.linalg.norm(arr, axis=1, keepdims=True)
+    safe = arr / np.clip(norms, 1e-12, None)
+    sims = safe @ safe.transpose(1, 0)
+    mean_sim = np.mean(sims, axis=1)
+    medoid_idx = int(np.argmax(mean_sim))
+    anchor = safe[int(medoid_idx)]
+    return (safe @ anchor).astype(np.float64, copy=False)
+
+
+def _deterministic_hash_quantile_labels(
+    records: Sequence[Any],
+    data_root: str,
+    bins: int,
+) -> Tuple[np.ndarray, List[str]]:
+    n = int(len(records))
+    k = max(2, min(int(n), int(max(2, int(bins)))))
+    if n <= 0:
+        return np.zeros((0,), dtype=np.int64), []
+    root = Path(str(data_root)).resolve()
+    key_rows: List[Tuple[int, int]] = []
+    for ri, rec in enumerate(records):
+        p = Path(_record_path(rec)).resolve()
+        try:
+            rel_txt = str(p.relative_to(root)).replace("\\", "/")
+        except Exception:
+            rel_txt = str(p).replace("\\", "/")
+        digest = hashlib.sha256(rel_txt.strip().lower().encode("utf-8")).digest()
+        order_key = int.from_bytes(digest[:8], byteorder="little", signed=False)
+        key_rows.append((int(order_key), int(ri)))
+    key_rows.sort(key=lambda kv: (int(kv[0]), int(kv[1])))
+    labels = np.zeros((int(n),), dtype=np.int64)
+    for rank, (_, row_idx) in enumerate(key_rows):
+        labels[int(row_idx)] = int((int(rank) * int(k)) // max(1, int(n)))
+    class_names = [f"split_hash_bin_{i}" for i in range(int(k))]
+    return labels.astype(np.int64, copy=False), class_names
+
+
+def _wave_output_native_bucket(path: str) -> str:
+    p = str(path).replace("\\", "/").lower().strip()
+    if not p:
+        return "unknown"
+    if p == "__structured_seed__":
+        return "structured_seed"
+    if "/latent_wave_pool/noise/" in p:
+        return "latent_noise"
+    if "/latent_wave_pool/mix/" in p:
+        return "latent_mix"
+    if "/accepted_wave_library/" in p:
+        return "accepted_loopback"
+    return "external_source"
+
+
+def _wave_semantic_label_from_weighted_angular_centroid(
+    term_counts: Dict[str, int],
+    semantic_class_names: Optional[Sequence[str]],
+    semantic_label_bank: Optional[np.ndarray],
+) -> Tuple[str, float, int]:
+    if semantic_class_names is None or semantic_label_bank is None:
+        return "", 0.0, 0
+    class_names = [str(x) for x in list(semantic_class_names)]
+    if len(class_names) <= 0:
+        return "", 0.0, 0
+    bank_arr = np.asarray(semantic_label_bank, dtype=np.float32)
+    if int(bank_arr.ndim) != 2:
+        return "", 0.0, 0
+    rows = min(int(bank_arr.shape[0]), int(len(class_names)))
+    if rows <= 0:
+        return "", 0.0, 0
+    bank_norm = _normalize_l2_rows_np(bank_arr[: int(rows), :].astype(np.float32, copy=False))
+    name_to_idx: Dict[str, int] = {}
+    for i, name in enumerate(class_names[: int(rows)]):
+        key = re.sub(r"\s+", " ", str(name)).strip().lower()
+        if key and key not in name_to_idx:
+            name_to_idx[key] = int(i)
+    weights = np.zeros((int(rows),), dtype=np.float32)
+    for term, cnt in term_counts.items():
+        key = re.sub(r"\s+", " ", str(term)).strip().lower()
+        if not key:
+            continue
+        idx = name_to_idx.get(key, None)
+        if idx is None:
+            continue
+        w = float(max(0, int(cnt)))
+        if w <= 0.0:
+            continue
+        weights[int(idx)] += float(w)
+    active = np.where(weights > 0.0)[0].astype(np.int64)
+    if int(active.size) <= 0:
+        return "", 0.0, 0
+    centroid = np.sum(bank_norm[active, :] * weights[active][:, None], axis=0)
+    denom = float(np.linalg.norm(centroid))
+    if denom <= 1e-12:
+        return "", 0.0, 0
+    centroid = (centroid / denom).astype(np.float32, copy=False)
+    sims = np.matmul(bank_norm, centroid.astype(np.float32, copy=False))
+    best_idx = int(np.argmax(sims))
+    if best_idx < 0 or best_idx >= int(rows):
+        return "", 0.0, int(active.size)
+    return str(class_names[int(best_idx)]), float(sims[best_idx]), int(active.size)
+
+
+def _refresh_wave_library_semantic_centroid(
+    library_dir: Path,
+    wave_category: str,
+    semantic_class_names: Optional[Sequence[str]],
+    semantic_label_bank: Optional[np.ndarray],
+) -> Dict[str, Any]:
+    index_path = library_dir / "index.jsonl"
+    category_key = str(wave_category).strip() or "unknown"
+    waves_dir = library_dir / "waves" / category_key
+    waves_dir.mkdir(parents=True, exist_ok=True)
+    out_path = waves_dir / "_semantic_centroid.json"
+    info: Dict[str, Any] = {
+        "refreshed": False,
+        "reason": "",
+        "index_path": str(index_path),
+        "output_path": str(out_path),
+        "wave_category": str(category_key),
+    }
+    if not index_path.exists():
+        info["reason"] = "missing_index"
+        return info
+    term_counter: Counter = Counter()
+    try:
+        with index_path.open("r", encoding="utf-8") as f:
+            for line in f:
+                s = line.strip()
+                if not s:
+                    continue
+                try:
+                    row = json.loads(s)
+                except Exception:
+                    continue
+                row_category = str(row.get("wave_category", "")).strip() or "unknown"
+                if str(row_category) != str(category_key):
+                    continue
+                terms = row.get("semantic_terms", [])
+                if not isinstance(terms, list):
+                    continue
+                for t in terms:
+                    key = re.sub(r"\s+", " ", str(t)).strip().lower()
+                    if key:
+                        term_counter[str(key)] += 1
+    except Exception as ex:
+        info["reason"] = f"scan_failed:{type(ex).__name__}"
+        return info
+    label, score, mapped = _wave_semantic_label_from_weighted_angular_centroid(
+        term_counts={str(k): int(v) for k, v in term_counter.items()},
+        semantic_class_names=semantic_class_names,
+        semantic_label_bank=semantic_label_bank,
+    )
+    if not str(label).strip():
+        if len(term_counter) > 0:
+            label = str(term_counter.most_common(1)[0][0])
+        else:
+            label = "unknown"
+        score = 0.0
+    payload = {
+        "updated_at": float(time.time()),
+        "label": str(label),
+        "score": float(score),
+        "mapped_terms": int(mapped),
+        "label_counts_top": [[str(k), int(v)] for k, v in term_counter.most_common(32)],
+        "index_path": str(index_path),
+        "wave_folder": str((Path("waves") / category_key).as_posix()),
+        "wave_category": str(category_key),
+        "centroid_mode": "weighted_angular_centroid_projection",
+    }
+    try:
+        out_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    except Exception as ex:
+        info["reason"] = f"write_failed:{type(ex).__name__}"
+        return info
+    info["refreshed"] = True
+    info["reason"] = "ok"
+    info["label"] = str(label)
+    info["score"] = float(score)
+    info["mapped_terms"] = int(mapped)
+    return info
+
+
 def _evaluate_zero_shot_queries_on_images(
     classifier: nn.Module,
     x: torch.Tensor,
@@ -395,6 +684,8 @@ def _evaluate_zero_shot_queries_on_images(
     max_samples: int = 128,
     max_report_samples: int = 8,
 ) -> Dict[str, Any]:
+    from wav_ml_models import TinyConvClassifier, _autocast_context, _resolve_amp_dtype
+
     if not isinstance(classifier, TinyConvClassifier):
         return {"ran": False, "reason": f"unsupported_classifier:{type(classifier).__name__}"}
     if x is None or int(x.ndim) != 4 or int(x.shape[0]) <= 0:
@@ -441,7 +732,7 @@ def _evaluate_zero_shot_queries_on_images(
         xb = x[i : i + bsz].to(device, non_blocking=True)
         if channels_last:
             xb = xb.contiguous(memory_format=torch.channels_last)
-        with _autocast_context(device=device, enabled=use_amp, amp_dtype_t=amp_dtype_t):
+        with _autocast_context(device=device, use_amp=use_amp, amp_dtype_t=amp_dtype_t):
             feat = classifier.extract_features(xb)
             sims = classifier.semantic_logits_from_features(
                 feat=feat,
@@ -540,6 +831,8 @@ def _build_wave_classifier_dataset_from_transformer(
     semantic_label_bank: Optional[np.ndarray] = None,
     stream_target_labels: Optional[Sequence[Any]] = None,
 ):
+    from wav_ml_models import _autocast_context, _resolve_amp_dtype
+
     rng = np.random.default_rng(rng_seed)
     x_all = []
     y_all = []
@@ -577,7 +870,7 @@ def _build_wave_classifier_dataset_from_transformer(
             xb = xb.pin_memory()
         xb = xb.to(device, non_blocking=True)
         with torch.no_grad():
-            with _autocast_context(device=device, enabled=amp_enabled, amp_dtype_t=amp_dtype_t):
+            with _autocast_context(device=device, use_amp=amp_enabled, amp_dtype_t=amp_dtype_t):
                 xh = transformer(xb)
                 imgs = render_mono_wave_to_tensor(xh, cfg=cfg, image_hw=image_hw, sample_bits=sample_bits)
                 if channels_last:
@@ -716,7 +1009,7 @@ def _build_wave_classifier_dataset_from_transformer(
 
 
 def _build_labels(
-    records: Sequence[WaveRecord],
+    records: Sequence[Any],
     data_root: str,
     label_mode: str,
     pseudo_classes: int,
@@ -726,7 +1019,7 @@ def _build_labels(
     if label_mode == "folder":
         names: List[str] = []
         for rec in records:
-            p = Path(rec.path).resolve()
+            p = Path(_record_path(rec)).resolve()
             try:
                 rel = p.relative_to(root)
                 if len(rel.parts) >= 2:
@@ -755,7 +1048,8 @@ def _build_labels(
     pseudo_classes = max(2, int(pseudo_classes))
     base_cfg = RenderConfig()
     enc_coords = []
-    for rec in records:
+    for rec_any in records:
+        rec = _ensure_wave_record(rec_any)
         mono, _ = _decode_record_to_mono(rec, base_cfg, max_points=65536)
         enc_coords.append(_spectral_encoding_unit_coords(mono, sr=rec.framerate, bins=128))
     enc_np = np.asarray(enc_coords, dtype=np.float64)

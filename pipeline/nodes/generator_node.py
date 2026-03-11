@@ -44,6 +44,7 @@ Joint mode
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import torch
@@ -158,11 +159,11 @@ class BuildGANNode(PipelineNode):
 
         generator = ConditionalBitPlaneGenerator(
             num_classes=n_classes,
+            image_hw=(self.cfg.image_size, self.cfg.image_size),
             z_dim=self.cfg.z_dim,
             depth=self.cfg.g_depth,
             base_ch=self.cfg.g_base_ch,
-            max_ch=self.cfg.g_max_ch,
-            image_size=self.cfg.image_size,
+            min_ch=max(8, int(getattr(self.cfg, "g_min_ch", 12) or 12)),
         ).to(ctx.device)
 
         discriminator = ConditionalBitPlaneDiscriminator(
@@ -170,7 +171,6 @@ class BuildGANNode(PipelineNode):
             depth=self.cfg.d_depth,
             base_ch=self.cfg.d_base_ch,
             max_ch=self.cfg.d_max_ch,
-            image_size=self.cfg.image_size,
         ).to(ctx.device)
 
         if self.cfg.compile_model:
@@ -323,12 +323,16 @@ def _try_restore_vocab_snapshot(
 ) -> None:
 
     try:
-        vocab_hash = _compute_gd_vocab_hash(ctx.class_names, ctx.active_extra_terms)
+        vocab_hash, _profile = _compute_gd_vocab_hash(
+            supervised_class_names=ctx.class_names,
+            fixed_extra_terms=ctx.active_extra_terms,
+            condition_num_classes=max(1, int(len(ctx.class_names))),
+            args=ctx.args,
+            active_extra_terms=ctx.active_extra_terms,
+        )
         snap_dir = str(cfg.vocab_snapshot_dir).strip() or str(ctx.output_dir / "gd_vocab_library")
-        snap = _load_gd_vocab_library_snapshot(snap_dir, vocab_hash)
-        if snap is not None:
-            generator.load_state_dict(snap["generator"], strict=False)
-            discriminator.load_state_dict(snap["discriminator"], strict=False)
+        snap = _load_gd_vocab_library_snapshot(snap_dir, vocab_hash, generator, discriminator)
+        if bool(snap.get("loaded", False)):
             _log(f"[GAN] restored vocab snapshot for hash {vocab_hash[:8]}")
     except Exception as exc:
         _log(f"[GAN] vocab snapshot restore skipped: {exc}")
@@ -337,12 +341,21 @@ def _try_restore_vocab_snapshot(
 def _save_vocab_snapshot(ctx: PipelineContext, cfg: GeneratorConfig) -> None:
 
     try:
-        vocab_hash = _compute_gd_vocab_hash(ctx.class_names, ctx.active_extra_terms)
+        vocab_hash, profile = _compute_gd_vocab_hash(
+            supervised_class_names=ctx.class_names,
+            fixed_extra_terms=ctx.active_extra_terms,
+            condition_num_classes=max(1, int(len(ctx.class_names))),
+            args=ctx.args,
+            active_extra_terms=ctx.active_extra_terms,
+        )
         snap_dir = str(cfg.vocab_snapshot_dir).strip() or str(ctx.output_dir / "gd_vocab_library")
         _save_gd_vocab_library_snapshot(
-            snap_dir, vocab_hash,
+            snap_dir,
+            vocab_hash,
+            condition_num_classes=max(1, int(len(ctx.class_names))),
             generator=ctx.generator,
             discriminator=ctx.discriminator,
+            meta=profile,
         )
     except Exception as exc:
         _log(f"[GAN] vocab snapshot save failed: {exc}")

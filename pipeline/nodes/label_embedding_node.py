@@ -17,10 +17,14 @@ sentence-transformer inference) so re-running each round is acceptable.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+import json
+from pathlib import Path
+import re
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
+import torch.nn as nn
 
 from pipeline.context import PipelineContext
 from pipeline.graph import PipelineNode
@@ -255,6 +259,8 @@ def _apply_label_embedding_bank_to_classifier(
     bank_np: Optional[np.ndarray],
     args,
 ) -> Dict[str, Any]:
+    from wav_ml_models import TinyConvClassifier
+
     target = classifier
     if not isinstance(target, TinyConvClassifier):
         wrapped = getattr(classifier, "_orig_mod", None)

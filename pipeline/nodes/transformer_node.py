@@ -233,14 +233,21 @@ class BuildTransformerNode(PipelineNode):
     def execute(self, ctx: PipelineContext) -> None:
         from wav_ml_models import WavePatchTransformer, maybe_compile_module, SinusoidalLRController, SinusoidalLROptions
 
+        chunk_samples = _resolve_transformer_chunk_samples(ctx, self.cfg)
+        bundle_names = [str(x).strip() for x in list(self.cfg.filter_bundle_names) if str(x).strip()]
+        prefilter_enabled = bool(self.cfg.deskew_enabled or ("deskew" in {x.lower() for x in bundle_names}))
+
         model = WavePatchTransformer(
+            chunk_samples=chunk_samples,
             d_model=self.cfg.d_model,
             nhead=self.cfg.nhead,
             num_layers=self.cfg.num_layers,
             ff_mult=self.cfg.ff_mult,
+            max_delta=float(getattr(ctx.args, "max_delta", 0.2)),
             dropout=self.cfg.dropout,
-            image_size=self.cfg.image_size,
             patch_size=self.cfg.patch_size,
+            prefilter_enabled=prefilter_enabled,
+            aux_filter_bundle_names=(bundle_names or None),
         ).to(ctx.device)
 
         if self.cfg.compile_model:
@@ -337,6 +344,7 @@ class TransformerTrainNode(GatedNode):
             device=ctx.device,
             epochs=1,
             steps_per_epoch=self.cfg.steps_per_round,
+            chunk_samples=_resolve_transformer_chunk_samples(ctx, self.cfg),
             lr=self.cfg.lr,
             lr_sine_cycles=self.cfg.lr_cycles,
             lr_sine_tail_fraction=self.cfg.lr_tail_fraction,
@@ -393,6 +401,22 @@ def _degrade_prob(
         return float(start)
     t = min(1.0, float(step) / float(max(1, total_rounds - 1)))
     return float(start) + t * (float(end) - float(start))
+
+
+def _resolve_transformer_chunk_samples(ctx: PipelineContext, cfg: TransformerConfig) -> int:
+    from pipeline.utils import _resolve_synced_chunk_samples
+
+    if ctx.render_config is None:
+        return max(1, int(cfg.chunk_samples or 1))
+    requested = int(cfg.chunk_samples or getattr(ctx.args, "chunk_samples", 0) or 1)
+    chunk_samples, _sync_info = _resolve_synced_chunk_samples(
+        requested_chunk_samples=requested,
+        patch_size=int(cfg.patch_size),
+        cfg=ctx.render_config,
+        image_hw=(int(cfg.image_size), int(cfg.image_size)),
+    )
+    cfg.chunk_samples = int(chunk_samples)
+    return int(chunk_samples)
 
 
 def _load_transformer_checkpoint(model, path: str) -> None:

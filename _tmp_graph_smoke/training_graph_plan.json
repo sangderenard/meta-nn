@@ -1,0 +1,1320 @@
+{
+  "condition_blobs": {
+    "gates.all_base_passed": {
+      "callable": "_all_gates_passed",
+      "description": "True when pregestation, gestation, and Berkeley have cleared, or the GUI gate override is active.",
+      "label": "All base gates passed"
+    },
+    "gates.early_passed": {
+      "callable": "_early_gates_passed",
+      "description": "True when pregestation and gestation have both cleared, or the GUI gate override is active.",
+      "label": "Early gates passed"
+    },
+    "gates.pregestation_passed": {
+      "callable": "_gate_pregestation_passed",
+      "description": "True when Stage 0 has cleared, or the GUI gate override is active.",
+      "label": "Pregestation gate passed"
+    },
+    "gates.wave_stage_ready": {
+      "callable": "_wave_stage_ready",
+      "description": "True when the transformer exists and the upstream gates allow the wave classifier stage.",
+      "label": "Wave stage ready"
+    },
+    "orchestration.mode_has_generator": {
+      "callable": "_generator_exists",
+      "description": "True when orchestration_mode includes the generator stage.",
+      "label": "Generator mode enabled"
+    }
+  },
+  "config_blobs": {
+    "berkeley_data": {
+      "batch_size": 32,
+      "berkeley_data_root": "",
+      "cache_device": "cpu",
+      "channels_last": false,
+      "external_val_fraction": 0.2,
+      "gate_val_batch_size": 0,
+      "gate_val_max_val": 0,
+      "gate_val_num_workers": 0,
+      "image_size": 64,
+      "max_train": 0,
+      "num_workers": 2,
+      "prebuild_batches": 0,
+      "prefetch_factor": 4,
+      "rebuild_every_n_rounds": 0,
+      "seed": 42
+    },
+    "berkeley_gate": {
+      "confidence_target": 0.0,
+      "eval_batch_size": 0,
+      "f1_target": 0.0,
+      "loss_target": 0.12,
+      "required_consecutive": 1
+    },
+    "berkeley_payload": {
+      "auto_install_scipy": false,
+      "berkeley_data_root": "toys_to_survive_development/data/berkeley_sbd",
+      "build_batch_size": 128,
+      "build_num_workers": 2,
+      "cache_mb": 2048,
+      "force_cache_rebuild": false,
+      "image_size": 0,
+      "max_images": 1024,
+      "payload_bank_dir": "",
+      "seed": 1337
+    },
+    "classifier": {
+      "amp": false,
+      "amp_dtype": "float16",
+      "base_ch": 64,
+      "channels_last": false,
+      "classifier_init_ckpt": "",
+      "classifier_init_scope": "features",
+      "compile_model": false,
+      "context_blocks": 8,
+      "context_dropout": 0.05,
+      "fake_class_batch_size": 32,
+      "fake_class_disc_weight": 0.35,
+      "fake_class_enabled": true,
+      "fake_class_steps": 48,
+      "gate_replica_sync_every_n_rounds": 1,
+      "grad_accum_steps": 1,
+      "grad_clip": 1.0,
+      "label_embedding_backend": "sentence_transformers",
+      "label_embedding_dim": 384,
+      "label_embedding_model": "sentence-transformers/all-MiniLM-L6-v2",
+      "label_embedding_temperature": 10.0,
+      "lora_alpha": 16.0,
+      "lora_churn_slots": 4,
+      "lora_enabled": false,
+      "lora_rank": 8,
+      "lr": 0.002,
+      "lr_cycles": 1.0,
+      "lr_min_scale": 0.0,
+      "lr_tail_fraction": 0.15,
+      "mask_decoder_channels": 0,
+      "max_ch": 384,
+      "semantic_cosine_weight": 0.35,
+      "stage0_batch_size": 8,
+      "stage0_epochs": 4,
+      "stage0_loss_target": 1.5,
+      "stage0_required_consecutive": 1,
+      "stage0_samples_per_combo": 4,
+      "stage1_batch_size": 0,
+      "stage1_epochs": 1,
+      "stage1_loss_target": 0.18,
+      "stage1_required_consecutive": 1,
+      "stage2_batch_size": 32,
+      "stage2_cache_mb": 512,
+      "stage2_confidence_target": 0.0,
+      "stage2_epochs": 1,
+      "stage2_f1_target": 0.0,
+      "stage2_loss_target": 0.12,
+      "stage2_num_workers": 2,
+      "stage2_prefetch_factor": 0,
+      "stage2_required_consecutive": 1,
+      "stageC_batch_size": 16,
+      "stageC_lora_rank": 8,
+      "stageC_steps_per_slot": 64,
+      "weight_decay": 1e-05
+    },
+    "embedding": {
+      "backend": "sentence_transformers",
+      "label_text_json": "",
+      "model_name": "sentence-transformers/all-MiniLM-L6-v2",
+      "target_dim": 384,
+      "temperature": 10.0
+    },
+    "generator": {
+      "adv_weight": 0.5,
+      "amp": false,
+      "amp_dtype": "float16",
+      "compile_model": false,
+      "d_base_ch": 96,
+      "d_beta1": 0.0,
+      "d_beta2": 0.99,
+      "d_depth": 5,
+      "d_lr": 0.0002,
+      "d_max_ch": 512,
+      "d_patch_size": 8,
+      "d_steps_per_g_step": 1,
+      "d_weight_decay": 0.0,
+      "discriminator_init_ckpt": "",
+      "feature_score_weight": 1.5,
+      "g_base_ch": 128,
+      "g_beta1": 0.0,
+      "g_beta2": 0.99,
+      "g_depth": 6,
+      "g_lr": 0.0002,
+      "g_max_ch": 512,
+      "g_weight_decay": 0.0,
+      "gate_feature_score_target": 0.55,
+      "gate_required_consecutive": 1,
+      "generator_init_ckpt": "",
+      "image_size": 64,
+      "joint_mode": true,
+      "r1_weight": 10.0,
+      "steps_per_round": 120,
+      "vocab_snapshot_dir": "",
+      "vocab_snapshot_enabled": true,
+      "wave_recon_weight": 0.0,
+      "z_dim": 128
+    },
+    "generator_gate": {
+      "feature_score_target": 0.55,
+      "required_consecutive": 1
+    },
+    "gestation": {
+      "batch_size": 0,
+      "cache_mb": -1,
+      "image_size": 128,
+      "num_workers": 0,
+      "samples_per_term": 1
+    },
+    "pregestation": {
+      "batch_size": 8,
+      "cache_mb": -1,
+      "circle_radius_temperature": 1.0,
+      "displacement_temperature": 1.0,
+      "image_size": 128,
+      "mode_sequence": [
+        "direction_color",
+        "symbol",
+        "noise_texture"
+      ],
+      "num_workers": 0,
+      "samples_per_combo": 4,
+      "seed": 1337
+    },
+    "transformer": {
+      "amp": false,
+      "amp_dtype": "float16",
+      "channels_last": false,
+      "chunk_samples": 0,
+      "compile_mode": "default",
+      "compile_model": false,
+      "config_search_batch_size": 16,
+      "config_search_epochs_per_trial": 2,
+      "config_search_max_points": 32768,
+      "config_search_scipy_refine": false,
+      "config_search_threshold": 0.35,
+      "config_search_topk": 3,
+      "config_search_trials": 10,
+      "config_search_w_cov": 0.3,
+      "config_search_w_mean": 0.1,
+      "config_search_w_topk": 0.6,
+      "d_model": 256,
+      "degrade_curriculum_enabled": true,
+      "degrade_end_prob": 0.5,
+      "degrade_start_prob": 0.0,
+      "deskew_channels": 16,
+      "deskew_enabled": false,
+      "dropout": 0.1,
+      "entropy_weight": 0.6,
+      "feature_score_weight": 1.5,
+      "ff_mult": 4,
+      "filter_bundle_names": [],
+      "gate_entropy_min": 0.4,
+      "gate_required_consecutive": 1,
+      "gate_score_target": 0.0,
+      "grad_accum_steps": 1,
+      "grad_clip": 1.0,
+      "high_bit_weight": 0.5,
+      "image_size": 128,
+      "low_bit_weight": 0.08,
+      "lr": 0.0002,
+      "lr_cycles": 1.0,
+      "lr_min_scale": 0.0,
+      "lr_tail_fraction": 0.15,
+      "nhead": 8,
+      "num_layers": 8,
+      "patch_size": 16,
+      "rank_loss_weight": 0.4,
+      "sample_bits": 16,
+      "seed": 1337,
+      "spurious_weight": 0.35,
+      "steps_per_round": 40,
+      "transformer_init_ckpt": "",
+      "wave_l1_weight": 1.0,
+      "weight_decay": 1e-05
+    },
+    "transformer_gate": {
+      "entropy_min": 0.4,
+      "feature_score_min": 0.0,
+      "required_consecutive": 1,
+      "score_target": 0.0
+    },
+    "vocab": {
+      "churn_append_mode": false,
+      "churn_every_n_cycles": 1,
+      "churn_n": 1,
+      "classifier_init_ckpt": "",
+      "extra_terms_cli": "",
+      "extra_terms_inline": [],
+      "extra_terms_json": "",
+      "flashcard_enabled": false,
+      "flashcard_rows_per_term": 2,
+      "image_size": 128,
+      "removed_seed_terms": [],
+      "seed": 1337,
+      "symbol_bootstrap_origin_label": "internal bootstrap root vocab",
+      "symbol_include_pictograms": true,
+      "symbol_pool_mode": "synthetic",
+      "symbol_pool_root": "toys_to_survive_development/data/semantic_symbol_pool",
+      "symbol_pool_samples_per_term": 1,
+      "total_slots": 50
+    },
+    "wave": {
+      "amp": false,
+      "amp_dtype": "fp16",
+      "base_ch": 64,
+      "batch_size": 32,
+      "context_blocks": 4,
+      "context_dropout": 0.05,
+      "epochs_per_round": 1,
+      "feedback_max_weight": 1.0,
+      "feedback_min_weight": 0.3,
+      "gate_entropy_min": 0.4,
+      "gate_feature_score_min": 0.55,
+      "gate_required_consecutive": 3,
+      "grad_accum_steps": 1,
+      "grad_clip": 1.0,
+      "label_mode": "folder",
+      "lr": 0.001,
+      "max_accepted_chunks": 768,
+      "max_ch": 384,
+      "min_train_samples": 64,
+      "n_label_buckets": 8,
+      "num_workers": 0,
+      "val_fraction": 0.15,
+      "weight_decay": 1e-05,
+      "zero_shot_enabled": true,
+      "zero_shot_query_terms": "",
+      "zero_shot_top_k": 3
+    },
+    "wave_gate": {
+      "entropy_min": 0.4,
+      "feature_score_min": 0.55,
+      "required_consecutive": 3
+    },
+    "wave_pool": {
+      "chunk_samples": 0,
+      "latent_pool_dir": "",
+      "latent_pool_duration_s": 2.0,
+      "latent_pool_noise_profiles": [],
+      "latent_pool_noise_std": 0.5,
+      "latent_pool_sample_rate": 16000,
+      "latent_pool_size": 192,
+      "latent_reinject_copy_gain": 0.7,
+      "latent_reinject_dir": "",
+      "latent_reinject_noise_gain": 0.35,
+      "latent_reinject_ratio": 0.5,
+      "latent_structured_gain": 0.8,
+      "latent_structured_noise_gain": 0.2,
+      "latent_structured_ratio": 0.85,
+      "max_streams": 300,
+      "min_stream_seconds": 0.5,
+      "seed": 1337,
+      "wav_dir": ""
+    }
+  },
+  "edges": [
+    {
+      "condition_id": "",
+      "edge_id": "wave_pool__to__init_vocab__startup_01",
+      "enabled": true,
+      "kind": "startup",
+      "metadata": {
+        "condition_callable": "",
+        "label": "startup"
+      },
+      "source_node_id": "wave_pool",
+      "target_node_id": "init_vocab"
+    },
+    {
+      "condition_id": "",
+      "edge_id": "init_vocab__to__build_classifier__startup_01",
+      "enabled": true,
+      "kind": "startup",
+      "metadata": {
+        "condition_callable": "",
+        "label": "startup"
+      },
+      "source_node_id": "init_vocab",
+      "target_node_id": "build_classifier"
+    },
+    {
+      "condition_id": "",
+      "edge_id": "build_classifier__to__config_search__startup_01",
+      "enabled": true,
+      "kind": "startup",
+      "metadata": {
+        "condition_callable": "",
+        "label": "startup"
+      },
+      "source_node_id": "build_classifier",
+      "target_node_id": "config_search"
+    },
+    {
+      "condition_id": "",
+      "edge_id": "config_search__to__build_transformer__startup_01",
+      "enabled": true,
+      "kind": "startup",
+      "metadata": {
+        "condition_callable": "",
+        "label": "startup"
+      },
+      "source_node_id": "config_search",
+      "target_node_id": "build_transformer"
+    },
+    {
+      "condition_id": "orchestration.mode_has_generator",
+      "edge_id": "build_transformer__to__build_gan__if_gan_mode_01",
+      "enabled": true,
+      "kind": "if_gan_mode",
+      "metadata": {
+        "condition_callable": "_generator_exists",
+        "label": "if_gan_mode"
+      },
+      "source_node_id": "build_transformer",
+      "target_node_id": "build_gan"
+    },
+    {
+      "condition_id": "",
+      "edge_id": "wave_pool__to__build_wave_classifier__startup_01",
+      "enabled": true,
+      "kind": "startup",
+      "metadata": {
+        "condition_callable": "",
+        "label": "startup"
+      },
+      "source_node_id": "wave_pool",
+      "target_node_id": "build_wave_classifier"
+    },
+    {
+      "condition_id": "",
+      "edge_id": "build_classifier__to__vocab_churn__per_round_01",
+      "enabled": true,
+      "kind": "per_round",
+      "metadata": {
+        "condition_callable": "",
+        "label": "per_round"
+      },
+      "source_node_id": "build_classifier",
+      "target_node_id": "vocab_churn"
+    },
+    {
+      "condition_id": "",
+      "edge_id": "vocab_churn__to__build_symbol_pool__per_round_01",
+      "enabled": true,
+      "kind": "per_round",
+      "metadata": {
+        "condition_callable": "",
+        "label": "per_round"
+      },
+      "source_node_id": "vocab_churn",
+      "target_node_id": "build_symbol_pool"
+    },
+    {
+      "condition_id": "",
+      "edge_id": "build_symbol_pool__to__build_label_embedding__per_round_01",
+      "enabled": true,
+      "kind": "per_round",
+      "metadata": {
+        "condition_callable": "",
+        "label": "per_round"
+      },
+      "source_node_id": "build_symbol_pool",
+      "target_node_id": "build_label_embedding"
+    },
+    {
+      "condition_id": "",
+      "edge_id": "build_label_embedding__to__pregestation_data__per_round_01",
+      "enabled": true,
+      "kind": "per_round",
+      "metadata": {
+        "condition_callable": "",
+        "label": "per_round"
+      },
+      "source_node_id": "build_label_embedding",
+      "target_node_id": "pregestation_data"
+    },
+    {
+      "condition_id": "",
+      "edge_id": "build_label_embedding__to__gestation_data__per_round_01",
+      "enabled": true,
+      "kind": "per_round",
+      "metadata": {
+        "condition_callable": "",
+        "label": "per_round"
+      },
+      "source_node_id": "build_label_embedding",
+      "target_node_id": "gestation_data"
+    },
+    {
+      "condition_id": "",
+      "edge_id": "build_label_embedding__to__berkeley_payload__per_round_01",
+      "enabled": true,
+      "kind": "per_round",
+      "metadata": {
+        "condition_callable": "",
+        "label": "per_round"
+      },
+      "source_node_id": "build_label_embedding",
+      "target_node_id": "berkeley_payload"
+    },
+    {
+      "condition_id": "",
+      "edge_id": "berkeley_payload__to__payload_validation_data__per_round_01",
+      "enabled": true,
+      "kind": "per_round",
+      "metadata": {
+        "condition_callable": "",
+        "label": "per_round"
+      },
+      "source_node_id": "berkeley_payload",
+      "target_node_id": "payload_validation_data"
+    },
+    {
+      "condition_id": "",
+      "edge_id": "berkeley_payload__to__build_flashcard_rows__per_round_01",
+      "enabled": true,
+      "kind": "per_round",
+      "metadata": {
+        "condition_callable": "",
+        "label": "per_round"
+      },
+      "source_node_id": "berkeley_payload",
+      "target_node_id": "build_flashcard_rows"
+    },
+    {
+      "condition_id": "gates.pregestation_passed",
+      "edge_id": "build_label_embedding__to__berkeley_data__after_gate0_01",
+      "enabled": true,
+      "kind": "after_gate0",
+      "metadata": {
+        "condition_callable": "_gate_pregestation_passed",
+        "label": "after_gate0"
+      },
+      "source_node_id": "build_label_embedding",
+      "target_node_id": "berkeley_data"
+    },
+    {
+      "condition_id": "",
+      "edge_id": "pregestation_data__to__stage_0_pregestation__stage0_01",
+      "enabled": true,
+      "kind": "stage0",
+      "metadata": {
+        "condition_callable": "",
+        "label": "stage0"
+      },
+      "source_node_id": "pregestation_data",
+      "target_node_id": "stage_0_pregestation"
+    },
+    {
+      "condition_id": "gates.pregestation_passed",
+      "edge_id": "stage_0_pregestation__to__gestation_data__after_gate0_01",
+      "enabled": true,
+      "kind": "after_gate0",
+      "metadata": {
+        "condition_callable": "_gate_pregestation_passed",
+        "label": "after_gate0"
+      },
+      "source_node_id": "stage_0_pregestation",
+      "target_node_id": "gestation_data"
+    },
+    {
+      "condition_id": "gates.pregestation_passed",
+      "edge_id": "gestation_data__to__stage_1_gestation__after_gate0_01",
+      "enabled": true,
+      "kind": "after_gate0",
+      "metadata": {
+        "condition_callable": "_gate_pregestation_passed",
+        "label": "after_gate0"
+      },
+      "source_node_id": "gestation_data",
+      "target_node_id": "stage_1_gestation"
+    },
+    {
+      "condition_id": "gates.early_passed",
+      "edge_id": "stage_1_gestation__to__stage_2_berkeley__after_gate1_01",
+      "enabled": true,
+      "kind": "after_gate1",
+      "metadata": {
+        "condition_callable": "_early_gates_passed",
+        "label": "after_gate1"
+      },
+      "source_node_id": "stage_1_gestation",
+      "target_node_id": "stage_2_berkeley"
+    },
+    {
+      "condition_id": "gates.early_passed",
+      "edge_id": "berkeley_data__to__stage_2_berkeley__after_gate1_01",
+      "enabled": true,
+      "kind": "after_gate1",
+      "metadata": {
+        "condition_callable": "_early_gates_passed",
+        "label": "after_gate1"
+      },
+      "source_node_id": "berkeley_data",
+      "target_node_id": "stage_2_berkeley"
+    },
+    {
+      "condition_id": "gates.early_passed",
+      "edge_id": "stage_2_berkeley__to__gate_berkeley__after_gate1_01",
+      "enabled": true,
+      "kind": "after_gate1",
+      "metadata": {
+        "condition_callable": "_early_gates_passed",
+        "label": "after_gate1"
+      },
+      "source_node_id": "stage_2_berkeley",
+      "target_node_id": "gate_berkeley"
+    },
+    {
+      "condition_id": "gates.early_passed",
+      "edge_id": "gate_berkeley__to__stage_r_transformer__after_gate1_01",
+      "enabled": true,
+      "kind": "after_gate1",
+      "metadata": {
+        "condition_callable": "_early_gates_passed",
+        "label": "after_gate1"
+      },
+      "source_node_id": "gate_berkeley",
+      "target_node_id": "stage_r_transformer"
+    },
+    {
+      "condition_id": "gates.early_passed",
+      "edge_id": "stage_r_transformer__to__gate_transformer__after_gate1_01",
+      "enabled": true,
+      "kind": "after_gate1",
+      "metadata": {
+        "condition_callable": "_early_gates_passed",
+        "label": "after_gate1"
+      },
+      "source_node_id": "stage_r_transformer",
+      "target_node_id": "gate_transformer"
+    },
+    {
+      "condition_id": "gates.all_base_passed",
+      "edge_id": "gate_transformer__to__stage_g_generator__after_all_gates_01",
+      "enabled": true,
+      "kind": "after_all_gates",
+      "metadata": {
+        "condition_callable": "_all_gates_passed",
+        "label": "after_all_gates"
+      },
+      "source_node_id": "gate_transformer",
+      "target_node_id": "stage_g_generator"
+    },
+    {
+      "condition_id": "gates.all_base_passed",
+      "edge_id": "stage_g_generator__to__gate_generator__after_all_gates_01",
+      "enabled": true,
+      "kind": "after_all_gates",
+      "metadata": {
+        "condition_callable": "_all_gates_passed",
+        "label": "after_all_gates"
+      },
+      "source_node_id": "stage_g_generator",
+      "target_node_id": "gate_generator"
+    },
+    {
+      "condition_id": "gates.all_base_passed",
+      "edge_id": "gate_berkeley__to__stage_c_lora__after_all_gates_01",
+      "enabled": true,
+      "kind": "after_all_gates",
+      "metadata": {
+        "condition_callable": "_all_gates_passed",
+        "label": "after_all_gates"
+      },
+      "source_node_id": "gate_berkeley",
+      "target_node_id": "stage_c_lora"
+    },
+    {
+      "condition_id": "gates.all_base_passed",
+      "edge_id": "stage_c_lora__to__stage_fake_feedback__after_all_gates_01",
+      "enabled": true,
+      "kind": "after_all_gates",
+      "metadata": {
+        "condition_callable": "_all_gates_passed",
+        "label": "after_all_gates"
+      },
+      "source_node_id": "stage_c_lora",
+      "target_node_id": "stage_fake_feedback"
+    },
+    {
+      "condition_id": "gates.wave_stage_ready",
+      "edge_id": "build_wave_classifier__to__stage_w_wave_classifier__after_transformer_gate_01",
+      "enabled": true,
+      "kind": "after_transformer_gate",
+      "metadata": {
+        "condition_callable": "_wave_stage_ready",
+        "label": "after_transformer_gate"
+      },
+      "source_node_id": "build_wave_classifier",
+      "target_node_id": "stage_w_wave_classifier"
+    },
+    {
+      "condition_id": "gates.wave_stage_ready",
+      "edge_id": "stage_w_wave_classifier__to__gate_wave__after_transformer_gate_01",
+      "enabled": true,
+      "kind": "after_transformer_gate",
+      "metadata": {
+        "condition_callable": "_wave_stage_ready",
+        "label": "after_transformer_gate"
+      },
+      "source_node_id": "stage_w_wave_classifier",
+      "target_node_id": "gate_wave"
+    },
+    {
+      "condition_id": "",
+      "edge_id": "gate_wave__to__sync_gate_replica__end_of_round_01",
+      "enabled": true,
+      "kind": "end_of_round",
+      "metadata": {
+        "condition_callable": "",
+        "label": "end_of_round"
+      },
+      "source_node_id": "gate_wave",
+      "target_node_id": "sync_gate_replica"
+    },
+    {
+      "condition_id": "",
+      "edge_id": "gate_transformer__to__sync_gate_replica__end_of_round_01",
+      "enabled": true,
+      "kind": "end_of_round",
+      "metadata": {
+        "condition_callable": "",
+        "label": "end_of_round"
+      },
+      "source_node_id": "gate_transformer",
+      "target_node_id": "sync_gate_replica"
+    },
+    {
+      "condition_id": "",
+      "edge_id": "gate_berkeley__to__sync_gate_replica__end_of_round_01",
+      "enabled": true,
+      "kind": "end_of_round",
+      "metadata": {
+        "condition_callable": "",
+        "label": "end_of_round"
+      },
+      "source_node_id": "gate_berkeley",
+      "target_node_id": "sync_gate_replica"
+    },
+    {
+      "condition_id": "",
+      "edge_id": "sync_gate_replica__to__checkpoint_save__end_of_round_01",
+      "enabled": true,
+      "kind": "end_of_round",
+      "metadata": {
+        "condition_callable": "",
+        "label": "end_of_round"
+      },
+      "source_node_id": "sync_gate_replica",
+      "target_node_id": "checkpoint_save"
+    }
+  ],
+  "entry_node_ids": [
+    "wave_pool"
+  ],
+  "layout": {
+    "annotations": [],
+    "groups": {
+      "bootstrap": {
+        "label": "Bootstrap",
+        "lane_index": 0
+      },
+      "build": {
+        "label": "Build",
+        "lane_index": 1
+      },
+      "data": {
+        "label": "Data",
+        "lane_index": 3
+      },
+      "gates": {
+        "label": "Gates",
+        "lane_index": 5
+      },
+      "housekeeping": {
+        "label": "Housekeeping",
+        "lane_index": 6
+      },
+      "train": {
+        "label": "Train",
+        "lane_index": 4
+      },
+      "vocab": {
+        "label": "Vocab",
+        "lane_index": 2
+      }
+    },
+    "positions": {
+      "berkeley_data": {
+        "x": 1440.0,
+        "y": 506.0
+      },
+      "berkeley_payload": {
+        "x": 1440.0,
+        "y": 562.0
+      },
+      "build_classifier": {
+        "x": 480.0,
+        "y": 150.0
+      },
+      "build_flashcard_rows": {
+        "x": 1680.0,
+        "y": 300.0
+      },
+      "build_gan": {
+        "x": 1200.0,
+        "y": 150.0
+      },
+      "build_label_embedding": {
+        "x": 1200.0,
+        "y": 300.0
+      },
+      "build_symbol_pool": {
+        "x": 960.0,
+        "y": 300.0
+      },
+      "build_transformer": {
+        "x": 960.0,
+        "y": 150.0
+      },
+      "build_wave_classifier": {
+        "x": 240.0,
+        "y": 150.0
+      },
+      "checkpoint_save": {
+        "x": 3600.0,
+        "y": 900.0
+      },
+      "config_search": {
+        "x": 720.0,
+        "y": 150.0
+      },
+      "gate_berkeley": {
+        "x": 2640.0,
+        "y": 750.0
+      },
+      "gate_generator": {
+        "x": 3600.0,
+        "y": 750.0
+      },
+      "gate_transformer": {
+        "x": 3120.0,
+        "y": 750.0
+      },
+      "gate_wave": {
+        "x": 720.0,
+        "y": 750.0
+      },
+      "gestation_data": {
+        "x": 1920.0,
+        "y": 450.0
+      },
+      "init_vocab": {
+        "x": 240.0,
+        "y": 300.0
+      },
+      "payload_validation_data": {
+        "x": 1680.0,
+        "y": 450.0
+      },
+      "pregestation_data": {
+        "x": 1440.0,
+        "y": 450.0
+      },
+      "stage_0_pregestation": {
+        "x": 1680.0,
+        "y": 600.0
+      },
+      "stage_1_gestation": {
+        "x": 2160.0,
+        "y": 600.0
+      },
+      "stage_2_berkeley": {
+        "x": 2400.0,
+        "y": 600.0
+      },
+      "stage_c_lora": {
+        "x": 2880.0,
+        "y": 600.0
+      },
+      "stage_fake_feedback": {
+        "x": 3120.0,
+        "y": 600.0
+      },
+      "stage_g_generator": {
+        "x": 3360.0,
+        "y": 600.0
+      },
+      "stage_r_transformer": {
+        "x": 2880.0,
+        "y": 656.0
+      },
+      "stage_w_wave_classifier": {
+        "x": 480.0,
+        "y": 600.0
+      },
+      "sync_gate_replica": {
+        "x": 3360.0,
+        "y": 900.0
+      },
+      "vocab_churn": {
+        "x": 720.0,
+        "y": 300.0
+      },
+      "wave_pool": {
+        "x": 0.0,
+        "y": 0.0
+      }
+    }
+  },
+  "metadata": {
+    "generated_by": "pipeline.orchestrator.build_training_graph_plan",
+    "graph_name": "wav_ml_pipeline",
+    "graph_summary": "PipelineGraph('wav_ml_pipeline') - 30 nodes, 33 edges\n  wave_pool                                   (root)\n  init_vocab                                  <-[wave_pool]\n  build_wave_classifier                       <-[wave_pool]\n  build_classifier                            <-[init_vocab]\n  stage_w_wave_classifier                     <-[build_wave_classifier]  if(gates.wave_stage_ready)\n  config_search                               <-[build_classifier]\n  vocab_churn                                 <-[build_classifier]\n  gate_wave                                   <-[stage_w_wave_classifier]  if(gates.wave_stage_ready)\n  build_transformer                           <-[config_search]\n  build_symbol_pool                           <-[vocab_churn]\n  build_gan                                   <-[build_transformer]  if(orchestration.mode_has_generator)\n  build_label_embedding                       <-[build_symbol_pool]\n  pregestation_data                           <-[build_label_embedding]\n  berkeley_payload                            <-[build_label_embedding]\n  berkeley_data                               <-[build_label_embedding]  if(gates.pregestation_passed)\n  stage_0_pregestation                        <-[pregestation_data]\n  payload_validation_data                     <-[berkeley_payload]\n  build_flashcard_rows                        <-[berkeley_payload]\n  gestation_data                              <-[build_label_embedding, stage_0_pregestation]  if(gates.pregestation_passed)\n  stage_1_gestation                           <-[gestation_data]  if(gates.pregestation_passed)\n  stage_2_berkeley                            <-[stage_1_gestation, berkeley_data]  if(gates.early_passed, gates.early_passed)\n  gate_berkeley                               <-[stage_2_berkeley]  if(gates.early_passed)\n  stage_r_transformer                         <-[gate_berkeley]  if(gates.early_passed)\n  stage_c_lora                                <-[gate_berkeley]  if(gates.all_base_passed)\n  gate_transformer                            <-[stage_r_transformer]  if(gates.early_passed)\n  stage_fake_feedback                         <-[stage_c_lora]  if(gates.all_base_passed)\n  stage_g_generator                           <-[gate_transformer]  if(gates.all_base_passed)\n  sync_gate_replica                           <-[gate_wave, gate_transformer, gate_berkeley]\n  gate_generator                              <-[stage_g_generator]  if(gates.all_base_passed)\n  checkpoint_save                             <-[sync_gate_replica]"
+  },
+  "name": "WAV ML Training Plan",
+  "nodes": [
+    {
+      "config_id": "wave_pool",
+      "enabled": true,
+      "group_id": "bootstrap",
+      "icon": "wave",
+      "kind": "WavePoolNode",
+      "label": "Discover WAV files and decode to float32 streams",
+      "metadata": {
+        "description": "Discover WAV files and decode to float32 streams",
+        "node_class": "WavePoolNode",
+        "node_id": "wave_pool"
+      },
+      "node_id": "wave_pool"
+    },
+    {
+      "config_id": "vocab",
+      "enabled": true,
+      "group_id": "vocab",
+      "icon": "vocab",
+      "kind": "InitVocabNode",
+      "label": "Load and assemble initial semantic vocabulary",
+      "metadata": {
+        "description": "Load and assemble initial semantic vocabulary",
+        "node_class": "InitVocabNode",
+        "node_id": "init_vocab"
+      },
+      "node_id": "init_vocab"
+    },
+    {
+      "config_id": "classifier",
+      "enabled": true,
+      "group_id": "build",
+      "icon": "classifier",
+      "kind": "BuildClassifierNode",
+      "label": "Instantiate TinyConvClassifier + optimizer",
+      "metadata": {
+        "description": "Instantiate TinyConvClassifier + optimizer",
+        "node_class": "BuildClassifierNode",
+        "node_id": "build_classifier"
+      },
+      "node_id": "build_classifier"
+    },
+    {
+      "config_id": "transformer",
+      "enabled": true,
+      "group_id": "build",
+      "icon": "transformer",
+      "kind": "ConfigSearchNode",
+      "label": "Score random RenderConfig candidates via classifier feature metric",
+      "metadata": {
+        "description": "Score random RenderConfig candidates via classifier feature metric",
+        "node_class": "ConfigSearchNode",
+        "node_id": "config_search"
+      },
+      "node_id": "config_search"
+    },
+    {
+      "config_id": "transformer",
+      "enabled": true,
+      "group_id": "build",
+      "icon": "transformer",
+      "kind": "BuildTransformerNode",
+      "label": "Instantiate WavePatchTransformer + optimizer",
+      "metadata": {
+        "description": "Instantiate WavePatchTransformer + optimizer",
+        "node_class": "BuildTransformerNode",
+        "node_id": "build_transformer"
+      },
+      "node_id": "build_transformer"
+    },
+    {
+      "config_id": "generator",
+      "enabled": true,
+      "group_id": "build",
+      "icon": "generator",
+      "kind": "BuildGANNode",
+      "label": "Instantiate ConditionalBitPlaneGenerator + Discriminator",
+      "metadata": {
+        "description": "Instantiate ConditionalBitPlaneGenerator + Discriminator",
+        "node_class": "BuildGANNode",
+        "node_id": "build_gan"
+      },
+      "node_id": "build_gan"
+    },
+    {
+      "config_id": "wave",
+      "enabled": true,
+      "group_id": "build",
+      "icon": "wave",
+      "kind": "BuildWaveClassifierNode",
+      "label": "Instantiate wave-feedback TinyConvClassifier",
+      "metadata": {
+        "description": "Instantiate wave-feedback TinyConvClassifier",
+        "node_class": "BuildWaveClassifierNode",
+        "node_id": "build_wave_classifier"
+      },
+      "node_id": "build_wave_classifier"
+    },
+    {
+      "config_id": "berkeley_payload",
+      "enabled": true,
+      "group_id": "data",
+      "icon": "classifier",
+      "kind": "BerkeleyPayloadNode",
+      "label": "Build/load Berkeley SBD payload image bank",
+      "metadata": {
+        "description": "Build/load Berkeley SBD payload image bank",
+        "node_class": "BerkeleyPayloadNode",
+        "node_id": "berkeley_payload"
+      },
+      "node_id": "berkeley_payload"
+    },
+    {
+      "config_id": "vocab",
+      "enabled": true,
+      "group_id": "vocab",
+      "icon": "vocab",
+      "kind": "VocabChurnNode",
+      "label": "Rotate extra vocab terms (churn) on schedule",
+      "metadata": {
+        "description": "Rotate extra vocab terms (churn) on schedule",
+        "node_class": "VocabChurnNode",
+        "node_id": "vocab_churn"
+      },
+      "node_id": "vocab_churn"
+    },
+    {
+      "config_id": "vocab",
+      "enabled": true,
+      "group_id": "vocab",
+      "icon": "vocab",
+      "kind": "BuildSymbolPoolNode",
+      "label": "Build per-term symbol image pool",
+      "metadata": {
+        "description": "Build per-term symbol image pool",
+        "node_class": "BuildSymbolPoolNode",
+        "node_id": "build_symbol_pool"
+      },
+      "node_id": "build_symbol_pool"
+    },
+    {
+      "config_id": "embedding",
+      "enabled": true,
+      "group_id": "vocab",
+      "icon": "node",
+      "kind": "BuildLabelEmbeddingNode",
+      "label": "Build sentence-transformer label embedding bank",
+      "metadata": {
+        "description": "Build sentence-transformer label embedding bank",
+        "node_class": "BuildLabelEmbeddingNode",
+        "node_id": "build_label_embedding"
+      },
+      "node_id": "build_label_embedding"
+    },
+    {
+      "config_id": "vocab",
+      "enabled": true,
+      "group_id": "vocab",
+      "icon": "vocab",
+      "kind": "BuildFlashcardRowsNode",
+      "label": "Build per-term GAN conditioning flashcard rows",
+      "metadata": {
+        "description": "Build per-term GAN conditioning flashcard rows",
+        "node_class": "BuildFlashcardRowsNode",
+        "node_id": "build_flashcard_rows"
+      },
+      "node_id": "build_flashcard_rows"
+    },
+    {
+      "config_id": "pregestation",
+      "enabled": true,
+      "group_id": "data",
+      "icon": "data",
+      "kind": "PregestationDataNode",
+      "label": "Build Stage 0 pregestation dataset (synthetic geometric logic)",
+      "metadata": {
+        "description": "Build Stage 0 pregestation dataset (synthetic geometric logic)",
+        "node_class": "PregestationDataNode",
+        "node_id": "pregestation_data"
+      },
+      "node_id": "pregestation_data"
+    },
+    {
+      "config_id": "gestation",
+      "enabled": true,
+      "group_id": "data",
+      "icon": "data",
+      "kind": "GestationDataNode",
+      "label": "Build Stage 1 gestation dataset (bootstrap primitive symbols)",
+      "metadata": {
+        "description": "Build Stage 1 gestation dataset (bootstrap primitive symbols)",
+        "node_class": "GestationDataNode",
+        "node_id": "gestation_data"
+      },
+      "node_id": "gestation_data"
+    },
+    {
+      "config_id": "berkeley_data",
+      "enabled": true,
+      "group_id": "data",
+      "icon": "classifier",
+      "kind": "BerkeleyDataNode",
+      "label": "Build Stage 2 Berkeley SBD refresh DataLoader",
+      "metadata": {
+        "description": "Build Stage 2 Berkeley SBD refresh DataLoader",
+        "node_class": "BerkeleyDataNode",
+        "node_id": "berkeley_data"
+      },
+      "node_id": "berkeley_data"
+    },
+    {
+      "config_id": "",
+      "enabled": true,
+      "group_id": "data",
+      "icon": "data",
+      "kind": "PayloadValidationDataNode",
+      "label": "Build payload gate validation dataset (Gate 2 deck)",
+      "metadata": {
+        "description": "Build payload gate validation dataset (Gate 2 deck)",
+        "node_class": "PayloadValidationDataNode",
+        "node_id": "payload_validation_data"
+      },
+      "node_id": "payload_validation_data"
+    },
+    {
+      "config_id": "classifier",
+      "enabled": true,
+      "group_id": "train",
+      "icon": "node",
+      "kind": "PregestationTrainNode",
+      "label": "Stage 0: pre-gestation classifier training (geometric logic)",
+      "metadata": {
+        "description": "Stage 0: pre-gestation classifier training (geometric logic)",
+        "node_class": "PregestationTrainNode",
+        "node_id": "stage_0_pregestation"
+      },
+      "node_id": "stage_0_pregestation"
+    },
+    {
+      "config_id": "classifier",
+      "enabled": true,
+      "group_id": "train",
+      "icon": "node",
+      "kind": "GestationTrainNode",
+      "label": "Stage 1: gestation classifier training (bootstrap primitives)",
+      "metadata": {
+        "description": "Stage 1: gestation classifier training (bootstrap primitives)",
+        "node_class": "GestationTrainNode",
+        "node_id": "stage_1_gestation"
+      },
+      "node_id": "stage_1_gestation"
+    },
+    {
+      "config_id": "classifier",
+      "enabled": true,
+      "group_id": "train",
+      "icon": "classifier",
+      "kind": "BerkeleyRefreshTrainNode",
+      "label": "Stage 2: Berkeley SBD refresh (full multi-label classification)",
+      "metadata": {
+        "description": "Stage 2: Berkeley SBD refresh (full multi-label classification)",
+        "node_class": "BerkeleyRefreshTrainNode",
+        "node_id": "stage_2_berkeley"
+      },
+      "node_id": "stage_2_berkeley"
+    },
+    {
+      "config_id": "transformer",
+      "enabled": true,
+      "group_id": "train",
+      "icon": "transformer",
+      "kind": "TransformerTrainNode",
+      "label": "Stage R: WavePatchTransformer feature-score training",
+      "metadata": {
+        "description": "Stage R: WavePatchTransformer feature-score training",
+        "node_class": "TransformerTrainNode",
+        "node_id": "stage_r_transformer"
+      },
+      "node_id": "stage_r_transformer"
+    },
+    {
+      "config_id": "generator",
+      "enabled": true,
+      "group_id": "train",
+      "icon": "generator",
+      "kind": "GeneratorTrainNode",
+      "label": "Stage G: Conditional GAN training (generator + discriminator)",
+      "metadata": {
+        "description": "Stage G: Conditional GAN training (generator + discriminator)",
+        "node_class": "GeneratorTrainNode",
+        "node_id": "stage_g_generator"
+      },
+      "node_id": "stage_g_generator"
+    },
+    {
+      "config_id": "wave",
+      "enabled": true,
+      "group_id": "train",
+      "icon": "wave",
+      "kind": "WaveClassifierTrainNode",
+      "label": "Stage W: Wave classifier training on transformer outputs",
+      "metadata": {
+        "description": "Stage W: Wave classifier training on transformer outputs",
+        "node_class": "WaveClassifierTrainNode",
+        "node_id": "stage_w_wave_classifier"
+      },
+      "node_id": "stage_w_wave_classifier"
+    },
+    {
+      "config_id": "classifier",
+      "enabled": true,
+      "group_id": "train",
+      "icon": "classifier",
+      "kind": "LoRARoundNode",
+      "label": "Stage C: LoRA slot switching and per-term Berkeley training",
+      "metadata": {
+        "description": "Stage C: LoRA slot switching and per-term Berkeley training",
+        "node_class": "LoRARoundNode",
+        "node_id": "stage_c_lora"
+      },
+      "node_id": "stage_c_lora"
+    },
+    {
+      "config_id": "classifier",
+      "enabled": true,
+      "group_id": "train",
+      "icon": "classifier",
+      "kind": "FakeClassFeedbackNode",
+      "label": "Fake-class feedback: train classifier to detect GAN outputs",
+      "metadata": {
+        "description": "Fake-class feedback: train classifier to detect GAN outputs",
+        "node_class": "FakeClassFeedbackNode",
+        "node_id": "stage_fake_feedback"
+      },
+      "node_id": "stage_fake_feedback"
+    },
+    {
+      "config_id": "berkeley_gate",
+      "enabled": true,
+      "group_id": "gates",
+      "icon": "classifier",
+      "kind": "BerkeleyGateNode",
+      "label": "Gate 2: Berkeley classifier confidence + macro-F1 evaluation",
+      "metadata": {
+        "description": "Gate 2: Berkeley classifier confidence + macro-F1 evaluation",
+        "node_class": "BerkeleyGateNode",
+        "node_id": "gate_berkeley"
+      },
+      "node_id": "gate_berkeley"
+    },
+    {
+      "config_id": "transformer_gate",
+      "enabled": true,
+      "group_id": "gates",
+      "icon": "transformer",
+      "kind": "TransformerGateNode",
+      "label": "Gate R: transformer feature score + entropy evaluation",
+      "metadata": {
+        "description": "Gate R: transformer feature score + entropy evaluation",
+        "node_class": "TransformerGateNode",
+        "node_id": "gate_transformer"
+      },
+      "node_id": "gate_transformer"
+    },
+    {
+      "config_id": "generator_gate",
+      "enabled": true,
+      "group_id": "gates",
+      "icon": "generator",
+      "kind": "GeneratorGateNode",
+      "label": "Gate G: generator feature score evaluation",
+      "metadata": {
+        "description": "Gate G: generator feature score evaluation",
+        "node_class": "GeneratorGateNode",
+        "node_id": "gate_generator"
+      },
+      "node_id": "gate_generator"
+    },
+    {
+      "config_id": "wave_gate",
+      "enabled": true,
+      "group_id": "gates",
+      "icon": "wave",
+      "kind": "WaveGateNode",
+      "label": "Gate W: wave entropy + feature score feedback evaluation",
+      "metadata": {
+        "description": "Gate W: wave entropy + feature score feedback evaluation",
+        "node_class": "WaveGateNode",
+        "node_id": "gate_wave"
+      },
+      "node_id": "gate_wave"
+    },
+    {
+      "config_id": "",
+      "enabled": true,
+      "group_id": "housekeeping",
+      "icon": "sync",
+      "kind": "SyncGateReplicaNode",
+      "label": "Sync frozen CPU gate_classifier from main classifier",
+      "metadata": {
+        "description": "Sync frozen CPU gate_classifier from main classifier",
+        "node_class": "SyncGateReplicaNode",
+        "node_id": "sync_gate_replica"
+      },
+      "node_id": "sync_gate_replica"
+    },
+    {
+      "config_id": "",
+      "enabled": true,
+      "group_id": "housekeeping",
+      "icon": "checkpoint",
+      "kind": "CheckpointSaveNode",
+      "label": "Save pipeline checkpoint to disk",
+      "metadata": {
+        "description": "Save pipeline checkpoint to disk",
+        "node_class": "CheckpointSaveNode",
+        "node_id": "checkpoint_save"
+      },
+      "node_id": "checkpoint_save"
+    }
+  ],
+  "plan_id": "wav_ml_pipeline:e3221021b6e3",
+  "revision": 1,
+  "schema_version": 1,
+  "worker_hints": {
+    "capabilities": [
+      "plan_apply",
+      "run_control"
+    ],
+    "device_preference": "cuda:0",
+    "entrypoint": "wav_pipeline_graph.py",
+    "orchestration_cycles": 3,
+    "orchestration_mode": "sequential",
+    "orchestration_rounds": 2,
+    "output_dir": "c:\\dev\\Powershell\\nodus\\toys_to_survive_development\\_tmp_graph_smoke"
+  }
+}

@@ -3,8 +3,9 @@ setlocal EnableExtensions EnableDelayedExpansion
 
 REM Run from repo root: c:\dev\Powershell\nodus
 set "PYTHON=python"
-set "SCRIPT=toys_to_survive_development\wav_config_transformer_pipeline.py"
+set "LEGACY_SCRIPT=toys_to_survive_development\wav_config_transformer_pipeline.py"
 set "GRAPH_SCRIPT=toys_to_survive_development\wav_pipeline_graph.py"
+set "SCRIPT=%GRAPH_SCRIPT%"
 set "GUI_SCRIPT=toys_to_survive_development\wav_ml_gui_main.py"
 set "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True"
 set "HF_HUB_OFFLINE=1"
@@ -260,7 +261,6 @@ set "ENDLESS_MAX_RUNS=0"
 set "ENDLESS_SEED_STRIDE=9973"
 set "ENDLESS_SLEEP_SECONDS=2"
 set "GUI_STOP_EXIT_CODE=42"
-set "USE_GRAPH_PIPELINE=0"
 set "WEIGHT_BACKUP_ENABLED=1"
 set "WEIGHT_BACKUP_SUBDIR=_weight_backup"
 set "WEIGHT_BACKUP_MAX_KEEP=10"
@@ -369,15 +369,15 @@ if "%BERKELEY_PAYLOAD_CACHE_REBUILD%"=="1" set "BERKELEY_PAYLOAD_CACHE_REBUILD_A
 set "GATE_TOTAL_TOKEN_SCHEDULE_ARG=--gate-total-token-schedule-enabled"
 if not "%GATE_TOTAL_TOKEN_SCHEDULE%"=="1" set "GATE_TOTAL_TOKEN_SCHEDULE_ARG=--no-gate-total-token-schedule-enabled"
 
-if not exist "%SCRIPT%" (
-  echo Missing script: %SCRIPT%
+if not exist "%GRAPH_SCRIPT%" (
+  echo Missing graph runner: %GRAPH_SCRIPT%
   exit /b 1
 )
-if "%USE_GRAPH_PIPELINE%"=="1" (
-  set "SCRIPT=%GRAPH_SCRIPT%"
+if not exist "%LEGACY_SCRIPT%" (
+  echo [launcher] warning: legacy monolith shim not found: %LEGACY_SCRIPT%
 )
 if not exist "%SCRIPT%" (
-  echo Missing script: %SCRIPT%
+  echo Missing active pipeline entrypoint: %SCRIPT%
   exit /b 1
 )
 
@@ -395,7 +395,8 @@ if not defined LOCAL_ST_MODEL_DIR (
 )
 set "LABEL_EMBED_MODEL=!LOCAL_ST_MODEL_DIR!"
 echo [launcher] Local embedding model: !LABEL_EMBED_MODEL!
-echo [launcher] pipeline entrypoint: %SCRIPT%
+echo [launcher] graph runner: %SCRIPT%
+echo [launcher] gui entrypoint: %GUI_SCRIPT%
 
 echo [launcher] Berkeley pretrain disabled; classifier init starts from scratch.
 
@@ -422,6 +423,8 @@ set /a RUN_SEED=%BASE_SEED% + ((RUN_INDEX - 1) * %ENDLESS_SEED_STRIDE%)
 call :apply_runtime_overrides
 echo.
 echo [launcher] run !RUN_INDEX! seed=!RUN_SEED! endless=%ENDLESS_MODE%
+call :ensure_gui_ready
+if errorlevel 1 exit /b !ERRORLEVEL!
 echo [launcher] gate_pregestation_loss_target=!GATE_PREGESTATION_LOSS_TARGET! maintain=!GATE_PREGESTATION_MAINTAIN!
 echo [launcher] gate_gestation_loss_target=!GATE_GESTATION_LOSS_TARGET!
 echo [launcher] gate_berkeley_loss_target=!GATE_BERKELEY_LOSS_TARGET!
@@ -468,6 +471,18 @@ if exist "%RUNTIME_OVERRIDES_FILE%" (
 )
 exit /b 0
 
+:ensure_gui_ready
+if not "%STAGE_OPENGL_LAUNCH_STANDALONE%"=="1" exit /b 0
+if exist "%VIEWER_PORT_FILE%" (
+  call :probe_gui_ipc
+  if "!ERRORLEVEL!"=="0" exit /b 0
+  echo [launcher] stale GUI port file detected; relaunching standalone GUI...
+  del /f /q "%VIEWER_PORT_FILE%" >nul 2>&1
+)
+echo [launcher] GUI port file missing; attempting to (re)launch standalone GUI...
+call :launch_gui
+exit /b !ERRORLEVEL!
+
 :launch_gui
 if not "%STAGE_OPENGL_LAUNCH_STANDALONE%"=="1" exit /b 0
 if not exist "%GUI_SCRIPT%" (
@@ -486,22 +501,30 @@ start "nodus-viewer" /B %PYTHON% %GUI_SCRIPT% ^
 set /a _GUI_WAIT_LOOPS=0
 :wait_for_gui_port
 if exist "%VIEWER_PORT_FILE%" (
-  echo [launcher] GUI ready: %VIEWER_PORT_FILE%
-  exit /b 0
+  call :probe_gui_ipc
+  if "!ERRORLEVEL!"=="0" (
+    echo [launcher] GUI ready: %VIEWER_PORT_FILE%
+    exit /b 0
+  )
 )
 set /a _GUI_WAIT_LOOPS+=1
 if !_GUI_WAIT_LOOPS! GEQ 80 (
-  echo [launcher] warning: GUI port file not detected yet (%VIEWER_PORT_FILE%).
+  echo [launcher] warning: GUI port file not detected yet ^(%VIEWER_PORT_FILE%^).
   echo [launcher] pipeline will still start and attempt to connect.
   exit /b 0
 )
 timeout /t 1 /nobreak >nul
 goto wait_for_gui_port
 
+:probe_gui_ipc
+if not exist "%VIEWER_PORT_FILE%" exit /b 1
+%PYTHON% -c "import pathlib, sys; from multiprocessing.connection import Client; port = int(pathlib.Path(sys.argv[1]).read_text(encoding='utf-8').strip()); conn = Client(('localhost', port), family='AF_INET', authkey=b'nodus_viewer_v1'); conn.close()" "%VIEWER_PORT_FILE%" >nul 2>&1
+exit /b %ERRORLEVEL%
+
 :run_pipeline
 set "RUN_SEED=%~1"
 set "RUN_EXTRA_ARG=%~2"
-%PYTHON% %GRAPH_SCRIPT% ^
+%PYTHON% %SCRIPT% ^
   --objective-mode berkeley_multilabel ^
   --output-dir "%OUTPUT_DIR%" %RESUME_ARG% ^
   --checkpoint-every-round %CHECKPOINT_EVERY_ROUND% %CKPT_SEGMENT_ARG% ^

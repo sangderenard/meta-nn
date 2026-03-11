@@ -33,6 +33,14 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
+import hashlib
+import json
+import math
+import numpy as np
+import re
+import torch
+import torch.nn.functional as F
+
 from pipeline.context import PipelineContext
 from pipeline.graph import PipelineNode
 from pipeline.nodes.base import OneTimeNode
@@ -2670,6 +2678,49 @@ def _build_pregestation_logic_rows(
 # Recognized color term names whose score maps can be extracted by
 # _semantic_color_score_maps.  "grey" is an alias for "gray" and both are
 # included so either spelling in the term list triggers mask extraction.
+
+
+def _normalize_attention_map(mask: Any, gamma: float = 1.0, blur_kernel: int = 0) -> np.ndarray:
+    arr = np.asarray(mask, dtype=np.float32)
+    if int(arr.ndim) != 2 or int(arr.size) <= 0:
+        return np.zeros_like(np.asarray(arr, dtype=np.float32), dtype=np.float32)
+    arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32, copy=False)
+    arr = np.maximum(arr, 0.0).astype(np.float32, copy=False)
+    vmax = float(np.max(arr)) if int(arr.size) > 0 else 0.0
+    if vmax > 1e-8:
+        arr = (arr / float(vmax)).astype(np.float32, copy=False)
+    else:
+        return np.zeros_like(arr, dtype=np.float32)
+    vmean = float(np.mean(arr)) if int(arr.size) > 0 else 0.0
+    if vmean > 1e-8:
+        arr = np.clip(arr / float(max(vmean * 2.0, 1.0)), 0.0, 1.0).astype(np.float32, copy=False)
+    gm = max(0.35, float(gamma))
+    if abs(gm - 1.0) > 1e-6:
+        arr = np.power(np.clip(arr, 0.0, 1.0), gm).astype(np.float32, copy=False)
+    kk = int(blur_kernel)
+    if kk >= 3:
+        kk = int(kk) | 1
+        arr = np.asarray(
+            F.avg_pool2d(
+                torch.from_numpy(arr[None, None, ...]),
+                kernel_size=int(kk),
+                stride=1,
+                padding=int(kk // 2),
+            )[0, 0].cpu().numpy(),
+            dtype=np.float32,
+        )
+        vmax = float(np.max(arr)) if int(arr.size) > 0 else 0.0
+        if vmax > 1e-8:
+            arr = (arr / float(vmax)).astype(np.float32, copy=False)
+    return np.clip(arr, 0.0, 1.0).astype(np.float32, copy=False)
+
+
+def _composite_mask_stack(stack: Any) -> np.ndarray:
+    arr = np.asarray(stack, dtype=np.float32)
+    if int(arr.ndim) != 3 or int(arr.shape[0]) <= 0:
+        return np.zeros((0, 0) if int(arr.ndim) < 2 else (int(arr.shape[-2]), int(arr.shape[-1])), dtype=np.float32)
+    composite = np.sum(arr, axis=0).astype(np.float32, copy=False)
+    return _normalize_attention_map(composite, gamma=1.0, blur_kernel=0)
 
 
 def _enrich_pregestation_stack_with_observed_color_masks(

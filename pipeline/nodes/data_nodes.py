@@ -254,30 +254,25 @@ class PregestationDataNode(PipelineNode):
             return  # vocab unchanged; reuse existing loader
 
         from pipeline.nodes.vocab_node import _build_pregestation_logic_rows
-        from pipeline.utils import _resolve_semantic_stage_cache_root
         from semantic_dataset_loaders import (
+            BootstrapDynamicDataset,
             build_loader_from_manifest,
             StageDatasetManifest,
         )
 
-        # ctx.semantic_cache_nonce is set by the orchestrator at startup —
-        # no ctx.args fallback needed.
-        _resolve_semantic_stage_cache_root(
-            output_dir=ctx.output_dir,
-            cache_dir=ctx.semantic_stage_cache_dir,
-            cache_nonce=ctx.semantic_cache_nonce or "",
-        )
-
         # _build_pregestation_logic_rows(image_size, seed, samples_per_combo,
-        #   active_terms_lc, circle_radius_temperature,
-        #   circle_displacement_temperature, mode)
-        # → (images, targets, terms_list, info) per single mode.
+        #   active_terms_lc, circle_radius_temperature, circle_displacement_temperature, mode)
+        # → (images, composite_masks, mask_stacks, term_rows, info) per single mode.
         # Loop over mode_sequence and concatenate.
         active_terms_lc = [t.lower() for t in ctx.class_names]
         all_images: list = []
+        all_masks: list = []
+        all_mask_stacks: list = []
         all_targets: list = []
+        all_term_rows: list = []
+        target_dim = max(1, int(len(ctx.class_names)))
         for mode in self.cfg.mode_sequence:
-            imgs, tgts, _terms, _info = _build_pregestation_logic_rows(
+            imgs, masks, mask_stacks, term_rows, _info = _build_pregestation_logic_rows(
                 image_size=self.cfg.image_size,
                 seed=self.cfg.seed,
                 samples_per_combo=self.cfg.samples_per_combo,
@@ -287,25 +282,57 @@ class PregestationDataNode(PipelineNode):
                 mode=mode,
             )
             all_images.extend(imgs)
-            all_targets.extend(tgts)
+            all_masks.extend(masks)
+            all_mask_stacks.extend(mask_stacks)
+            all_term_rows.extend(term_rows)
+            for term_row in term_rows:
+                y = np.zeros((target_dim,), dtype=np.float32)
+                for term in term_row:
+                    idx = ctx.semantic_term_to_idx.get(str(term).strip().lower(), -1)
+                    if int(idx) >= 0:
+                        y[int(idx)] = 1.0
+                all_targets.append(y)
 
-        ctx.pregestation_logic_rows = {"images": all_images, "targets": all_targets}
+        ctx.pregestation_logic_rows = {
+            "images": all_images,
+            "masks": all_masks,
+            "mask_stacks": all_mask_stacks,
+            "targets": all_targets,
+            "terms": all_term_rows,
+        }
 
         if not all_images:
             _log("[pregestation-data] WARNING: no images built; skipping loader")
             return
 
-        manifest = StageDatasetManifest(
-            stage_name="pregestation",
+        dataset = BootstrapDynamicDataset(
             images=all_images,
             targets=all_targets,
+            total_rows=int(len(all_images)),
+            seed=int(self.cfg.seed),
+            augment=False,
+            expected_target_dim=target_dim,
+            semantic_term_to_idx=ctx.semantic_term_to_idx,
+            augment_apply_terms=False,
+            return_masks=True,
+            return_mask_stack=True,
+            dataset_name="pregestation",
+            base_masks=(all_masks if len(all_masks) == len(all_images) else None),
         )
-        loader = build_loader_from_manifest(
-            manifest=manifest,
-            batch_size=self.cfg.batch_size,
-            num_workers=self.cfg.num_workers,
-            shuffle=True,
+        if len(all_mask_stacks) == len(all_images):
+            for i, mask_stack in enumerate(all_mask_stacks):
+                dataset.base_mask_stacks[i] = np.asarray(mask_stack, dtype=np.float32)
+
+        manifest = StageDatasetManifest(
+            name="pregestation",
+            dataset=dataset,
+            batch_size=max(1, int(self.cfg.batch_size)),
+            seed=int(self.cfg.seed),
+            num_workers=max(0, int(self.cfg.num_workers)),
+            device_type=str(getattr(ctx.device, "type", "cpu")),
         )
+        loader, _count = build_loader_from_manifest(manifest=manifest)
+        ctx.pregestation_dataset = dataset
         ctx.pregestation_loader = loader
         self._last_vocab_hash = current_hash
         _log(f"[pregestation-data] {len(all_images)} images "
@@ -369,17 +396,29 @@ class GestationDataNode(PipelineNode):
             _log("[gestation-data] WARNING: no symbol images; gestation loader skipped")
             return
 
-        manifest = StageDatasetManifest(
-            stage_name="gestation",
+        dataset = BootstrapDynamicDataset(
             images=images,
             targets=targets,
+            total_rows=int(len(images)),
+            seed=int(getattr(ctx.args, "seed", 0) or 0),
+            augment=False,
+            expected_target_dim=max(1, int(len(ctx.class_names))),
+            semantic_term_to_idx=ctx.semantic_term_to_idx,
+            augment_apply_terms=False,
+            return_masks=False,
+            return_mask_stack=False,
+            dataset_name="gestation",
         )
-        loader = build_loader_from_manifest(
-            manifest=manifest,
-            batch_size=self.cfg.batch_size,
-            num_workers=self.cfg.num_workers,
-            shuffle=True,
+        manifest = StageDatasetManifest(
+            name="gestation",
+            dataset=dataset,
+            batch_size=max(1, int(self.cfg.batch_size)),
+            seed=int(getattr(ctx.args, "seed", 0) or 0),
+            num_workers=max(0, int(self.cfg.num_workers)),
+            device_type=str(getattr(ctx.device, "type", "cpu")),
         )
+        loader, _count = build_loader_from_manifest(manifest=manifest)
+        ctx.gestation_dataset = dataset
         ctx.gestation_loader = loader
         self._last_vocab_hash = current_hash
         _log(f"[gestation-data] {len(images)} images batch_size={self.cfg.batch_size}")

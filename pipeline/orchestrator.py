@@ -447,18 +447,27 @@ def _make_viewer_proxy(args, cycles: int):
     port_file = str(_arg_value(args, "viewer_port_file", default="") or "").strip()
     if not port_file:
         return None
+    required = bool(_arg_value(args, "stage_opengl_preview_required", default=False))
     try:
         from wav_ml_viewer import ViewerIPCProxy
 
         image_size = int(_arg_value(args, "image_size", default=64))
-        return ViewerIPCProxy(
+        proxy = ViewerIPCProxy(
             port_file=port_file,
             enabled=True,
             image_hw=(image_size, image_size),
             scale=max(1, int(_arg_value(args, "stage_opengl_preview_scale", "transformer_viz_scale", default=1))),
             cycle_slots=max(0, int(cycles)),
         )
+        if required and (proxy is None or not bool(getattr(proxy, "enabled", False))):
+            raise RuntimeError(
+                "stage OpenGL preview is required, but the standalone GUI IPC connection "
+                f"could not be established via {port_file!r}"
+            )
+        return proxy
     except Exception as exc:
+        if required:
+            raise
         _log(f"[orchestrator] WARNING: viewer IPC setup failed: {exc}")
         return None
 
