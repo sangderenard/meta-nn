@@ -66,7 +66,8 @@ from typing import Any, Optional
 import torch
 
 from pipeline.context import PipelineContext
-from pipeline.graph import PipelineGraph
+from pipeline.graph import EdgeReactionSpec, PipelineGraph
+from pipeline.graph_layers import build_graph_layers as _materialize_graph_layers
 from pipeline.plan_protocol import (
     DEFAULT_PLAN_FILENAME,
     DEFAULT_RUNTIME_SNAPSHOT_FILENAME,
@@ -349,6 +350,10 @@ def _build_condition_blobs() -> dict:
     }
 
 
+def _build_graph_layers(graph: PipelineGraph) -> dict:
+    return _materialize_graph_layers(graph)
+
+
 def _node_group_id(node_id: str) -> str:
     if node_id in {"wave_pool"}:
         return "bootstrap"
@@ -371,6 +376,111 @@ def _node_group_id(node_id: str) -> str:
     }:
         return "build"
     return "other"
+
+
+def _node_faculty(node_id: str) -> str:
+    return _node_group_id(node_id)
+
+
+def _node_archetype(node_id: str) -> str:
+    if node_id == "data_node":
+        return "storage_authority"
+    if node_id.startswith("gate_"):
+        return "gate"
+    if node_id.startswith("stage_"):
+        return "stage"
+    if node_id.startswith("build_"):
+        return "builder"
+    if node_id in {"wave_pool", "init_vocab", "vocab_churn"}:
+        return "seed"
+    if node_id in {"build_symbol_pool", "build_label_embedding", "build_flashcard_rows"}:
+        return "materializer"
+    if node_id in {"sync_gate_replica", "checkpoint_save"}:
+        return "housekeeping"
+    return "node"
+
+
+def _edge_schedule_reaction_name(label: str) -> str:
+    mapping = {
+        "startup": "schedule.bootstrap",
+        "per_round": "schedule.round",
+        "end_of_round": "schedule.finalize",
+    }
+    return mapping.get(str(label or "").strip(), "schedule.transition")
+
+
+def _edge_provided_resources(method_name: str, label: str) -> list[str]:
+    mapping = {
+        "provide_pregestation": ["pregestation_loader", "pregestation_dataset"],
+        "provide_gestation": ["gestation_loader", "gestation_dataset"],
+        "provide_berkeley_data": ["berkeley_refresh_loader", "berkeley_gate_val_loader", "berkeley_cache"],
+        "provide_payload": ["payload_bank", "payload_conditions", "payload_masks", "payload_bank_ready"],
+        "provide_gate_data": [
+            "berkeley_refresh_loader",
+            "berkeley_gate_val_loader",
+            "payload_validation_loader",
+            "payload_validation_dataset",
+            "payload_bank",
+        ],
+    }
+    resources = list(mapping.get(str(method_name or ""), []))
+    if resources:
+        return resources
+    label_text = str(label or "")
+    if label_text.startswith("provides:"):
+        return [label_text.split(":", 1)[1]]
+    return []
+
+
+def _apply_execution_layer_metadata(graph: PipelineGraph) -> None:
+    raw_edges = getattr(graph, "_edges", None)
+    if not isinstance(raw_edges, list):
+        return
+
+    for edge in raw_edges:
+        edge.layer = "execution"
+        edge.metadata = dict(getattr(edge, "metadata", {}) or {})
+        edge.metadata.setdefault("execution_layer", True)
+
+        if edge.on_traverse is not None:
+            method_name = getattr(getattr(edge.on_traverse, "__func__", edge.on_traverse), "__name__", "")
+            defaults = {
+                "consumer": str(edge.target_id),
+                "resources": _edge_provided_resources(method_name, edge.label),
+            }
+            if edge.condition_id:
+                defaults["condition_id"] = str(edge.condition_id)
+            edge.reaction = EdgeReactionSpec(
+                reaction_name="data.provide",
+                target_function=(f"DataNode.{method_name}" if method_name else "data.provide"),
+                defaults=defaults,
+                layer="execution",
+                metadata={
+                    "template": "data.provide",
+                    "source_node_id": str(edge.source_id),
+                    "target_node_id": str(edge.target_id),
+                },
+            )
+            continue
+
+        phase = str(edge.label or "flow")
+        defaults = {
+            "phase": phase,
+            "target_node_id": str(edge.target_id),
+        }
+        if edge.condition_id:
+            defaults["condition_id"] = str(edge.condition_id)
+        edge.reaction = EdgeReactionSpec(
+            reaction_name=_edge_schedule_reaction_name(phase),
+            target_function="scheduler.activate",
+            defaults=defaults,
+            layer="execution",
+            metadata={
+                "template": _edge_schedule_reaction_name(phase),
+                "source_node_id": str(edge.source_id),
+                "target_node_id": str(edge.target_id),
+            },
+        )
 
 
 def _node_icon(node_id: str) -> str:
@@ -437,6 +547,10 @@ def _build_plan_node_metadata(graph: PipelineGraph) -> dict:
             "icon": _node_icon(node_id),
             "config_id": _node_config_id(node_id),
             "group_id": _node_group_id(node_id),
+            "object_type": "object",
+            "faculty": _node_faculty(node_id),
+            "archetype": _node_archetype(node_id),
+            "layer": "execution",
             "metadata": {
                 "node_id": node_id,
                 "description": str(getattr(node, "description", "") or ""),
@@ -525,6 +639,7 @@ def build_training_graph_plan(args, output_dir: Path, *, graph: Optional[Pipelin
         worker_hints=worker_hints,
         metadata=metadata,
         node_metadata=_build_plan_node_metadata(graph),
+        graph_layers=_build_graph_layers(graph),
     )
 
 
@@ -1040,6 +1155,7 @@ def build_pipeline_graph(
     g.add_edge("gate_berkeley", "sync_gate_replica", label="end_of_round")
     g.add_edge("sync_gate_replica", "checkpoint_save", label="end_of_round")
 
+    _apply_execution_layer_metadata(g)
     return g
 
 
@@ -1140,6 +1256,7 @@ def run(args, output_dir: Path, initial_plan=None) -> None:
         )
         ctx.graph_plan = build_training_graph_plan(args, output_dir, graph=graph, cfg=cfg)
     ctx.plan_id = str(ctx.graph_plan.plan_id)
+    ctx.graph_layers = dict(getattr(ctx.graph_plan, "graph_layers", {}) or {})
     if ctx.graph_plan_path is not None:
         try:
             ctx.graph_plan.save_json(ctx.graph_plan_path)
@@ -1199,6 +1316,7 @@ def run(args, output_dir: Path, initial_plan=None) -> None:
                     graph = new_graph
                     ctx.graph_plan = apply_payload.plan
                     ctx.plan_id = str(apply_payload.plan.plan_id)
+                    ctx.graph_layers = dict(getattr(apply_payload.plan, "graph_layers", {}) or {})
                     if ctx.graph_plan_path is not None:
                         try:
                             apply_payload.plan.save_json(ctx.graph_plan_path)

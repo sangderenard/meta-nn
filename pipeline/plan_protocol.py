@@ -19,7 +19,7 @@ if TYPE_CHECKING:
     from pipeline.graph import PipelineGraph
 
 
-PLAN_SCHEMA_VERSION = 1
+PLAN_SCHEMA_VERSION = 2
 IPC_PROTOCOL_VERSION = 1
 
 DEFAULT_PLAN_FILENAME = "training_graph_plan.json"
@@ -101,6 +101,10 @@ class GraphNodeRecord:
     icon: str = ""
     config_id: str = ""
     group_id: str = ""
+    object_type: str = "object"
+    faculty: str = "other"
+    archetype: str = ""
+    layer: str = "execution"
     enabled: bool = True
     metadata: Dict[str, Any] = field(default_factory=dict)
 
@@ -112,6 +116,10 @@ class GraphNodeRecord:
             "icon": str(self.icon),
             "config_id": str(self.config_id),
             "group_id": str(self.group_id),
+            "object_type": str(self.object_type),
+            "faculty": str(self.faculty),
+            "archetype": str(self.archetype),
+            "layer": str(self.layer),
             "enabled": bool(self.enabled),
             "metadata": _jsonable(self.metadata),
         }
@@ -125,6 +133,10 @@ class GraphNodeRecord:
             icon=str(data.get("icon", "")),
             config_id=str(data.get("config_id", "")),
             group_id=str(data.get("group_id", "")),
+            object_type=str(data.get("object_type", "object")),
+            faculty=str(data.get("faculty", "other")),
+            archetype=str(data.get("archetype", "")),
+            layer=str(data.get("layer", "execution")),
             enabled=bool(data.get("enabled", True)),
             metadata=dict(data.get("metadata", {})),
         )
@@ -137,6 +149,10 @@ class GraphEdgeRecord:
     source_node_id: str
     target_node_id: str
     condition_id: str = ""
+    layer: str = "execution"
+    target_function: str = ""
+    reaction_name: str = ""
+    reaction_defaults: Dict[str, Any] = field(default_factory=dict)
     enabled: bool = True
     metadata: Dict[str, Any] = field(default_factory=dict)
 
@@ -147,6 +163,10 @@ class GraphEdgeRecord:
             "source_node_id": str(self.source_node_id),
             "target_node_id": str(self.target_node_id),
             "condition_id": str(self.condition_id),
+            "layer": str(self.layer),
+            "target_function": str(self.target_function),
+            "reaction_name": str(self.reaction_name),
+            "reaction_defaults": _jsonable(self.reaction_defaults),
             "enabled": bool(self.enabled),
             "metadata": _jsonable(self.metadata),
         }
@@ -159,6 +179,10 @@ class GraphEdgeRecord:
             source_node_id=str(data["source_node_id"]),
             target_node_id=str(data["target_node_id"]),
             condition_id=str(data.get("condition_id", "")),
+            layer=str(data.get("layer", "execution")),
+            target_function=str(data.get("target_function", "")),
+            reaction_name=str(data.get("reaction_name", "")),
+            reaction_defaults=dict(data.get("reaction_defaults", {})),
             enabled=bool(data.get("enabled", True)),
             metadata=dict(data.get("metadata", {})),
         )
@@ -207,6 +231,7 @@ class TrainingGraphPlan:
     config_blobs: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     condition_blobs: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     worker_hints: Dict[str, Any] = field(default_factory=dict)
+    graph_layers: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     layout: GraphLayoutRecord = field(default_factory=GraphLayoutRecord)
     metadata: Dict[str, Any] = field(default_factory=dict)
 
@@ -276,6 +301,7 @@ class TrainingGraphPlan:
             "config_blobs": _jsonable(self.config_blobs),
             "condition_blobs": _jsonable(self.condition_blobs),
             "worker_hints": _jsonable(self.worker_hints),
+            "graph_layers": _jsonable(self.graph_layers),
             "layout": self.layout.to_dict(),
             "metadata": _jsonable(self.metadata),
         }
@@ -301,6 +327,7 @@ class TrainingGraphPlan:
             config_blobs=dict(data.get("config_blobs", {})),
             condition_blobs=dict(data.get("condition_blobs", {})),
             worker_hints=dict(data.get("worker_hints", {})),
+            graph_layers=dict(data.get("graph_layers", {})),
             layout=GraphLayoutRecord.from_dict(dict(data.get("layout", {}))),
             metadata=dict(data.get("metadata", {})),
         )
@@ -754,6 +781,7 @@ def plan_from_pipeline_graph(
     worker_hints: Optional[Dict[str, Any]] = None,
     metadata: Optional[Dict[str, Any]] = None,
     node_metadata: Optional[Dict[str, Dict[str, Any]]] = None,
+    graph_layers: Optional[Dict[str, Any]] = None,
 ) -> TrainingGraphPlan:
     raw_nodes = getattr(graph, "nodes", None)
     raw_nodes = raw_nodes if isinstance(raw_nodes, dict) else getattr(graph, "_nodes", {})
@@ -764,7 +792,15 @@ def plan_from_pipeline_graph(
     node_meta_map = dict(node_metadata or {})
     for node_id, node in raw_nodes.items():
         meta = dict(node_meta_map.get(str(node_id), {}))
-        record_meta = dict(meta.get("metadata", {}))
+        runtime_shape = getattr(node, "runtime_shape", None)
+        if callable(runtime_shape):
+            try:
+                runtime_shape = runtime_shape()
+            except TypeError:
+                runtime_shape = getattr(node, "runtime_shape", None)
+        shape_metadata = dict(getattr(runtime_shape, "metadata", {}) or {})
+        record_meta = dict(shape_metadata)
+        record_meta.update(dict(meta.get("metadata", {})))
         record_meta.setdefault("description", str(getattr(node, "description", "") or ""))
         record_meta.setdefault("node_class", type(node).__name__)
         node_records.append(
@@ -775,6 +811,10 @@ def plan_from_pipeline_graph(
                 icon=str(meta.get("icon", "")),
                 config_id=str(meta.get("config_id", "")),
                 group_id=str(meta.get("group_id", "other")),
+                object_type=str(meta.get("object_type", getattr(runtime_shape, "object_type", "object"))),
+                faculty=str(meta.get("faculty", getattr(runtime_shape, "faculty", "other"))),
+                archetype=str(meta.get("archetype", getattr(runtime_shape, "archetype", type(node).__name__))),
+                layer=str(meta.get("layer", getattr(runtime_shape, "layer", "execution"))),
                 enabled=bool(meta.get("enabled", True)),
                 metadata=_jsonable(record_meta),
             )
@@ -789,25 +829,49 @@ def plan_from_pipeline_graph(
         condition_id = str(getattr(edge, "condition_id", "") or "")
         pair_key = (source_id, target_id)
         pair_counts[pair_key] += 1
+
+        reaction = getattr(edge, "reaction", None)
+        reaction_defaults = dict(getattr(reaction, "defaults", {}) or {})
+        serialized_defaults = _jsonable(reaction_defaults)
+        if not isinstance(serialized_defaults, dict):
+            serialized_defaults = {"value": serialized_defaults}
+
+        record_meta = dict(getattr(reaction, "metadata", {}) or {})
+        record_meta.update(dict(getattr(edge, "metadata", {}) or {}))
+        record_meta.update(
+            _clean_dict(
+                {
+                    "label": str(getattr(edge, "label", "") or ""),
+                    "condition_callable": getattr(getattr(edge, "condition", None), "__name__", ""),
+                }
+            )
+        )
+
         edge_records.append(
             GraphEdgeRecord(
-                edge_id=_edge_identity(source_id, target_id, kind, condition_id, pair_counts[pair_key]),
+                edge_id=str(
+                    getattr(edge, "edge_id", "")
+                    or _edge_identity(source_id, target_id, kind, condition_id, pair_counts[pair_key])
+                ),
                 kind=kind,
                 source_node_id=source_id,
                 target_node_id=target_id,
                 condition_id=condition_id,
-                enabled=True,
-                metadata=_clean_dict(
-                    {
-                        "label": str(getattr(edge, "label", "") or ""),
-                        "condition_callable": getattr(getattr(edge, "condition", None), "__name__", ""),
-                    }
+                layer=str(getattr(edge, "layer", getattr(reaction, "layer", "execution")) or "execution"),
+                target_function=str(
+                    getattr(reaction, "target_function", "")
+                    or getattr(getattr(edge, "on_traverse", None), "__name__", "")
                 ),
+                reaction_name=str(getattr(reaction, "reaction_name", "") or kind or "flow"),
+                reaction_defaults=serialized_defaults,
+                enabled=True,
+                metadata=_jsonable(record_meta),
             )
         )
 
     serialized_configs = serialize_config_blobs(dict(config_blobs or {}))
     serialized_conditions = serialize_config_blobs(dict(condition_blobs or {}))
+    serialized_layers = _jsonable(dict(graph_layers or {}))
     plan_name = str(name or getattr(graph, "name", "Training Graph"))
     plan_digest = _stable_digest(
         {
@@ -816,6 +880,7 @@ def plan_from_pipeline_graph(
             "edges": [edge.to_dict() for edge in edge_records],
             "configs": serialized_configs,
             "conditions": serialized_conditions,
+            "layers": serialized_layers,
         }
     )
     plan_id = f"{str(getattr(graph, 'name', 'graph')).strip() or 'graph'}:{plan_digest}"
@@ -830,6 +895,7 @@ def plan_from_pipeline_graph(
         config_blobs=serialized_configs,
         condition_blobs=serialized_conditions,
         worker_hints=_jsonable(dict(worker_hints or {})),
+        graph_layers=serialized_layers,
         layout=build_layout_from_records(node_records, edge_records),
         metadata=_jsonable(dict(metadata or {})),
     )

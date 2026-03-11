@@ -5,6 +5,8 @@
 
 ## 1. Graph Execution Model
 
+This document describes the **execution layer** of the graph. Provenance edges and Nodus-style stack views are separate future layers; they should be projected from this layer, not collapsed into it.
+
 ### Edge-Driven Data Provision
 
 The pipeline graph executor fires `PipelineEdge.on_traverse(ctx)` for every **active** incoming

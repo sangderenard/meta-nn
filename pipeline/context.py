@@ -202,6 +202,8 @@ class PipelineContext:
     total_rounds_completed: int = 0
     vocab_rotation_cycle: int = 0
     last_node_statuses: Dict[str, str] = field(default_factory=dict)
+    edge_reaction_overrides: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    graph_layers: Dict[str, Dict[str, Any]] = field(default_factory=dict)
 
     # ---- orchestration configuration (plan-driven) ----------------------
     # These mirror the top-level CLI flags; stored here so nodes can read
