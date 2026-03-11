@@ -55,6 +55,7 @@ from pipeline.nodes.base import (
 )
 import gc
 import math
+import re
 import time
 import numpy as np
 
@@ -636,14 +637,16 @@ def _run_berkeley_refresh_epochs(
     loader: DataLoader,
     device: torch.device,
     epochs: int,
-    lr: float,
-    weight_decay: float,
-    max_steps: int,
-    min_steps: int,
-    lr_sine_cycles: float,
-    lr_sine_frequency: float,
-    lr_sine_tail_fraction: float,
-    lr_sine_min_scale: float,
+    optimizer: torch.optim.Optimizer,
+    grad_scaler: Any,
+    stage_label: str,
+    args: Any,
+    max_steps: int = 0,
+    min_steps: int = 0,
+    lr_sine_cycles: float = 1.0,
+    lr_sine_frequency: float = 0.0,
+    lr_sine_tail_fraction: float = 0.15,
+    lr_sine_min_scale: float = 0.0,
     amp_enabled: bool = False,
     amp_dtype: str = "float16",
     channels_last: bool = False,
@@ -691,9 +694,9 @@ def _run_berkeley_refresh_epochs(
                 _log("[berkeley-refresh] disabled cudnn benchmark for refresh stage to avoid one-sample workspace spikes")
         except Exception:
             restore_cudnn_benchmark = None
-    amp_dtype_t = _resolve_amp_dtype(amp_dtype) if amp_enabled else torch.float16
+    amp_dtype_t = resolve_amp_dtype(amp_dtype) if amp_enabled else torch.float16
     use_scaler = bool(amp_enabled and device.type == "cuda" and amp_dtype_t == torch.float16)
-    scaler = _make_grad_scaler(enabled=use_scaler)
+    scaler = grad_scaler
     grad_accum_steps = max(1, int(grad_accum_steps))
     mode_key = re.sub(r"\s+", "_", str(semantic_mask_supervision_mode)).strip().lower()
     use_cache = (
@@ -716,7 +719,7 @@ def _run_berkeley_refresh_epochs(
     knockout_rng = np.random.default_rng(max(0, int(target_label_knockout_seed)))
     knockout_rows_applied = 0
     knockout_labels_dropped = 0
-    opt = torch.optim.AdamW(classifier.parameters(), lr=float(lr), weight_decay=float(weight_decay))
+    opt = optimizer
     min_steps = max(0, int(min_steps))
     if use_cache:
         cache_n = int(cache_x.shape[0])
@@ -855,7 +858,7 @@ def _run_berkeley_refresh_epochs(
                                 knockout_labels_dropped += int(labels_drop)
                             if bool(runtime_channels_last) and xb_part.device == device:
                                 xb_part = xb_part.contiguous(memory_format=torch.channels_last)
-                            with _autocast_context(device=device, enabled=amp_enabled, amp_dtype_t=amp_dtype_t):
+                            with autocast_context(device=device, enabled=amp_enabled, amp_dtype=amp_dtype_t):
                                 out = _forward_classifier_outputs_require_mask(
                                     classifier=classifier,
                                     xb=xb_part,
@@ -1114,9 +1117,9 @@ def _run_fake_class_refresh_epochs(
             ),
         }
 
-    amp_dtype_t = _resolve_amp_dtype(amp_dtype) if amp_enabled else torch.float16
+    amp_dtype_t = resolve_amp_dtype(amp_dtype) if amp_enabled else torch.float16
     use_scaler = bool(amp_enabled and device.type == "cuda" and amp_dtype_t == torch.float16)
-    scaler = _make_grad_scaler(enabled=use_scaler)
+    scaler = make_grad_scaler(enabled=use_scaler)
     grad_accum_steps = max(1, int(grad_accum_steps))
     n_steps = max(1, int(steps_per_epoch))
     updates_per_epoch = int(math.ceil(float(n_steps) / float(grad_accum_steps)))
@@ -1178,15 +1181,15 @@ def _run_fake_class_refresh_epochs(
             cond = cond_bank.index_select(0, idx_t).to(device=device, dtype=torch.float32)
             z = torch.randn((int(cond.shape[0]), max(8, int(z_dim))), device=device)
             with torch.no_grad():
-                with _autocast_context(device=device, enabled=amp_enabled, amp_dtype_t=amp_dtype_t):
+                with autocast_context(device=device, enabled=amp_enabled, amp_dtype=amp_dtype_t):
                     xb = generator(z, cond).to(torch.float32)
                 disc_logits = None
                 if discriminator is not None:
-                    with _autocast_context(device=device, enabled=amp_enabled, amp_dtype_t=amp_dtype_t):
+                    with autocast_context(device=device, enabled=amp_enabled, amp_dtype=amp_dtype_t):
                         disc_logits = discriminator(xb, cond).to(torch.float32)
             if channels_last:
                 xb = xb.contiguous(memory_format=torch.channels_last)
-            with _autocast_context(device=device, enabled=amp_enabled, amp_dtype_t=amp_dtype_t):
+            with autocast_context(device=device, enabled=amp_enabled, amp_dtype=amp_dtype_t):
                 feat = classifier.extract_features(xb)
                 z_norm = classifier.encode_semantic_from_features(feat)
                 fake_cos = torch.sum(z_norm * fake_vec.unsqueeze(0).to(device=z_norm.device, dtype=z_norm.dtype), dim=1)

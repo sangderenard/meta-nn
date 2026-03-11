@@ -17,6 +17,23 @@ import argparse
 import math
 import time
 from pathlib import Path
+from multiprocessing.connection import Client
+
+
+def _probe_existing_viewer(port_file: Path) -> bool:
+    """Return True when an existing standalone GUI is reachable via the port file."""
+    try:
+        if not port_file.exists():
+            return False
+        raw = port_file.read_text(encoding="utf-8").strip()
+        if not raw:
+            return False
+        port = int(raw)
+        conn = Client(("localhost", port), family="AF_INET", authkey=b"nodus_viewer_v1")
+        conn.close()
+        return True
+    except Exception:
+        return False
 
 
 def _load_history(viewer, out_dir: Path) -> None:
@@ -197,12 +214,18 @@ def main():
                         help="Write the actual IPC port number to this file")
     args = parser.parse_args()
 
-    # Import viewer after arg parse so the window opens as fast as possible
-    from wav_ml_viewer import _TransformerStatusOpenGLViewer, ViewerIPCServer
-
     image_hw = (int(args.image_size), int(args.image_size))
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+    port_file = Path(args.port_file) if args.port_file else (out_dir / ".viewer_port")
+
+    # Refuse to launch a duplicate GUI when an existing viewer is already reachable.
+    if _probe_existing_viewer(port_file):
+        print(f"[gui] existing viewer detected via {port_file}; skipping duplicate launch", flush=True)
+        return
+
+    # Import viewer after arg parse so the window opens as fast as possible
+    from wav_ml_viewer import _TransformerStatusOpenGLViewer, ViewerIPCServer
 
     viewer = _TransformerStatusOpenGLViewer(
         enabled=True,
@@ -215,8 +238,7 @@ def main():
     _load_history(viewer, out_dir)
 
     # Start IPC server for training processes to connect
-    port_file = args.port_file or str(out_dir / ".viewer_port")
-    server = ViewerIPCServer(viewer, port=int(args.port), port_file=port_file)
+    server = ViewerIPCServer(viewer, port=int(args.port), port_file=str(port_file))
     server.start()
 
     print("[gui] viewer ready, waiting for training process...", flush=True)
@@ -236,9 +258,8 @@ def main():
         viewer.close()
         # Clean up port file
         try:
-            pf = Path(port_file)
-            if pf.exists():
-                pf.unlink()
+            if port_file.exists():
+                port_file.unlink()
         except Exception:
             pass
 

@@ -489,7 +489,15 @@ if not exist "%GUI_SCRIPT%" (
   echo [launcher] standalone GUI script not found: %GUI_SCRIPT%
   exit /b 0
 )
-if exist "%VIEWER_PORT_FILE%" del /f /q "%VIEWER_PORT_FILE%" >nul 2>&1
+if exist "%VIEWER_PORT_FILE%" (
+  call :probe_gui_ipc
+  if "!ERRORLEVEL!"=="0" (
+    echo [launcher] existing standalone GUI already reachable; skipping duplicate launch.
+    exit /b 0
+  )
+  echo [launcher] stale GUI port file detected before launch; removing stale file.
+  del /f /q "%VIEWER_PORT_FILE%" >nul 2>&1
+)
 echo [launcher] launching standalone GUI...
 start "nodus-viewer" /B %PYTHON% %GUI_SCRIPT% ^
   --output-dir "%OUTPUT_DIR%" ^

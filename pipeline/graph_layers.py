@@ -521,9 +521,14 @@ def _build_execution_program_from_specs(
     previous_step_id = ""
     transition_ordinal = 1
 
-    for node_id in sequence:
+    for idx, node_id in enumerate(sequence):
         step_id = node_step_ids[str(node_id)]
         node_step = step_map[step_id]
+        next_step_id = (
+            node_step_ids[str(sequence[idx + 1])]
+            if (idx + 1) < len(sequence)
+            else hold_step_id
+        )
         if not previous_step_id:
             previous_step_id = step_id
             continue
@@ -578,7 +583,7 @@ def _build_execution_program_from_specs(
                     "transition_id": f"transition_{transition_ordinal:03d}_hold",
                     "ordinal": int(transition_ordinal),
                     "from_step_id": decision_step_id,
-                    "to_step_id": hold_step_id,
+                    "to_step_id": next_step_id,
                     "label": f"{transition_ordinal}.0",
                     "kind": "branch",
                     "branch": "hold",

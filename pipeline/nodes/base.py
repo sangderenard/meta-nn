@@ -158,11 +158,16 @@ class TrainableModelNode(GatedNode):
 # AMP helpers (shared by all training nodes)
 # ---------------------------------------------------------------------------
 
-def resolve_amp_dtype(amp_dtype_str: str) -> torch.dtype:
+def resolve_amp_dtype(amp_dtype_str: Any) -> torch.dtype:
+    if isinstance(amp_dtype_str, torch.dtype):
+        if amp_dtype_str in (torch.float16, torch.bfloat16):
+            return amp_dtype_str
+        raise ValueError(f"Unsupported amp dtype: {amp_dtype_str!r}")
+
     key = str(amp_dtype_str).strip().lower()
-    if key in ("fp16", "float16", "half"):
+    if key in ("fp16", "float16", "half", "torch.float16"):
         return torch.float16
-    if key in ("bf16", "bfloat16"):
+    if key in ("bf16", "bfloat16", "torch.bfloat16"):
         return torch.bfloat16
     raise ValueError(f"Unsupported amp dtype: {amp_dtype_str!r}")
 
