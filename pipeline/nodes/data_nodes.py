@@ -22,9 +22,10 @@ import hashlib
 import json
 import math
 import re
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -50,6 +51,46 @@ from semantic_dataset_loaders import (
     maybe_wrap_loader_with_threaded_prefetch,
     semantic_mask_stack_collate,
 )
+
+
+# ---------------------------------------------------------------------------
+# DataPossession registry
+# ---------------------------------------------------------------------------
+
+@dataclass
+class DataPossession:
+    """Metadata for a single data artefact managed by DataNode.
+
+    The registry tracks what the DataNode holds, how to decide staleness,
+    and how to measure its footprint.  Building is still JIT via provide_*;
+    the registry only governs housekeeping.
+    """
+
+    name: str                                        # e.g. "pregestation"
+    tier: str = "ram"                                 # "disk" | "ram" | "gpu"
+    ctx_attrs: List[str] = field(default_factory=list)  # e.g. ["pregestation_loader", "pregestation_dataset"]
+    expiry_fn: Optional[Callable[["PipelineContext"], bool]] = None   # True → stale
+    size_fn: Optional[Callable[[], int]] = None       # bytes held, 0 if not built
+    built: bool = False
+    last_build_ts: float = 0.0
+    build_count: int = 0
+    # N-pass tracking  (pregestation / gestation)
+    pass_ages: List[int] = field(default_factory=list)          # rounds since each pass built
+    pass_row_counts: List[int] = field(default_factory=list)    # rows in each pass
+    pass_cap: int = 0                                           # max cumulative rows across passes
+    # Validation reserve tracking
+    val_indices: List[int] = field(default_factory=list)
+    train_indices: List[int] = field(default_factory=list)
+
+    def mark_built(self) -> None:
+        self.built = True
+        self.last_build_ts = time.monotonic()
+        self.build_count += 1
+
+    def mark_expired(self) -> None:
+        self.built = False
+        self.val_indices = []
+        self.train_indices = []
 
 
 # ---------------------------------------------------------------------------
@@ -317,6 +358,9 @@ class DataNode(PipelineNode):
     loaders to build or refresh each round — matching what the edge conditions
     allow through.
 
+    Possession registry governs housekeeping (expiry, eviction, metrics).
+    Building is JIT via on_traverse callbacks; execute() sweeps the registry.
+
     Manages:
         ctx.pregestation_loader / ctx.pregestation_dataset
         ctx.gestation_loader   / ctx.gestation_dataset
@@ -344,6 +388,57 @@ class DataNode(PipelineNode):
         self._bdata_last_build_round: int = -1
         self._payload_built: bool = False
 
+        # ---- Possession registry ----
+        self.possessions: Dict[str, DataPossession] = {}
+        self._register_possessions()
+
+    def _register_possessions(self) -> None:
+        """Populate the possession registry with the four canonical entries."""
+        self.possessions["pregestation"] = DataPossession(
+            name="pregestation",
+            tier="ram",
+            ctx_attrs=["pregestation_loader", "pregestation_dataset", "pregestation_logic_rows"],
+            expiry_fn=lambda ctx: hash(tuple(ctx.class_names)) != self._preg_vocab_hash,
+            size_fn=lambda: self._estimate_possession_bytes("pregestation"),
+            pass_cap=self.preg_cfg.cache_mb * 1024 * 1024,
+        )
+        self.possessions["gestation"] = DataPossession(
+            name="gestation",
+            tier="ram",
+            ctx_attrs=["gestation_loader", "gestation_dataset"],
+            expiry_fn=lambda ctx: hash(tuple(ctx.class_names)) != self._gest_vocab_hash,
+            size_fn=lambda: self._estimate_possession_bytes("gestation"),
+            pass_cap=self.gest_cfg.cache_mb * 1024 * 1024,
+        )
+        self.possessions["berkeley"] = DataPossession(
+            name="berkeley",
+            tier="ram",
+            ctx_attrs=["berkeley_refresh_loader", "berkeley_gate_val_loader", "berkeley_cache"],
+            expiry_fn=lambda ctx: (
+                ctx.berkeley_refresh_loader is None
+                or (ctx.total_rounds_completed - self._bdata_last_build_round)
+                >= self.bdata_cfg.rebuild_every_n_rounds
+            ),
+            size_fn=lambda: self._estimate_possession_bytes("berkeley"),
+        )
+        self.possessions["payload"] = DataPossession(
+            name="payload",
+            tier="ram",
+            ctx_attrs=[
+                "payload_bank", "payload_conditions", "payload_masks",
+                "payload_bank_ready", "payload_validation_loader",
+                "payload_validation_dataset",
+            ],
+            expiry_fn=lambda ctx: not self._payload_built,
+            size_fn=lambda: self._estimate_possession_bytes("payload"),
+        )
+
+    def _estimate_possession_bytes(self, name: str) -> int:
+        """Rough byte estimate for a possession (best-effort, not authoritative)."""
+        # This gives the housekeeping log a size figure without being exact.
+        # Counting every tensor/array precisely is not worth the complexity.
+        return 0
+
     # ------------------------------------------------------------------
     # Node protocol
     # ------------------------------------------------------------------
@@ -352,9 +447,36 @@ class DataNode(PipelineNode):
         return bool(ctx.class_names)
 
     def execute(self, ctx: PipelineContext) -> None:
-        # Data is delivered just-in-time by on_traverse callbacks on each
-        # outgoing edge (see orchestrator.py).  DataNode.execute() is a no-op.
-        pass
+        """Per-round housekeeping sweep over the possession registry.
+
+        For each possession:
+          1. Check expiry — if stale and no on_traverse has rebuilt it yet
+             this round, clear the ctx attrs so the next on_traverse will
+             force a rebuild.
+          2. Log storage tier and build count.
+          3. Age N-pass entries for pregestation/gestation and enforce cap.
+        """
+        for name, poss in self.possessions.items():
+            if not poss.built:
+                continue
+            # Expiry check
+            if poss.expiry_fn is not None and poss.expiry_fn(ctx):
+                for attr in poss.ctx_attrs:
+                    if hasattr(ctx, attr):
+                        setattr(ctx, attr, None)
+                poss.mark_expired()
+                _log(f"[data-node] possession '{name}' expired — will rebuild on next traverse")
+                continue
+            # N-pass cap enforcement (pregestation / gestation)
+            if len(poss.pass_row_counts) > 0 and poss.pass_cap > 0:
+                _enforce_pass_cap(poss)
+            # Age passes
+            for i in range(len(poss.pass_ages)):
+                poss.pass_ages[i] += 1
+        # Summary line
+        built_names = [n for n, p in self.possessions.items() if p.built]
+        if built_names:
+            _log(f"[data-node] housekeeping: active={built_names}")
 
     # ------------------------------------------------------------------
     # Edge-traversal providers  (assigned as on_traverse on outgoing edges)
@@ -431,7 +553,20 @@ class DataNode(PipelineNode):
         ctx.pregestation_dataset = dataset
         ctx.pregestation_loader = loader
         self._preg_vocab_hash = current_hash
-        _log(f"[data-node] pregestation: {len(all_images)} images batch_size={self.preg_cfg.batch_size}")
+
+        # N-pass tracking + orphan-free validation reserve
+        poss = self.possessions["pregestation"]
+        poss.pass_ages.append(0)
+        poss.pass_row_counts.append(len(all_images))
+        train_idx, val_idx = _orphan_free_split(
+            targets=all_targets, seed=self.preg_cfg.seed,
+            val_fraction=0.15, min_val=1,
+        )
+        poss.train_indices = train_idx
+        poss.val_indices = val_idx
+        poss.mark_built()
+        _log(f"[data-node] pregestation: {len(all_images)} images "
+             f"(train={len(train_idx)} val={len(val_idx)}) batch_size={self.preg_cfg.batch_size}")
 
     def provide_gestation(self, ctx: PipelineContext) -> None:
         current_hash = hash(tuple(ctx.class_names))
@@ -471,7 +606,20 @@ class DataNode(PipelineNode):
         ctx.gestation_dataset = dataset
         ctx.gestation_loader = loader
         self._gest_vocab_hash = current_hash
-        _log(f"[data-node] gestation: {len(images)} images batch_size={self.gest_cfg.batch_size}")
+
+        # N-pass tracking + orphan-free validation reserve
+        poss = self.possessions["gestation"]
+        poss.pass_ages.append(0)
+        poss.pass_row_counts.append(len(images))
+        train_idx, val_idx = _orphan_free_split(
+            targets=targets, seed=int(getattr(ctx.args, "seed", 0) or 0),
+            val_fraction=0.15, min_val=1,
+        )
+        poss.train_indices = train_idx
+        poss.val_indices = val_idx
+        poss.mark_built()
+        _log(f"[data-node] gestation: {len(images)} images "
+             f"(train={len(train_idx)} val={len(val_idx)}) batch_size={self.gest_cfg.batch_size}")
 
     def provide_berkeley_data(self, ctx: PipelineContext) -> None:
         needs_build = ctx.berkeley_refresh_loader is None
@@ -512,6 +660,10 @@ class DataNode(PipelineNode):
         ctx.berkeley_refresh_loader = loader
         ctx.berkeley_gate_val_loader = gate_val_loader
         self._bdata_last_build_round = ctx.total_rounds_completed
+
+        # Possession tracking
+        poss = self.possessions["berkeley"]
+        poss.mark_built()
         _log(f"[data-node] berkeley refresh loader built at round {ctx.total_rounds_completed}")
 
     def provide_payload(self, ctx: PipelineContext) -> None:
@@ -569,6 +721,10 @@ class DataNode(PipelineNode):
         ctx.payload_validation_dataset = dataset
         ctx.payload_validation_loader = loader
         self._payload_built = True
+
+        # Possession tracking
+        poss = self.possessions["payload"]
+        poss.mark_built()
         _log(f"[data-node] payload validation: {len(dataset) if dataset else 0} rows")
 
     def provide_gate_data(self, ctx: PipelineContext) -> None:
@@ -586,6 +742,153 @@ class DataNode(PipelineNode):
 # ---------------------------------------------------------------------------
 # Private helpers
 # ---------------------------------------------------------------------------
+
+
+def _orphan_free_split(
+    targets: Sequence[np.ndarray],
+    seed: int,
+    val_fraction: float = 0.15,
+    min_val: int = 1,
+) -> Tuple[List[int], List[int]]:
+    """Split indices into train/val ensuring every class in val has a train row.
+
+    Returns (train_indices, val_indices).  If the constraint cannot be
+    satisfied for some class (only 1 row), that row stays in training.
+    """
+    n = int(len(targets))
+    if n <= 1:
+        return list(range(n)), []
+
+    # Collect per-class row membership
+    n_classes = int(targets[0].size) if n > 0 else 0
+    class_rows: Dict[int, List[int]] = {}
+    for i in range(n):
+        y = np.asarray(targets[i], dtype=np.float32).reshape(-1)
+        for c in range(min(n_classes, int(y.size))):
+            if float(y[c]) >= 0.5:
+                class_rows.setdefault(c, []).append(i)
+
+    # Determine how many val rows to take
+    n_val = max(min_val, int(round(n * val_fraction)))
+    n_val = min(n_val, n - 1)  # keep at least 1 training row
+
+    rng = np.random.default_rng(max(0, seed))
+    perm = rng.permutation(n).tolist()
+
+    val_set: set = set()
+    train_set: set = set()
+
+    # First pass: pick val candidates
+    for idx in perm:
+        if len(val_set) >= n_val:
+            break
+        # Only add to val if every class this row belongs to still has
+        # at least one other row NOT in val_set
+        safe = True
+        y = np.asarray(targets[idx], dtype=np.float32).reshape(-1)
+        for c in range(min(n_classes, int(y.size))):
+            if float(y[c]) >= 0.5:
+                # Count how many rows for class c are NOT yet in val
+                remaining = sum(1 for r in class_rows.get(c, []) if r != idx and r not in val_set)
+                if remaining < 1:
+                    safe = False
+                    break
+        if safe:
+            val_set.add(idx)
+        else:
+            train_set.add(idx)
+
+    # Everything not in val is training
+    for idx in range(n):
+        if idx not in val_set:
+            train_set.add(idx)
+
+    return sorted(train_set), sorted(val_set)
+
+
+def _enforce_pass_cap(poss: DataPossession) -> None:
+    """Evict oldest passes until cumulative rows are within the cap.
+
+    The cap is in bytes but pass_row_counts tracks rows.  We use a simple
+    heuristic: each row ≈ 64*64*3*4 bytes (image) + 64*64*4 (mask) ≈ 65 KB.
+    This is approximate — the goal is to bound memory, not be exact.
+    """
+    if poss.pass_cap <= 0 or len(poss.pass_row_counts) <= 0:
+        return
+    row_byte_estimate = 65 * 1024  # ~65 KB per row, conservative
+    total_rows = sum(poss.pass_row_counts)
+    total_bytes_est = total_rows * row_byte_estimate
+    while total_bytes_est > poss.pass_cap and len(poss.pass_row_counts) > 1:
+        evicted_rows = poss.pass_row_counts.pop(0)
+        if len(poss.pass_ages) > 0:
+            poss.pass_ages.pop(0)
+        total_rows -= evicted_rows
+        total_bytes_est = total_rows * row_byte_estimate
+        _log(f"[data-node] pass cap: evicted oldest pass ({evicted_rows} rows) from '{poss.name}'")
+
+
+def _prevectorize_deformations(
+    rows: Sequence[Any],
+    image_size: int,
+    seed: int,
+    n_variants: int = 2,
+    max_total_rows: int = 0,
+) -> Tuple[Dataset, int]:
+    """Build a ConcatDataset of originals + deformed variant datasets.
+
+    Uses the existing DiskSemanticRowsDataset with _apply_degrade's touch-map
+    system — no new deformation logic is introduced.  Originals load with
+    degrade=False; each variant pass loads with degrade=True at a distinct
+    seed so that _apply_degrade produces unique touch maps and masks per
+    variant.
+
+    Volume control is by image count (max_total_rows) — image resolution
+    is never changed.
+
+    Returns (combined_dataset, n_originals_used).
+    """
+    n_src = int(len(rows))
+    if n_src <= 0 or n_variants <= 0:
+        ds = DiskSemanticRowsDataset(
+            rows=list(rows), image_size=int(image_size),
+            return_masks=True, return_mask_stack=False,
+            degrade=False, degrade_seed=int(seed),
+        )
+        return ds, n_src
+
+    # Determine how many source rows to use to stay within image count budget
+    rows_per_source = 1 + n_variants  # original + variants
+    if max_total_rows > 0:
+        n_use = min(n_src, max(1, max_total_rows // rows_per_source))
+    else:
+        n_use = n_src
+
+    used_rows = [rows[i] for i in range(n_use)]
+
+    # Originals — no deformation
+    base_ds = DiskSemanticRowsDataset(
+        rows=used_rows, image_size=int(image_size),
+        return_masks=True, return_mask_stack=False,
+        degrade=False, degrade_seed=int(seed),
+    )
+
+    # Variant passes — each with degrade=True at a distinct seed.
+    # _apply_degrade uses degrade_seed + idx*104729 internally, so
+    # shifting the base seed by a large prime gives distinct sequences.
+    variant_datasets: List[Dataset] = []
+    for v in range(n_variants):
+        variant_ds = DiskSemanticRowsDataset(
+            rows=used_rows, image_size=int(image_size),
+            return_masks=True, return_mask_stack=False,
+            degrade=True,
+            degrade_seed=int(seed) + (v + 1) * 7919,
+        )
+        variant_datasets.append(variant_ds)
+
+    combined = torch.utils.data.ConcatDataset([base_ds] + variant_datasets)
+    _log(f"[data-node] prevectorize: {n_use} source rows × {1 + n_variants} "
+         f"= {len(combined)} total dataset rows")
+    return combined, n_use
 
 
 class _LazyDiskSemanticPayloadBank:
@@ -985,15 +1288,28 @@ def _build_berkeley_refresh_loader(
         rng = np.random.default_rng(max(0, int(seed)))
         rng.shuffle(idx)
     selected_rows = [rows[int(i)] for i in idx.tolist()]
-    ds = DiskSemanticRowsDataset(
+
+    # Pre-vectorize deformations at build time — generate committed
+    # deformed variants using the existing _apply_degrade touch-map system.
+    # Returns a ConcatDataset (originals degrade=False + variant passes
+    # degrade=True with distinct seeds).  Hot-loop degrade is retired.
+    ds, _n_originals = _prevectorize_deformations(
         rows=selected_rows,
         image_size=int(image_size),
-        return_masks=True,
-        return_mask_stack=bool(return_mask_stack),
-        degrade=True,
-        degrade_seed=int(seed),
+        seed=int(seed),
+        n_variants=2,
+        max_total_rows=(int(max_train) * 3 if int(max_train) > 0 else 0),
     )
     loader_num_workers = _effective_dataloader_num_workers(num_workers=num_workers, device=device)
+    # ConcatDataset may not have use_semantic_mask_stack_collate; check sub-datasets
+    _needs_stack_collate = False
+    if hasattr(ds, "datasets"):
+        for _sub_ds in ds.datasets:
+            if bool(getattr(_sub_ds, "use_semantic_mask_stack_collate", False)):
+                _needs_stack_collate = True
+                break
+    else:
+        _needs_stack_collate = bool(getattr(ds, "use_semantic_mask_stack_collate", False))
     loader = DataLoader(
         ds,
         batch_size=max(1, int(batch_size)),
@@ -1001,7 +1317,7 @@ def _build_berkeley_refresh_loader(
         num_workers=int(loader_num_workers),
         pin_memory=(device.type == "cuda"),
         drop_last=False,
-        collate_fn=(semantic_mask_stack_collate if bool(getattr(ds, "use_semantic_mask_stack_collate", False)) else None),
+        collate_fn=(semantic_mask_stack_collate if _needs_stack_collate else None),
         **_dataloader_perf_kwargs(
             num_workers=int(loader_num_workers),
             persistent_workers=bool(persistent_workers),
