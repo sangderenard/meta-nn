@@ -53,7 +53,7 @@ def main() -> None:
     original_argv = list(sys.argv)
     try:
         sys.argv = list(passthrough_argv)
-        from wav_config_transformer_pipeline import parse_args
+        from pipeline.cli import parse_args
         args = parse_args()
     except SystemExit:
         raise

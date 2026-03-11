@@ -501,7 +501,7 @@ goto wait_for_gui_port
 :run_pipeline
 set "RUN_SEED=%~1"
 set "RUN_EXTRA_ARG=%~2"
-%PYTHON% %SCRIPT% ^
+%PYTHON% %GRAPH_SCRIPT% ^
   --objective-mode berkeley_multilabel ^
   --output-dir "%OUTPUT_DIR%" %RESUME_ARG% ^
   --checkpoint-every-round %CHECKPOINT_EVERY_ROUND% %CKPT_SEGMENT_ARG% ^
