@@ -18,6 +18,8 @@ README_EXECUTION_START = "<!-- BEGIN:GENERATED_EXECUTION_LAYER -->"
 README_EXECUTION_END = "<!-- END:GENERATED_EXECUTION_LAYER -->"
 README_INFERENCE_START = "<!-- BEGIN:GENERATED_INFERENCE_LAYER -->"
 README_INFERENCE_END = "<!-- END:GENERATED_INFERENCE_LAYER -->"
+README_STACK_VIEW_START = "<!-- BEGIN:GENERATED_STACK_VIEW_LAYER -->"
+README_STACK_VIEW_END = "<!-- END:GENERATED_STACK_VIEW_LAYER -->"
 
 NODE_STYLE_MAP: Dict[str, Dict[str, str]] = {
     "bootstrap": {"fill": "#E9F1F7", "stroke": "#4B6B88", "color": "#102A43"},
@@ -99,6 +101,18 @@ def _layer_edge(
 def build_graph_layers(graph: PipelineGraph) -> Dict[str, Dict[str, Any]]:
     execution_layer = _build_execution_layer(graph)
     execution_program = build_execution_program(graph)
+    from pipeline.plan_protocol import plan_from_pipeline_graph as _export_plan
+    _plan = _export_plan(graph, graph_layers={}, execution_program=execution_program)
+    execution_nodes = [
+        n for n in list(getattr(_plan, "nodes", []) or [])
+        if bool(getattr(n, "enabled", True))
+        and str(getattr(n, "layer", "execution") or "execution") == "execution"
+    ]
+    execution_edges = [
+        e for e in list(getattr(_plan, "edges", []) or [])
+        if bool(getattr(e, "enabled", True))
+        and str(getattr(e, "layer", "execution") or "execution") == "execution"
+    ]
     return {
         "execution": execution_layer,
         "execution_overlay": build_execution_overlay_layer(execution_layer, execution_program),
@@ -112,15 +126,7 @@ def build_graph_layers(graph: PipelineGraph) -> Dict[str, Dict[str, Any]]:
             "nodes": [],
             "edges": [],
         },
-        "stack_view": {
-            "layer_id": "stack_view",
-            "label": "Operations stack view",
-            "description": "Reserved layer for Nodus-style stack rendering, sub-node ports, and dependency-timed ticks.",
-            "status": "planned",
-            "mermaid_direction": "LR",
-            "nodes": [],
-            "edges": [],
-        },
+        "stack_view": _build_stack_view_layer(execution_nodes, execution_edges),
     }
 
 
@@ -134,6 +140,11 @@ def build_execution_layer_from_records(
     for node in nodes:
         metadata = dict(node.metadata or {})
         faculty = str(node.faculty or node.group_id or "other")
+        subnodes_info = [
+            {"subnode_id": sn.subnode_id, "kind": sn.kind, "label": sn.label}
+            for sn in (getattr(node, "subnodes", None) or [])
+            if getattr(sn, "enabled", True)
+        ]
         layer_nodes.append(
             _layer_node(
                 node.node_id,
@@ -147,6 +158,7 @@ def build_execution_layer_from_records(
                     "node_id": str(node.node_id),
                     "class_name": str(node.kind or ""),
                     "description": str(metadata.get("description", "") or ""),
+                    "subnodes": subnodes_info,
                 },
             )
         )
@@ -215,19 +227,82 @@ def build_graph_layers_from_plan(plan: TrainingGraphPlan) -> Dict[str, Dict[str,
             "edges": [],
         },
     )
-    layers.setdefault(
-        "stack_view",
-        {
-            "layer_id": "stack_view",
-            "label": "Operations stack view",
-            "description": "Reserved layer for Nodus-style stack rendering, sub-node ports, and dependency-timed ticks.",
-            "status": "planned",
-            "mermaid_direction": "LR",
-            "nodes": [],
-            "edges": [],
-        },
-    )
+    layers["stack_view"] = _build_stack_view_layer(execution_nodes, execution_edges)
     return layers
+
+
+def _build_stack_view_layer(
+    nodes: Iterable[GraphNodeRecord],
+    edges: Iterable[GraphEdgeRecord],
+) -> Dict[str, Any]:
+    """Materialize the stack-view layer from node subnodes."""
+    layer_nodes: List[Dict[str, Any]] = []
+    layer_edges: List[Dict[str, Any]] = []
+    node_list = list(nodes)
+    edge_list = list(edges)
+
+    for node in node_list:
+        layer_nodes.append(
+            _layer_node(
+                node.node_id,
+                str(node.label or node.node_id),
+                faculty=str(node.faculty or "other"),
+                archetype=str(node.archetype or node.kind or "node"),
+                metadata={"node_id": str(node.node_id)},
+            )
+        )
+        for sn in sorted(getattr(node, "subnodes", None) or [], key=lambda s: getattr(s, "order", 0)):
+            if not getattr(sn, "enabled", True):
+                continue
+            layer_nodes.append(
+                _layer_node(
+                    sn.subnode_id,
+                    str(sn.label or sn.kind),
+                    faculty=str(node.faculty or "other"),
+                    archetype=str(sn.kind),
+                    shape="process",
+                    metadata={
+                        "subnode_id": str(sn.subnode_id),
+                        "parent_node_id": str(sn.parent_node_id),
+                        "kind": str(sn.kind),
+                    },
+                )
+            )
+            layer_edges.append(
+                _layer_edge(
+                    node.node_id,
+                    sn.subnode_id,
+                    label=str(sn.kind),
+                    readme_label=str(sn.kind),
+                    reaction_name="node.owns",
+                    target_function="",
+                    metadata={"style_role": "ownership"},
+                )
+            )
+
+    for edge in edge_list:
+        metadata = dict(edge.metadata or {})
+        layer_edges.append(
+            _layer_edge(
+                str(edge.source_node_id),
+                str(edge.target_node_id),
+                label=str(metadata.get("label", edge.kind) or edge.kind or ""),
+                readme_label="",
+                reaction_name=str(edge.reaction_name or ""),
+                target_function=str(edge.target_function or ""),
+                metadata={"edge_id": str(edge.edge_id)},
+            )
+        )
+
+    return {
+        "layer_id": "stack_view",
+        "label": "Operations Stack View",
+        "description": "Node-interior processes and their ownership edges alongside the execution topology.",
+        "status": "active",
+        "mermaid_direction": "LR",
+        "nodes": layer_nodes,
+        "edges": layer_edges,
+    }
 
 
 def build_execution_program(graph: PipelineGraph) -> Dict[str, Any]:
@@ -863,14 +938,17 @@ def update_readme_flowcharts(readme_path: Path, *, graph: Optional[PipelineGraph
     layers = build_graph_layers(graph)
     execution_block = render_readme_execution_section(layers)
     inference_block = render_readme_layer_section(layers["inference"])
+    stack_view_block = render_readme_layer_section(layers["stack_view"]) if layers.get("stack_view", {}).get("status") == "active" else ""
 
     text = readme_path.read_text(encoding="utf-8")
     text = _replace_marked_block(text, README_EXECUTION_START, README_EXECUTION_END, execution_block)
     text = _replace_marked_block(text, README_INFERENCE_START, README_INFERENCE_END, inference_block)
+    text = _replace_marked_block(text, README_STACK_VIEW_START, README_STACK_VIEW_END, stack_view_block)
     readme_path.write_text(text, encoding="utf-8")
     return {
         "execution": execution_block,
         "inference": inference_block,
+        "stack_view": stack_view_block,
     }
 
 
@@ -1229,9 +1307,17 @@ def _dense_node_label(node: Dict[str, Any]) -> str:
     faculty = str(node.get("faculty", "other") or "other").strip()
     archetype = str(node.get("archetype", "node") or "node").strip()
     detail = " / ".join(part for part in [object_type, faculty, archetype] if part)
-    if not detail:
-        return base
-    return f"{base}<br/>{detail}"
+    label = f"{base}<br/>{detail}" if detail else base
+    subnodes = list(dict(node.get("metadata", {}) or {}).get("subnodes", []) or [])
+    if subnodes:
+        sn_labels = [
+            str(sn.get("label", "") or sn.get("kind", "")).strip()
+            for sn in subnodes[:5]
+        ]
+        sn_labels = [s for s in sn_labels if s]
+        if sn_labels:
+            label += "<br/><small>" + " \u00b7 ".join(sn_labels) + "</small>"
+    return label
 
 
 def _edge_style(layer_id: str, edge: Dict[str, Any]) -> Dict[str, str]:
@@ -1241,6 +1327,8 @@ def _edge_style(layer_id: str, edge: Dict[str, Any]) -> Dict[str, str]:
         if branch == "hold":
             return {"stroke": "#111111", "width": "2px", "opacity": "0.95", "dasharray": "6 3"}
         return {"stroke": "#111111", "width": "3px", "opacity": "0.98", "dasharray": "0"}
+    if str(metadata.get("style_role", "") or "") == "ownership":
+        return {"stroke": "#8B5CF6", "width": "2px", "opacity": "0.85", "dasharray": "4 2"}
 
     label = str(edge.get("label", "") or "").strip().lower()
     readme_label = str(edge.get("readme_label", "") or "").strip().lower()
@@ -1357,7 +1445,7 @@ def _escape_mermaid(text: str) -> str:
 
 def main(argv: Optional[Iterable[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="Generate layered Mermaid flowcharts from the graph definitions.")
-    parser.add_argument("--layer", choices=["execution", "execution_overlay", "inference"], default="", help="Print a single layer Mermaid flowchart.")
+    parser.add_argument("--layer", choices=["execution", "execution_overlay", "inference", "stack_view"], default="", help="Print a single layer Mermaid flowchart.")
     parser.add_argument("--view", choices=["dense", "minimal", "reaction"], default="dense", help="Rendering mode for --layer output.")
     parser.add_argument("--write-readme", action="store_true", help="Update README.md generated Mermaid sections in place.")
     parser.add_argument("--readme-path", default="README.md", help="README path to update when --write-readme is set.")

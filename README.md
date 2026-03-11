@@ -758,6 +758,730 @@ flowchart LR
 </details>
 <!-- END:GENERATED_INFERENCE_LAYER -->
 
+<!-- BEGIN:GENERATED_STACK_VIEW_LAYER -->
+**Operations Stack View Dense Infographic**
+
+```mermaid
+%%{init: {'theme':'base','flowchart':{'curve':'basis','htmlLabels':true}}}%%
+flowchart LR
+    subgraph group_other[Other]
+        wave_pool["Wave Pool<br/>object / other / WavePoolNode"]
+        wave_pool__should_run["Gate check<br/>object / other / gate_check"]
+        wave_pool__execute["Discover WAV files and decode to float32 streams<br/>object / other / execute"]
+        init_vocab["Init Vocab<br/>object / other / InitVocabNode"]
+        init_vocab__execute["Load and assemble initial semantic vocabulary<br/>object / other / execute"]
+        build_classifier["Build Classifier<br/>object / other / BuildClassifierNode"]
+        build_classifier__should_run["Gate check<br/>object / other / gate_check"]
+        build_classifier__execute["Instantiate TinyConvClassifier + optimizer<br/>object / other / execute"]
+        config_search["Config Search<br/>object / other / ConfigSearchNode"]
+        config_search__should_run["Gate check<br/>object / other / gate_check"]
+        config_search__execute["Score random RenderConfig candidates via classifier feature metric<br/>object / other / execute"]
+        build_transformer["Build Transformer<br/>object / other / BuildTransformerNode"]
+        build_transformer__should_run["Gate check<br/>object / other / gate_check"]
+        build_transformer__execute["Instantiate WavePatchTransformer + optimizer<br/>object / other / execute"]
+        build_gan["Build Gan<br/>object / other / BuildGANNode"]
+        build_gan__should_run["Gate check<br/>object / other / gate_check"]
+        build_gan__execute["Instantiate ConditionalBitPlaneGenerator + Discriminator<br/>object / other / execute"]
+        build_wave_classifier["Build Wave Classifier<br/>object / other / BuildWaveClassifierNode"]
+        build_wave_classifier__should_run["Gate check<br/>object / other / gate_check"]
+        build_wave_classifier__execute["Instantiate wave-feedback TinyConvClassifier<br/>object / other / execute"]
+        vocab_churn["Vocab Churn<br/>object / other / VocabChurnNode"]
+        vocab_churn__should_run["Gate check<br/>object / other / gate_check"]
+        vocab_churn__execute["Rotate extra vocab terms (churn) on schedule<br/>object / other / execute"]
+        build_symbol_pool["Build Symbol Pool<br/>object / other / BuildSymbolPoolNode"]
+        build_symbol_pool__execute["Build per-term symbol image pool<br/>object / other / execute"]
+        build_label_embedding["Build Label Embedding<br/>object / other / BuildLabelEmbeddingNode"]
+        build_label_embedding__should_run["Gate check<br/>object / other / gate_check"]
+        build_label_embedding__execute["Build sentence-transformer label embedding bank<br/>object / other / execute"]
+        build_flashcard_rows["Build Flashcard Rows<br/>object / other / BuildFlashcardRowsNode"]
+        build_flashcard_rows__should_run["Gate check<br/>object / other / gate_check"]
+        build_flashcard_rows__execute["Build per-term GAN conditioning flashcard rows<br/>object / other / execute"]
+        data_node["Data Node<br/>object / other / DataNode"]
+        data_node__should_run["Gate check<br/>object / other / gate_check"]
+        data_node__execute["Build/refresh all training dataloaders<br/>object / other / execute"]
+        stage_0_pregestation["Stage 0 Pregestation<br/>object / other / PregestationTrainNode"]
+        stage_0_pregestation__should_run["Gate check<br/>object / other / gate_check"]
+        stage_0_pregestation__execute["Stage 0: pre-gestation classifier training (geometric logic)<br/>object / other / execute"]
+        stage_1_gestation["Stage 1 Gestation<br/>object / other / GestationTrainNode"]
+        stage_1_gestation__execute["Stage 1: gestation classifier training (bootstrap primitives)<br/>object / other / execute"]
+        stage_2_berkeley["Stage 2 Berkeley<br/>object / other / BerkeleyRefreshTrainNode"]
+        stage_2_berkeley__execute["Stage 2: Berkeley SBD refresh (full multi-label classification)<br/>object / other / execute"]
+        stage_r_transformer["Stage R Transformer<br/>object / other / TransformerTrainNode"]
+        stage_r_transformer__should_run["Gate check<br/>object / other / gate_check"]
+        stage_r_transformer__execute["Stage R: WavePatchTransformer feature-score training<br/>object / other / execute"]
+        stage_g_generator["Stage G Generator<br/>object / other / GeneratorTrainNode"]
+        stage_g_generator__should_run["Gate check<br/>object / other / gate_check"]
+        stage_g_generator__execute["Stage G: Conditional GAN training (generator + discriminator)<br/>object / other / execute"]
+        stage_w_wave_classifier["Stage W Wave Classifier<br/>object / other / WaveClassifierTrainNode"]
+        stage_w_wave_classifier__should_run["Gate check<br/>object / other / gate_check"]
+        stage_w_wave_classifier__execute["Stage W: Wave classifier training on transformer outputs<br/>object / other / execute"]
+        stage_c_lora["Stage C Lora<br/>object / other / LoRARoundNode"]
+        stage_c_lora__execute["Stage C: LoRA slot switching and per-term Berkeley training<br/>object / other / execute"]
+        stage_fake_feedback["Stage Fake Feedback<br/>object / other / FakeClassFeedbackNode"]
+        stage_fake_feedback__should_run["Gate check<br/>object / other / gate_check"]
+        stage_fake_feedback__execute["Fake-class feedback: train classifier to detect GAN outputs<br/>object / other / execute"]
+        gate_0_pregestation_eval["Gate 0 Pregestation Eval<br/>object / other / PregestationEvalNode"]
+        gate_0_pregestation_eval__should_run["Gate check<br/>object / other / gate_check"]
+        gate_0_pregestation_eval__execute["Gate 0 Eval: pre-gestation validation loss<br/>object / other / execute"]
+        gate_1_gestation_eval["Gate 1 Gestation Eval<br/>object / other / GestationEvalNode"]
+        gate_1_gestation_eval__should_run["Gate check<br/>object / other / gate_check"]
+        gate_1_gestation_eval__execute["Gate 1 Eval: gestation validation loss<br/>object / other / execute"]
+        gate_berkeley["Gate Berkeley<br/>object / other / BerkeleyGateNode"]
+        gate_berkeley__should_run["Gate check<br/>object / other / gate_check"]
+        gate_berkeley__execute["Gate 2 Eval: Berkeley classifier confidence + macro-F1<br/>object / other / execute"]
+        gate_transformer["Gate Transformer<br/>object / other / TransformerGateNode"]
+        gate_transformer__should_run["Gate check<br/>object / other / gate_check"]
+        gate_transformer__execute["Gate R Eval: transformer feature score + entropy<br/>object / other / execute"]
+        gate_generator["Gate Generator<br/>object / other / GeneratorGateNode"]
+        gate_generator__should_run["Gate check<br/>object / other / gate_check"]
+        gate_generator__execute["Gate G Eval: generator feature score<br/>object / other / execute"]
+        gate_wave["Gate Wave<br/>object / other / WaveGateNode"]
+        gate_wave__should_run["Gate check<br/>object / other / gate_check"]
+        gate_wave__execute["Gate W Eval: wave entropy + feature score feedback<br/>object / other / execute"]
+        sync_gate_replica["Sync Gate Replica<br/>object / other / SyncGateReplicaNode"]
+        sync_gate_replica__should_run["Gate check<br/>object / other / gate_check"]
+        sync_gate_replica__execute["Sync frozen CPU gate_classifier from main classifier<br/>object / other / execute"]
+        checkpoint_save["Checkpoint Save<br/>object / other / CheckpointSaveNode"]
+        checkpoint_save__should_run["Gate check<br/>object / other / gate_check"]
+        checkpoint_save__execute["Save pipeline checkpoint to disk<br/>object / other / execute"]
+    end
+
+    wave_pool -- "gate_check" --> wave_pool__should_run
+    wave_pool -- "execute" --> wave_pool__execute
+    init_vocab -- "execute" --> init_vocab__execute
+    build_classifier -- "gate_check" --> build_classifier__should_run
+    build_classifier -- "execute" --> build_classifier__execute
+    config_search -- "gate_check" --> config_search__should_run
+    config_search -- "execute" --> config_search__execute
+    build_transformer -- "gate_check" --> build_transformer__should_run
+    build_transformer -- "execute" --> build_transformer__execute
+    build_gan -- "gate_check" --> build_gan__should_run
+    build_gan -- "execute" --> build_gan__execute
+    build_wave_classifier -- "gate_check" --> build_wave_classifier__should_run
+    build_wave_classifier -- "execute" --> build_wave_classifier__execute
+    vocab_churn -- "gate_check" --> vocab_churn__should_run
+    vocab_churn -- "execute" --> vocab_churn__execute
+    build_symbol_pool -- "execute" --> build_symbol_pool__execute
+    build_label_embedding -- "gate_check" --> build_label_embedding__should_run
+    build_label_embedding -- "execute" --> build_label_embedding__execute
+    build_flashcard_rows -- "gate_check" --> build_flashcard_rows__should_run
+    build_flashcard_rows -- "execute" --> build_flashcard_rows__execute
+    data_node -- "gate_check" --> data_node__should_run
+    data_node -- "execute" --> data_node__execute
+    stage_0_pregestation -- "gate_check" --> stage_0_pregestation__should_run
+    stage_0_pregestation -- "execute" --> stage_0_pregestation__execute
+    stage_1_gestation -- "execute" --> stage_1_gestation__execute
+    stage_2_berkeley -- "execute" --> stage_2_berkeley__execute
+    stage_r_transformer -- "gate_check" --> stage_r_transformer__should_run
+    stage_r_transformer -- "execute" --> stage_r_transformer__execute
+    stage_g_generator -- "gate_check" --> stage_g_generator__should_run
+    stage_g_generator -- "execute" --> stage_g_generator__execute
+    stage_w_wave_classifier -- "gate_check" --> stage_w_wave_classifier__should_run
+    stage_w_wave_classifier -- "execute" --> stage_w_wave_classifier__execute
+    stage_c_lora -- "execute" --> stage_c_lora__execute
+    stage_fake_feedback -- "gate_check" --> stage_fake_feedback__should_run
+    stage_fake_feedback -- "execute" --> stage_fake_feedback__execute
+    gate_0_pregestation_eval -- "gate_check" --> gate_0_pregestation_eval__should_run
+    gate_0_pregestation_eval -- "execute" --> gate_0_pregestation_eval__execute
+    gate_1_gestation_eval -- "gate_check" --> gate_1_gestation_eval__should_run
+    gate_1_gestation_eval -- "execute" --> gate_1_gestation_eval__execute
+    gate_berkeley -- "gate_check" --> gate_berkeley__should_run
+    gate_berkeley -- "execute" --> gate_berkeley__execute
+    gate_transformer -- "gate_check" --> gate_transformer__should_run
+    gate_transformer -- "execute" --> gate_transformer__execute
+    gate_generator -- "gate_check" --> gate_generator__should_run
+    gate_generator -- "execute" --> gate_generator__execute
+    gate_wave -- "gate_check" --> gate_wave__should_run
+    gate_wave -- "execute" --> gate_wave__execute
+    sync_gate_replica -- "gate_check" --> sync_gate_replica__should_run
+    sync_gate_replica -- "execute" --> sync_gate_replica__execute
+    checkpoint_save -- "gate_check" --> checkpoint_save__should_run
+    checkpoint_save -- "execute" --> checkpoint_save__execute
+    wave_pool -- "startup" --> init_vocab
+    init_vocab -- "startup" --> build_classifier
+    build_classifier -- "startup" --> config_search
+    config_search -- "startup" --> build_transformer
+    build_transformer -- "if_gan_mode" --> build_gan
+    wave_pool -- "startup" --> build_wave_classifier
+    build_classifier -- "per_round" --> vocab_churn
+    vocab_churn -- "per_round" --> build_symbol_pool
+    build_symbol_pool -- "per_round" --> build_label_embedding
+    build_label_embedding -- "per_round" --> data_node
+    data_node -- "provides:pregestation_loader" --> stage_0_pregestation
+    data_node -- "provides:pregestation_eval_loader" --> gate_0_pregestation_eval
+    data_node -- "provides:gestation_loader" --> stage_1_gestation
+    data_node -- "provides:gestation_eval_loader" --> gate_1_gestation_eval
+    data_node -- "provides:berkeley_refresh_loader" --> stage_2_berkeley
+    data_node -- "provides:gate_val_loader+payload_val_loader" --> gate_berkeley
+    data_node -- "provides:payload_bank" --> stage_g_generator
+    data_node -- "provides:payload_images" --> build_flashcard_rows
+    stage_0_pregestation -- "after_stage0" --> gate_0_pregestation_eval
+    gate_0_pregestation_eval -- "after_gate0" --> stage_1_gestation
+    stage_1_gestation -- "after_stage1" --> gate_1_gestation_eval
+    gate_1_gestation_eval -- "after_gate1" --> stage_2_berkeley
+    stage_2_berkeley -- "after_gate1" --> gate_berkeley
+    gate_berkeley -- "after_gate1" --> stage_r_transformer
+    stage_r_transformer -- "after_gate1" --> gate_transformer
+    gate_transformer -- "after_all_gates" --> stage_g_generator
+    stage_g_generator -- "after_all_gates" --> gate_generator
+    gate_berkeley -- "after_all_gates" --> stage_c_lora
+    stage_c_lora -- "after_all_gates" --> stage_fake_feedback
+    build_wave_classifier -- "after_transformer_gate" --> stage_w_wave_classifier
+    stage_w_wave_classifier -- "after_transformer_gate" --> gate_wave
+    gate_wave -- "end_of_round" --> sync_gate_replica
+    gate_transformer -- "end_of_round" --> sync_gate_replica
+    gate_berkeley -- "end_of_round" --> sync_gate_replica
+    sync_gate_replica -- "end_of_round" --> checkpoint_save
+
+    classDef faculty_bootstrap fill:#E9F1F7,stroke:#4B6B88,color:#102A43,stroke-width:2px;
+    classDef faculty_build fill:#F8EFE5,stroke:#B07219,color:#40210F,stroke-width:2px;
+    classDef faculty_vocab fill:#FFF7CC,stroke:#9A7D0A,color:#3D3100,stroke-width:2px;
+    classDef faculty_data fill:#DFF6F5,stroke:#127475,color:#053B3C,stroke-width:2px;
+    classDef faculty_train fill:#FFE8D6,stroke:#C05621,color:#4A1D05,stroke-width:2px;
+    classDef faculty_gates fill:#FDE2E4,stroke:#C0392B,color:#4A0F13,stroke-width:2px;
+    classDef faculty_housekeeping fill:#E8F5E9,stroke:#2E7D32,color:#102A12,stroke-width:2px;
+    classDef faculty_io fill:#DDEBFF,stroke:#2563EB,color:#0F172A,stroke-width:2px;
+    classDef faculty_inference fill:#F4F1DE,stroke:#3D405B,color:#1B1F2A,stroke-width:2px;
+    classDef faculty_buffer fill:#E0FBFC,stroke:#006D77,color:#00313A,stroke-width:2px;
+    classDef faculty_gate fill:#FDE2E4,stroke:#C0392B,color:#4A0F13,stroke-width:2px;
+    classDef faculty_other fill:#F3F4F6,stroke:#6B7280,color:#111827,stroke-width:2px;
+    class wave_pool,wave_pool__should_run,wave_pool__execute,init_vocab,init_vocab__execute,build_classifier,build_classifier__should_run,build_classifier__execute,config_search,config_search__should_run,config_search__execute,build_transformer,build_transformer__should_run,build_transformer__execute,build_gan,build_gan__should_run,build_gan__execute,build_wave_classifier,build_wave_classifier__should_run,build_wave_classifier__execute,vocab_churn,vocab_churn__should_run,vocab_churn__execute,build_symbol_pool,build_symbol_pool__execute,build_label_embedding,build_label_embedding__should_run,build_label_embedding__execute,build_flashcard_rows,build_flashcard_rows__should_run,build_flashcard_rows__execute,data_node,data_node__should_run,data_node__execute,stage_0_pregestation,stage_0_pregestation__should_run,stage_0_pregestation__execute,stage_1_gestation,stage_1_gestation__execute,stage_2_berkeley,stage_2_berkeley__execute,stage_r_transformer,stage_r_transformer__should_run,stage_r_transformer__execute,stage_g_generator,stage_g_generator__should_run,stage_g_generator__execute,stage_w_wave_classifier,stage_w_wave_classifier__should_run,stage_w_wave_classifier__execute,stage_c_lora,stage_c_lora__execute,stage_fake_feedback,stage_fake_feedback__should_run,stage_fake_feedback__execute,gate_0_pregestation_eval,gate_0_pregestation_eval__should_run,gate_0_pregestation_eval__execute,gate_1_gestation_eval,gate_1_gestation_eval__should_run,gate_1_gestation_eval__execute,gate_berkeley,gate_berkeley__should_run,gate_berkeley__execute,gate_transformer,gate_transformer__should_run,gate_transformer__execute,gate_generator,gate_generator__should_run,gate_generator__execute,gate_wave,gate_wave__should_run,gate_wave__execute,sync_gate_replica,sync_gate_replica__should_run,sync_gate_replica__execute,checkpoint_save,checkpoint_save__should_run,checkpoint_save__execute faculty_other;
+    linkStyle 0 stroke:#8B5CF6,stroke-width:2px,opacity:0.85,stroke-dasharray:4 2;
+    linkStyle 1 stroke:#8B5CF6,stroke-width:2px,opacity:0.85,stroke-dasharray:4 2;
+    linkStyle 2 stroke:#8B5CF6,stroke-width:2px,opacity:0.85,stroke-dasharray:4 2;
+    linkStyle 3 stroke:#8B5CF6,stroke-width:2px,opacity:0.85,stroke-dasharray:4 2;
+    linkStyle 4 stroke:#8B5CF6,stroke-width:2px,opacity:0.85,stroke-dasharray:4 2;
+    linkStyle 5 stroke:#8B5CF6,stroke-width:2px,opacity:0.85,stroke-dasharray:4 2;
+    linkStyle 6 stroke:#8B5CF6,stroke-width:2px,opacity:0.85,stroke-dasharray:4 2;
+    linkStyle 7 stroke:#8B5CF6,stroke-width:2px,opacity:0.85,stroke-dasharray:4 2;
+    linkStyle 8 stroke:#8B5CF6,stroke-width:2px,opacity:0.85,stroke-dasharray:4 2;
+    linkStyle 9 stroke:#8B5CF6,stroke-width:2px,opacity:0.85,stroke-dasharray:4 2;
+    linkStyle 10 stroke:#8B5CF6,stroke-width:2px,opacity:0.85,stroke-dasharray:4 2;
+    linkStyle 11 stroke:#8B5CF6,stroke-width:2px,opacity:0.85,stroke-dasharray:4 2;
+    linkStyle 12 stroke:#8B5CF6,stroke-width:2px,opacity:0.85,stroke-dasharray:4 2;
+    linkStyle 13 stroke:#8B5CF6,stroke-width:2px,opacity:0.85,stroke-dasharray:4 2;
+    linkStyle 14 stroke:#8B5CF6,stroke-width:2px,opacity:0.85,stroke-dasharray:4 2;
+    linkStyle 15 stroke:#8B5CF6,stroke-width:2px,opacity:0.85,stroke-dasharray:4 2;
+    linkStyle 16 stroke:#8B5CF6,stroke-width:2px,opacity:0.85,stroke-dasharray:4 2;
+    linkStyle 17 stroke:#8B5CF6,stroke-width:2px,opacity:0.85,stroke-dasharray:4 2;
+    linkStyle 18 stroke:#8B5CF6,stroke-width:2px,opacity:0.85,stroke-dasharray:4 2;
+    linkStyle 19 stroke:#8B5CF6,stroke-width:2px,opacity:0.85,stroke-dasharray:4 2;
+    linkStyle 20 stroke:#8B5CF6,stroke-width:2px,opacity:0.85,stroke-dasharray:4 2;
+    linkStyle 21 stroke:#8B5CF6,stroke-width:2px,opacity:0.85,stroke-dasharray:4 2;
+    linkStyle 22 stroke:#8B5CF6,stroke-width:2px,opacity:0.85,stroke-dasharray:4 2;
+    linkStyle 23 stroke:#8B5CF6,stroke-width:2px,opacity:0.85,stroke-dasharray:4 2;
+    linkStyle 24 stroke:#8B5CF6,stroke-width:2px,opacity:0.85,stroke-dasharray:4 2;
+    linkStyle 25 stroke:#8B5CF6,stroke-width:2px,opacity:0.85,stroke-dasharray:4 2;
+    linkStyle 26 stroke:#8B5CF6,stroke-width:2px,opacity:0.85,stroke-dasharray:4 2;
+    linkStyle 27 stroke:#8B5CF6,stroke-width:2px,opacity:0.85,stroke-dasharray:4 2;
+    linkStyle 28 stroke:#8B5CF6,stroke-width:2px,opacity:0.85,stroke-dasharray:4 2;
+    linkStyle 29 stroke:#8B5CF6,stroke-width:2px,opacity:0.85,stroke-dasharray:4 2;
+    linkStyle 30 stroke:#8B5CF6,stroke-width:2px,opacity:0.85,stroke-dasharray:4 2;
+    linkStyle 31 stroke:#8B5CF6,stroke-width:2px,opacity:0.85,stroke-dasharray:4 2;
+    linkStyle 32 stroke:#8B5CF6,stroke-width:2px,opacity:0.85,stroke-dasharray:4 2;
+    linkStyle 33 stroke:#8B5CF6,stroke-width:2px,opacity:0.85,stroke-dasharray:4 2;
+    linkStyle 34 stroke:#8B5CF6,stroke-width:2px,opacity:0.85,stroke-dasharray:4 2;
+    linkStyle 35 stroke:#8B5CF6,stroke-width:2px,opacity:0.85,stroke-dasharray:4 2;
+    linkStyle 36 stroke:#8B5CF6,stroke-width:2px,opacity:0.85,stroke-dasharray:4 2;
+    linkStyle 37 stroke:#8B5CF6,stroke-width:2px,opacity:0.85,stroke-dasharray:4 2;
+    linkStyle 38 stroke:#8B5CF6,stroke-width:2px,opacity:0.85,stroke-dasharray:4 2;
+    linkStyle 39 stroke:#8B5CF6,stroke-width:2px,opacity:0.85,stroke-dasharray:4 2;
+    linkStyle 40 stroke:#8B5CF6,stroke-width:2px,opacity:0.85,stroke-dasharray:4 2;
+    linkStyle 41 stroke:#8B5CF6,stroke-width:2px,opacity:0.85,stroke-dasharray:4 2;
+    linkStyle 42 stroke:#8B5CF6,stroke-width:2px,opacity:0.85,stroke-dasharray:4 2;
+    linkStyle 43 stroke:#8B5CF6,stroke-width:2px,opacity:0.85,stroke-dasharray:4 2;
+    linkStyle 44 stroke:#8B5CF6,stroke-width:2px,opacity:0.85,stroke-dasharray:4 2;
+    linkStyle 45 stroke:#8B5CF6,stroke-width:2px,opacity:0.85,stroke-dasharray:4 2;
+    linkStyle 46 stroke:#8B5CF6,stroke-width:2px,opacity:0.85,stroke-dasharray:4 2;
+    linkStyle 47 stroke:#8B5CF6,stroke-width:2px,opacity:0.85,stroke-dasharray:4 2;
+    linkStyle 48 stroke:#8B5CF6,stroke-width:2px,opacity:0.85,stroke-dasharray:4 2;
+    linkStyle 49 stroke:#8B5CF6,stroke-width:2px,opacity:0.85,stroke-dasharray:4 2;
+    linkStyle 50 stroke:#8B5CF6,stroke-width:2px,opacity:0.85,stroke-dasharray:4 2;
+    linkStyle 51 stroke:#2A9D8F,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
+    linkStyle 52 stroke:#2A9D8F,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
+    linkStyle 53 stroke:#2A9D8F,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
+    linkStyle 54 stroke:#2A9D8F,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
+    linkStyle 55 stroke:#577590,stroke-width:3px,opacity:0.85,stroke-dasharray:8 3;
+    linkStyle 56 stroke:#2A9D8F,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
+    linkStyle 57 stroke:#E9C46A,stroke-width:3px,opacity:0.9,stroke-dasharray:2 2;
+    linkStyle 58 stroke:#E9C46A,stroke-width:3px,opacity:0.9,stroke-dasharray:2 2;
+    linkStyle 59 stroke:#E9C46A,stroke-width:3px,opacity:0.9,stroke-dasharray:2 2;
+    linkStyle 60 stroke:#E9C46A,stroke-width:3px,opacity:0.9,stroke-dasharray:2 2;
+    linkStyle 61 stroke:#1D70A2,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
+    linkStyle 62 stroke:#1D70A2,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
+    linkStyle 63 stroke:#1D70A2,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
+    linkStyle 64 stroke:#1D70A2,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
+    linkStyle 65 stroke:#1D70A2,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
+    linkStyle 66 stroke:#1D70A2,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
+    linkStyle 67 stroke:#1D70A2,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
+    linkStyle 68 stroke:#1D70A2,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
+    linkStyle 69 stroke:#F4A261,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
+    linkStyle 70 stroke:#F4A261,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
+    linkStyle 71 stroke:#F4A261,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
+    linkStyle 72 stroke:#F4A261,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
+    linkStyle 73 stroke:#F4A261,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
+    linkStyle 74 stroke:#F4A261,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
+    linkStyle 75 stroke:#F4A261,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
+    linkStyle 76 stroke:#E76F51,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
+    linkStyle 77 stroke:#E76F51,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
+    linkStyle 78 stroke:#E76F51,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
+    linkStyle 79 stroke:#E76F51,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
+    linkStyle 80 stroke:#B56576,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
+    linkStyle 81 stroke:#B56576,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
+    linkStyle 82 stroke:#2B9348,stroke-width:3px,opacity:0.9,stroke-dasharray:4 2;
+    linkStyle 83 stroke:#2B9348,stroke-width:3px,opacity:0.9,stroke-dasharray:4 2;
+    linkStyle 84 stroke:#2B9348,stroke-width:3px,opacity:0.9,stroke-dasharray:4 2;
+    linkStyle 85 stroke:#2B9348,stroke-width:3px,opacity:0.9,stroke-dasharray:4 2;
+```
+
+Node colors group bootstrap, build, vocab, data, train, gate, and housekeeping faculties. Edge colors separate startup, per-round, data-provision, gated progression, and end-of-round reactions.
+
+<details>
+
+<summary>Minimal schematic view</summary>
+
+
+
+```mermaid
+%%{init: {'theme':'base','flowchart':{'curve':'basis','htmlLabels':true}}}%%
+flowchart LR
+    wave_pool["Wave Pool"]
+    wave_pool__should_run["Gate check"]
+    wave_pool__execute["Discover WAV files and decode to float32 streams"]
+    init_vocab["Init Vocab"]
+    init_vocab__execute["Load and assemble initial semantic vocabulary"]
+    build_classifier["Build Classifier"]
+    build_classifier__should_run["Gate check"]
+    build_classifier__execute["Instantiate TinyConvClassifier + optimizer"]
+    config_search["Config Search"]
+    config_search__should_run["Gate check"]
+    config_search__execute["Score random RenderConfig candidates via classifier feature metric"]
+    build_transformer["Build Transformer"]
+    build_transformer__should_run["Gate check"]
+    build_transformer__execute["Instantiate WavePatchTransformer + optimizer"]
+    build_gan["Build Gan"]
+    build_gan__should_run["Gate check"]
+    build_gan__execute["Instantiate ConditionalBitPlaneGenerator + Discriminator"]
+    build_wave_classifier["Build Wave Classifier"]
+    build_wave_classifier__should_run["Gate check"]
+    build_wave_classifier__execute["Instantiate wave-feedback TinyConvClassifier"]
+    vocab_churn["Vocab Churn"]
+    vocab_churn__should_run["Gate check"]
+    vocab_churn__execute["Rotate extra vocab terms (churn) on schedule"]
+    build_symbol_pool["Build Symbol Pool"]
+    build_symbol_pool__execute["Build per-term symbol image pool"]
+    build_label_embedding["Build Label Embedding"]
+    build_label_embedding__should_run["Gate check"]
+    build_label_embedding__execute["Build sentence-transformer label embedding bank"]
+    build_flashcard_rows["Build Flashcard Rows"]
+    build_flashcard_rows__should_run["Gate check"]
+    build_flashcard_rows__execute["Build per-term GAN conditioning flashcard rows"]
+    data_node["Data Node"]
+    data_node__should_run["Gate check"]
+    data_node__execute["Build/refresh all training dataloaders"]
+    stage_0_pregestation["Stage 0 Pregestation"]
+    stage_0_pregestation__should_run["Gate check"]
+    stage_0_pregestation__execute["Stage 0: pre-gestation classifier training (geometric logic)"]
+    stage_1_gestation["Stage 1 Gestation"]
+    stage_1_gestation__execute["Stage 1: gestation classifier training (bootstrap primitives)"]
+    stage_2_berkeley["Stage 2 Berkeley"]
+    stage_2_berkeley__execute["Stage 2: Berkeley SBD refresh (full multi-label classification)"]
+    stage_r_transformer["Stage R Transformer"]
+    stage_r_transformer__should_run["Gate check"]
+    stage_r_transformer__execute["Stage R: WavePatchTransformer feature-score training"]
+    stage_g_generator["Stage G Generator"]
+    stage_g_generator__should_run["Gate check"]
+    stage_g_generator__execute["Stage G: Conditional GAN training (generator + discriminator)"]
+    stage_w_wave_classifier["Stage W Wave Classifier"]
+    stage_w_wave_classifier__should_run["Gate check"]
+    stage_w_wave_classifier__execute["Stage W: Wave classifier training on transformer outputs"]
+    stage_c_lora["Stage C Lora"]
+    stage_c_lora__execute["Stage C: LoRA slot switching and per-term Berkeley training"]
+    stage_fake_feedback["Stage Fake Feedback"]
+    stage_fake_feedback__should_run["Gate check"]
+    stage_fake_feedback__execute["Fake-class feedback: train classifier to detect GAN outputs"]
+    gate_0_pregestation_eval["Gate 0 Pregestation Eval"]
+    gate_0_pregestation_eval__should_run["Gate check"]
+    gate_0_pregestation_eval__execute["Gate 0 Eval: pre-gestation validation loss"]
+    gate_1_gestation_eval["Gate 1 Gestation Eval"]
+    gate_1_gestation_eval__should_run["Gate check"]
+    gate_1_gestation_eval__execute["Gate 1 Eval: gestation validation loss"]
+    gate_berkeley["Gate Berkeley"]
+    gate_berkeley__should_run["Gate check"]
+    gate_berkeley__execute["Gate 2 Eval: Berkeley classifier confidence + macro-F1"]
+    gate_transformer["Gate Transformer"]
+    gate_transformer__should_run["Gate check"]
+    gate_transformer__execute["Gate R Eval: transformer feature score + entropy"]
+    gate_generator["Gate Generator"]
+    gate_generator__should_run["Gate check"]
+    gate_generator__execute["Gate G Eval: generator feature score"]
+    gate_wave["Gate Wave"]
+    gate_wave__should_run["Gate check"]
+    gate_wave__execute["Gate W Eval: wave entropy + feature score feedback"]
+    sync_gate_replica["Sync Gate Replica"]
+    sync_gate_replica__should_run["Gate check"]
+    sync_gate_replica__execute["Sync frozen CPU gate_classifier from main classifier"]
+    checkpoint_save["Checkpoint Save"]
+    checkpoint_save__should_run["Gate check"]
+    checkpoint_save__execute["Save pipeline checkpoint to disk"]
+
+    wave_pool --> wave_pool__should_run
+    wave_pool --> wave_pool__execute
+    init_vocab --> init_vocab__execute
+    build_classifier --> build_classifier__should_run
+    build_classifier --> build_classifier__execute
+    config_search --> config_search__should_run
+    config_search --> config_search__execute
+    build_transformer --> build_transformer__should_run
+    build_transformer --> build_transformer__execute
+    build_gan --> build_gan__should_run
+    build_gan --> build_gan__execute
+    build_wave_classifier --> build_wave_classifier__should_run
+    build_wave_classifier --> build_wave_classifier__execute
+    vocab_churn --> vocab_churn__should_run
+    vocab_churn --> vocab_churn__execute
+    build_symbol_pool --> build_symbol_pool__execute
+    build_label_embedding --> build_label_embedding__should_run
+    build_label_embedding --> build_label_embedding__execute
+    build_flashcard_rows --> build_flashcard_rows__should_run
+    build_flashcard_rows --> build_flashcard_rows__execute
+    data_node --> data_node__should_run
+    data_node --> data_node__execute
+    stage_0_pregestation --> stage_0_pregestation__should_run
+    stage_0_pregestation --> stage_0_pregestation__execute
+    stage_1_gestation --> stage_1_gestation__execute
+    stage_2_berkeley --> stage_2_berkeley__execute
+    stage_r_transformer --> stage_r_transformer__should_run
+    stage_r_transformer --> stage_r_transformer__execute
+    stage_g_generator --> stage_g_generator__should_run
+    stage_g_generator --> stage_g_generator__execute
+    stage_w_wave_classifier --> stage_w_wave_classifier__should_run
+    stage_w_wave_classifier --> stage_w_wave_classifier__execute
+    stage_c_lora --> stage_c_lora__execute
+    stage_fake_feedback --> stage_fake_feedback__should_run
+    stage_fake_feedback --> stage_fake_feedback__execute
+    gate_0_pregestation_eval --> gate_0_pregestation_eval__should_run
+    gate_0_pregestation_eval --> gate_0_pregestation_eval__execute
+    gate_1_gestation_eval --> gate_1_gestation_eval__should_run
+    gate_1_gestation_eval --> gate_1_gestation_eval__execute
+    gate_berkeley --> gate_berkeley__should_run
+    gate_berkeley --> gate_berkeley__execute
+    gate_transformer --> gate_transformer__should_run
+    gate_transformer --> gate_transformer__execute
+    gate_generator --> gate_generator__should_run
+    gate_generator --> gate_generator__execute
+    gate_wave --> gate_wave__should_run
+    gate_wave --> gate_wave__execute
+    sync_gate_replica --> sync_gate_replica__should_run
+    sync_gate_replica --> sync_gate_replica__execute
+    checkpoint_save --> checkpoint_save__should_run
+    checkpoint_save --> checkpoint_save__execute
+    wave_pool --> init_vocab
+    init_vocab --> build_classifier
+    build_classifier --> config_search
+    config_search --> build_transformer
+    build_transformer --> build_gan
+    wave_pool --> build_wave_classifier
+    build_classifier --> vocab_churn
+    vocab_churn --> build_symbol_pool
+    build_symbol_pool --> build_label_embedding
+    build_label_embedding --> data_node
+    data_node --> stage_0_pregestation
+    data_node --> gate_0_pregestation_eval
+    data_node --> stage_1_gestation
+    data_node --> gate_1_gestation_eval
+    data_node --> stage_2_berkeley
+    data_node --> gate_berkeley
+    data_node --> stage_g_generator
+    data_node --> build_flashcard_rows
+    stage_0_pregestation --> gate_0_pregestation_eval
+    gate_0_pregestation_eval --> stage_1_gestation
+    stage_1_gestation --> gate_1_gestation_eval
+    gate_1_gestation_eval --> stage_2_berkeley
+    stage_2_berkeley --> gate_berkeley
+    gate_berkeley --> stage_r_transformer
+    stage_r_transformer --> gate_transformer
+    gate_transformer --> stage_g_generator
+    stage_g_generator --> gate_generator
+    gate_berkeley --> stage_c_lora
+    stage_c_lora --> stage_fake_feedback
+    build_wave_classifier --> stage_w_wave_classifier
+    stage_w_wave_classifier --> gate_wave
+    gate_wave --> sync_gate_replica
+    gate_transformer --> sync_gate_replica
+    gate_berkeley --> sync_gate_replica
+    sync_gate_replica --> checkpoint_save
+```
+
+</details>
+
+<details>
+
+<summary>Reaction-colored view</summary>
+
+
+
+```mermaid
+%%{init: {'theme':'base','flowchart':{'curve':'basis','htmlLabels':true}}}%%
+flowchart LR
+    wave_pool["Wave Pool"]
+    wave_pool__should_run["Gate check"]
+    wave_pool__execute["Discover WAV files and decode to float32 streams"]
+    init_vocab["Init Vocab"]
+    init_vocab__execute["Load and assemble initial semantic vocabulary"]
+    build_classifier["Build Classifier"]
+    build_classifier__should_run["Gate check"]
+    build_classifier__execute["Instantiate TinyConvClassifier + optimizer"]
+    config_search["Config Search"]
+    config_search__should_run["Gate check"]
+    config_search__execute["Score random RenderConfig candidates via classifier feature metric"]
+    build_transformer["Build Transformer"]
+    build_transformer__should_run["Gate check"]
+    build_transformer__execute["Instantiate WavePatchTransformer + optimizer"]
+    build_gan["Build Gan"]
+    build_gan__should_run["Gate check"]
+    build_gan__execute["Instantiate ConditionalBitPlaneGenerator + Discriminator"]
+    build_wave_classifier["Build Wave Classifier"]
+    build_wave_classifier__should_run["Gate check"]
+    build_wave_classifier__execute["Instantiate wave-feedback TinyConvClassifier"]
+    vocab_churn["Vocab Churn"]
+    vocab_churn__should_run["Gate check"]
+    vocab_churn__execute["Rotate extra vocab terms (churn) on schedule"]
+    build_symbol_pool["Build Symbol Pool"]
+    build_symbol_pool__execute["Build per-term symbol image pool"]
+    build_label_embedding["Build Label Embedding"]
+    build_label_embedding__should_run["Gate check"]
+    build_label_embedding__execute["Build sentence-transformer label embedding bank"]
+    build_flashcard_rows["Build Flashcard Rows"]
+    build_flashcard_rows__should_run["Gate check"]
+    build_flashcard_rows__execute["Build per-term GAN conditioning flashcard rows"]
+    data_node["Data Node"]
+    data_node__should_run["Gate check"]
+    data_node__execute["Build/refresh all training dataloaders"]
+    stage_0_pregestation["Stage 0 Pregestation"]
+    stage_0_pregestation__should_run["Gate check"]
+    stage_0_pregestation__execute["Stage 0: pre-gestation classifier training (geometric logic)"]
+    stage_1_gestation["Stage 1 Gestation"]
+    stage_1_gestation__execute["Stage 1: gestation classifier training (bootstrap primitives)"]
+    stage_2_berkeley["Stage 2 Berkeley"]
+    stage_2_berkeley__execute["Stage 2: Berkeley SBD refresh (full multi-label classification)"]
+    stage_r_transformer["Stage R Transformer"]
+    stage_r_transformer__should_run["Gate check"]
+    stage_r_transformer__execute["Stage R: WavePatchTransformer feature-score training"]
+    stage_g_generator["Stage G Generator"]
+    stage_g_generator__should_run["Gate check"]
+    stage_g_generator__execute["Stage G: Conditional GAN training (generator + discriminator)"]
+    stage_w_wave_classifier["Stage W Wave Classifier"]
+    stage_w_wave_classifier__should_run["Gate check"]
+    stage_w_wave_classifier__execute["Stage W: Wave classifier training on transformer outputs"]
+    stage_c_lora["Stage C Lora"]
+    stage_c_lora__execute["Stage C: LoRA slot switching and per-term Berkeley training"]
+    stage_fake_feedback["Stage Fake Feedback"]
+    stage_fake_feedback__should_run["Gate check"]
+    stage_fake_feedback__execute["Fake-class feedback: train classifier to detect GAN outputs"]
+    gate_0_pregestation_eval["Gate 0 Pregestation Eval"]
+    gate_0_pregestation_eval__should_run["Gate check"]
+    gate_0_pregestation_eval__execute["Gate 0 Eval: pre-gestation validation loss"]
+    gate_1_gestation_eval["Gate 1 Gestation Eval"]
+    gate_1_gestation_eval__should_run["Gate check"]
+    gate_1_gestation_eval__execute["Gate 1 Eval: gestation validation loss"]
+    gate_berkeley["Gate Berkeley"]
+    gate_berkeley__should_run["Gate check"]
+    gate_berkeley__execute["Gate 2 Eval: Berkeley classifier confidence + macro-F1"]
+    gate_transformer["Gate Transformer"]
+    gate_transformer__should_run["Gate check"]
+    gate_transformer__execute["Gate R Eval: transformer feature score + entropy"]
+    gate_generator["Gate Generator"]
+    gate_generator__should_run["Gate check"]
+    gate_generator__execute["Gate G Eval: generator feature score"]
+    gate_wave["Gate Wave"]
+    gate_wave__should_run["Gate check"]
+    gate_wave__execute["Gate W Eval: wave entropy + feature score feedback"]
+    sync_gate_replica["Sync Gate Replica"]
+    sync_gate_replica__should_run["Gate check"]
+    sync_gate_replica__execute["Sync frozen CPU gate_classifier from main classifier"]
+    checkpoint_save["Checkpoint Save"]
+    checkpoint_save__should_run["Gate check"]
+    checkpoint_save__execute["Save pipeline checkpoint to disk"]
+
+    wave_pool -- "gate_check | node.owns" --> wave_pool__should_run
+    wave_pool -- "execute | node.owns" --> wave_pool__execute
+    init_vocab -- "execute | node.owns" --> init_vocab__execute
+    build_classifier -- "gate_check | node.owns" --> build_classifier__should_run
+    build_classifier -- "execute | node.owns" --> build_classifier__execute
+    config_search -- "gate_check | node.owns" --> config_search__should_run
+    config_search -- "execute | node.owns" --> config_search__execute
+    build_transformer -- "gate_check | node.owns" --> build_transformer__should_run
+    build_transformer -- "execute | node.owns" --> build_transformer__execute
+    build_gan -- "gate_check | node.owns" --> build_gan__should_run
+    build_gan -- "execute | node.owns" --> build_gan__execute
+    build_wave_classifier -- "gate_check | node.owns" --> build_wave_classifier__should_run
+    build_wave_classifier -- "execute | node.owns" --> build_wave_classifier__execute
+    vocab_churn -- "gate_check | node.owns" --> vocab_churn__should_run
+    vocab_churn -- "execute | node.owns" --> vocab_churn__execute
+    build_symbol_pool -- "execute | node.owns" --> build_symbol_pool__execute
+    build_label_embedding -- "gate_check | node.owns" --> build_label_embedding__should_run
+    build_label_embedding -- "execute | node.owns" --> build_label_embedding__execute
+    build_flashcard_rows -- "gate_check | node.owns" --> build_flashcard_rows__should_run
+    build_flashcard_rows -- "execute | node.owns" --> build_flashcard_rows__execute
+    data_node -- "gate_check | node.owns" --> data_node__should_run
+    data_node -- "execute | node.owns" --> data_node__execute
+    stage_0_pregestation -- "gate_check | node.owns" --> stage_0_pregestation__should_run
+    stage_0_pregestation -- "execute | node.owns" --> stage_0_pregestation__execute
+    stage_1_gestation -- "execute | node.owns" --> stage_1_gestation__execute
+    stage_2_berkeley -- "execute | node.owns" --> stage_2_berkeley__execute
+    stage_r_transformer -- "gate_check | node.owns" --> stage_r_transformer__should_run
+    stage_r_transformer -- "execute | node.owns" --> stage_r_transformer__execute
+    stage_g_generator -- "gate_check | node.owns" --> stage_g_generator__should_run
+    stage_g_generator -- "execute | node.owns" --> stage_g_generator__execute
+    stage_w_wave_classifier -- "gate_check | node.owns" --> stage_w_wave_classifier__should_run
+    stage_w_wave_classifier -- "execute | node.owns" --> stage_w_wave_classifier__execute
+    stage_c_lora -- "execute | node.owns" --> stage_c_lora__execute
+    stage_fake_feedback -- "gate_check | node.owns" --> stage_fake_feedback__should_run
+    stage_fake_feedback -- "execute | node.owns" --> stage_fake_feedback__execute
+    gate_0_pregestation_eval -- "gate_check | node.owns" --> gate_0_pregestation_eval__should_run
+    gate_0_pregestation_eval -- "execute | node.owns" --> gate_0_pregestation_eval__execute
+    gate_1_gestation_eval -- "gate_check | node.owns" --> gate_1_gestation_eval__should_run
+    gate_1_gestation_eval -- "execute | node.owns" --> gate_1_gestation_eval__execute
+    gate_berkeley -- "gate_check | node.owns" --> gate_berkeley__should_run
+    gate_berkeley -- "execute | node.owns" --> gate_berkeley__execute
+    gate_transformer -- "gate_check | node.owns" --> gate_transformer__should_run
+    gate_transformer -- "execute | node.owns" --> gate_transformer__execute
+    gate_generator -- "gate_check | node.owns" --> gate_generator__should_run
+    gate_generator -- "execute | node.owns" --> gate_generator__execute
+    gate_wave -- "gate_check | node.owns" --> gate_wave__should_run
+    gate_wave -- "execute | node.owns" --> gate_wave__execute
+    sync_gate_replica -- "gate_check | node.owns" --> sync_gate_replica__should_run
+    sync_gate_replica -- "execute | node.owns" --> sync_gate_replica__execute
+    checkpoint_save -- "gate_check | node.owns" --> checkpoint_save__should_run
+    checkpoint_save -- "execute | node.owns" --> checkpoint_save__execute
+    wave_pool -- "startup | schedule.bootstrap" --> init_vocab
+    init_vocab -- "startup | schedule.bootstrap" --> build_classifier
+    build_classifier -- "startup | schedule.bootstrap" --> config_search
+    config_search -- "startup | schedule.bootstrap" --> build_transformer
+    build_transformer -- "if_gan_mode | schedule.transition" --> build_gan
+    wave_pool -- "startup | schedule.bootstrap" --> build_wave_classifier
+    build_classifier -- "per_round | schedule.round" --> vocab_churn
+    vocab_churn -- "per_round | schedule.round" --> build_symbol_pool
+    build_symbol_pool -- "per_round | schedule.round" --> build_label_embedding
+    build_label_embedding -- "per_round | schedule.round" --> data_node
+    data_node -- "provides:pregestation_loader | data.provide" --> stage_0_pregestation
+    data_node -- "provides:pregestation_eval_loader | data.provide" --> gate_0_pregestation_eval
+    data_node -- "provides:gestation_loader | data.provide" --> stage_1_gestation
+    data_node -- "provides:gestation_eval_loader | data.provide" --> gate_1_gestation_eval
+    data_node -- "provides:berkeley_refresh_loader | data.provide" --> stage_2_berkeley
+    data_node -- "provides:gate_val_loader+payload_val_loader | data.provide" --> gate_berkeley
+    data_node -- "provides:payload_bank | data.provide" --> stage_g_generator
+    data_node -- "provides:payload_images | data.provide" --> build_flashcard_rows
+    stage_0_pregestation -- "after_stage0 | schedule.transition" --> gate_0_pregestation_eval
+    gate_0_pregestation_eval -- "after_gate0 | schedule.transition" --> stage_1_gestation
+    stage_1_gestation -- "after_stage1 | schedule.transition" --> gate_1_gestation_eval
+    gate_1_gestation_eval -- "after_gate1 | schedule.transition" --> stage_2_berkeley
+    stage_2_berkeley -- "after_gate1 | schedule.transition" --> gate_berkeley
+    gate_berkeley -- "after_gate1 | schedule.transition" --> stage_r_transformer
+    stage_r_transformer -- "after_gate1 | schedule.transition" --> gate_transformer
+    gate_transformer -- "after_all_gates | schedule.transition" --> stage_g_generator
+    stage_g_generator -- "after_all_gates | schedule.transition" --> gate_generator
+    gate_berkeley -- "after_all_gates | schedule.transition" --> stage_c_lora
+    stage_c_lora -- "after_all_gates | schedule.transition" --> stage_fake_feedback
+    build_wave_classifier -- "after_transformer_gate | schedule.transition" --> stage_w_wave_classifier
+    stage_w_wave_classifier -- "after_transformer_gate | schedule.transition" --> gate_wave
+    gate_wave -- "end_of_round | schedule.finalize" --> sync_gate_replica
+    gate_transformer -- "end_of_round | schedule.finalize" --> sync_gate_replica
+    gate_berkeley -- "end_of_round | schedule.finalize" --> sync_gate_replica
+    sync_gate_replica -- "end_of_round | schedule.finalize" --> checkpoint_save
+
+    linkStyle 0 stroke:#8B5CF6,stroke-width:2px,opacity:0.85,stroke-dasharray:4 2;
+    linkStyle 1 stroke:#8B5CF6,stroke-width:2px,opacity:0.85,stroke-dasharray:4 2;
+    linkStyle 2 stroke:#8B5CF6,stroke-width:2px,opacity:0.85,stroke-dasharray:4 2;
+    linkStyle 3 stroke:#8B5CF6,stroke-width:2px,opacity:0.85,stroke-dasharray:4 2;
+    linkStyle 4 stroke:#8B5CF6,stroke-width:2px,opacity:0.85,stroke-dasharray:4 2;
+    linkStyle 5 stroke:#8B5CF6,stroke-width:2px,opacity:0.85,stroke-dasharray:4 2;
+    linkStyle 6 stroke:#8B5CF6,stroke-width:2px,opacity:0.85,stroke-dasharray:4 2;
+    linkStyle 7 stroke:#8B5CF6,stroke-width:2px,opacity:0.85,stroke-dasharray:4 2;
+    linkStyle 8 stroke:#8B5CF6,stroke-width:2px,opacity:0.85,stroke-dasharray:4 2;
+    linkStyle 9 stroke:#8B5CF6,stroke-width:2px,opacity:0.85,stroke-dasharray:4 2;
+    linkStyle 10 stroke:#8B5CF6,stroke-width:2px,opacity:0.85,stroke-dasharray:4 2;
+    linkStyle 11 stroke:#8B5CF6,stroke-width:2px,opacity:0.85,stroke-dasharray:4 2;
+    linkStyle 12 stroke:#8B5CF6,stroke-width:2px,opacity:0.85,stroke-dasharray:4 2;
+    linkStyle 13 stroke:#8B5CF6,stroke-width:2px,opacity:0.85,stroke-dasharray:4 2;
+    linkStyle 14 stroke:#8B5CF6,stroke-width:2px,opacity:0.85,stroke-dasharray:4 2;
+    linkStyle 15 stroke:#8B5CF6,stroke-width:2px,opacity:0.85,stroke-dasharray:4 2;
+    linkStyle 16 stroke:#8B5CF6,stroke-width:2px,opacity:0.85,stroke-dasharray:4 2;
+    linkStyle 17 stroke:#8B5CF6,stroke-width:2px,opacity:0.85,stroke-dasharray:4 2;
+    linkStyle 18 stroke:#8B5CF6,stroke-width:2px,opacity:0.85,stroke-dasharray:4 2;
+    linkStyle 19 stroke:#8B5CF6,stroke-width:2px,opacity:0.85,stroke-dasharray:4 2;
+    linkStyle 20 stroke:#8B5CF6,stroke-width:2px,opacity:0.85,stroke-dasharray:4 2;
+    linkStyle 21 stroke:#8B5CF6,stroke-width:2px,opacity:0.85,stroke-dasharray:4 2;
+    linkStyle 22 stroke:#8B5CF6,stroke-width:2px,opacity:0.85,stroke-dasharray:4 2;
+    linkStyle 23 stroke:#8B5CF6,stroke-width:2px,opacity:0.85,stroke-dasharray:4 2;
+    linkStyle 24 stroke:#8B5CF6,stroke-width:2px,opacity:0.85,stroke-dasharray:4 2;
+    linkStyle 25 stroke:#8B5CF6,stroke-width:2px,opacity:0.85,stroke-dasharray:4 2;
+    linkStyle 26 stroke:#8B5CF6,stroke-width:2px,opacity:0.85,stroke-dasharray:4 2;
+    linkStyle 27 stroke:#8B5CF6,stroke-width:2px,opacity:0.85,stroke-dasharray:4 2;
+    linkStyle 28 stroke:#8B5CF6,stroke-width:2px,opacity:0.85,stroke-dasharray:4 2;
+    linkStyle 29 stroke:#8B5CF6,stroke-width:2px,opacity:0.85,stroke-dasharray:4 2;
+    linkStyle 30 stroke:#8B5CF6,stroke-width:2px,opacity:0.85,stroke-dasharray:4 2;
+    linkStyle 31 stroke:#8B5CF6,stroke-width:2px,opacity:0.85,stroke-dasharray:4 2;
+    linkStyle 32 stroke:#8B5CF6,stroke-width:2px,opacity:0.85,stroke-dasharray:4 2;
+    linkStyle 33 stroke:#8B5CF6,stroke-width:2px,opacity:0.85,stroke-dasharray:4 2;
+    linkStyle 34 stroke:#8B5CF6,stroke-width:2px,opacity:0.85,stroke-dasharray:4 2;
+    linkStyle 35 stroke:#8B5CF6,stroke-width:2px,opacity:0.85,stroke-dasharray:4 2;
+    linkStyle 36 stroke:#8B5CF6,stroke-width:2px,opacity:0.85,stroke-dasharray:4 2;
+    linkStyle 37 stroke:#8B5CF6,stroke-width:2px,opacity:0.85,stroke-dasharray:4 2;
+    linkStyle 38 stroke:#8B5CF6,stroke-width:2px,opacity:0.85,stroke-dasharray:4 2;
+    linkStyle 39 stroke:#8B5CF6,stroke-width:2px,opacity:0.85,stroke-dasharray:4 2;
+    linkStyle 40 stroke:#8B5CF6,stroke-width:2px,opacity:0.85,stroke-dasharray:4 2;
+    linkStyle 41 stroke:#8B5CF6,stroke-width:2px,opacity:0.85,stroke-dasharray:4 2;
+    linkStyle 42 stroke:#8B5CF6,stroke-width:2px,opacity:0.85,stroke-dasharray:4 2;
+    linkStyle 43 stroke:#8B5CF6,stroke-width:2px,opacity:0.85,stroke-dasharray:4 2;
+    linkStyle 44 stroke:#8B5CF6,stroke-width:2px,opacity:0.85,stroke-dasharray:4 2;
+    linkStyle 45 stroke:#8B5CF6,stroke-width:2px,opacity:0.85,stroke-dasharray:4 2;
+    linkStyle 46 stroke:#8B5CF6,stroke-width:2px,opacity:0.85,stroke-dasharray:4 2;
+    linkStyle 47 stroke:#8B5CF6,stroke-width:2px,opacity:0.85,stroke-dasharray:4 2;
+    linkStyle 48 stroke:#8B5CF6,stroke-width:2px,opacity:0.85,stroke-dasharray:4 2;
+    linkStyle 49 stroke:#8B5CF6,stroke-width:2px,opacity:0.85,stroke-dasharray:4 2;
+    linkStyle 50 stroke:#8B5CF6,stroke-width:2px,opacity:0.85,stroke-dasharray:4 2;
+    linkStyle 51 stroke:#2A9D8F,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
+    linkStyle 52 stroke:#2A9D8F,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
+    linkStyle 53 stroke:#2A9D8F,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
+    linkStyle 54 stroke:#2A9D8F,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
+    linkStyle 55 stroke:#577590,stroke-width:3px,opacity:0.85,stroke-dasharray:8 3;
+    linkStyle 56 stroke:#2A9D8F,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
+    linkStyle 57 stroke:#E9C46A,stroke-width:3px,opacity:0.9,stroke-dasharray:2 2;
+    linkStyle 58 stroke:#E9C46A,stroke-width:3px,opacity:0.9,stroke-dasharray:2 2;
+    linkStyle 59 stroke:#E9C46A,stroke-width:3px,opacity:0.9,stroke-dasharray:2 2;
+    linkStyle 60 stroke:#E9C46A,stroke-width:3px,opacity:0.9,stroke-dasharray:2 2;
+    linkStyle 61 stroke:#1D70A2,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
+    linkStyle 62 stroke:#1D70A2,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
+    linkStyle 63 stroke:#1D70A2,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
+    linkStyle 64 stroke:#1D70A2,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
+    linkStyle 65 stroke:#1D70A2,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
+    linkStyle 66 stroke:#1D70A2,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
+    linkStyle 67 stroke:#1D70A2,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
+    linkStyle 68 stroke:#1D70A2,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
+    linkStyle 69 stroke:#F4A261,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
+    linkStyle 70 stroke:#F4A261,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
+    linkStyle 71 stroke:#F4A261,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
+    linkStyle 72 stroke:#F4A261,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
+    linkStyle 73 stroke:#F4A261,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
+    linkStyle 74 stroke:#F4A261,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
+    linkStyle 75 stroke:#F4A261,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
+    linkStyle 76 stroke:#E76F51,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
+    linkStyle 77 stroke:#E76F51,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
+    linkStyle 78 stroke:#E76F51,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
+    linkStyle 79 stroke:#E76F51,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
+    linkStyle 80 stroke:#B56576,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
+    linkStyle 81 stroke:#B56576,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
+    linkStyle 82 stroke:#2B9348,stroke-width:3px,opacity:0.9,stroke-dasharray:4 2;
+    linkStyle 83 stroke:#2B9348,stroke-width:3px,opacity:0.9,stroke-dasharray:4 2;
+    linkStyle 84 stroke:#2B9348,stroke-width:3px,opacity:0.9,stroke-dasharray:4 2;
+    linkStyle 85 stroke:#2B9348,stroke-width:3px,opacity:0.9,stroke-dasharray:4 2;
+```
+
+</details>
+<!-- END:GENERATED_STACK_VIEW_LAYER -->
+
 ## Node Roles
 
 - `InitVocabNode`: establishes the current term inventory and semantic target space.

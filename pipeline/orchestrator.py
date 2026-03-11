@@ -745,7 +745,7 @@ def _execution_plan_edges(plan) -> list[Any]:
     return edges if edges else [edge for edge in list(getattr(plan, "edges", []) or []) if bool(getattr(edge, "enabled", True))]
 
 
-def _condition_for_plan_edge(condition_id: str):
+def _condition_for_plan_edge(condition_id: str, *, condition_blobs: dict | None = None):
     registry = {
         _CONDITION_ID_GENERATOR_MODE: _generator_exists,
         _CONDITION_ID_PREGESTATION_GATE: _gate_pregestation_passed,
@@ -756,30 +756,77 @@ def _condition_for_plan_edge(condition_id: str):
     resolved_id = str(condition_id or "").strip()
     if not resolved_id:
         return None
-    if resolved_id not in registry:
-        raise ValueError(f"Unsupported plan edge condition_id {resolved_id!r}")
-    return registry[resolved_id]
+    if resolved_id in registry:
+        return registry[resolved_id]
+    blob = dict((condition_blobs or {}).get(resolved_id, {}) or {})
+    predicate_name = str(blob.get("callable_ref", "") or "").rsplit(".", 1)[-1].strip()
+    if predicate_name:
+        def _plan_condition(ctx, _name=predicate_name):
+            fn = getattr(ctx, _name, None)
+            return bool(fn()) if callable(fn) else False
+        return _plan_condition
+    raise ValueError(f"Unsupported plan edge condition_id {resolved_id!r}")
 
 
-def _resolve_plan_edge_callback(graph: PipelineGraph, edge_record):
+def _resolve_callback_from_ref(
+    graph: PipelineGraph,
+    callable_ref: str,
+    owner_node_id: str,
+    *,
+    edge_id: str = "",
+    strict: bool = False,
+):
+    """Resolve a callable_ref to an actual method on a graph node."""
+    method_name = str(callable_ref or "").rsplit(".", 1)[-1].strip()
+    source_id = str(owner_node_id or "").strip()
+    if not method_name or not source_id:
+        if strict:
+            raise ValueError(f"Plan edge {edge_id!r} is missing callback metadata")
+        return None
+    source_node = graph.nodes.get(source_id)
+    if source_node is None:
+        if strict:
+            raise ValueError(f"Plan edge references unknown callback source node {source_id!r}")
+        return None
+    callback = getattr(source_node, method_name, None)
+    if callback is None and strict:
+        raise ValueError(
+            f"Plan edge {edge_id!r} expects callback {callable_ref!r} "
+            f"but node {source_id!r} does not provide it"
+        )
+    return callback
+
+
+def _resolve_plan_edge_callback(graph: PipelineGraph, edge_record, *, action_map: dict | None = None):
+    """Resolve the on_traverse callback for a plan edge.
+
+    Resolution order:
+      1. Action registry (action_id → callable_ref)
+      2. Legacy edge metadata (reaction_name + target_function)
+    """
+    edge_id_str = str(getattr(edge_record, "edge_id", "<unknown>"))
+    action_map = dict(action_map or {})
+    action_id = str(getattr(edge_record, "action_id", "") or "").strip()
+
+    if action_id and action_id in action_map:
+        action = action_map[action_id]
+        callable_ref = str(getattr(action, "callable_ref", "") or "").strip()
+        owner_id = str(
+            getattr(action, "owner_node_id", "") or getattr(edge_record, "source_node_id", "") or ""
+        ).strip()
+        if callable_ref and owner_id:
+            resolved = _resolve_callback_from_ref(graph, callable_ref, owner_id, edge_id=edge_id_str)
+            if resolved is not None:
+                return resolved
+
     reaction_name = str(getattr(edge_record, "reaction_name", "") or "").strip()
     target_function = str(getattr(edge_record, "target_function", "") or "").strip()
     if reaction_name != "data.provide":
         return None
-    method_name = target_function.rsplit(".", 1)[-1].strip()
     source_id = str(getattr(edge_record, "source_node_id", "") or "").strip()
-    if not method_name or not source_id:
-        raise ValueError(f"Plan edge {getattr(edge_record, 'edge_id', '<unknown>')!r} is missing data callback metadata")
-    source_node = graph.nodes.get(source_id)
-    if source_node is None:
-        raise ValueError(f"Plan edge references unknown callback source node {source_id!r}")
-    callback = getattr(source_node, method_name, None)
-    if callback is None:
-        raise ValueError(
-            f"Plan edge {getattr(edge_record, 'edge_id', '<unknown>')!r} expects callback {target_function!r} "
-            f"but node {source_id!r} does not provide it"
-        )
-    return callback
+    return _resolve_callback_from_ref(
+        graph, target_function, source_id, edge_id=edge_id_str, strict=True,
+    )
 
 
 def _plan_edge_label(edge_record) -> str:
@@ -836,6 +883,11 @@ def build_training_graph_from_plan(plan) -> PipelineGraph:
     available_nodes = base_graph.nodes
     selected_nodes = _execution_plan_nodes(plan)
     selected_edges = _execution_plan_edges(plan)
+    action_map = {
+        a.action_id: a
+        for a in (getattr(plan, "actions", None) or [])
+    }
+    condition_blobs = dict(getattr(plan, "condition_blobs", {}) or {})
     graph_name = str(getattr(plan, "name", "") or getattr(base_graph, "name", "wav_ml_pipeline"))
     graph = PipelineGraph(name=graph_name)
 
@@ -859,10 +911,13 @@ def build_training_graph_from_plan(plan) -> PipelineGraph:
         graph.add_edge(
             source_id,
             target_id,
-            condition=_condition_for_plan_edge(str(getattr(edge_record, "condition_id", "") or "")),
+            condition=_condition_for_plan_edge(
+                str(getattr(edge_record, "condition_id", "") or ""),
+                condition_blobs=condition_blobs,
+            ),
             label=_plan_edge_label(edge_record),
             condition_id=str(getattr(edge_record, "condition_id", "") or ""),
-            on_traverse=_resolve_plan_edge_callback(graph, edge_record),
+            on_traverse=_resolve_plan_edge_callback(graph, edge_record, action_map=action_map),
             edge_id=str(getattr(edge_record, "edge_id", "") or ""),
             layer=str(getattr(edge_record, "layer", "execution") or "execution"),
             target_function=str(getattr(edge_record, "target_function", "") or ""),

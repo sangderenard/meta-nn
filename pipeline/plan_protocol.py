@@ -94,6 +94,102 @@ class NodePosition:
 
 
 @dataclass
+class ActionRecord:
+    """Unified action object — any callable unit in the IR.
+
+    Captures edge traversals, node-internal methods, subnode processes,
+    and condition checks.  Every executable behaviour in the graph is
+    represented by an ActionRecord so that the plan is both a complete
+    dependency description *and* a runnable program.
+    """
+
+    action_id: str
+    kind: str = "edge_traverse"  # edge_traverse | node_method | subnode_process | condition_check
+    callable_ref: str = ""       # e.g. "DataNode.provide_pregestation_loader"
+    owner_node_id: str = ""      # node that owns this action (empty for edge-global)
+    reaction_name: str = ""
+    parameters: Dict[str, Any] = field(default_factory=dict)
+    resources_in: list[str] = field(default_factory=list)
+    resources_out: list[str] = field(default_factory=list)
+    enabled: bool = True
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "action_id": str(self.action_id),
+            "kind": str(self.kind),
+            "callable_ref": str(self.callable_ref),
+            "owner_node_id": str(self.owner_node_id),
+            "reaction_name": str(self.reaction_name),
+            "parameters": _jsonable(self.parameters),
+            "resources_in": [str(r) for r in self.resources_in],
+            "resources_out": [str(r) for r in self.resources_out],
+            "enabled": bool(self.enabled),
+            "metadata": _jsonable(self.metadata),
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "ActionRecord":
+        return cls(
+            action_id=str(data["action_id"]),
+            kind=str(data.get("kind", "edge_traverse")),
+            callable_ref=str(data.get("callable_ref", "")),
+            owner_node_id=str(data.get("owner_node_id", "")),
+            reaction_name=str(data.get("reaction_name", "")),
+            parameters=dict(data.get("parameters", {})),
+            resources_in=[str(r) for r in data.get("resources_in", [])],
+            resources_out=[str(r) for r in data.get("resources_out", [])],
+            enabled=bool(data.get("enabled", True)),
+            metadata=dict(data.get("metadata", {})),
+        )
+
+
+@dataclass
+class SubnodeRecord:
+    """An inner process owned by one node — analogous to a class method.
+
+    Subnodes model the internal faculties of a node: individual training
+    cores, evaluation passes, data preparation steps, etc.  They are
+    definitively inside the purview of a single node, not utilities, not
+    global-scope faculties, not cross-boundary behaviours.
+    """
+
+    subnode_id: str
+    parent_node_id: str
+    kind: str = "execute"  # execute | training_core | gate_eval | data_prep | io | sync
+    label: str = ""
+    action_ids: list[str] = field(default_factory=list)
+    order: int = 0
+    enabled: bool = True
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "subnode_id": str(self.subnode_id),
+            "parent_node_id": str(self.parent_node_id),
+            "kind": str(self.kind),
+            "label": str(self.label),
+            "action_ids": [str(aid) for aid in self.action_ids],
+            "order": int(self.order),
+            "enabled": bool(self.enabled),
+            "metadata": _jsonable(self.metadata),
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "SubnodeRecord":
+        return cls(
+            subnode_id=str(data["subnode_id"]),
+            parent_node_id=str(data["parent_node_id"]),
+            kind=str(data.get("kind", "execute")),
+            label=str(data.get("label", "")),
+            action_ids=[str(aid) for aid in data.get("action_ids", [])],
+            order=int(data.get("order", 0)),
+            enabled=bool(data.get("enabled", True)),
+            metadata=dict(data.get("metadata", {})),
+        )
+
+
+@dataclass
 class GraphNodeRecord:
     node_id: str
     kind: str
@@ -107,6 +203,8 @@ class GraphNodeRecord:
     layer: str = "execution"
     enabled: bool = True
     metadata: Dict[str, Any] = field(default_factory=dict)
+    subnodes: list[SubnodeRecord] = field(default_factory=list)
+    owned_action_ids: list[str] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -122,6 +220,8 @@ class GraphNodeRecord:
             "layer": str(self.layer),
             "enabled": bool(self.enabled),
             "metadata": _jsonable(self.metadata),
+            "subnodes": [sn.to_dict() for sn in self.subnodes],
+            "owned_action_ids": [str(aid) for aid in self.owned_action_ids],
         }
 
     @classmethod
@@ -139,6 +239,12 @@ class GraphNodeRecord:
             layer=str(data.get("layer", "execution")),
             enabled=bool(data.get("enabled", True)),
             metadata=dict(data.get("metadata", {})),
+            subnodes=[
+                SubnodeRecord.from_dict(dict(sn))
+                for sn in data.get("subnodes", [])
+                if isinstance(sn, dict)
+            ],
+            owned_action_ids=[str(aid) for aid in data.get("owned_action_ids", [])],
         )
 
 
@@ -155,6 +261,7 @@ class GraphEdgeRecord:
     reaction_defaults: Dict[str, Any] = field(default_factory=dict)
     enabled: bool = True
     metadata: Dict[str, Any] = field(default_factory=dict)
+    action_id: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -169,6 +276,7 @@ class GraphEdgeRecord:
             "reaction_defaults": _jsonable(self.reaction_defaults),
             "enabled": bool(self.enabled),
             "metadata": _jsonable(self.metadata),
+            "action_id": str(self.action_id),
         }
 
     @classmethod
@@ -185,6 +293,7 @@ class GraphEdgeRecord:
             reaction_defaults=dict(data.get("reaction_defaults", {})),
             enabled=bool(data.get("enabled", True)),
             metadata=dict(data.get("metadata", {})),
+            action_id=str(data.get("action_id", "")),
         )
 
 
@@ -227,6 +336,7 @@ class TrainingGraphPlan:
     schema_version: int = PLAN_SCHEMA_VERSION
     nodes: List[GraphNodeRecord] = field(default_factory=list)
     edges: List[GraphEdgeRecord] = field(default_factory=list)
+    actions: List[ActionRecord] = field(default_factory=list)
     entry_node_ids: List[str] = field(default_factory=list)
     config_blobs: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     condition_blobs: Dict[str, Dict[str, Any]] = field(default_factory=dict)
@@ -283,6 +393,33 @@ class TrainingGraphPlan:
         if visited != len(known_nodes):
             raise ValueError("TrainingGraphPlan contains a cycle.")
 
+        action_ids = [action.action_id for action in self.actions]
+        if len(set(action_ids)) != len(action_ids):
+            raise ValueError("TrainingGraphPlan contains duplicate action ids.")
+        action_id_set = set(action_ids)
+        for edge in self.edges:
+            if edge.action_id and edge.action_id not in action_id_set:
+                raise ValueError(
+                    f"Edge {edge.edge_id!r} references unknown action {edge.action_id!r}."
+                )
+        for node in self.nodes:
+            for aid in node.owned_action_ids:
+                if aid not in action_id_set:
+                    raise ValueError(
+                        f"Node {node.node_id!r} references unknown owned action {aid!r}."
+                    )
+            for subnode in node.subnodes:
+                if subnode.parent_node_id != node.node_id:
+                    raise ValueError(
+                        f"Subnode {subnode.subnode_id!r} parent mismatch: "
+                        f"expected {node.node_id!r}, got {subnode.parent_node_id!r}."
+                    )
+                for aid in subnode.action_ids:
+                    if aid not in action_id_set:
+                        raise ValueError(
+                            f"Subnode {subnode.subnode_id!r} references unknown action {aid!r}."
+                        )
+
     def node_map(self) -> Dict[str, GraphNodeRecord]:
         return {node.node_id: node for node in self.nodes}
 
@@ -298,6 +435,7 @@ class TrainingGraphPlan:
             "revision": int(self.revision),
             "nodes": [node.to_dict() for node in self.nodes],
             "edges": [edge.to_dict() for edge in self.edges],
+            "actions": [action.to_dict() for action in self.actions],
             "entry_node_ids": [str(node_id) for node_id in self.entry_node_ids],
             "config_blobs": _jsonable(self.config_blobs),
             "condition_blobs": _jsonable(self.condition_blobs),
@@ -324,6 +462,11 @@ class TrainingGraphPlan:
                 GraphEdgeRecord.from_dict(dict(edge))
                 for edge in data.get("edges", [])
                 if isinstance(edge, dict)
+            ],
+            actions=[
+                ActionRecord.from_dict(dict(a))
+                for a in data.get("actions", [])
+                if isinstance(a, dict)
             ],
             entry_node_ids=[str(node_id) for node_id in data.get("entry_node_ids", [])],
             config_blobs=dict(data.get("config_blobs", {})),
@@ -774,6 +917,121 @@ def build_layout_from_records(
     return GraphLayoutRecord(positions=positions, groups=groups, annotations=[])
 
 
+# ---------------------------------------------------------------------------
+# Subnode / action introspection
+# ---------------------------------------------------------------------------
+
+def _has_overridden_method(cls: type, method_name: str) -> bool:
+    """True if *cls* defines *method_name* rather than inheriting it unchanged."""
+    method = getattr(cls, method_name, None)
+    if method is None:
+        return False
+    for base in cls.__mro__[1:]:
+        base_method = getattr(base, method_name, None)
+        if base_method is not None:
+            return method is not base_method
+    return False
+
+
+def _parse_declared_subnodes(
+    node_id: str,
+    raw: list,
+) -> tuple[list[SubnodeRecord], list[ActionRecord]]:
+    """Convert raw ``declare_subnodes()`` output to typed records."""
+    subnodes: list[SubnodeRecord] = []
+    actions: list[ActionRecord] = []
+    for idx, item in enumerate(raw):
+        d = dict(item) if isinstance(item, dict) else {}
+        sn_id = str(d.get("subnode_id", f"{node_id}::sub_{idx}"))
+        kind = str(d.get("kind", "execute"))
+        label = str(d.get("label", sn_id))
+        callable_ref = str(d.get("callable_ref", ""))
+        action_id = f"action::node::{node_id}::{kind}_{idx}"
+        if callable_ref:
+            actions.append(ActionRecord(
+                action_id=action_id,
+                kind="subnode_process",
+                callable_ref=callable_ref,
+                owner_node_id=node_id,
+                metadata=dict(d.get("metadata", {})),
+            ))
+        subnode_action_ids = [action_id] if callable_ref else []
+        subnodes.append(SubnodeRecord(
+            subnode_id=sn_id,
+            parent_node_id=node_id,
+            kind=kind,
+            label=label,
+            action_ids=subnode_action_ids,
+            order=int(d.get("order", idx)),
+            metadata=dict(d.get("metadata", {})),
+        ))
+    return subnodes, actions
+
+
+def _infer_subnodes_and_actions(
+    node_id: str,
+    node: Any,
+) -> tuple[list[SubnodeRecord], list[ActionRecord]]:
+    """Discover inner faculties of *node* for IR representation.
+
+    If the node implements ``declare_subnodes()``, those are used verbatim.
+    Otherwise a minimal set of subnodes is inferred from class structure:
+    an ``execute`` process (always), and a ``gate_check`` process when the
+    node overrides ``should_run``.
+    """
+    declare_fn = getattr(node, "declare_subnodes", None)
+    if callable(declare_fn):
+        try:
+            raw = declare_fn()
+            if isinstance(raw, list) and raw:
+                return _parse_declared_subnodes(node_id, raw)
+        except Exception:
+            pass
+
+    class_name = type(node).__name__
+    subnodes: list[SubnodeRecord] = []
+    actions: list[ActionRecord] = []
+
+    exec_action_id = f"action::node::{node_id}::execute"
+    actions.append(ActionRecord(
+        action_id=exec_action_id,
+        kind="node_method",
+        callable_ref=f"{class_name}.execute",
+        owner_node_id=node_id,
+    ))
+
+    has_custom_should_run = _has_overridden_method(type(node), "should_run")
+    should_run_action_ids: list[str] = []
+    if has_custom_should_run:
+        gate_action_id = f"action::node::{node_id}::should_run"
+        actions.append(ActionRecord(
+            action_id=gate_action_id,
+            kind="condition_check",
+            callable_ref=f"{class_name}.should_run",
+            owner_node_id=node_id,
+        ))
+        should_run_action_ids.append(gate_action_id)
+        subnodes.append(SubnodeRecord(
+            subnode_id=f"{node_id}::should_run",
+            parent_node_id=node_id,
+            kind="gate_check",
+            label="Gate check",
+            action_ids=should_run_action_ids,
+            order=-1,
+        ))
+
+    subnodes.append(SubnodeRecord(
+        subnode_id=f"{node_id}::execute",
+        parent_node_id=node_id,
+        kind="execute",
+        label=str(getattr(node, "description", "") or class_name),
+        action_ids=[exec_action_id],
+        order=0,
+    ))
+
+    return subnodes, actions
+
+
 def plan_from_pipeline_graph(
     graph: "PipelineGraph",
     *,
@@ -885,12 +1143,50 @@ def plan_from_pipeline_graph(
     serialized_conditions = serialize_config_blobs(dict(condition_blobs or {}))
     serialized_layers = _jsonable(dict(graph_layers or {}))
     serialized_execution_program = _jsonable(dict(execution_program or {}))
+
+    # ── build unified action records ─────────────────────────────────────
+    action_records: list[ActionRecord] = []
+    for edge_record in edge_records:
+        resources_out = [
+            str(r)
+            for r in list(edge_record.reaction_defaults.get("resources", []) or [])
+            if str(r or "").strip()
+        ]
+        edge_action = ActionRecord(
+            action_id=f"action::edge::{edge_record.edge_id}",
+            kind="edge_traverse",
+            callable_ref=str(edge_record.target_function),
+            owner_node_id=str(edge_record.source_node_id),
+            reaction_name=str(edge_record.reaction_name),
+            parameters=dict(edge_record.reaction_defaults),
+            resources_out=resources_out,
+            metadata={"edge_id": str(edge_record.edge_id)},
+        )
+        action_records.append(edge_action)
+        edge_record.action_id = edge_action.action_id
+
+    for node_record in node_records:
+        node_obj = raw_nodes.get(str(node_record.node_id))
+        if node_obj is None:
+            continue
+        subnodes, node_actions = _infer_subnodes_and_actions(
+            str(node_record.node_id), node_obj,
+        )
+        node_record.subnodes = subnodes
+        action_records.extend(node_actions)
+        node_record.owned_action_ids = [a.action_id for a in node_actions]
+
+    # Materialize stack_view from enriched node records
+    from pipeline.graph_layers import _build_stack_view_layer  # local to avoid circular import
+    serialized_layers["stack_view"] = _build_stack_view_layer(node_records, edge_records)
+
     plan_name = str(name or getattr(graph, "name", "Training Graph"))
     plan_digest = _stable_digest(
         {
             "name": plan_name,
             "nodes": [node.to_dict() for node in node_records],
             "edges": [edge.to_dict() for edge in edge_records],
+            "actions": [action.to_dict() for action in action_records],
             "configs": serialized_configs,
             "conditions": serialized_conditions,
             "layers": serialized_layers,
@@ -905,6 +1201,7 @@ def plan_from_pipeline_graph(
         revision=int(revision),
         nodes=node_records,
         edges=edge_records,
+        actions=action_records,
         entry_node_ids=_root_node_ids([node.node_id for node in node_records], edge_records),
         config_blobs=serialized_configs,
         condition_blobs=serialized_conditions,

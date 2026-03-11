@@ -132,6 +132,16 @@ class PipelineNode(ABC):
         """Run this node's logic.  Reads from *ctx*, writes results back."""
         ...
 
+    def declare_subnodes(self) -> List[Dict[str, Any]]:
+        """Declare internal sub-processes for IR introspection.
+
+        Override to expose the inner faculties of this node — individual
+        training cores, evaluation passes, data preparation steps, etc.
+        Each entry is a dict with at least ``subnode_id`` and ``kind``.
+        The plan exporter calls this when building the action registry.
+        """
+        return []
+
     def __repr__(self) -> str:  # pragma: no cover
         return f"<{type(self).__name__} id={self.node_id!r}>"
 

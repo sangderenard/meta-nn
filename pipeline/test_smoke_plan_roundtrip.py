@@ -67,7 +67,7 @@ from pipeline.nodes.gate_nodes import (
     GeneratorGateConfig,
     WaveGateConfig,
 )
-from pipeline.plan_protocol import plan_from_pipeline_graph, TrainingGraphPlan
+from pipeline.plan_protocol import plan_from_pipeline_graph, TrainingGraphPlan, ActionRecord, SubnodeRecord
 from pipeline.graph import PipelineGraph, PipelineNode
 from pipeline.context import PipelineContext
 from pipeline.graph_layers import (
@@ -301,6 +301,10 @@ old
 <!-- BEGIN:GENERATED_INFERENCE_LAYER -->
 old
 <!-- END:GENERATED_INFERENCE_LAYER -->
+
+<!-- BEGIN:GENERATED_STACK_VIEW_LAYER -->
+old
+<!-- END:GENERATED_STACK_VIEW_LAYER -->
 """,
             encoding="utf-8",
         )
@@ -673,6 +677,64 @@ def test_execution_program_flow_supports_cycles():
 
 # ── main ──────────────────────────────────────────────────────────────────────
 
+def test_action_subnode_roundtrip(plan: TrainingGraphPlan):
+    """Verify action records, subnode records, and their JSON roundtrip."""
+    print("\n--- test_action_subnode_roundtrip ---")
+    # plan.actions should be populated from edges + node introspection
+    _assert(len(plan.actions) > 0, f"plan has {len(plan.actions)} action records")
+    # every action should have an action_id and kind
+    for action in plan.actions:
+        _assert(isinstance(action, ActionRecord), f"action {action.action_id} is ActionRecord")
+        _assert(bool(action.action_id), "action has non-empty action_id")
+        _assert(action.kind in ("edge_traverse", "node_method", "subnode_process", "condition_check"),
+                f"action {action.action_id} has valid kind {action.kind!r}")
+    # every edge should have an action_id that references an existing action
+    action_id_set = {a.action_id for a in plan.actions}
+    for edge in plan.edges:
+        _assert(bool(edge.action_id), f"edge {edge.edge_id} has action_id")
+        _assert(edge.action_id in action_id_set, f"edge {edge.edge_id} action_id {edge.action_id!r} in action registry")
+    # at least some nodes should have subnodes
+    nodes_with_subnodes = [n for n in plan.nodes if n.subnodes]
+    _assert(len(nodes_with_subnodes) > 0, f"{len(nodes_with_subnodes)} nodes have subnodes")
+    for node in nodes_with_subnodes:
+        for sn in node.subnodes:
+            _assert(isinstance(sn, SubnodeRecord), f"subnode {sn.subnode_id} is SubnodeRecord")
+            _assert(sn.parent_node_id == node.node_id, f"subnode {sn.subnode_id} parent matches node {node.node_id}")
+        _assert(len(node.owned_action_ids) > 0, f"node {node.node_id} has owned action ids")
+        for aid in node.owned_action_ids:
+            _assert(aid in action_id_set, f"node {node.node_id} owned action {aid!r} in action registry")
+    # JSON roundtrip preserves actions and subnodes
+    with tempfile.TemporaryDirectory() as td:
+        path = Path(td) / "action_roundtrip.json"
+        plan.save_json(path)
+        reloaded = TrainingGraphPlan.load_json(path)
+    _assert(len(reloaded.actions) == len(plan.actions), "action count survives roundtrip")
+    reloaded_action_ids = {a.action_id for a in reloaded.actions}
+    for a in plan.actions:
+        _assert(a.action_id in reloaded_action_ids, f"action {a.action_id} survives roundtrip")
+    for orig_node in plan.nodes:
+        reloaded_node = next((n for n in reloaded.nodes if n.node_id == orig_node.node_id), None)
+        _assert(reloaded_node is not None, f"node {orig_node.node_id} survives roundtrip")
+        _assert(len(reloaded_node.subnodes) == len(orig_node.subnodes),
+                f"node {orig_node.node_id} subnode count survives roundtrip")
+        _assert(reloaded_node.owned_action_ids == orig_node.owned_action_ids,
+                f"node {orig_node.node_id} owned_action_ids survive roundtrip")
+    for orig_edge in plan.edges:
+        reloaded_edge = next((e for e in reloaded.edges if e.edge_id == orig_edge.edge_id), None)
+        _assert(reloaded_edge is not None, f"edge {orig_edge.edge_id} survives roundtrip")
+        _assert(reloaded_edge.action_id == orig_edge.action_id,
+                f"edge {orig_edge.edge_id} action_id survives roundtrip")
+    # validation should still pass
+    reloaded.validate()
+    _ok("action/subnode records populated, referenced, and survive JSON roundtrip")
+    # stack_view layer should be materialized with subnodes
+    layers = plan.graph_layers or {}
+    stack_view = layers.get("stack_view", {})
+    _assert(stack_view.get("status") == "active", "stack_view layer is active")
+    _assert(len(stack_view.get("nodes", [])) > 0, "stack_view has nodes")
+    _assert(len(stack_view.get("edges", [])) > 0, "stack_view has edges")
+    _ok("stack_view layer materialized with subnodes")
+
 def main():
     print("=== Smoke test: plan round-trip ===")
     graph, node_count, edge_count = test_build_pipeline_graph()
@@ -690,6 +752,7 @@ def main():
     test_execution_program_guards_drive_runtime()
     test_execution_program_flow_visits_decision_and_hold()
     test_execution_program_flow_supports_cycles()
+    test_action_subnode_roundtrip(reloaded_plan)
     print("\n=== All checks passed ===")
 
 
