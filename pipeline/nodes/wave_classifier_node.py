@@ -47,6 +47,8 @@ import torch
 from pipeline.context import PipelineContext
 from pipeline.graph import PipelineNode
 from pipeline.nodes.base import GatedNode, make_grad_scaler
+import json
+import numpy as np
 
 
 # ---------------------------------------------------------------------------
@@ -195,7 +197,6 @@ class WaveClassifierTrainNode(GatedNode):
 
     def execute(self, ctx: PipelineContext) -> None:
         from wav_config_transformer_pipeline import (
-            _build_wave_classifier_dataset_from_transformer,
             _wave_feedback_gate_pass,
             _wave_feedback_snapshot,
         )
@@ -306,7 +307,6 @@ def _count_wave_labels(ctx: PipelineContext, cfg: WaveClassifierConfig) -> int:
     if cfg.label_mode == "hash" or cfg.label_mode == "spectral":
         return cfg.n_label_buckets
     # folder mode: count unique parent directories
-    from wav_config_transformer_pipeline import _build_labels
     paths = [str(r.path) if hasattr(r, "path") else str(r) for r in ctx.wav_records]
     labels = _build_labels(paths, mode="folder")
     n = len(set(labels)) if labels else 2
@@ -354,7 +354,6 @@ def _run_zero_shot_eval(
     if val_loader is None:
         return 0.0
     try:
-        from wav_config_transformer_pipeline import _evaluate_zero_shot_queries_on_images
 
         query_str = cfg.zero_shot_query_terms.strip() or ";".join(ctx.active_extra_terms[:16])
         result = _evaluate_zero_shot_queries_on_images(
@@ -375,3 +374,401 @@ def _run_zero_shot_eval(
 
 def _log(msg: str) -> None:
     print(msg, flush=True)
+
+
+# =========================================================================
+# Functions extracted from wav_config_transformer_pipeline.py
+# =========================================================================
+
+
+def _evaluate_zero_shot_queries_on_images(
+    classifier: nn.Module,
+    x: torch.Tensor,
+    query_texts: Sequence[str],
+    query_emb_np: np.ndarray,
+    batch_size: int,
+    device: torch.device,
+    amp_enabled: bool = False,
+    amp_dtype: str = "float16",
+    channels_last: bool = False,
+    topk: int = 3,
+    max_samples: int = 128,
+    max_report_samples: int = 8,
+) -> Dict[str, Any]:
+    if not isinstance(classifier, TinyConvClassifier):
+        return {"ran": False, "reason": f"unsupported_classifier:{type(classifier).__name__}"}
+    if x is None or int(x.ndim) != 4 or int(x.shape[0]) <= 0:
+        return {"ran": False, "reason": "empty_input"}
+    queries = [str(q) for q in query_texts if str(q).strip()]
+    if len(queries) <= 0:
+        return {"ran": False, "reason": "no_queries"}
+    q_np = np.asarray(query_emb_np, dtype=np.float32)
+    if q_np.ndim != 2 or int(q_np.shape[0]) != len(queries):
+        return {
+            "ran": False,
+            "reason": (
+                f"query_shape_mismatch: queries={len(queries)} "
+                f"emb_shape={tuple(q_np.shape)}"
+            ),
+        }
+    q_np = _normalize_l2_rows_np(q_np)
+    q_dim = int(q_np.shape[1])
+    emb_dim = int(classifier.embed_proj.out_features)
+    if q_dim != emb_dim:
+        return {
+            "ran": False,
+            "reason": f"query_dim_mismatch: query_dim={q_dim} embed_dim={emb_dim}",
+        }
+
+    use_amp = bool(amp_enabled and device.type == "cuda")
+    amp_dtype_t = _resolve_amp_dtype(amp_dtype) if use_amp else torch.float16
+    q_bank = torch.from_numpy(q_np).to(device=device, dtype=torch.float32)
+    n_all = int(x.shape[0])
+    n_use = int(n_all if int(max_samples) <= 0 else min(n_all, max(1, int(max_samples))))
+    bsz = max(1, int(batch_size))
+    q_n = int(q_bank.shape[0])
+    report_cap = max(0, int(max_report_samples))
+    topk_eff = max(1, min(int(topk), q_n))
+
+    sum_scores = torch.zeros((q_n,), dtype=torch.float64)
+    top1_counts = torch.zeros((q_n,), dtype=torch.int64)
+    top1_score_sum = 0.0
+    sample_rows: List[Dict[str, Any]] = []
+
+    was_training = bool(classifier.training)
+    classifier.eval()
+    for i in range(0, n_use, bsz):
+        xb = x[i : i + bsz].to(device, non_blocking=True)
+        if channels_last:
+            xb = xb.contiguous(memory_format=torch.channels_last)
+        with _autocast_context(device=device, enabled=use_amp, amp_dtype_t=amp_dtype_t):
+            feat = classifier.extract_features(xb)
+            sims = classifier.semantic_logits_from_features(
+                feat=feat,
+                bank=q_bank,
+                temperature=1.0,
+            ).to(torch.float32)
+        sum_scores += sims.sum(dim=0).detach().to("cpu", dtype=torch.float64)
+        top1_vals, top1_idx = torch.max(sims, dim=1)
+        top1_score_sum += float(top1_vals.sum().item())
+        top1_counts += torch.bincount(top1_idx.detach().to("cpu"), minlength=q_n)
+
+        if len(sample_rows) < report_cap:
+            take = min(int(sims.shape[0]), int(report_cap - len(sample_rows)))
+            vals, idxs = torch.topk(sims, k=topk_eff, dim=1)
+            vals = vals.detach().to("cpu", dtype=torch.float32)
+            idxs = idxs.detach().to("cpu", dtype=torch.int64)
+            for r in range(take):
+                hits = []
+                for j in range(topk_eff):
+                    q_idx = int(idxs[r, j].item())
+                    hits.append(
+                        {
+                            "query_idx": int(q_idx),
+                            "query": str(queries[q_idx]),
+                            "score": float(vals[r, j].item()),
+                        }
+                    )
+                sample_rows.append(
+                    {
+                        "sample_idx": int(i + r),
+                        "topk": hits,
+                    }
+                )
+    classifier.train(was_training)
+
+    denom = float(max(1, n_use))
+    mean_scores = (sum_scores / denom).numpy()
+    top1_rate = (top1_counts.to(dtype=torch.float64) / denom).numpy()
+    order = np.argsort(-mean_scores)
+    query_rows: List[Dict[str, Any]] = []
+    for q_idx in order.tolist():
+        q_i = int(q_idx)
+        query_rows.append(
+            {
+                "query_idx": int(q_i),
+                "query": str(queries[q_i]),
+                "mean_score": float(mean_scores[q_i]),
+                "top1_rate": float(top1_rate[q_i]),
+                "top1_count": int(top1_counts[q_i].item()),
+            }
+        )
+
+    best = query_rows[0] if len(query_rows) > 0 else {}
+    return {
+        "ran": True,
+        "samples": int(n_use),
+        "num_queries": int(q_n),
+        "topk": int(topk_eff),
+        "mean_top1_score": float(top1_score_sum / denom),
+        "best_query": str(best.get("query", "")),
+        "best_query_mean_score": float(best.get("mean_score", 0.0)),
+        "best_query_top1_rate": float(best.get("top1_rate", 0.0)),
+        "query_rows": query_rows,
+        "sample_rows": sample_rows,
+    }
+
+
+def _build_wave_classifier_dataset_from_transformer(
+    streams: Sequence[np.ndarray],
+    labels: Sequence[int],
+    metas: Sequence[Dict],
+    cfg: RenderConfig,
+    transformer: nn.Module,
+    berkeley_classifier: nn.Module,
+    sample_bits: int,
+    image_hw: Tuple[int, int],
+    chunk_samples: int,
+    total_samples: int,
+    batch_size: int,
+    device: torch.device,
+    rng_seed: int,
+    accept_score_threshold: float,
+    accept_l1_threshold: float,
+    library_dir: Path,
+    library_limit: int,
+    cycle_id: int,
+    round_id: int,
+    accepted_only: bool = False,
+    run_tag: str = "",
+    library_serial_start: int = 0,
+    amp_enabled: bool = False,
+    amp_dtype: str = "float16",
+    channels_last: bool = False,
+    pin_memory: bool = False,
+    semantic_class_names: Optional[Sequence[str]] = None,
+    semantic_label_bank: Optional[np.ndarray] = None,
+    stream_target_labels: Optional[Sequence[Any]] = None,
+):
+    rng = np.random.default_rng(rng_seed)
+    x_all = []
+    y_all = []
+    accepted_rows = []
+    transformer.eval()
+    berkeley_classifier.eval()
+    amp_dtype_t = _resolve_amp_dtype(amp_dtype) if amp_enabled else torch.float16
+
+    target_samples = max(1, int(total_samples))
+    accepted_only = bool(accepted_only)
+    # When accepted_only is enabled, keep drawing until we reach the requested
+    # accepted-set size (or a bounded attempt budget).
+    max_draw_samples = target_samples if (not accepted_only) else max(target_samples, target_samples * 8)
+
+    drawn = 0
+    kept = 0
+    dirty_wave_categories: set = set()
+    while drawn < max_draw_samples and ((kept < target_samples) if accepted_only else (drawn < target_samples)):
+        if accepted_only:
+            b = min(int(batch_size), max_draw_samples - drawn)
+        else:
+            b = min(int(batch_size), target_samples - drawn)
+        if b <= 0:
+            break
+        xb_np, yb_np, picked = _sample_stream_chunks_with_labels(
+            streams=streams,
+            labels=labels,
+            metas=metas,
+            batch_size=b,
+            chunk_samples=chunk_samples,
+            rng=rng,
+        )
+        xb = torch.from_numpy(xb_np)
+        if pin_memory and device.type == "cuda":
+            xb = xb.pin_memory()
+        xb = xb.to(device, non_blocking=True)
+        with torch.no_grad():
+            with _autocast_context(device=device, enabled=amp_enabled, amp_dtype_t=amp_dtype_t):
+                xh = transformer(xb)
+                imgs = render_mono_wave_to_tensor(xh, cfg=cfg, image_hw=image_hw, sample_bits=sample_bits)
+                if channels_last:
+                    imgs = imgs.contiguous(memory_format=torch.channels_last)
+                logits = berkeley_classifier(imgs)
+            probs = torch.sigmoid(logits)
+            k = max(1, min(3, int(probs.shape[1])))
+            per_score = torch.topk(probs, k=k, dim=1).values.mean(dim=1)
+            per_l1 = torch.mean(torch.abs(xh - xb), dim=1)
+
+        accept_mask = (per_score >= float(accept_score_threshold)) & (per_l1 <= float(accept_l1_threshold))
+        if accepted_only:
+            if bool(torch.any(accept_mask)):
+                keep_idx = torch.nonzero(accept_mask, as_tuple=False).squeeze(1)
+                keep_np = keep_idx.detach().cpu().numpy()
+                x_all.append(imgs.index_select(0, keep_idx).detach().cpu())
+                y_all.append(torch.from_numpy(yb_np[keep_np]))
+                kept += int(keep_idx.numel())
+        else:
+            x_all.append(imgs.detach().cpu())
+            y_all.append(torch.from_numpy(yb_np))
+            kept += int(b)
+        drawn += int(b)
+
+        if library_limit > 0 and len(accepted_rows) < int(library_limit):
+            library_dir.mkdir(parents=True, exist_ok=True)
+            index_path = library_dir / "index.jsonl"
+            with index_path.open("a", encoding="utf-8") as f:
+                for i in range(b):
+                    sc = float(per_score[i].item())
+                    l1 = float(per_l1[i].item())
+                    if sc >= float(accept_score_threshold) and l1 <= float(accept_l1_threshold):
+                        serial = int(library_serial_start) + len(accepted_rows)
+                        if run_tag:
+                            fn = f"{run_tag}_cycle{cycle_id:03d}_round{round_id:03d}_{serial:08d}.wav"
+                        else:
+                            fn = f"cycle{cycle_id:03d}_round{round_id:03d}_{serial:08d}.wav"
+                        source_path = str(picked[i].get("path", ""))
+                        wave_origin_bucket = _wave_output_native_bucket(source_path)
+                        out_dir = library_dir / "waves" / wave_origin_bucket
+                        out_dir.mkdir(parents=True, exist_ok=True)
+                        out_path = out_dir / fn
+                        _save_mono_wav(out_path, xh[i].detach().cpu().numpy(), framerate=int(picked[i]["framerate"]))
+                        sem_terms: List[str] = []
+                        source_terms = picked[i].get("semantic_terms", [])
+                        if isinstance(source_terms, list):
+                            sem_terms.extend([str(x) for x in source_terms])
+                        stream_idx = int(picked[i].get("_stream_index", -1))
+                        if (
+                            stream_target_labels is not None
+                            and semantic_class_names is not None
+                            and 0 <= int(stream_idx) < int(len(stream_target_labels))
+                        ):
+                            src_target = stream_target_labels[int(stream_idx)]
+                            if src_target is not None:
+                                src_arr = np.asarray(src_target, dtype=np.float32).reshape(-1)
+                                src_take = min(int(src_arr.size), int(len(semantic_class_names)))
+                                if int(src_take) > 0:
+                                    src_pos = np.where(np.asarray(src_arr[: int(src_take)], dtype=np.float32) >= 0.5)[0]
+                                    for ti in src_pos.tolist():
+                                        if 0 <= int(ti) < int(len(semantic_class_names)):
+                                            sem_terms.append(str(semantic_class_names[int(ti)]))
+                        src_label_idx = int(yb_np[i])
+                        if semantic_class_names is not None and 0 <= src_label_idx < len(semantic_class_names):
+                            sem_terms.append(str(semantic_class_names[src_label_idx]))
+                        if semantic_class_names is not None and int(probs.shape[1]) > 0:
+                            p_row = probs[i].detach().to(torch.float32).cpu().numpy().reshape(-1)
+                            p_take = min(int(p_row.size), int(len(semantic_class_names)))
+                            if int(p_take) > 0:
+                                p_clip = np.asarray(p_row[: int(p_take)], dtype=np.float32)
+                                pred_pos = np.where(p_clip >= 0.20)[0].astype(np.int64).tolist()
+                                if int(len(pred_pos)) <= 0:
+                                    pred_pos = [int(np.argmax(p_clip))]
+                                for pi in pred_pos:
+                                    if 0 <= int(pi) < int(len(semantic_class_names)):
+                                        sem_terms.append(str(semantic_class_names[int(pi)]))
+                        sem_terms.extend(
+                            [
+                                "regurgitated content",
+                                "wave native output",
+                                f"wave origin {wave_origin_bucket.replace('_', ' ')}",
+                            ]
+                        )
+                        generated_noise_terms = _semantic_noise_terms_from_spectrum_sample(
+                            xh[i].detach().cpu().numpy().reshape(-1)
+                        )
+                        if wave_origin_bucket == "latent_noise":
+                            sem_terms.extend(list(generated_noise_terms))
+                        elif wave_origin_bucket in {"latent_mix", "accepted_loopback", "structured_seed"}:
+                            sem_terms.extend(["mixed noise and signal", "noise", "signal"])
+                            sem_terms.extend(list(generated_noise_terms))
+                        else:
+                            sem_terms.append("signal")
+                        sem_terms = _semantic_expand_inferred_tags(sem_terms)
+                        row = {
+                            "file": str(out_path),
+                            "label": int(yb_np[i]),
+                            "score": sc,
+                            "l1": l1,
+                            "source": source_path,
+                            "semantic_terms": list(sem_terms),
+                            "wave_category": str(wave_origin_bucket),
+                            "cycle": int(cycle_id),
+                            "round": int(round_id),
+                        }
+                        f.write(json.dumps(row) + "\n")
+                        accepted_rows.append(row)
+                        dirty_wave_categories.add(str(wave_origin_bucket))
+                    if len(accepted_rows) >= int(library_limit):
+                        break
+
+    for wave_category in sorted([str(x) for x in dirty_wave_categories]):
+        _refresh_wave_library_semantic_centroid(
+            library_dir=library_dir,
+            wave_category=wave_category,
+            semantic_class_names=semantic_class_names,
+            semantic_label_bank=semantic_label_bank,
+        )
+
+    if len(x_all) == 0:
+        x = torch.empty((0, 3, int(image_hw[0]), int(image_hw[1])), dtype=torch.float32)
+        y = torch.empty((0,), dtype=torch.long)
+    else:
+        x = torch.cat(x_all, dim=0)
+        y = torch.cat(y_all, dim=0).long()
+        if accepted_only and int(x.shape[0]) > target_samples:
+            x = x[:target_samples]
+            y = y[:target_samples]
+    if accepted_only and int(x.shape[0]) < target_samples:
+        print(
+            f"[wave-cls-dataset] accepted_only target={target_samples} got={int(x.shape[0])} "
+            f"(drawn={drawn}, max_draw={max_draw_samples})",
+            flush=True,
+        )
+    return x, y, accepted_rows
+
+
+def _build_labels(
+    records: Sequence[WaveRecord],
+    data_root: str,
+    label_mode: str,
+    pseudo_classes: int,
+    single_class_fallback: str = "spectral_cosine_quantile",
+):
+    root = Path(data_root).resolve()
+    if label_mode == "folder":
+        names: List[str] = []
+        for rec in records:
+            p = Path(rec.path).resolve()
+            try:
+                rel = p.relative_to(root)
+                if len(rel.parts) >= 2:
+                    names.append(rel.parts[0])
+                else:
+                    names.append(p.parent.name)
+            except Exception:
+                names.append(p.parent.name)
+        uniq = sorted(set(names))
+        if len(uniq) >= 2:
+            lut = {n: i for i, n in enumerate(uniq)}
+            labels = np.array([lut[n] for n in names], dtype=np.int64)
+            return labels, uniq, "folder"
+
+        fallback_mode = str(single_class_fallback).strip().lower()
+        if fallback_mode in ("path_hash_quantile", "path_hash", "deterministic_path_hash"):
+            labels, class_names = _deterministic_hash_quantile_labels(
+                records=records,
+                data_root=str(data_root),
+                bins=int(pseudo_classes),
+            )
+            return labels, class_names, "folder_hash_quantile"
+
+        _log("Folder labels are single-class; switching to pseudo labels from cosine-unified spectral encoding bins.")
+
+    pseudo_classes = max(2, int(pseudo_classes))
+    base_cfg = RenderConfig()
+    enc_coords = []
+    for rec in records:
+        mono, _ = _decode_record_to_mono(rec, base_cfg, max_points=65536)
+        enc_coords.append(_spectral_encoding_unit_coords(mono, sr=rec.framerate, bins=128))
+    enc_np = np.asarray(enc_coords, dtype=np.float64)
+    vals = _cosine_medoid_projection_scores(enc_np)
+    if int(vals.size) != int(len(records)):
+        vals = np.zeros((int(len(records)),), dtype=np.float64)
+    q = np.linspace(0.0, 1.0, pseudo_classes + 1)
+    edges = np.quantile(vals, q)
+    if np.allclose(edges, edges[0]):
+        rank = np.argsort(np.argsort(vals))
+        labels = (rank * pseudo_classes) // max(1, len(vals))
+    else:
+        labels = np.searchsorted(edges[1:-1], vals, side="right")
+    labels = labels.astype(np.int64)
+    class_names = [f"pseudo_cos_bin_{i}" for i in range(int(labels.max()) + 1)]
+    return labels, class_names, "spectral_cosine_quantile"

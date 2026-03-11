@@ -84,10 +84,6 @@ class BuildLabelEmbeddingNode(PipelineNode):
         return current_hash != self._last_class_names_hash
 
     def execute(self, ctx: PipelineContext) -> None:
-        from wav_config_transformer_pipeline import (
-            _build_label_embedding_bank,
-            _apply_label_embedding_bank_to_classifier,
-        )
 
         bank_np, label_texts, info = _build_label_embedding_bank(
             class_names=ctx.class_names,
@@ -150,3 +146,137 @@ def _make_embedding_args(cfg: LabelEmbeddingConfig, ctx: PipelineContext) -> Any
 
 def _log(msg: str) -> None:
     print(msg, flush=True)
+
+
+# =========================================================================
+# Functions extracted from wav_config_transformer_pipeline.py
+# =========================================================================
+
+_ST_MODEL_CACHE: Dict[Tuple[str, str], Any] = {}
+
+
+def _normalize_l2_rows_np(x: np.ndarray) -> np.ndarray:
+    if x.ndim != 2:
+        raise ValueError(f"Expected 2D array for row normalization, got shape={tuple(x.shape)}")
+    n = np.linalg.norm(x, axis=1, keepdims=True)
+    n = np.clip(n, 1e-8, None)
+    return (x / n).astype(np.float32, copy=False)
+
+
+def _resolve_label_texts(class_names: Sequence[str], override_json: str) -> List[str]:
+    base = [re.sub(r"\s+", " ", str(x)).strip() for x in class_names]
+    base = [x if len(x) > 0 else "__empty_label__" for x in base]
+    path = str(override_json).strip()
+    if not path:
+        return base
+    p = Path(path)
+    if not p.exists():
+        raise FileNotFoundError(f"Label text override JSON not found: {p}")
+    blob = json.loads(p.read_text(encoding="utf-8"))
+    out = list(base)
+    if isinstance(blob, list):
+        if len(blob) == len(out):
+            out = [re.sub(r"\s+", " ", str(x)).strip() for x in blob]
+        else:
+            n = min(len(blob), len(out))
+            for i in range(n):
+                out[i] = re.sub(r"\s+", " ", str(blob[i])).strip()
+        return [x if len(x) > 0 else "__empty_label__" for x in out]
+    if isinstance(blob, dict):
+        for i, name in enumerate(base):
+            key_idx = str(i)
+            if key_idx in blob:
+                out[i] = re.sub(r"\s+", " ", str(blob[key_idx])).strip()
+            elif name in blob:
+                out[i] = re.sub(r"\s+", " ", str(blob[name])).strip()
+        return [x if len(x) > 0 else "__empty_label__" for x in out]
+    raise RuntimeError("Label text override JSON must be a list[str] or dict[str,str].")
+
+
+def _encode_texts_sentence_transformers(texts: Sequence[str], model_name: str, device: torch.device) -> np.ndarray:
+    try:
+        from sentence_transformers import SentenceTransformer
+    except Exception as e:
+        raise RuntimeError(
+            "sentence-transformers backend requested but package is unavailable. "
+            "Install with: pip install sentence-transformers"
+        ) from e
+    st_device = "cuda" if (device.type == "cuda" and torch.cuda.is_available()) else "cpu"
+    cache_key = (str(model_name), str(st_device))
+    model = _ST_MODEL_CACHE.get(cache_key, None)
+    if model is None:
+        model = SentenceTransformer(str(model_name), device=st_device)
+        _ST_MODEL_CACHE[cache_key] = model
+    vec = model.encode(list(texts), convert_to_numpy=True, normalize_embeddings=True, show_progress_bar=False)
+    if not isinstance(vec, np.ndarray):
+        vec = np.asarray(vec, dtype=np.float32)
+    return _normalize_l2_rows_np(vec.astype(np.float32, copy=False))
+
+
+def _build_label_embedding_bank(
+    class_names: Sequence[str],
+    args,
+    device: torch.device,
+) -> Tuple[np.ndarray, List[str], Dict[str, Any]]:
+    label_texts = _resolve_label_texts(class_names=class_names, override_json=str(args.label_text_json))
+    backend_req = str(args.label_embedding_backend).strip().lower()
+    if backend_req != "sentence_transformers":
+        raise RuntimeError(
+            "Only sentence-transformers semantic vectors are permitted. "
+            f"Received --label-embedding-backend={backend_req!r}."
+        )
+    model_name = str(args.label_embedding_model).strip()
+    emb = _encode_texts_sentence_transformers(label_texts, model_name=model_name, device=device)
+    native_dim = int(emb.shape[1])
+
+    target_dim = int(args.label_embedding_dim)
+    if target_dim > 0 and target_dim != int(emb.shape[1]):
+        raise RuntimeError(
+            "Sentence-transformer geometry is configured as strict; "
+            f"--label-embedding-dim must match model native dim ({int(emb.shape[1])}), got {int(target_dim)}."
+        )
+
+    info = {
+        "enabled": True,
+        "backend_requested": str(args.label_embedding_backend),
+        "backend_used": "sentence_transformers",
+        "model_name": model_name,
+        "num_classes": int(len(class_names)),
+        "native_dim": int(native_dim),
+        "dim": int(emb.shape[1]),
+        "temperature": float(args.label_embedding_temperature),
+        "fallback_reason": "",
+    }
+    return emb.astype(np.float32, copy=False), label_texts, info
+
+
+def _apply_label_embedding_bank_to_classifier(
+    classifier: nn.Module,
+    bank_np: Optional[np.ndarray],
+    args,
+) -> Dict[str, Any]:
+    target = classifier
+    if not isinstance(target, TinyConvClassifier):
+        wrapped = getattr(classifier, "_orig_mod", None)
+        if isinstance(wrapped, TinyConvClassifier):
+            target = wrapped
+        else:
+            return {"applied": False, "reason": f"unsupported_model:{type(classifier).__name__}"}
+    if not isinstance(target, TinyConvClassifier):
+        return {"applied": False, "reason": f"unsupported_model:{type(classifier).__name__}"}
+    if bank_np is None:
+        target.disable_label_embedding_bank()
+        return {"applied": False, "reason": "bank_none"}
+    bank_arr = np.asarray(bank_np, dtype=np.float32)
+    if int(bank_arr.ndim) != 2 or int(bank_arr.shape[0]) <= 0 or int(bank_arr.shape[1]) <= 0:
+        return {"applied": False, "reason": f"invalid_bank_shape:{tuple(bank_arr.shape)}"}
+    bank_arr = _normalize_l2_rows_np(bank_arr.astype(np.float32, copy=False))
+    device = next(target.parameters()).device
+    bank_t = torch.from_numpy(bank_arr).to(device=device)
+    target.set_label_embedding_bank(bank_t, temperature=float(args.label_embedding_temperature))
+    return {
+        "applied": True,
+        "classes": int(bank_t.shape[0]),
+        "dim": int(bank_t.shape[1]),
+        "temperature": float(args.label_embedding_temperature),
+    }

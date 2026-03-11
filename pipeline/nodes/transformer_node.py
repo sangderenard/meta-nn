@@ -45,6 +45,7 @@ import torch
 from pipeline.context import PipelineContext
 from pipeline.graph import PipelineNode
 from pipeline.nodes.base import GatedNode, make_grad_scaler
+import json
 
 
 # ---------------------------------------------------------------------------
@@ -157,11 +158,6 @@ class ConfigSearchNode(PipelineNode):
 
     def execute(self, ctx: PipelineContext) -> None:
         import numpy as np
-        from wav_config_transformer_pipeline import (
-            _score_config_with_classifier,
-            _random_configs,
-            _try_scipy_refine,
-        )
 
         best_cfg = None
         best_score = float("-inf")
@@ -412,3 +408,144 @@ def _load_transformer_checkpoint(model, path: str) -> None:
 
 def _log(msg: str) -> None:
     print(msg, flush=True)
+
+
+# =========================================================================
+# Functions extracted from wav_config_transformer_pipeline.py
+# =========================================================================
+
+
+def _score_config_with_classifier(
+    records: Sequence[WaveRecord],
+    indices: Sequence[int],
+    cfg: RenderConfig,
+    image_hw: Tuple[int, int],
+    classifier: nn.Module,
+    device: torch.device,
+    batch_size: int,
+    score_topk: int,
+    score_threshold: float,
+    score_w_topk: float,
+    score_w_cov: float,
+    score_w_mean: float,
+    amp_enabled: bool = False,
+    amp_dtype: str = "float16",
+    channels_last: bool = False,
+    active_classes: int = 0,
+):
+    if len(indices) == 0:
+        return {
+            "score": float("-inf"),
+            "topk_mean": 0.0,
+            "hard_coverage": 0.0,
+            "mean_prob": 0.0,
+            "num_images": 0,
+        }
+
+    logits_all = []
+    amp_dtype_t = _resolve_amp_dtype(amp_dtype) if amp_enabled else torch.float16
+    for i in range(0, len(indices), max(1, int(batch_size))):
+        batch_idx = indices[i : i + max(1, int(batch_size))]
+        xb = []
+        for idx in batch_idx:
+            img_u8, _ = render_record(records[idx], cfg)
+            xb.append(image_u8_to_tensor(img_u8, image_hw=image_hw))
+        x = torch.stack(xb, dim=0).to(device, non_blocking=True)
+        if channels_last:
+            x = x.contiguous(memory_format=torch.channels_last)
+        with _autocast_context(device=device, enabled=amp_enabled, amp_dtype_t=amp_dtype_t):
+            logits = classifier(x)
+            if int(active_classes) > 0 and int(logits.shape[1]) > int(active_classes):
+                logits = logits[:, : int(active_classes)]
+        logits_all.append(logits.detach().cpu())
+
+    logits_cat = torch.cat(logits_all, dim=0)
+    probs = torch.sigmoid(logits_cat)
+    ent = -(probs * torch.log2(torch.clamp(probs, 1e-8, 1.0)) + (1.0 - probs) * torch.log2(torch.clamp(1.0 - probs, 1e-8, 1.0)))
+    s = multilabel_feature_score(
+        logits_cat,
+        topk=score_topk,
+        threshold=score_threshold,
+        w_topk=score_w_topk,
+        w_cov=score_w_cov,
+        w_mean=score_w_mean,
+    )
+    return {
+        "score": float(s["score"].item()),
+        "topk_mean": float(s["topk_mean"].item()),
+        "hard_coverage": float(s["hard_coverage"].item()),
+        "mean_prob": float(s["mean_prob"].item()),
+        "mean_entropy": float(ent.mean().item()),
+        "num_images": int(logits_cat.shape[0]),
+    }
+
+
+def _random_configs(num_trials: int, rng: np.random.Generator, max_points: int):
+    color_choices = [m[0] for m in COLOR_MODES]
+    widths = [256, 384, 512, 768, 1024, 1536, 2048, 3072, 4096]
+    downs = [1, 2, 3, 4, 6, 8]
+    mono_choices = ["Mix", "L", "R", "LR stride"]
+
+    cfgs = [
+        RenderConfig(
+            width=1024,
+            downsample=1,
+            color_mode=COLOR_MODES[0][0],
+            mono_pick="Mix",
+            bitmask_enable=False,
+            max_points=max_points,
+        )
+    ]
+    for _ in range(max(0, int(num_trials) - 1)):
+        use_mask = bool(rng.random() < 0.5)
+        lo = int(rng.integers(0, 12))
+        hi = int(rng.integers(lo, min(16, lo + 9)))
+        cfgs.append(
+            RenderConfig(
+                width=int(rng.choice(widths)),
+                downsample=int(rng.choice(downs)),
+                color_mode=str(rng.choice(color_choices)),
+                mono_pick=str(rng.choice(mono_choices)),
+                empty_fill=0,
+                bitmask_enable=use_mask,
+                bitmask_low=lo,
+                bitmask_high=hi,
+                max_points=max_points,
+            )
+        )
+    return cfgs
+
+
+def _try_scipy_refine(best_cfg: RenderConfig, max_points: int, enabled: bool):
+    if not enabled:
+        return [best_cfg]
+    try:
+        from scipy import optimize  # noqa: F401
+    except Exception:
+        _log("scipy is not installed; skipping scipy config refinement.")
+        return [best_cfg]
+
+    _log("scipy detected; running lightweight local config jitter around the current best.")
+    rng = np.random.default_rng(777)
+    width_jitter = [max(128, best_cfg.width + int(k) * 64) for k in range(-2, 3)]
+    ds_jitter = [max(1, best_cfg.downsample + k) for k in (-1, 0, 1)]
+    mask_lows = [max(0, best_cfg.bitmask_low + k) for k in (-2, -1, 0, 1, 2)]
+    mask_highs = [max(0, best_cfg.bitmask_high + k) for k in (-2, -1, 0, 1, 2)]
+    cfgs = []
+    for _ in range(6):
+        cfgs.append(
+            RenderConfig(
+                bitmode=best_cfg.bitmode,
+                use_channels=best_cfg.use_channels,
+                mono_pick=best_cfg.mono_pick,
+                width=int(rng.choice(width_jitter)),
+                downsample=int(rng.choice(ds_jitter)),
+                color_mode=best_cfg.color_mode,
+                empty_fill=best_cfg.empty_fill,
+                bitmask_enable=best_cfg.bitmask_enable,
+                bitmask_low=int(rng.choice(mask_lows)),
+                bitmask_high=int(rng.choice(mask_highs)),
+                max_points=max_points,
+            )
+        )
+    return [best_cfg] + cfgs

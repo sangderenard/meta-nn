@@ -51,6 +51,9 @@ import torch
 from pipeline.context import PipelineContext
 from pipeline.graph import PipelineNode
 from pipeline.nodes.base import GatedNode, make_grad_scaler
+import hashlib
+import json
+import numpy as np
 
 
 # ---------------------------------------------------------------------------
@@ -318,10 +321,6 @@ def _try_restore_vocab_snapshot(
     discriminator,
     cfg: GeneratorConfig,
 ) -> None:
-    from wav_config_transformer_pipeline import (
-        _load_gd_vocab_library_snapshot,
-        _compute_gd_vocab_hash,
-    )
 
     try:
         vocab_hash = _compute_gd_vocab_hash(ctx.class_names, ctx.active_extra_terms)
@@ -336,10 +335,6 @@ def _try_restore_vocab_snapshot(
 
 
 def _save_vocab_snapshot(ctx: PipelineContext, cfg: GeneratorConfig) -> None:
-    from wav_config_transformer_pipeline import (
-        _save_gd_vocab_library_snapshot,
-        _compute_gd_vocab_hash,
-    )
 
     try:
         vocab_hash = _compute_gd_vocab_hash(ctx.class_names, ctx.active_extra_terms)
@@ -355,3 +350,107 @@ def _save_vocab_snapshot(ctx: PipelineContext, cfg: GeneratorConfig) -> None:
 
 def _log(msg: str) -> None:
     print(msg, flush=True)
+
+
+# =========================================================================
+# Functions extracted from wav_config_transformer_pipeline.py
+# =========================================================================
+
+
+def _compute_gd_vocab_hash(
+    supervised_class_names: Sequence[str],
+    fixed_extra_terms: Sequence[str],
+    condition_num_classes: int,
+    args: Any,
+    active_extra_terms: Optional[Sequence[str]] = None,
+) -> Tuple[str, Dict[str, Any]]:
+    hash_basis: Dict[str, Any] = {
+        "supervised_class_names": [str(x) for x in supervised_class_names],
+        "fixed_extra_terms": [str(x) for x in fixed_extra_terms],
+        "condition_num_classes": int(condition_num_classes),
+        "label_embedding_backend": str(getattr(args, "label_embedding_backend", "")),
+        "label_embedding_model": str(getattr(args, "label_embedding_model", "")),
+        "label_embedding_dim": int(getattr(args, "label_embedding_dim", 0)),
+        "semantic_label_mode": "presence_v2",
+        "generator": {
+            "z_dim": int(getattr(args, "generator_z_dim", 0)),
+            "base_ch": int(getattr(args, "generator_base_ch", 0)),
+            "depth": int(getattr(args, "generator_depth", 0)),
+            "min_ch": int(getattr(args, "generator_min_ch", 0)),
+        },
+        "discriminator": {
+            "base_ch": int(getattr(args, "discriminator_base_ch", 0)),
+            "depth": int(getattr(args, "discriminator_depth", 0)),
+            "max_ch": int(getattr(args, "discriminator_max_ch", 0)),
+        },
+    }
+    profile: Dict[str, Any] = dict(hash_basis)
+    profile["active_extra_terms"] = [str(x) for x in (active_extra_terms or [])]
+    blob = json.dumps(hash_basis, sort_keys=True, ensure_ascii=True, separators=(",", ":")).encode("utf-8")
+    digest = hashlib.sha256(blob).hexdigest()[:24]
+    return str(digest), profile
+
+
+def _save_gd_vocab_library_snapshot(
+    library_dir: Path,
+    vocab_hash: str,
+    condition_num_classes: int,
+    generator: Optional[nn.Module],
+    discriminator: Optional[nn.Module],
+    meta: Dict[str, Any],
+) -> Dict[str, Any]:
+    if generator is None or discriminator is None:
+        return {"saved": False, "reason": "missing_generator_or_discriminator"}
+    h = str(vocab_hash).strip()
+    if not h:
+        return {"saved": False, "reason": "empty_vocab_hash"}
+    c = max(1, int(condition_num_classes))
+    subdir = Path(library_dir) / f"{h}_c{int(c)}"
+    subdir.mkdir(parents=True, exist_ok=True)
+    gen_path = subdir / "generator.pt"
+    disc_path = subdir / "discriminator.pt"
+    meta_path = subdir / "meta.json"
+    torch.save({"state_dict": generator.state_dict()}, gen_path)
+    torch.save({"state_dict": discriminator.state_dict()}, disc_path)
+    blob = dict(meta) if isinstance(meta, dict) else {}
+    blob["vocab_hash"] = str(h)
+    blob["condition_num_classes"] = int(c)
+    blob["timestamp"] = float(time.time())
+    meta_path.write_text(json.dumps(blob, indent=2), encoding="utf-8")
+    return {"saved": True, "dir": str(subdir), "generator": str(gen_path), "discriminator": str(disc_path)}
+
+
+def _load_gd_vocab_library_snapshot(
+    library_dir: Path,
+    vocab_hash: str,
+    generator: Optional[nn.Module],
+    discriminator: Optional[nn.Module],
+) -> Dict[str, Any]:
+    if generator is None or discriminator is None:
+        return {"loaded": False, "reason": "missing_generator_or_discriminator"}
+    h = str(vocab_hash).strip()
+    if not h:
+        return {"loaded": False, "reason": "empty_vocab_hash"}
+    root = Path(library_dir)
+    if not root.exists():
+        return {"loaded": False, "reason": "library_missing"}
+    candidates = sorted(root.glob(f"{h}_c*"), key=lambda p: p.stat().st_mtime, reverse=True)
+    if len(candidates) <= 0:
+        return {"loaded": False, "reason": "snapshot_not_found", "hash": str(h)}
+    pick = candidates[0]
+    gen_path = pick / "generator.pt"
+    disc_path = pick / "discriminator.pt"
+    if not gen_path.exists() or not disc_path.exists():
+        return {"loaded": False, "reason": "snapshot_incomplete", "dir": str(pick)}
+    gen_blob = _torch_load_cpu(str(gen_path))
+    disc_blob = _torch_load_cpu(str(disc_path))
+    gen_state = _extract_state_dict(gen_blob)
+    disc_state = _extract_state_dict(disc_blob)
+    gen_info = _apply_state_dict(generator, gen_state, source_name=f"gd_vocab_library:{pick.name}:generator")
+    disc_info = _apply_state_dict(discriminator, disc_state, source_name=f"gd_vocab_library:{pick.name}:discriminator")
+    return {
+        "loaded": True,
+        "dir": str(pick),
+        "generator": gen_info,
+        "discriminator": disc_info,
+    }
