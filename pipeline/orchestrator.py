@@ -16,13 +16,18 @@ Graph topology (sequential stages per round)
          │
     [build_label_embedding]
          │
-    [pregestation_data] ─► [stage_0_pregestation]
+    [data_node] ─────────────────────►[stage_0_pregestation]
+                ─(after_gate0)──────►[stage_1_gestation]
+                ─(after_gate1)──────►[stage_2_berkeley]
+                ─(after_gate1)──────►[gate_berkeley]
+                ─(after_all_gates)──►[stage_g_generator]
+                ──────────────────►[build_flashcard_rows]
                                    │
-    [gestation_data] ─────────────►[stage_1_gestation]  ← cond: gate_pregestation
+                              [stage_0_pregestation]
                                    │
-    [berkeley_payload] ────────────►[payload_validation_data]
+                              [stage_1_gestation]  ← cond: gate_pregestation
                                    │
-    [berkeley_data] ───────────────►[stage_2_berkeley]   ← cond: early_gates
+                              [stage_2_berkeley]   ← cond: early_gates
                                    │
                               [gate_berkeley]             ← cond: early_gates
                                    │
@@ -117,14 +122,10 @@ from pipeline.nodes.data_nodes import (
     WavePoolConfig,
     WavePoolNode,
     PregestationDataConfig,
-    PregestationDataNode,
     GestationDataConfig,
-    GestationDataNode,
     BerkeleyPayloadConfig,
-    BerkeleyPayloadNode,
     BerkeleyDataConfig,
-    BerkeleyDataNode,
-    PayloadValidationDataNode,
+    DataNode,
 )
 from pipeline.nodes.gate_nodes import (
     BerkeleyGateConfig,
@@ -355,7 +356,7 @@ def _node_group_id(node_id: str) -> str:
         return "gates"
     if node_id in {"sync_gate_replica", "checkpoint_save"}:
         return "housekeeping"
-    if node_id.endswith("_data") or node_id in {"berkeley_payload", "payload_validation_data"}:
+    if node_id.endswith("_data") or node_id in {"data_node", "berkeley_payload", "payload_validation_data"}:
         return "data"
     if node_id.startswith("stage_"):
         return "train"
@@ -383,7 +384,7 @@ def _node_icon(node_id: str) -> str:
         return "generator"
     if "classifier" in node_id or "berkeley" in node_id or "lora" in node_id or "fake_feedback" in node_id:
         return "classifier"
-    if node_id.endswith("_data") or "payload" in node_id:
+    if node_id == "data_node" or node_id.endswith("_data") or "payload" in node_id:
         return "data"
     if node_id.startswith("gate_"):
         return "gate"
@@ -402,6 +403,7 @@ def _node_config_id(node_id: str) -> str:
         "build_symbol_pool": "vocab",
         "build_label_embedding": "embedding",
         "build_flashcard_rows": "vocab",
+        "data_node": "data",
         "pregestation_data": "pregestation",
         "gestation_data": "gestation",
         "berkeley_payload": "berkeley_payload",
@@ -903,7 +905,6 @@ def build_pipeline_graph(
     g.add_node(BuildTransformerNode(transformer_cfg))
     g.add_node(BuildGANNode(generator_cfg))
     g.add_node(BuildWaveClassifierNode(wave_cfg))
-    g.add_node(BerkeleyPayloadNode(berkeley_payload_cfg))
 
     # Per-round vocab / embedding
     g.add_node(VocabChurnNode(vocab_cfg))
@@ -911,11 +912,14 @@ def build_pipeline_graph(
     g.add_node(BuildLabelEmbeddingNode(embedding_cfg))
     g.add_node(BuildFlashcardRowsNode(vocab_cfg))
 
-    # Data
-    g.add_node(PregestationDataNode(pregestation_cfg))
-    g.add_node(GestationDataNode(gestation_cfg))
-    g.add_node(BerkeleyDataNode(berkeley_data_cfg))
-    g.add_node(PayloadValidationDataNode())
+    # Data (single node providing all training dataloaders)
+    _data_node = DataNode(
+        preg_cfg=pregestation_cfg,
+        gest_cfg=gestation_cfg,
+        payload_cfg=berkeley_payload_cfg,
+        bdata_cfg=berkeley_data_cfg,
+    )
+    g.add_node(_data_node)
 
     # Training stages
     g.add_node(PregestationTrainNode(classifier_cfg))
@@ -958,34 +962,45 @@ def build_pipeline_graph(
     g.add_edge("vocab_churn", "build_symbol_pool", label="per_round")
     g.add_edge("build_symbol_pool", "build_label_embedding", label="per_round")
 
-    # == Data construction ==========================================
+    # == DataNode feeds all training stages =============================
+    # DataNode runs after label embedding (needs latest vocab/embeddings)
+    g.add_edge("build_label_embedding", "data_node", label="per_round")
 
-    g.add_edge("build_label_embedding", "pregestation_data", label="per_round")
-    g.add_edge("build_label_embedding", "gestation_data", label="per_round")
-    g.add_edge("build_label_embedding", "berkeley_payload", label="per_round")
-    g.add_edge("berkeley_payload", "payload_validation_data", label="per_round")
-    g.add_edge("berkeley_payload", "build_flashcard_rows", label="per_round")
+    # Pregestation: data_node provides ctx.pregestation_loader to stage 0
+    g.add_edge("data_node", "stage_0_pregestation",
+               label="provides:pregestation_loader",
+               on_traverse=_data_node.provide_pregestation)
 
-    g.add_edge("build_label_embedding", "berkeley_data",
-               condition=_gate_pregestation_passed, label="after_gate0", condition_id=_CONDITION_ID_PREGESTATION_GATE)
+    # Gestation: data_node provides ctx.gestation_loader to stage 1 (after gate 0)
+    g.add_edge("data_node", "stage_1_gestation",
+               condition=_gate_pregestation_passed, label="provides:gestation_loader",
+               condition_id=_CONDITION_ID_PREGESTATION_GATE,
+               on_traverse=_data_node.provide_gestation)
 
-    # == Stage 0 — Pre-gestation ===================================
+    # Berkeley refresh: data_node provides ctx.berkeley_refresh_loader to stage 2 (after early gates)
+    g.add_edge("data_node", "stage_2_berkeley",
+               condition=_early_gates_passed, label="provides:berkeley_refresh_loader",
+               condition_id=_CONDITION_ID_EARLY_GATES,
+               on_traverse=_data_node.provide_berkeley_data)
 
-    g.add_edge("pregestation_data", "stage_0_pregestation", label="stage0")
+    # Gate 2 eval: data_node provides berkeley loaders + payload validation loader
+    g.add_edge("data_node", "gate_berkeley",
+               condition=_early_gates_passed, label="provides:gate_val_loader+payload_val_loader",
+               condition_id=_CONDITION_ID_EARLY_GATES,
+               on_traverse=_data_node.provide_gate_data)
 
-    # == Stage 1 — Gestation =======================================
+    # GAN training: data_node provides ctx.payload_bank + ctx.payload_conditions (after all gates)
+    g.add_edge("data_node", "stage_g_generator",
+               condition=_all_gates_passed, label="provides:payload_bank",
+               condition_id=_CONDITION_ID_ALL_GATES,
+               on_traverse=_data_node.provide_payload)
 
-    g.add_edge("stage_0_pregestation", "gestation_data",
-               condition=_gate_pregestation_passed, label="after_gate0", condition_id=_CONDITION_ID_PREGESTATION_GATE)
-    g.add_edge("gestation_data", "stage_1_gestation",
-               condition=_gate_pregestation_passed, label="after_gate0", condition_id=_CONDITION_ID_PREGESTATION_GATE)
+    # Flashcard: data_node provides ctx.payload_bank (optional, always offered)
+    g.add_edge("data_node", "build_flashcard_rows",
+               label="provides:payload_images",
+               on_traverse=_data_node.provide_payload)
 
-    # == Stage 2 — Berkeley refresh ================================
-
-    g.add_edge("stage_1_gestation", "stage_2_berkeley",
-               condition=_early_gates_passed, label="after_gate1", condition_id=_CONDITION_ID_EARLY_GATES)
-    g.add_edge("berkeley_data", "stage_2_berkeley",
-               condition=_early_gates_passed, label="after_gate1", condition_id=_CONDITION_ID_EARLY_GATES)
+    # == Stage 2 → gate_berkeley ====================================
 
     g.add_edge("stage_2_berkeley", "gate_berkeley",
                condition=_early_gates_passed, label="after_gate1", condition_id=_CONDITION_ID_EARLY_GATES)

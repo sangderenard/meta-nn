@@ -253,7 +253,6 @@ class PregestationTrainNode(PipelineNode):
         return ctx.pregestation_loader is not None and ctx.classifier is not None
 
     def execute(self, ctx: PipelineContext) -> None:
-
         result = _run_berkeley_refresh_epochs(
             classifier=ctx.classifier,
             optimizer=ctx.classifier_optimizer,
@@ -305,7 +304,6 @@ class GestationTrainNode(GatedNode):
         self.cfg = cfg
 
     def execute(self, ctx: PipelineContext) -> None:
-
         result = _run_berkeley_refresh_epochs(
             classifier=ctx.classifier,
             optimizer=ctx.classifier_optimizer,
@@ -357,7 +355,6 @@ class BerkeleyRefreshTrainNode(GatedNode):
         self.cfg = cfg
 
     def execute(self, ctx: PipelineContext) -> None:
-
         result = _run_berkeley_refresh_epochs(
             classifier=ctx.classifier,
             optimizer=ctx.classifier_optimizer,

@@ -28,6 +28,14 @@ import os
 import sys
 from pathlib import Path
 
+# Probe-import scipy.io BEFORE any torch/pipeline import to prevent Windows
+# DLL ordering conflict that causes STATUS_HEAP_CORRUPTION (0xC0000374).
+try:
+    import scipy.io as _scipy_io_probe  # noqa: F401
+    del _scipy_io_probe
+except ImportError:
+    pass
+
 
 def main() -> None:
     graph_cli, passthrough_argv = _parse_graph_cli(sys.argv)
@@ -201,10 +209,6 @@ def _print_graph_summary(args=None) -> None:
         vocab_cfg=cfg["vocab"],
         embedding_cfg=cfg["embedding"],
         wave_pool_cfg=cfg["wave_pool"],
-        pregestation_cfg=cfg["pregestation"],
-        gestation_cfg=cfg["gestation"],
-        berkeley_payload_cfg=cfg["berkeley_payload"],
-        berkeley_data_cfg=cfg["berkeley_data"],
         berkeley_gate_cfg=cfg["berkeley_gate"],
         transformer_gate_cfg=cfg["transformer_gate"],
         generator_gate_cfg=cfg["generator_gate"],
@@ -232,10 +236,6 @@ def _print_graph_legend() -> None:
         vocab_cfg=cfg["vocab"],
         embedding_cfg=cfg["embedding"],
         wave_pool_cfg=cfg["wave_pool"],
-        pregestation_cfg=cfg["pregestation"],
-        gestation_cfg=cfg["gestation"],
-        berkeley_payload_cfg=cfg["berkeley_payload"],
-        berkeley_data_cfg=cfg["berkeley_data"],
         berkeley_gate_cfg=cfg["berkeley_gate"],
         transformer_gate_cfg=cfg["transformer_gate"],
         generator_gate_cfg=cfg["generator_gate"],

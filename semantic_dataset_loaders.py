@@ -20,7 +20,6 @@ import torch.nn.functional as F
 from PIL import Image
 from torch.utils.data import DataLoader, Dataset
 from torch.utils.data._utils.collate import default_collate
-from torchvision.datasets import SBDataset
 from torchvision.transforms import InterpolationMode
 from torchvision.transforms import functional as TF
 
@@ -119,6 +118,75 @@ def normalize_vocab_terms(terms: Sequence[str]) -> List[str]:
         seen.add(k)
         out.append(t)
     return out
+
+
+def convert_sbd_mat_to_npz(root) -> None:
+    """One-time conversion of {root}/cls/*.mat → {root}/cls/*.npz.
+
+    After this, scipy.io.loadmat is no longer needed to read Berkeley SBD masks.
+    Idempotent: skips any .mat file that already has a matching .npz.
+    """
+    from pathlib import Path as _Path
+    cls_dir = _Path(str(root)) / "cls"
+    if not cls_dir.exists():
+        return
+    needs = [f for f in sorted(cls_dir.glob("*.mat")) if not (cls_dir / f"{f.stem}.npz").exists()]
+    if not needs:
+        return
+    try:
+        import scipy.io as sio
+        import numpy as _np
+        print(f"[mat2npz] converting {len(needs)} Berkeley .mat masks → .npz (one-time) ...", flush=True)
+        errors = 0
+        for mat_path in needs:
+            try:
+                blob = sio.loadmat(str(mat_path), squeeze_me=False, struct_as_record=False)
+                gtcls = blob.get("GTcls", None)
+                seg = None
+                try:
+                    seg = _np.asarray(gtcls[0, 0].Segmentation, dtype=_np.uint8)
+                except Exception:
+                    try:
+                        seg = _np.asarray(gtcls.Segmentation[0, 0], dtype=_np.uint8)
+                    except Exception:
+                        pass
+                if seg is not None:
+                    _np.savez_compressed(str(cls_dir / f"{mat_path.stem}.npz"), segmentation=seg)
+            except Exception:
+                errors += 1
+        print(f"[mat2npz] done. errors={errors}", flush=True)
+    except ImportError:
+        print("[mat2npz] scipy not available; mat→npz conversion skipped", flush=True)
+
+
+def _read_sbd_split_file(root, split_name: str):
+    """Read Berkeley SBD split file and return (image_paths, mask_stems).
+
+    Does not import scipy or torchvision — just reads the .txt index file.
+    Prefers train_noval.txt for the train split (excludes val overlap).
+    Returns: (list of Path, list of str stem names)
+    """
+    from pathlib import Path as _Path
+    root = _Path(str(root))
+    dataset_dir = root / "dataset"
+    candidates = []
+    if split_name == "train":
+        candidates.append(dataset_dir / "train_noval.txt")
+    candidates.append(dataset_dir / f"{split_name}.txt")
+    split_file = next((c for c in candidates if c.exists()), None)
+    if split_file is None:
+        return [], []
+    img_dir = root / "img"
+    cls_dir = root / "cls"
+    lines = [ln.strip() for ln in split_file.read_text(encoding="utf-8").splitlines() if ln.strip()]
+    image_paths = []
+    mask_stems = []
+    for name in lines:
+        img_p = img_dir / f"{name}.jpg"
+        if img_p.exists():
+            image_paths.append(img_p)
+            mask_stems.append(str(name))
+    return image_paths, mask_stems
 
 
 @dataclass
@@ -1933,32 +2001,47 @@ class DiskSemanticRowsDataset(Dataset):
         if str(row.mask_path).strip():
             mask_path = Path(str(row.mask_path))
             if mask_path.exists():
-                if str(mask_path.suffix).strip().lower() == ".mat":
+                if str(mask_path.suffix).strip().lower() in (".mat", ".npz"):
+                    _npz_path = mask_path.with_suffix(".npz")
+                    _mat_path = mask_path.with_suffix(".mat")
                     try:
-                        from scipy.io import loadmat
-                    except Exception as e:
-                        raise RuntimeError(
-                            f"scipy is required to read Berkeley SBD mask files: {mask_path} ({type(e).__name__}: {e})"
-                        ) from e
-                    blob = loadmat(str(mask_path), squeeze_me=False, struct_as_record=False)
-                    seg = None
-                    gtcls = blob.get("GTcls", None)
-                    try:
-                        seg = np.asarray(gtcls[0, 0].Segmentation, dtype=np.float32)
-                    except Exception:
-                        try:
-                            seg = np.asarray(gtcls.Segmentation[0, 0], dtype=np.float32)
-                        except Exception:
+                        if _npz_path.exists():
+                            _d = np.load(str(_npz_path), allow_pickle=False)
+                            seg = np.asarray(_d["segmentation"], dtype=np.float32)
+                        elif _mat_path.exists():
+                            try:
+                                from scipy.io import loadmat
+                            except Exception as e:
+                                raise RuntimeError(
+                                    f"scipy is required to read Berkeley SBD mask files: {_mat_path} ({type(e).__name__}: {e})"
+                                ) from e
+                            blob = loadmat(str(_mat_path), squeeze_me=False, struct_as_record=False)
                             seg = None
-                    if seg is None:
-                        raise RuntimeError(f"Could not extract Berkeley segmentation from mask file: {mask_path}")
-                    arr = (np.asarray(seg, dtype=np.float32) > 0.0).astype(np.float32, copy=False)
-                    if int(arr.shape[1]) != int(w) or int(arr.shape[0]) != int(h):
-                        arr = np.asarray(
-                            TF.resize(Image.fromarray((arr * 255.0).astype(np.uint8), mode="L"), [int(h), int(w)], interpolation=InterpolationMode.NEAREST),
-                            dtype=np.float32,
-                        )
-                    return _exact_mask(arr / 255.0)
+                            gtcls = blob.get("GTcls", None)
+                            try:
+                                seg = np.asarray(gtcls[0, 0].Segmentation, dtype=np.float32)
+                            except Exception:
+                                try:
+                                    seg = np.asarray(gtcls.Segmentation[0, 0], dtype=np.float32)
+                                except Exception:
+                                    seg = None
+                            if seg is None:
+                                raise RuntimeError(f"Could not extract Berkeley segmentation from mask file: {_mat_path}")
+                        else:
+                            seg = None
+                    except RuntimeError:
+                        raise
+                    except Exception:
+                        seg = None
+                    if seg is not None:
+                        arr = (np.asarray(seg, dtype=np.float32) > 0.0).astype(np.float32, copy=False)
+                        if int(arr.shape[1]) != int(w) or int(arr.shape[0]) != int(h):
+                            arr = np.asarray(
+                                TF.resize(Image.fromarray((arr * 255.0).astype(np.uint8), mode="L"), [int(h), int(w)], interpolation=InterpolationMode.NEAREST),
+                                dtype=np.float32,
+                            )
+                        return _exact_mask(arr / 255.0)
+                    # fall through to next branch if seg is None
                 with Image.open(str(mask_path)) as im:
                     gray = im.convert("L")
                     if int(gray.size[0]) != int(w) or int(gray.size[1]) != int(h):
@@ -2283,21 +2366,28 @@ def _build_and_store_row_mask_cache(
     if str(mask_path).strip():
         mp = Path(str(mask_path))
         if mp.exists():
-            if str(mp.suffix).strip().lower() == ".mat":
+            if str(mp.suffix).strip().lower() in (".mat", ".npz"):
+                _npz_path = mp.with_suffix(".npz")
+                _mat_path = mp.with_suffix(".mat")
                 try:
-                    from scipy.io import loadmat
-                    blob = loadmat(str(mp), squeeze_me=False, struct_as_record=False)
-                    seg = None
-                    gtcls = blob.get("GTcls", None)
-                    try:
-                        seg = np.asarray(gtcls[0, 0].Segmentation, dtype=np.float32)
-                    except Exception:
+                    if _npz_path.exists():
+                        _data = np.load(str(_npz_path), allow_pickle=False)
+                        seg = np.asarray(_data["segmentation"], dtype=np.float32)
+                        explicit_mask = (seg > 0.0).astype(np.float32, copy=False)
+                    elif _mat_path.exists():
+                        from scipy.io import loadmat
+                        blob = loadmat(str(_mat_path), squeeze_me=False, struct_as_record=False)
+                        seg = None
+                        gtcls = blob.get("GTcls", None)
                         try:
-                            seg = np.asarray(gtcls.Segmentation[0, 0], dtype=np.float32)
+                            seg = np.asarray(gtcls[0, 0].Segmentation, dtype=np.float32)
                         except Exception:
-                            seg = None
-                    if seg is not None:
-                        explicit_mask = (np.asarray(seg, dtype=np.float32) > 0.0).astype(np.float32, copy=False)
+                            try:
+                                seg = np.asarray(gtcls.Segmentation[0, 0], dtype=np.float32)
+                            except Exception:
+                                seg = None
+                        if seg is not None:
+                            explicit_mask = (np.asarray(seg, dtype=np.float32) > 0.0).astype(np.float32, copy=False)
                 except Exception:
                     explicit_mask = None
             else:
@@ -2553,9 +2643,10 @@ def collect_semantic_disk_rows(
                 out_vec[int(idx)] = 1.0
         return out_vec, normalize_vocab_terms(list(out_terms) + list(color_terms))
 
+    convert_sbd_mat_to_npz(root)
     split_specs = [("train", "berkeley_sbd_train"), ("val", "berkeley_sbd_val")]
     for split_name, source_key in split_specs:
-        ds = SBDataset(root=str(root), image_set=split_name, mode="segmentation", download=False)
+        _split_images, _mask_stems = _read_sbd_split_file(root, split_name)
         label_path = root / "cache" / f"sbd_{split_name}_multilabel.npz"
         if not label_path.exists():
             raise RuntimeError(
@@ -2566,14 +2657,14 @@ def collect_semantic_disk_rows(
             if "labels" not in z.files:
                 raise RuntimeError(f"'labels' key missing in {label_path}")
             labels_split = np.asarray(z["labels"], dtype=np.float32)
-        if int(labels_split.shape[0]) != int(len(ds.images)):
+        if int(labels_split.shape[0]) != int(len(_split_images)):
             raise RuntimeError(
                 "Berkeley image/label row mismatch for disk rows: "
-                f"split={split_name} images={int(len(ds.images))} labels={int(labels_split.shape[0])}"
+                f"split={split_name} images={int(len(_split_images))} labels={int(labels_split.shape[0])}"
             )
         split_specs_rows: List[Tuple[Path, np.ndarray, str, str, str]] = []
         split_missing = 0
-        for i, img_path in enumerate(ds.images):
+        for i, img_path in enumerate(_split_images):
             ip = Path(str(img_path))
             if not ip.exists():
                 split_missing += 1
@@ -2594,7 +2685,7 @@ def collect_semantic_disk_rows(
                 (
                     ip,
                     np.asarray(yv, dtype=np.float32).reshape(-1).copy(),
-                    str(ds.masks[int(i)]) if int(i) < int(len(ds.masks)) else "",
+                    str(root / "cls" / f"{_mask_stems[int(i)]}.mat") if int(i) < int(len(_mask_stems)) else "",
                     str(source_key),
                     str(split_name),
                 )

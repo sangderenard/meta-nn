@@ -85,7 +85,6 @@ class BerkeleyGateNode(GatedNode):
         )
 
     def execute(self, ctx: PipelineContext) -> None:
-
         result = _evaluate_berkeley_classifier_gate(
             classifier=ctx.gate_classifier,
             loader=ctx.payload_validation_loader,

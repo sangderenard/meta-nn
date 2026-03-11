@@ -1,21 +1,20 @@
 """
 Data Nodes — dataset and loader construction for every pipeline stage.
 
-Each node owns the idiosyncrasies of its data source:
+Nodes:
 
-  WavePoolNode          — discover WAV files; fall back to synthetic latent pool
-  PregestationDataNode  — Stage 0: synthetic geometric direction+colour images
-  GestationDataNode     — Stage 1: bootstrap primitive symbol images
-  BerkeleyDataNode      — Stage 2: Berkeley SBD + external payload images
-  BerkeleyPayloadNode   — build/load the on-disk payload image bank
+  WavePoolNode  — discover WAV files; fall back to synthetic latent pool
+  DataNode      — single node that owns ALL training dataloaders; wired via
+                  explicit labeled edges to every consuming training/gate node
 
 Data ownership
 --------------
-  WavePoolNode        → ctx.wav_records, ctx.float_streams, ctx.stream_paths
-  PregestationDataNode→ ctx.pregestation_loader, ctx.pregestation_dataset
-  GestationDataNode   → ctx.gestation_loader, ctx.gestation_dataset
-  BerkeleyDataNode    → ctx.berkeley_refresh_loader, ctx.berkeley_gate_val_loader
-  BerkeleyPayloadNode → ctx.payload_bank, ctx.payload_masks, ctx.payload_conditions, ctx.payload_bank_ready
+  WavePoolNode → ctx.wav_records, ctx.float_streams, ctx.stream_paths
+  DataNode     → ctx.pregestation_loader / ctx.pregestation_dataset
+               → ctx.gestation_loader   / ctx.gestation_dataset
+               → ctx.berkeley_refresh_loader / ctx.berkeley_gate_val_loader / ctx.berkeley_cache
+               → ctx.payload_bank / ctx.payload_masks / ctx.payload_conditions / ctx.payload_bank_ready
+               → ctx.payload_validation_loader / ctx.payload_validation_dataset
 """
 from __future__ import annotations
 
@@ -228,117 +227,6 @@ class PregestationDataConfig:
     seed: int = 42
 
 
-class PregestationDataNode(PipelineNode):
-    """Build the Stage 0 dataset: synthetic geometric direction+colour images.
-
-    The dataset is generated programmatically from active semantic terms and
-    their geometric/colour interpretations.  A loop-pool disk cache avoids
-    re-generating the same images every round.
-
-    Runs every round — the loader is rebuilt when vocab changes.
-    """
-
-    node_id = "pregestation_data"
-    description = "Build Stage 0 pregestation dataset (synthetic geometric logic)"
-
-    def __init__(self, cfg: PregestationDataConfig) -> None:
-        self.cfg = cfg
-        self._last_vocab_hash: int = -1
-
-    def should_run(self, ctx: PipelineContext) -> bool:
-        return bool(ctx.class_names)
-
-    def execute(self, ctx: PipelineContext) -> None:
-        current_hash = hash(tuple(ctx.class_names))
-        if current_hash == self._last_vocab_hash and ctx.pregestation_loader is not None:
-            return  # vocab unchanged; reuse existing loader
-
-        from pipeline.nodes.vocab_node import _build_pregestation_logic_rows
-        from semantic_dataset_loaders import (
-            BootstrapDynamicDataset,
-            build_loader_from_manifest,
-            StageDatasetManifest,
-        )
-
-        # _build_pregestation_logic_rows(image_size, seed, samples_per_combo,
-        #   active_terms_lc, circle_radius_temperature, circle_displacement_temperature, mode)
-        # → (images, composite_masks, mask_stacks, term_rows, info) per single mode.
-        # Loop over mode_sequence and concatenate.
-        active_terms_lc = [t.lower() for t in ctx.class_names]
-        all_images: list = []
-        all_masks: list = []
-        all_mask_stacks: list = []
-        all_targets: list = []
-        all_term_rows: list = []
-        target_dim = max(1, int(len(ctx.class_names)))
-        for mode in self.cfg.mode_sequence:
-            imgs, masks, mask_stacks, term_rows, _info = _build_pregestation_logic_rows(
-                image_size=self.cfg.image_size,
-                seed=self.cfg.seed,
-                samples_per_combo=self.cfg.samples_per_combo,
-                active_terms_lc=active_terms_lc,
-                circle_radius_temperature=self.cfg.circle_radius_temperature,
-                circle_displacement_temperature=self.cfg.displacement_temperature,
-                mode=mode,
-            )
-            all_images.extend(imgs)
-            all_masks.extend(masks)
-            all_mask_stacks.extend(mask_stacks)
-            all_term_rows.extend(term_rows)
-            for term_row in term_rows:
-                y = np.zeros((target_dim,), dtype=np.float32)
-                for term in term_row:
-                    idx = ctx.semantic_term_to_idx.get(str(term).strip().lower(), -1)
-                    if int(idx) >= 0:
-                        y[int(idx)] = 1.0
-                all_targets.append(y)
-
-        ctx.pregestation_logic_rows = {
-            "images": all_images,
-            "masks": all_masks,
-            "mask_stacks": all_mask_stacks,
-            "targets": all_targets,
-            "terms": all_term_rows,
-        }
-
-        if not all_images:
-            _log("[pregestation-data] WARNING: no images built; skipping loader")
-            return
-
-        dataset = BootstrapDynamicDataset(
-            images=all_images,
-            targets=all_targets,
-            total_rows=int(len(all_images)),
-            seed=int(self.cfg.seed),
-            augment=False,
-            expected_target_dim=target_dim,
-            semantic_term_to_idx=ctx.semantic_term_to_idx,
-            augment_apply_terms=False,
-            return_masks=True,
-            return_mask_stack=True,
-            dataset_name="pregestation",
-            base_masks=(all_masks if len(all_masks) == len(all_images) else None),
-        )
-        if len(all_mask_stacks) == len(all_images):
-            for i, mask_stack in enumerate(all_mask_stacks):
-                dataset.base_mask_stacks[i] = np.asarray(mask_stack, dtype=np.float32)
-
-        manifest = StageDatasetManifest(
-            name="pregestation",
-            dataset=dataset,
-            batch_size=max(1, int(self.cfg.batch_size)),
-            seed=int(self.cfg.seed),
-            num_workers=max(0, int(self.cfg.num_workers)),
-            device_type=str(getattr(ctx.device, "type", "cpu")),
-        )
-        loader, _count = build_loader_from_manifest(manifest=manifest)
-        ctx.pregestation_dataset = dataset
-        ctx.pregestation_loader = loader
-        self._last_vocab_hash = current_hash
-        _log(f"[pregestation-data] {len(all_images)} images "
-             f"batch_size={self.cfg.batch_size}")
-
-
 # ---------------------------------------------------------------------------
 # Gestation data node  (Stage 1)
 # ---------------------------------------------------------------------------
@@ -352,76 +240,6 @@ class GestationDataConfig:
     num_workers: int = 0
     samples_per_term: int = 32
     cache_mb: int = 128
-
-
-class GestationDataNode(PipelineNode):
-    """Build the Stage 1 dataset: bootstrap primitive symbol images.
-
-    Uses the symbol_pool built by BuildSymbolPoolNode.
-    Rebuilt when vocab changes.
-    """
-
-    node_id = "gestation_data"
-    description = "Build Stage 1 gestation dataset (bootstrap primitive symbols)"
-
-    def __init__(self, cfg: GestationDataConfig) -> None:
-        self.cfg = cfg
-        self._last_vocab_hash: int = -1
-
-    def should_run(self, ctx: PipelineContext) -> bool:
-        return bool(ctx.class_names)
-
-    def execute(self, ctx: PipelineContext) -> None:
-        current_hash = hash(tuple(ctx.class_names))
-        if current_hash == self._last_vocab_hash and ctx.gestation_loader is not None:
-            return
-
-        from semantic_dataset_loaders import (
-            BootstrapDynamicDataset,
-            build_loader_from_manifest,
-            StageDatasetManifest,
-        )
-
-        symbol_pool = ctx.symbol_pool or {}
-
-        # Flatten symbol pool into (image, target) pairs
-        images, targets = _flatten_symbol_pool(
-            symbol_pool=symbol_pool,
-            class_names=ctx.class_names,
-            semantic_term_to_idx=ctx.semantic_term_to_idx,
-            samples_per_term=self.cfg.samples_per_term,
-        )
-
-        if not images:
-            _log("[gestation-data] WARNING: no symbol images; gestation loader skipped")
-            return
-
-        dataset = BootstrapDynamicDataset(
-            images=images,
-            targets=targets,
-            total_rows=int(len(images)),
-            seed=int(getattr(ctx.args, "seed", 0) or 0),
-            augment=False,
-            expected_target_dim=max(1, int(len(ctx.class_names))),
-            semantic_term_to_idx=ctx.semantic_term_to_idx,
-            augment_apply_terms=False,
-            return_masks=False,
-            return_mask_stack=False,
-            dataset_name="gestation",
-        )
-        manifest = StageDatasetManifest(
-            name="gestation",
-            dataset=dataset,
-            batch_size=max(1, int(self.cfg.batch_size)),
-            seed=int(getattr(ctx.args, "seed", 0) or 0),
-            num_workers=max(0, int(self.cfg.num_workers)),
-            device_type=str(getattr(ctx.device, "type", "cpu")),
-        )
-        loader, _count = build_loader_from_manifest(manifest=manifest)
-        ctx.gestation_dataset = dataset
-        ctx.gestation_loader = loader
-        self._last_vocab_hash = current_hash
-        _log(f"[gestation-data] {len(images)} images batch_size={self.cfg.batch_size}")
 
 
 # ---------------------------------------------------------------------------
@@ -456,61 +274,6 @@ class BerkeleyPayloadConfig:
     auto_install_scipy: bool = False
 
 
-class BerkeleyPayloadNode(OneTimeNode):
-    """Build or load the on-disk Berkeley SBD payload image bank.
-
-    The payload bank is a pre-rendered collection of Berkeley SBD images
-    indexed by semantic labels.  It feeds the GAN generator (as supervised
-    targets) and Stage 2 classifier training.
-    """
-
-    node_id = "berkeley_payload"
-    description = "Build/load Berkeley SBD payload image bank"
-
-    def __init__(self, cfg: BerkeleyPayloadConfig) -> None:
-        super().__init__()
-        self.cfg = cfg
-
-    def _execute_once(self, ctx: PipelineContext) -> None:
-
-        berkeley_root = (
-            str(self.cfg.berkeley_data_root).strip()
-            or ctx.berkeley_data_root
-            or str(getattr(ctx.args, "berkeley_data_root", ""))
-        )
-
-        # _build_berkeley_payload_bank(data_root, image_size, auto_install_scipy,
-        #   max_samples, seed, source_root="", force_cache_rebuild=False)
-        # returns (out_images, out_targets, info, out_terms, out_masks)
-        out_images, out_targets, _info, _out_terms, out_masks = _build_berkeley_payload_bank(
-            data_root=berkeley_root,
-            image_size=self.cfg.image_size,
-            auto_install_scipy=self.cfg.auto_install_scipy,
-            max_samples=self.cfg.max_images or 0,
-            seed=self.cfg.seed,
-            source_root=str(self.cfg.payload_bank_dir).strip(),
-            force_cache_rebuild=self.cfg.force_cache_rebuild,
-        )
-
-        ctx.payload_bank = out_images
-        ctx.payload_masks = list(out_masks) if out_masks else []
-        ctx.payload_bank_ready = bool(out_images)
-
-        # Build payload conditions tensor
-        if out_images and out_targets:
-            n_classes = max(1, len(ctx.class_names)) if ctx.class_names else 1
-            conditions, _expansion_info = _expand_payload_conditions_with_semantic_bank(
-                payload_conditions=out_targets,
-                condition_num_classes=n_classes,
-                supervised_num_classes=n_classes,
-                label_embedding_bank=ctx.label_embedding_bank,
-            )
-            ctx.payload_conditions = conditions
-            _log(f"[berkeley-payload] bank ready: {len(conditions)} condition rows")
-        else:
-            _log("[berkeley-payload] WARNING: payload bank not available")
-
-
 # ---------------------------------------------------------------------------
 # Berkeley refresh data node  (Stage 2)
 # ---------------------------------------------------------------------------
@@ -542,127 +305,282 @@ class BerkeleyDataConfig:
     gate_val_max_val: int = 0        # 0 = all validation rows
 
 
-class BerkeleyDataNode(GatedNode):
-    """Build the Stage 2 Berkeley SBD refresh DataLoader.
+# ---------------------------------------------------------------------------
+# DataNode — single graph node owning all training dataloaders
+# ---------------------------------------------------------------------------
 
-    Requires Gate 0 (pre-gestation).  Rebuilt every rebuild_every_n_rounds rounds
-    to cycle through the Berkeley dataset with fresh shuffles and updated
-    semantic label assignments.
+class DataNode(PipelineNode):
+    """Single node that builds and refreshes all training dataloaders.
+
+    Graph edges from this node to consuming training/gate nodes declare exactly
+    which data flows where.  The node reads active gate states to decide which
+    loaders to build or refresh each round — matching what the edge conditions
+    allow through.
+
+    Manages:
+        ctx.pregestation_loader / ctx.pregestation_dataset
+        ctx.gestation_loader   / ctx.gestation_dataset
+        ctx.berkeley_refresh_loader / ctx.berkeley_gate_val_loader / ctx.berkeley_cache
+        ctx.payload_bank / ctx.payload_conditions / ctx.payload_masks / ctx.payload_bank_ready
+        ctx.payload_validation_loader / ctx.payload_validation_dataset
     """
 
-    node_id = "berkeley_data"
-    description = "Build Stage 2 Berkeley SBD refresh DataLoader"
-    required_gates = ["gate_pregestation"]
+    node_id = "data_node"
+    description = "Build/refresh all training dataloaders"
 
-    def __init__(self, cfg: BerkeleyDataConfig) -> None:
-        self.cfg = cfg
-        self._last_build_round: int = -1
+    def __init__(
+        self,
+        preg_cfg: "PregestationDataConfig",
+        gest_cfg: "GestationDataConfig",
+        payload_cfg: "BerkeleyPayloadConfig",
+        bdata_cfg: "BerkeleyDataConfig",
+    ) -> None:
+        self.preg_cfg = preg_cfg
+        self.gest_cfg = gest_cfg
+        self.payload_cfg = payload_cfg
+        self.bdata_cfg = bdata_cfg
+        self._preg_vocab_hash: int = -1
+        self._gest_vocab_hash: int = -1
+        self._bdata_last_build_round: int = -1
+        self._payload_built: bool = False
+
+    # ------------------------------------------------------------------
+    # Node protocol
+    # ------------------------------------------------------------------
 
     def should_run(self, ctx: PipelineContext) -> bool:
-        if not super().should_run(ctx):
-            return False
-        if ctx.berkeley_refresh_loader is None:
-            return True
-        rounds_since = ctx.total_rounds_completed - self._last_build_round
-        return rounds_since >= self.cfg.rebuild_every_n_rounds
+        return bool(ctx.class_names)
 
     def execute(self, ctx: PipelineContext) -> None:
-        data_root = (
-            str(self.cfg.berkeley_data_root).strip()
-            or getattr(ctx, "berkeley_data_root", "")
-            or ""
+        # Data is delivered just-in-time by on_traverse callbacks on each
+        # outgoing edge (see orchestrator.py).  DataNode.execute() is a no-op.
+        pass
+
+    # ------------------------------------------------------------------
+    # Edge-traversal providers  (assigned as on_traverse on outgoing edges)
+    # ------------------------------------------------------------------
+
+    def provide_pregestation(self, ctx: PipelineContext) -> None:
+        current_hash = hash(tuple(ctx.class_names))
+        if current_hash == self._preg_vocab_hash and ctx.pregestation_loader is not None:
+            return
+
+        from pipeline.nodes.vocab_node import _build_pregestation_logic_rows
+        from semantic_dataset_loaders import (
+            BootstrapDynamicDataset,
+            build_loader_from_manifest,
+            StageDatasetManifest,
         )
 
-        loader, _n_refresh = _build_berkeley_refresh_loader(
-            data_root=data_root,
-            image_size=self.cfg.image_size,
-            auto_install_scipy=False,
-            batch_size=self.cfg.batch_size,
-            num_workers=self.cfg.num_workers,
-            max_train=self.cfg.max_train,
-            seed=self.cfg.seed,
-            device=ctx.device,
-            external_val_fraction=self.cfg.external_val_fraction,
-            prefetch_factor=self.cfg.prefetch_factor,
-        )
-
-        gate_val_loader, _n_gate_val = _build_berkeley_gate_val_loader(
-            data_root=data_root,
-            image_size=self.cfg.image_size,
-            auto_install_scipy=False,
-            batch_size=self.cfg.gate_val_batch_size,
-            num_workers=self.cfg.gate_val_num_workers,
-            max_val=self.cfg.gate_val_max_val,
-            seed=self.cfg.seed,
-            device=ctx.device,
-        )
-
-        # Optional: pre-cache N batches into memory for fast iteration
-        if self.cfg.prebuild_batches > 0 and loader is not None:
-            cache = _build_berkeley_refresh_cache(
-                loader=loader,
-                device=ctx.device,
-                cache_batches=self.cfg.prebuild_batches,
-                cache_device=self.cfg.cache_device,
-                channels_last=self.cfg.channels_last,
+        active_terms_lc = [t.lower() for t in ctx.class_names]
+        all_images: list = []
+        all_masks: list = []
+        all_mask_stacks: list = []
+        all_targets: list = []
+        all_term_rows: list = []
+        target_dim = max(1, int(len(ctx.class_names)))
+        for mode in (self.preg_cfg.mode_sequence or ["direction_color", "symbol", "noise_texture"]):
+            imgs, masks, mask_stacks, term_rows, _info = _build_pregestation_logic_rows(
+                image_size=self.preg_cfg.image_size,
+                seed=self.preg_cfg.seed,
+                samples_per_combo=self.preg_cfg.samples_per_combo,
+                active_terms_lc=active_terms_lc,
+                circle_radius_temperature=self.preg_cfg.circle_radius_temperature,
+                circle_displacement_temperature=self.preg_cfg.displacement_temperature,
+                mode=mode,
             )
-            ctx.berkeley_cache = cache
+            all_images.extend(imgs)
+            all_masks.extend(masks)
+            all_mask_stacks.extend(mask_stacks)
+            all_term_rows.extend(term_rows)
+            for term_row in term_rows:
+                y = np.zeros((target_dim,), dtype=np.float32)
+                for term in term_row:
+                    idx = ctx.semantic_term_to_idx.get(str(term).strip().lower(), -1)
+                    if int(idx) >= 0:
+                        y[int(idx)] = 1.0
+                all_targets.append(y)
+
+        ctx.pregestation_logic_rows = {
+            "images": all_images, "masks": all_masks, "mask_stacks": all_mask_stacks,
+            "targets": all_targets, "terms": all_term_rows,
+        }
+        if not all_images:
+            _log("[data-node] WARNING: no pregestation images built")
+            return
+
+        dataset = BootstrapDynamicDataset(
+            images=all_images, targets=all_targets, total_rows=int(len(all_images)),
+            seed=int(self.preg_cfg.seed), augment=False, expected_target_dim=target_dim,
+            semantic_term_to_idx=ctx.semantic_term_to_idx, augment_apply_terms=False,
+            return_masks=True, return_mask_stack=True, dataset_name="pregestation",
+            base_masks=(all_masks if len(all_masks) == len(all_images) else None),
+        )
+        if len(all_mask_stacks) == len(all_images):
+            for i, ms in enumerate(all_mask_stacks):
+                dataset.base_mask_stacks[i] = np.asarray(ms, dtype=np.float32)
+
+        manifest = StageDatasetManifest(
+            name="pregestation", dataset=dataset,
+            batch_size=max(1, int(self.preg_cfg.batch_size)),
+            seed=int(self.preg_cfg.seed),
+            num_workers=max(0, int(self.preg_cfg.num_workers)),
+            device_type=str(getattr(ctx.device, "type", "cpu")),
+        )
+        loader, _count = build_loader_from_manifest(manifest=manifest)
+        ctx.pregestation_dataset = dataset
+        ctx.pregestation_loader = loader
+        self._preg_vocab_hash = current_hash
+        _log(f"[data-node] pregestation: {len(all_images)} images batch_size={self.preg_cfg.batch_size}")
+
+    def provide_gestation(self, ctx: PipelineContext) -> None:
+        current_hash = hash(tuple(ctx.class_names))
+        if current_hash == self._gest_vocab_hash and ctx.gestation_loader is not None:
+            return
+
+        from semantic_dataset_loaders import (
+            BootstrapDynamicDataset,
+            build_loader_from_manifest,
+            StageDatasetManifest,
+        )
+        symbol_pool = ctx.symbol_pool or {}
+        images, targets = _flatten_symbol_pool(
+            symbol_pool=symbol_pool, class_names=ctx.class_names,
+            semantic_term_to_idx=ctx.semantic_term_to_idx,
+            samples_per_term=self.gest_cfg.samples_per_term,
+        )
+        if not images:
+            _log("[data-node] WARNING: no gestation symbol images")
+            return
+
+        dataset = BootstrapDynamicDataset(
+            images=images, targets=targets, total_rows=int(len(images)),
+            seed=int(getattr(ctx.args, "seed", 0) or 0), augment=False,
+            expected_target_dim=max(1, int(len(ctx.class_names))),
+            semantic_term_to_idx=ctx.semantic_term_to_idx, augment_apply_terms=False,
+            return_masks=False, return_mask_stack=False, dataset_name="gestation",
+        )
+        manifest = StageDatasetManifest(
+            name="gestation", dataset=dataset,
+            batch_size=max(1, int(self.gest_cfg.batch_size)),
+            seed=int(getattr(ctx.args, "seed", 0) or 0),
+            num_workers=max(0, int(self.gest_cfg.num_workers)),
+            device_type=str(getattr(ctx.device, "type", "cpu")),
+        )
+        loader, _count = build_loader_from_manifest(manifest=manifest)
+        ctx.gestation_dataset = dataset
+        ctx.gestation_loader = loader
+        self._gest_vocab_hash = current_hash
+        _log(f"[data-node] gestation: {len(images)} images batch_size={self.gest_cfg.batch_size}")
+
+    def provide_berkeley_data(self, ctx: PipelineContext) -> None:
+        needs_build = ctx.berkeley_refresh_loader is None
+        if not needs_build:
+            rounds_since = ctx.total_rounds_completed - self._bdata_last_build_round
+            needs_build = rounds_since >= self.bdata_cfg.rebuild_every_n_rounds
+        if not needs_build:
+            return
+
+        data_root = (
+            str(self.bdata_cfg.berkeley_data_root).strip()
+            or getattr(ctx, "berkeley_data_root", "") or ""
+        )
+        loader, _n_refresh = _build_berkeley_refresh_loader(
+            data_root=data_root, image_size=self.bdata_cfg.image_size,
+            auto_install_scipy=False, batch_size=self.bdata_cfg.batch_size,
+            num_workers=self.bdata_cfg.num_workers, max_train=self.bdata_cfg.max_train,
+            seed=self.bdata_cfg.seed, device=ctx.device,
+            external_val_fraction=self.bdata_cfg.external_val_fraction,
+            prefetch_factor=self.bdata_cfg.prefetch_factor,
+        )
+        gate_val_loader, _n_gate_val = _build_berkeley_gate_val_loader(
+            data_root=data_root, image_size=self.bdata_cfg.image_size,
+            auto_install_scipy=False, batch_size=self.bdata_cfg.gate_val_batch_size,
+            num_workers=self.bdata_cfg.gate_val_num_workers,
+            max_val=self.bdata_cfg.gate_val_max_val,
+            seed=self.bdata_cfg.seed, device=ctx.device,
+        )
+        if self.bdata_cfg.prebuild_batches > 0 and loader is not None:
+            ctx.berkeley_cache = _build_berkeley_refresh_cache(
+                loader=loader, device=ctx.device,
+                cache_batches=self.bdata_cfg.prebuild_batches,
+                cache_device=self.bdata_cfg.cache_device,
+                channels_last=self.bdata_cfg.channels_last,
+            )
         else:
             ctx.berkeley_cache = None
-
         ctx.berkeley_refresh_loader = loader
         ctx.berkeley_gate_val_loader = gate_val_loader
-        self._last_build_round = ctx.total_rounds_completed
+        self._bdata_last_build_round = ctx.total_rounds_completed
+        _log(f"[data-node] berkeley refresh loader built at round {ctx.total_rounds_completed}")
 
-        _log(f"[berkeley-data] refresh loader rebuilt at round {ctx.total_rounds_completed}")
-
-
-# ---------------------------------------------------------------------------
-# Payload validation dataset node
-# ---------------------------------------------------------------------------
-
-class PayloadValidationDataNode(GatedNode):
-    """Build the payload gate validation dataset (Gate 2 evaluation deck).
-
-    Requires Gate 0.  Built once and reused.  Provides a fixed held-out subset
-    of Berkeley payload images for the Berkeley confidence/F1 gate check.
-    """
-
-    node_id = "payload_validation_data"
-    description = "Build payload gate validation dataset (Gate 2 deck)"
-    required_gates = ["gate_pregestation"]
-
-    def __init__(self) -> None:
-        self._built = False
-
-    def should_run(self, ctx: PipelineContext) -> bool:
-        if not super().should_run(ctx):
-            return False
-        return not self._built and ctx.payload_bank is not None
-
-    def execute(self, ctx: PipelineContext) -> None:
-        data_root = getattr(ctx, "berkeley_data_root", "") or ""
-        image_size = getattr(ctx, "image_size", 64) or 64
-        seed = getattr(ctx, "seed", 42) or 42
-
-        dataset, _labels_np, _terms_rows, _info = _build_payload_validation_gate_dataset(
-            data_root=data_root,
-            image_size=image_size,
-            seed=seed,
+    def provide_payload(self, ctx: PipelineContext) -> None:
+        if self._payload_built:
+            return
+        # One-time conversion of .mat masks → .npz so scipy is not needed thereafter
+        from semantic_dataset_loaders import convert_sbd_mat_to_npz
+        from pathlib import Path as _BPath
+        data_root = (
+            str(self.payload_cfg.berkeley_data_root).strip()
+            or getattr(ctx, "berkeley_data_root", "") or ""
         )
+        _broot = _BPath(data_root or "toys_to_survive_development/data/berkeley_sbd")
+        convert_sbd_mat_to_npz(_broot)
 
+        out_images, out_targets, _info, _out_terms, out_masks = _build_berkeley_payload_bank(
+            data_root=data_root,
+            image_size=self.payload_cfg.image_size,
+            auto_install_scipy=self.payload_cfg.auto_install_scipy,
+            max_samples=self.payload_cfg.max_images or 0,
+            seed=self.payload_cfg.seed,
+        )
+        ctx.payload_bank = out_images
+        ctx.payload_masks = list(out_masks) if out_masks else []
+        ctx.payload_bank_ready = bool(out_images)
+
+        # Build payload conditions vector
+        if out_images and out_targets and ctx.label_embedding_bank is not None:
+            n_classes = max(1, len(ctx.class_names)) if ctx.class_names else 1
+            conditions, _expansion_info = _expand_payload_conditions_with_semantic_bank(
+                payload_conditions=out_targets,
+                condition_num_classes=n_classes,
+                supervised_num_classes=n_classes,
+                label_embedding_bank=ctx.label_embedding_bank,
+            )
+            ctx.payload_conditions = conditions
+            _log(f"[data-node] payload bank: {len(conditions)} condition rows")
+        else:
+            ctx.payload_conditions = []
+
+        # Build payload validation loader (used by BerkeleyGateNode)
+        bdata_root = (
+            str(self.bdata_cfg.berkeley_data_root).strip()
+            or getattr(ctx, "berkeley_data_root", "") or ""
+        )
+        image_size = self.payload_cfg.image_size
+        seed = self.payload_cfg.seed
+        dataset, _labels_np, _terms_rows, _info2 = _build_payload_validation_gate_dataset(
+            data_root=bdata_root, image_size=image_size, seed=seed,
+        )
         loader, _n_val = _build_gate_loader_from_dataset(
-            dataset=dataset,
-            batch_size=32,
-            num_workers=0,
-            device=ctx.device,
-            seed=seed,
+            dataset=dataset, batch_size=32, num_workers=0,
+            device=ctx.device, seed=seed,
         ) if dataset is not None else (None, 0)
-
         ctx.payload_validation_dataset = dataset
         ctx.payload_validation_loader = loader
-        self._built = True
-        _log(f"[payload-val-data] built {len(dataset) if dataset else 0} rows")
+        self._payload_built = True
+        _log(f"[data-node] payload validation: {len(dataset) if dataset else 0} rows")
+
+    def provide_gate_data(self, ctx: PipelineContext) -> None:
+        """Provide both the berkeley refresh/gate-val loaders AND the payload bank.
+
+        Assigned as on_traverse on the data_node → gate_berkeley edge.
+        Gate evaluation needs all three: the refresh loader (for stage-2 training
+        that feeds into gate eval), the gate-val loader, and the payload
+        validation loader.  Both providers are idempotent.
+        """
+        self.provide_berkeley_data(ctx)
+        self.provide_payload(ctx)
 
 
 # ---------------------------------------------------------------------------

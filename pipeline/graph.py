@@ -63,6 +63,12 @@ class PipelineEdge:
     at execution time.  If the condition returns False the edge is inactive and
     the target node is skipped (unless another active edge also feeds it).
 
+    ``on_traverse`` is an optional ``(ctx) -> None`` called by the executor for
+    every *active* incoming edge immediately before the target node executes.
+    This is the mechanism by which a source node (e.g. DataNode) prepares
+    exactly the data the target needs — driven by the edge list, not by the
+    target node or by branching logic inside the source node's execute().
+
     ``label`` is purely informational and shows up in debug output.
     """
 
@@ -71,6 +77,7 @@ class PipelineEdge:
     condition: Optional[Callable[["PipelineContext"], bool]] = None  # noqa: F821
     label: str = ""
     condition_id: str = ""
+    on_traverse: Optional[Callable[["PipelineContext"], None]] = None  # noqa: F821
 
     def is_active(self, ctx: "PipelineContext") -> bool:  # noqa: F821
         if self.condition is None:
@@ -120,12 +127,18 @@ class PipelineGraph:
         condition: Optional[Callable[["PipelineContext"], bool]] = None,  # noqa: F821
         label: str = "",
         condition_id: str = "",
+        on_traverse: Optional[Callable[["PipelineContext"], None]] = None,  # noqa: F821
     ) -> "PipelineGraph":
         """Add a directed edge from *source_id* → *target_id*.
 
         ``condition`` is an optional callable ``(ctx) -> bool``; when it
         returns False the edge is inactive for that execution round and the
         target will be skipped (unless another active edge reaches it).
+
+        ``on_traverse`` is an optional ``(ctx) -> None`` fired by the executor
+        for each active incoming edge just before the target node runs.  Use it
+        to deliver exactly the data the target node needs (e.g. DataNode loader
+        builders assigned here drive data preparation by the edge list alone).
         """
         for nid in (source_id, target_id):
             if nid not in self._nodes:
@@ -140,6 +153,7 @@ class PipelineGraph:
                 condition=condition,
                 label=label,
                 condition_id=str(condition_id or ""),
+                on_traverse=on_traverse,
             )
         )
         return self
@@ -252,7 +266,8 @@ class PipelineGraph:
 
             # -- edge gate -------------------------------------------------
             incoming = [e for e in self._edges if e.target_id == node_id]
-            if incoming and not any(e.is_active(ctx) for e in incoming):
+            active_incoming = [e for e in incoming if e.is_active(ctx)]
+            if incoming and not active_incoming:
                 statuses[node_id] = "skipped:edge"
                 if verbose:
                     _log(f"[graph] SKIP {node_id!r} (all incoming edges inactive)")
@@ -264,6 +279,11 @@ class PipelineGraph:
                 if verbose:
                     _log(f"[graph] SKIP {node_id!r} (should_run=False)")
                 continue
+
+            # -- on_traverse callbacks (data provision by edge list) -------
+            for edge in active_incoming:
+                if edge.on_traverse is not None:
+                    edge.on_traverse(ctx)
 
             # -- execute ---------------------------------------------------
             if verbose:
