@@ -169,7 +169,7 @@ def _resolve_device(args) -> torch.device:
 
 
 def _load_resume_state(args, output_dir: Path) -> dict:
-    from wav_config_transformer_pipeline import _load_json, _torch_load_cpu
+    from pipeline.nodes.base import _load_json, _torch_load_cpu
 
     resume_enabled = bool(_arg_value(args, "auto_resume", default=False)) or bool(
         str(_arg_value(args, "resume_from", default="") or "").strip()
@@ -206,9 +206,11 @@ def _load_resume_state(args, output_dir: Path) -> dict:
 
 
 def _prepare_runtime(args, output_dir: Path, device: torch.device) -> dict:
-    from wav_config_transformer_pipeline import (
+    from pipeline.utils import (
         _hard_wipe_pipeline_caches,
         _soft_reset_label_caches,
+    )
+    from wav_ml_models import (
         configure_torch_runtime,
         set_seed,
     )
@@ -256,7 +258,7 @@ def _prepare_runtime(args, output_dir: Path, device: torch.device) -> dict:
 
 
 def _restore_context_from_resume(ctx: PipelineContext) -> None:
-    from wav_config_transformer_pipeline import RenderConfig
+    from wav_ml_core import RenderConfig
 
     resume_summary = ctx.resume_summary if isinstance(ctx.resume_summary, dict) else {}
     resume_ckpt = ctx.resume_pipeline_ckpt if isinstance(ctx.resume_pipeline_ckpt, dict) else {}

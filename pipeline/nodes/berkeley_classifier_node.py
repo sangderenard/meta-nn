@@ -406,7 +406,7 @@ class LoRARoundNode(GatedNode):
         if not self.cfg.lora_enabled:
             return
 
-        from wav_config_transformer_pipeline import (
+        from wav_ml_models import (
             ensure_tiny_classifier_lora_slot,
             install_tiny_classifier_lora,
             tiny_classifier_lora_snapshot,

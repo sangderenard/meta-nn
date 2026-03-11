@@ -396,7 +396,7 @@ def _degrade_prob(
 
 
 def _load_transformer_checkpoint(model, path: str) -> None:
-    from wav_config_transformer_pipeline import _apply_model_init, _torch_load_cpu
+    from pipeline.nodes.base import _apply_model_init, _torch_load_cpu
 
     try:
         ckpt = _torch_load_cpu(path)

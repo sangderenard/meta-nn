@@ -196,7 +196,7 @@ class WaveClassifierTrainNode(GatedNode):
         return ctx.transformer is not None and ctx.classifier is not None
 
     def execute(self, ctx: PipelineContext) -> None:
-        from wav_config_transformer_pipeline import (
+        from pipeline.nodes.gate_nodes import (
             _wave_feedback_gate_pass,
             _wave_feedback_snapshot,
         )

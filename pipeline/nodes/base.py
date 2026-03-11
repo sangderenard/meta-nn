@@ -8,15 +8,17 @@ Provides:
 """
 from __future__ import annotations
 
+import json
+import os
 from contextlib import nullcontext
-from typing import Any, Callable, List, Optional, Sequence
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
 
 from pipeline.graph import PipelineNode
 from pipeline.context import PipelineContext, GateState
-import json
 
 
 # ---------------------------------------------------------------------------
@@ -69,6 +71,87 @@ class OneTimeNode(PipelineNode):
 
     def _execute_once(self, ctx: PipelineContext) -> None:
         raise NotImplementedError
+
+
+# ---------------------------------------------------------------------------
+# Trainable-model base
+# ---------------------------------------------------------------------------
+
+class TrainableModelNode(GatedNode):
+    """Base for nodes that own and train an ``nn.Module``.
+
+    Subclasses set ``model_attr`` to the ``PipelineContext`` attribute name
+    that holds their model (e.g. ``"classifier"``).  The base class provides:
+
+      * AMP autocast/scaler helpers
+      * LoRA snapshot / restore (via wav_ml_models)
+      * Feature freeze / unfreeze
+      * Optimizer zero-grad + step + scaler convenience
+
+    This is intentionally thin — it only captures the mechanical boilerplate
+    shared across classifier, transformer, generator, and wave-classifier
+    training nodes.
+    """
+
+    model_attr: str = ""   # override in subclass
+
+    # -- helpers --------------------------------------------------------
+
+    def _get_model(self, ctx: PipelineContext) -> nn.Module:
+        """Return the model this node trains."""
+        model = getattr(ctx, self.model_attr, None)
+        if model is None:
+            raise RuntimeError(
+                f"{type(self).__name__}: ctx.{self.model_attr} is None"
+            )
+        return model
+
+    # AMP
+    @staticmethod
+    def amp_context(device: torch.device, enabled: bool, amp_dtype: torch.dtype):
+        return autocast_context(device, enabled, amp_dtype)
+
+    @staticmethod
+    def grad_scaler(enabled: bool):
+        return make_grad_scaler(enabled)
+
+    # LoRA
+    @staticmethod
+    def lora_snapshot(model: nn.Module) -> Dict[str, Any]:
+        """Capture the LoRA state of *model* (no-op if not a TinyConvClassifier)."""
+        from pipeline.utils import _snapshot_classifier_lora
+        return _snapshot_classifier_lora(model)
+
+    @staticmethod
+    def lora_restore(model: nn.Module, blob: Any, source: str) -> Dict[str, Any]:
+        from pipeline.utils import _restore_classifier_lora_from_blob
+        return _restore_classifier_lora_from_blob(model, blob, source)
+
+    @staticmethod
+    def lora_ensure_slot(model: nn.Module, slot_name: str):
+        from wav_ml_models import ensure_tiny_classifier_lora_slot
+        ensure_tiny_classifier_lora_slot(model, slot_name)
+
+    @staticmethod
+    def lora_install(model: nn.Module, slot_name: str, rank: int = 4, alpha: float = 1.0):
+        from wav_ml_models import install_tiny_classifier_lora
+        install_tiny_classifier_lora(model, slot_name, rank=rank, alpha=alpha)
+
+    @staticmethod
+    def lora_set_state(model: nn.Module, slot_name: str, active: bool = True):
+        from wav_ml_models import set_tiny_classifier_lora_state
+        set_tiny_classifier_lora_state(model, slot_name, active=active)
+
+    # Feature freeze
+    @staticmethod
+    def feature_freeze(model: nn.Module):
+        from pipeline.utils import _set_feature_freeze
+        _set_feature_freeze(model, freeze=True)
+
+    @staticmethod
+    def feature_unfreeze(model: nn.Module):
+        from pipeline.utils import _set_feature_freeze
+        _set_feature_freeze(model, freeze=False)
 
 
 # ---------------------------------------------------------------------------
@@ -221,6 +304,7 @@ def _try_partial_classifier_head_load(
 
 
 def _apply_model_init(model: nn.Module, ckpt_path: str):
+    from pipeline.utils import _restore_classifier_lora_from_blob
     if not ckpt_path:
         return {"used": False, "loaded_keys": 0, "skipped_keys": 0, "path": ""}
     p = Path(ckpt_path)
@@ -269,6 +353,7 @@ def _apply_state_dict(
     source_name: str,
     classifier_lora: Optional[Dict[str, Any]] = None,
 ):
+    from pipeline.utils import _restore_classifier_lora_from_blob
     lora_restore_info = _restore_classifier_lora_from_blob(
         model,
         ({"classifier_lora": dict(classifier_lora)} if isinstance(classifier_lora, dict) else None),

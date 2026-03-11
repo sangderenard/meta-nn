@@ -19,15 +19,38 @@ Data ownership
 """
 from __future__ import annotations
 
+import hashlib
+import json
+import math
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence, Tuple
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, Dataset
 
 from pipeline.context import PipelineContext
 from pipeline.graph import PipelineNode
 from pipeline.nodes.base import GatedNode, OneTimeNode
-import math
-import torch
+from pipeline.utils import (
+    _dataloader_perf_kwargs,
+    _default_class_names,
+    _effective_dataloader_num_workers,
+    _split_payload_cache_indices,
+)
+# Backward-compat alias — internal code now uses _default_class_names
+_default_berkeley_class_names = _default_class_names
+from pipeline.nodes.vocab_node import _normalize_vocab_terms, _semantic_term_index_map
+from semantic_dataset_loaders import (
+    DiskSemanticRowsDataset,
+    collect_semantic_disk_rows,
+    maybe_wrap_loader_with_threaded_prefetch,
+    semantic_mask_stack_collate,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -139,13 +162,26 @@ class WavePoolNode(PipelineNode):
                 _log(f"[wave-pool] WARNING: could not decode {rec}: {exc}")
         streams = raw_streams
 
-        streams, paths = _filter_stream_pool_for_chunk_samples(
-            streams=streams,
-            paths=paths,
-            chunk_samples=chunk_samples,
-            min_seconds=self.cfg.min_stream_seconds,
-            args=ctx.args,
-        )
+        # Filter out streams shorter than chunk_samples
+        if chunk_samples > 0:
+            keep = [
+                i for i, s in enumerate(streams)
+                if int(np.asarray(s).size) >= chunk_samples
+            ]
+            streams = [streams[i] for i in keep]
+            paths = [paths[i] for i in keep]
+        # Also drop streams shorter than min_stream_seconds
+        min_samples = 0
+        if self.cfg.min_stream_seconds > 0:
+            sr = self.cfg.latent_pool_sample_rate or 22050
+            min_samples = int(self.cfg.min_stream_seconds * sr)
+        if min_samples > 0:
+            keep = [
+                i for i, s in enumerate(streams)
+                if int(np.asarray(s).size) >= min_samples
+            ]
+            streams = [streams[i] for i in keep]
+            paths = [paths[i] for i in keep]
 
         ctx.wav_records = list(records)
         ctx.float_streams = list(streams)
@@ -217,10 +253,8 @@ class PregestationDataNode(PipelineNode):
         if current_hash == self._last_vocab_hash and ctx.pregestation_loader is not None:
             return  # vocab unchanged; reuse existing loader
 
-        from wav_config_transformer_pipeline import (
-            _build_pregestation_logic_rows,
-            _resolve_semantic_stage_cache_root,
-        )
+        from pipeline.nodes.vocab_node import _build_pregestation_logic_rows
+        from pipeline.utils import _resolve_semantic_stage_cache_root
         from semantic_dataset_loaders import (
             build_loader_from_manifest,
             StageDatasetManifest,
@@ -409,7 +443,7 @@ class BerkeleyPayloadNode(OneTimeNode):
         # _build_berkeley_payload_bank(data_root, image_size, auto_install_scipy,
         #   max_samples, seed, source_root="", force_cache_rebuild=False)
         # returns (out_images, out_targets, info, out_terms, out_masks)
-        out_images, _out_targets, _info, _out_terms, out_masks = _build_berkeley_payload_bank(
+        out_images, out_targets, _info, _out_terms, out_masks = _build_berkeley_payload_bank(
             data_root=berkeley_root,
             image_size=self.cfg.image_size,
             auto_install_scipy=self.cfg.auto_install_scipy,
@@ -424,12 +458,13 @@ class BerkeleyPayloadNode(OneTimeNode):
         ctx.payload_bank_ready = bool(out_images)
 
         # Build payload conditions tensor
-        if out_images:
-            conditions = _expand_payload_conditions_with_semantic_bank(
-                payload_bank=out_images,
-                class_names=ctx.class_names,
+        if out_images and out_targets:
+            n_classes = max(1, len(ctx.class_names)) if ctx.class_names else 1
+            conditions, _expansion_info = _expand_payload_conditions_with_semantic_bank(
+                payload_conditions=out_targets,
+                condition_num_classes=n_classes,
+                supervised_num_classes=n_classes,
                 label_embedding_bank=ctx.label_embedding_bank,
-                args=ctx.args,
             )
             ctx.payload_conditions = conditions
             _log(f"[berkeley-payload] bank ready: {len(conditions)} condition rows")
@@ -445,12 +480,19 @@ class BerkeleyPayloadNode(OneTimeNode):
 class BerkeleyDataConfig:
     """Idiosyncrasies of the Berkeley SBD Stage 2 refresh loader."""
 
+    berkeley_data_root: str = ""     # empty → from ctx
+    image_size: int = 64
     batch_size: int = 16
     num_workers: int = 0
-    prefetch_factor: int = 0
+    prefetch_factor: int = 2
+    max_train: int = 0               # 0 = use all available
+    seed: int = 42
+    external_val_fraction: float = 0.20
 
     # How many Berkeley refresh batches to pre-cache in memory/GPU
     prebuild_batches: int = 0      # 0 = stream on-the-fly
+    cache_device: str = "cpu"
+    channels_last: bool = False
 
     # How many rounds between full Berkeley refresh loader rebuilds
     rebuild_every_n_rounds: int = 4
@@ -458,6 +500,7 @@ class BerkeleyDataConfig:
     # Gate 2 validation loader settings
     gate_val_batch_size: int = 32
     gate_val_num_workers: int = 0
+    gate_val_max_val: int = 0        # 0 = all validation rows
 
 
 class BerkeleyDataNode(GatedNode):
@@ -485,35 +528,44 @@ class BerkeleyDataNode(GatedNode):
         return rounds_since >= self.cfg.rebuild_every_n_rounds
 
     def execute(self, ctx: PipelineContext) -> None:
-
-        loader = _build_berkeley_refresh_loader(
-            payload_bank=ctx.payload_bank,
-            class_names=ctx.class_names,
-            semantic_term_to_idx=ctx.semantic_term_to_idx,
-            label_embedding_bank=ctx.label_embedding_bank,
-            batch_size=self.cfg.batch_size,
-            num_workers=self.cfg.num_workers,
-            prefetch_factor=self.cfg.prefetch_factor,
-            device=ctx.device,
-            args=ctx.args,
+        data_root = (
+            str(self.cfg.berkeley_data_root).strip()
+            or getattr(ctx, "berkeley_data_root", "")
+            or ""
         )
 
-        gate_val_loader = _build_berkeley_gate_val_loader(
-            payload_bank=ctx.payload_bank,
-            class_names=ctx.class_names,
-            semantic_term_to_idx=ctx.semantic_term_to_idx,
-            label_embedding_bank=ctx.label_embedding_bank,
+        loader, _n_refresh = _build_berkeley_refresh_loader(
+            data_root=data_root,
+            image_size=self.cfg.image_size,
+            auto_install_scipy=False,
+            batch_size=self.cfg.batch_size,
+            num_workers=self.cfg.num_workers,
+            max_train=self.cfg.max_train,
+            seed=self.cfg.seed,
+            device=ctx.device,
+            external_val_fraction=self.cfg.external_val_fraction,
+            prefetch_factor=self.cfg.prefetch_factor,
+        )
+
+        gate_val_loader, _n_gate_val = _build_berkeley_gate_val_loader(
+            data_root=data_root,
+            image_size=self.cfg.image_size,
+            auto_install_scipy=False,
             batch_size=self.cfg.gate_val_batch_size,
             num_workers=self.cfg.gate_val_num_workers,
-            args=ctx.args,
+            max_val=self.cfg.gate_val_max_val,
+            seed=self.cfg.seed,
+            device=ctx.device,
         )
 
         # Optional: pre-cache N batches into memory for fast iteration
         if self.cfg.prebuild_batches > 0 and loader is not None:
             cache = _build_berkeley_refresh_cache(
                 loader=loader,
-                n_batches=self.cfg.prebuild_batches,
                 device=ctx.device,
+                cache_batches=self.cfg.prebuild_batches,
+                cache_device=self.cfg.cache_device,
+                channels_last=self.cfg.channels_last,
             )
             ctx.berkeley_cache = cache
         else:
@@ -550,20 +602,23 @@ class PayloadValidationDataNode(GatedNode):
         return not self._built and ctx.payload_bank is not None
 
     def execute(self, ctx: PipelineContext) -> None:
+        data_root = getattr(ctx, "berkeley_data_root", "") or ""
+        image_size = getattr(ctx, "image_size", 64) or 64
+        seed = getattr(ctx, "seed", 42) or 42
 
-        dataset = _build_payload_validation_gate_dataset(
-            payload_bank=ctx.payload_bank,
-            class_names=ctx.class_names,
-            semantic_term_to_idx=ctx.semantic_term_to_idx,
-            label_embedding_bank=ctx.label_embedding_bank,
-            args=ctx.args,
+        dataset, _labels_np, _terms_rows, _info = _build_payload_validation_gate_dataset(
+            data_root=data_root,
+            image_size=image_size,
+            seed=seed,
         )
 
-        loader = _build_gate_loader_from_dataset(
+        loader, _n_val = _build_gate_loader_from_dataset(
             dataset=dataset,
             batch_size=32,
             num_workers=0,
-        )
+            device=ctx.device,
+            seed=seed,
+        ) if dataset is not None else (None, 0)
 
         ctx.payload_validation_dataset = dataset
         ctx.payload_validation_loader = loader
@@ -574,6 +629,56 @@ class PayloadValidationDataNode(GatedNode):
 # ---------------------------------------------------------------------------
 # Private helpers
 # ---------------------------------------------------------------------------
+
+
+class _LazyDiskSemanticPayloadBank:
+    """Lazy payload bank backed by DiskSemanticRowsDataset — loads images on demand."""
+
+    def __init__(self, rows: Sequence[Any], image_size: int, seed: int = 0):
+        self._dataset = DiskSemanticRowsDataset(
+            rows=list(rows),
+            image_size=int(image_size),
+            return_masks=True,
+            return_mask_stack=False,
+            degrade=False,
+            degrade_seed=int(seed),
+        )
+
+    def __len__(self) -> int:
+        return int(len(self._dataset))
+
+    def get_image(self, index: int) -> np.ndarray:
+        sample = self._dataset[int(index)]
+        if not isinstance(sample, (tuple, list)) or int(len(sample)) < 1:
+            raise RuntimeError(f"Lazy payload image row returned unsupported sample type: {type(sample).__name__}")
+        return sample[0].detach().to(torch.float32).cpu().numpy().astype(np.float32, copy=False)
+
+    def get_mask(self, index: int) -> np.ndarray:
+        sample = self._dataset[int(index)]
+        if not isinstance(sample, (tuple, list)) or int(len(sample)) < 3:
+            raise RuntimeError(f"Lazy payload mask row returned unsupported sample type: {type(sample).__name__}")
+        mask_np = sample[2].detach().to(torch.float32).cpu().numpy().astype(np.float32, copy=False)
+        if int(mask_np.ndim) == 3 and int(mask_np.shape[0]) == 1:
+            mask_np = mask_np[0]
+        return np.asarray(mask_np, dtype=np.float32)
+
+
+class _LazyDiskSemanticPayloadView(Sequence[np.ndarray]):
+    """Sequence view into a lazy payload bank — returns images or masks by index."""
+
+    def __init__(self, bank: _LazyDiskSemanticPayloadBank, kind: str):
+        self._bank = bank
+        self._kind = str(kind).strip().lower()
+
+    def __len__(self) -> int:
+        return int(len(self._bank))
+
+    def __getitem__(self, index: int) -> np.ndarray:
+        if str(self._kind) == "image":
+            return self._bank.get_image(int(index))
+        if str(self._kind) == "mask":
+            return self._bank.get_mask(int(index))
+        raise KeyError(self._kind)
 
 def _bootstrap_latent_wav_pool(
     out_dir: Any,
@@ -590,23 +695,18 @@ def _bootstrap_latent_wav_pool(
     structured_gain: float,
     structured_noise_gain: float,
 ) -> Dict[str, Any]:
-    import json
-    import re
 
-    import numpy as np
-
-    from wav_config_transformer_pipeline import (
-        RenderConfig,
+    from wav_ml_core import RenderConfig, read_wav_record
+    from pipeline.wave_io import (
         _decode_record_to_mono,
         _fit_wave_length,
         _load_reinject_wave_paths,
         _sample_latent_noise_profile_key,
         _save_mono_wav,
-        _semantic_noise_terms_from_spectrum_sample,
         _synthesize_profiled_noise_wave,
         _synthesize_structured_wave,
-        read_wav_record,
     )
+    from pipeline.nodes.vocab_node import _semantic_noise_terms_from_spectrum_sample
 
     out_root = Path(out_dir)
     rng = np.random.default_rng(int(seed) + 424242)
@@ -736,8 +836,6 @@ def _flatten_symbol_pool(
     semantic_term_to_idx: Dict[str, int],
     samples_per_term: int,
 ) -> tuple:
-    import numpy as np
-
     images = []
     targets = []
     n_classes = len(class_names)
@@ -907,7 +1005,7 @@ def _build_berkeley_refresh_loader(
     del auto_install_scipy
     rows, rows_info = collect_semantic_disk_rows(
         data_root=str(data_root),
-        class_names=_default_berkeley_class_names(),
+        class_names=_default_class_names(),
         source_root="",
     )
     n_rows = int(len(rows))
@@ -1112,7 +1210,7 @@ def _build_berkeley_gate_val_loader(
     del auto_install_scipy
     rows, _ = collect_semantic_disk_rows(
         data_root=str(data_root),
-        class_names=_default_berkeley_class_names(),
+        class_names=_default_class_names(),
         source_root="",
     )
     val_rows = [r for r in rows if str(r.source).strip().lower() == "berkeley_sbd_val"]
@@ -1722,7 +1820,7 @@ def _build_payload_validation_gate_dataset(
 ) -> Tuple[Optional[Dataset], np.ndarray, List[List[str]], Dict[str, Any]]:
     rows, rows_info = collect_semantic_disk_rows(
         data_root=str(data_root),
-        class_names=_default_berkeley_class_names(),
+        class_names=_default_class_names(),
         source_root=str(source_root),
     )
     if int(len(rows)) <= 0:
@@ -2194,7 +2292,7 @@ def _build_berkeley_payload_bank(
     size = max(8, int(image_size))
     rows, rows_info = collect_semantic_disk_rows(
         data_root=str(data_root),
-        class_names=_default_berkeley_class_names(),
+        class_names=_default_class_names(),
         source_root=str(source_root),
     )
     if int(len(rows)) <= 0:
@@ -2203,7 +2301,7 @@ def _build_berkeley_payload_bank(
     labels_np = np.stack([np.asarray(r.label_vec, dtype=np.float32).reshape(-1) for r in rows], axis=0).astype(np.float32, copy=False)
     terms_rows = [list(_normalize_vocab_terms(r.terms)) for r in rows]
     source_rows = [str(r.source) for r in rows]
-    class_names = _default_berkeley_class_names()
+    class_names = _default_class_names()
     n_classes = max(1, int(len(class_names)))
     class_lut = {re.sub(r"\s+", " ", str(name)).strip().lower(): int(i) for i, name in enumerate(class_names)}
     berkeley_dataset_idx = int(class_lut.get("berkeley sbd dataset", -1))

@@ -305,7 +305,7 @@ class GeneratorTrainNode(GatedNode):
 # ---------------------------------------------------------------------------
 
 def _load_gan_checkpoint(model, path: str, label: str) -> None:
-    from wav_config_transformer_pipeline import _apply_model_init, _torch_load_cpu
+    from pipeline.nodes.base import _apply_model_init, _torch_load_cpu
 
     try:
         ckpt = _torch_load_cpu(path)

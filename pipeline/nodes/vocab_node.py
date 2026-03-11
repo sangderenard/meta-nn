@@ -643,7 +643,8 @@ def _build_full_term_pool(ctx: PipelineContext, cfg: VocabConfig) -> List[str]:
 
 
 def _resolve_supervised_class_names(ctx: PipelineContext) -> List[str]:
-    from wav_config_transformer_pipeline import _default_berkeley_class_names, _torch_load_cpu
+    from pipeline.utils import _default_class_names
+    from pipeline.nodes.base import _torch_load_cpu
 
     ckpt_path = str(getattr(ctx.args, "classifier_init_ckpt", "") or "").strip()
     if ckpt_path:
@@ -661,7 +662,7 @@ def _resolve_supervised_class_names(ctx: PipelineContext) -> List[str]:
                     return [f"berkeley_cls_{i}" for i in range(num_classes)]
             except Exception as exc:
                 _log(f"[vocab-init] WARNING: could not read classifier init metadata from {p}: {exc}")
-    return [str(x).strip() for x in _default_berkeley_class_names() if str(x).strip()]
+    return [str(x).strip() for x in _default_class_names() if str(x).strip()]
 
 
 def _log(msg: str) -> None:
@@ -1159,9 +1160,10 @@ def _semantic_tags_for_symbol_term(term: str) -> List[str]:
     berkeley_lut = getattr(_semantic_tags_for_symbol_term, "_berkeley_lut", None)
     if berkeley_lut is None:
         try:
+            from pipeline.utils import _default_class_names
             berkeley_lut = {
                 str(x).strip().lower()
-                for x in _default_berkeley_class_names()
+                for x in _default_class_names()
                 if str(x).strip()
             }
             # Keep only object-like Berkeley labels here; dataset tags and symbol namespaces
@@ -2379,7 +2381,8 @@ def _build_internal_bootstrap_symbol_pool(
 
     core_terms = _normalize_vocab_terms(_default_semantic_core_terms())
     try:
-        berkeley_terms = _normalize_vocab_terms(_default_berkeley_class_names())
+        from pipeline.utils import _default_class_names
+        berkeley_terms = _normalize_vocab_terms(_default_class_names())
     except Exception:
         berkeley_terms = []
     berkeley_term_lc = {str(x).strip().lower() for x in berkeley_terms}
