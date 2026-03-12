@@ -3,3 +3,4 @@ wav_pipeline_runs/
 _tmp_graph_smoke/
 __pycache__/
 *.py[cod]
+node_modules/

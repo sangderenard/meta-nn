@@ -1,0 +1,26 @@
+{
+  "name": "meta-nn",
+  "version": "1.0.0",
+  "description": "`meta-nn` is the extracted training and orchestration workspace for a graph-shaped meta network: a set of cooperating nodes that build vocabulary, prepare data possessions, train staged models, gate progress, and feed later stages with the results of earlier ones.",
+  "main": "index.js",
+  "directories": {
+    "doc": "docs"
+  },
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/sangderenard/meta-nn.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/sangderenard/meta-nn/issues"
+  },
+  "homepage": "https://github.com/sangderenard/meta-nn#readme",
+  "devDependencies": {
+    "@mermaid-js/mermaid-cli": "^11.12.0"
+  }
+}

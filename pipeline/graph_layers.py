@@ -7,6 +7,7 @@ shared source of truth.
 from __future__ import annotations
 
 import argparse
+import os
 import re
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
@@ -1476,55 +1477,74 @@ def _escape_mermaid(text: str) -> str:
     return str(text or "").replace('"', "'")
 
 
-def _http_export_artifact(
+def _resolve_local_mmdc() -> Path:
+    """Return the local project Mermaid CLI executable path."""
+    root = Path(__file__).resolve().parents[1]
+    exe = "mmdc.cmd" if os.name == "nt" else "mmdc"
+    candidate = root / "node_modules" / ".bin" / exe
+    if candidate.exists():
+        return candidate
+    # Cross-platform fallback in case the primary executable name differs.
+    for fallback in ("mmdc.cmd", "mmdc"):
+        alt = root / "node_modules" / ".bin" / fallback
+        if alt.exists():
+            return alt
+    raise RuntimeError(
+        "Local Mermaid CLI not found. Run: npm install --save-dev @mermaid-js/mermaid-cli"
+    )
+
+
+def _mmdc_export_artifact(
     mermaid_text: str,
     output_path: Path,
     *,
     scale: int = 2,
     background_color: str = "#f5f6f7",
 ) -> bool:
-    """Render *mermaid_text* through the public Kroki HTTP API.
-
-    This avoids local Node/mmdc toolchain requirements in CI.
-    Returns True on success, False when network/service is unavailable.
-    """
-    import urllib.request
+    """Render *mermaid_text* through local mmdc from node_modules/.bin."""
+    import subprocess
+    import tempfile
 
     fmt = str(output_path.suffix or "").lower().lstrip(".")
     if fmt not in ("png", "svg"):
-        print(f"[graph-layers] unsupported export format for HTTP renderer: .{fmt}", flush=True)
+        print(f"[graph-layers] unsupported export format for mmdc renderer: .{fmt}", flush=True)
         return False
 
-    if int(scale) > 2:
-        print(
-            "[graph-layers] note: png scale >2 requested; HTTP renderer may not honor explicit scale. "
-            "Use SVG for lossless download.",
-            flush=True,
-        )
+    mmdc = _resolve_local_mmdc()
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".mmd", delete=False, encoding="utf-8") as fh:
+        fh.write(mermaid_text)
+        tmp_mmd = Path(fh.name)
 
-    endpoint = f"https://kroki.io/mermaid/{fmt}"
-    req = urllib.request.Request(
-        endpoint,
-        data=mermaid_text.encode("utf-8"),
-        method="POST",
-        headers={
-            "Content-Type": "text/plain; charset=utf-8",
-            "User-Agent": "meta-nn-readme-graph/1.0",
-            "Accept": "image/svg+xml,image/png,*/*",
-        },
-    )
     try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            payload = resp.read()
-        if not payload:
-            print(f"[graph-layers] empty response from diagram renderer for {output_path}", flush=True)
+        cmd = [
+            str(mmdc),
+            "-i",
+            str(tmp_mmd),
+            "-o",
+            str(output_path),
+            "--scale",
+            str(max(1, int(scale))),
+            "--backgroundColor",
+            str(background_color or "#f5f6f7"),
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            err = (result.stderr or result.stdout or "").strip()
+            print(f"[graph-layers] local mmdc render failed for {output_path}: {err}", flush=True)
             return False
-        output_path.write_bytes(payload)
+        if not output_path.exists() or output_path.stat().st_size <= 0:
+            print(f"[graph-layers] local mmdc produced empty output: {output_path}", flush=True)
+            return False
         print(f"[graph-layers] diagram exported: {output_path}", flush=True)
         return True
     except Exception as exc:
-        print(f"[graph-layers] HTTP render failed for {output_path}: {exc}", flush=True)
+        print(f"[graph-layers] local mmdc render exception for {output_path}: {exc}", flush=True)
         return False
+    finally:
+        try:
+            tmp_mmd.unlink()
+        except Exception:
+            pass
 
 
 def main(argv: Optional[Iterable[str]] = None) -> int:
@@ -1538,13 +1558,13 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
                              "Applied to the %%%%{init}%%%% directive and, when --export-png is set, "
                             "embedded into Mermaid theme variables.")
     parser.add_argument("--export-png", action="store_true",
-                        help="Render each layer to PNG via HTTP renderer (no local Node tooling required).")
+                        help="Render each layer to PNG via local mmdc (node_modules/.bin).")
     parser.add_argument("--export-svg", action="store_true",
-                        help="Render each layer to SVG via HTTP renderer (recommended for lossless downloads).")
+                        help="Render each layer to SVG via local mmdc (node_modules/.bin).")
     parser.add_argument("--export-mmd", action="store_true",
                         help="Write each rendered Mermaid view to .mmd source files.")
     parser.add_argument("--png-scale", type=int, default=2,
-                        help="Requested PNG density hint (some HTTP renderers may ignore this).")
+                        help="Pixel-density multiplier passed to mmdc.")
     parser.add_argument("--png-output-dir", default=".", metavar="DIR",
                         help="Directory to write PNG files into (default: current directory).")
     parser.add_argument("--asset-link-prefix", default="", metavar="PREFIX",
@@ -1577,10 +1597,16 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
             for view in all_views:
                 chart = render_mermaid_flowchart(layer, view=view, background_color=bg)
                 stem = png_dir / f"{layer_id}_{view}"
-                if args.export_png:
-                    _http_export_artifact(chart, stem.with_suffix(".png"), scale=int(args.png_scale), background_color=png_bg)
                 if args.export_svg:
-                    _http_export_artifact(chart, stem.with_suffix(".svg"), scale=int(args.png_scale), background_color=png_bg)
+                    svg_out = stem.with_suffix(".svg")
+                    if not _mmdc_export_artifact(chart, svg_out, scale=int(args.png_scale), background_color=png_bg):
+                        raise RuntimeError(f"Failed to generate SVG: {svg_out}")
+
+                if args.export_png:
+                    png_out = stem.with_suffix(".png")
+                    if not _mmdc_export_artifact(chart, png_out, scale=int(args.png_scale), background_color=png_bg):
+                        raise RuntimeError(f"Failed to generate PNG: {png_out}")
+
                 if args.export_mmd:
                     stem.with_suffix(".mmd").write_text(chart, encoding="utf-8")
                     print(f"[graph-layers] mermaid source exported: {stem.with_suffix('.mmd')}", flush=True)
