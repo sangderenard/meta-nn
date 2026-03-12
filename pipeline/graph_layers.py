@@ -843,6 +843,7 @@ def render_mermaid_flowchart(
     *,
     view: str = "dense",
     emit_identity_comments: bool = False,
+    background_color: str = "",
 ) -> str:
     layer_id = str(layer.get("layer_id", "") or "execution")
     direction = str(layer.get("mermaid_direction", "TD") or "TD")
@@ -850,8 +851,13 @@ def render_mermaid_flowchart(
     edges = list(layer.get("edges", []) or [])
     alias_map: Dict[str, str] = {}
     used_aliases: set[str] = set()
+    bg = str(background_color or "").strip()
+    if bg:
+        theme_vars = f"'themeVariables':{{'background':'{bg}','mainBkg':'{bg}'}},"
+    else:
+        theme_vars = ""
     lines: List[str] = [
-        "%%{init: {'theme':'base','flowchart':{'curve':'basis','htmlLabels':true}}}%%",
+        f"%%{{init: {{'theme':'base',{theme_vars}'flowchart':{{'curve':'basis','htmlLabels':true}}}}}}%%",
         f"flowchart {direction}",
     ]
 
@@ -895,55 +901,79 @@ def render_mermaid_flowchart(
     return "\n".join(lines)
 
 
-def render_readme_layer_section(layer: Dict[str, Any]) -> str:
+def _artifact_download_links(layer_id: str, view: str, *, asset_link_prefix: str = "") -> str:
+    prefix = str(asset_link_prefix or "").strip().replace("\\", "/").rstrip("/")
+    if not prefix:
+        return ""
+    base = f"{prefix}/{layer_id}_{view}"
+    return (
+        f"Downloads: [PNG]({base}.png) | [SVG]({base}.svg) | [MMD]({base}.mmd)"
+    )
+
+
+def render_readme_layer_section(layer: Dict[str, Any], *, asset_link_prefix: str = "") -> str:
     title = str(layer.get("label", "Layer"))
+    layer_id = str(layer.get("layer_id", "layer") or "layer")
     dense_chart = _mermaid_code_block(render_mermaid_flowchart(layer, view="dense"))
     minimal_chart = _mermaid_code_block(render_mermaid_flowchart(layer, view="minimal"))
     reaction_chart = _mermaid_code_block(render_mermaid_flowchart(layer, view="reaction"))
     legend = _render_layer_legend(layer)
+    dense_links = _artifact_download_links(layer_id, "dense", asset_link_prefix=asset_link_prefix)
+    minimal_links = _artifact_download_links(layer_id, "minimal", asset_link_prefix=asset_link_prefix)
+    reaction_links = _artifact_download_links(layer_id, "reaction", asset_link_prefix=asset_link_prefix)
 
     return "\n\n".join(
         [
             f"**{title} Dense Infographic**",
             dense_chart,
+            dense_links,
             legend,
             "<details>",
             "<summary>Minimal schematic view</summary>",
             "",
             minimal_chart,
+            minimal_links,
             "</details>",
             "<details>",
             "<summary>Reaction-colored view</summary>",
             "",
             reaction_chart,
+            reaction_links,
             "</details>",
         ]
     )
 
 
-def render_readme_execution_section(layers: Dict[str, Dict[str, Any]]) -> str:
+def render_readme_execution_section(layers: Dict[str, Dict[str, Any]], *, asset_link_prefix: str = "") -> str:
     execution_layer = dict(layers.get("execution", {}) or {})
     overlay_layer = dict(layers.get("execution_overlay", {}) or {})
     blocks: List[str] = []
     if overlay_layer:
+        overlay_layer_id = str(overlay_layer.get("layer_id", "execution_overlay") or "execution_overlay")
         blocks.extend(
             [
                 f"**{str(overlay_layer.get('label', 'Training Composite Execution Overlay'))}**",
                 _mermaid_code_block(render_mermaid_flowchart(overlay_layer, view="dense")),
+                _artifact_download_links(overlay_layer_id, "dense", asset_link_prefix=asset_link_prefix),
                 _render_layer_legend(overlay_layer),
             ]
         )
     if execution_layer:
-        blocks.append(render_readme_layer_section(execution_layer))
+        blocks.append(render_readme_layer_section(execution_layer, asset_link_prefix=asset_link_prefix))
     return "\n\n".join(blocks)
 
 
-def update_readme_flowcharts(readme_path: Path, *, graph: Optional[PipelineGraph] = None) -> Dict[str, str]:
+def update_readme_flowcharts(
+    readme_path: Path,
+    *,
+    graph: Optional[PipelineGraph] = None,
+    asset_link_prefix: str = "",
+) -> Dict[str, str]:
     graph = graph if graph is not None else build_default_graph()
     layers = build_graph_layers(graph)
-    execution_block = render_readme_execution_section(layers)
-    inference_block = render_readme_layer_section(layers["inference"])
-    stack_view_block = render_readme_layer_section(layers["stack_view"]) if layers.get("stack_view", {}).get("status") == "active" else ""
+    execution_block = render_readme_execution_section(layers, asset_link_prefix=asset_link_prefix)
+    inference_block = render_readme_layer_section(layers["inference"], asset_link_prefix=asset_link_prefix)
+    stack_view_block = render_readme_layer_section(layers["stack_view"], asset_link_prefix=asset_link_prefix) if layers.get("stack_view", {}).get("status") == "active" else ""
 
     text = readme_path.read_text(encoding="utf-8")
     text = _replace_marked_block(text, README_EXECUTION_START, README_EXECUTION_END, execution_block)
@@ -1448,26 +1478,111 @@ def _escape_mermaid(text: str) -> str:
     return str(text or "").replace('"', "'")
 
 
+def _mmdc_export_artifact(
+    mermaid_text: str,
+    output_path: Path,
+    *,
+    scale: int = 2,
+    background_color: str = "#f5f6f7",
+) -> bool:
+    """Render *mermaid_text* to an output artifact via the mmdc CLI.
+
+    Returns True on success, False when mmdc is not installed or fails.
+    The input is written to a sibling .mmd temp file then removed after the call.
+    """
+    import shutil
+    import subprocess
+    import tempfile
+
+    mmdc = shutil.which("mmdc") or shutil.which("mmdc.cmd")
+    if mmdc is None:
+        print("[graph-layers] mmdc not found; skipping diagram export (install @mermaid-js/mermaid-cli)", flush=True)
+        return False
+
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".mmd", delete=False, encoding="utf-8") as fh:
+        fh.write(mermaid_text)
+        tmp_path = Path(fh.name)
+
+    try:
+        cmd = [
+            mmdc,
+            "--input", str(tmp_path),
+            "--output", str(output_path),
+            "--scale", str(max(1, int(scale))),
+            "--backgroundColor", str(background_color or "white"),
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            print(f"[graph-layers] mmdc error: {result.stderr.strip()}", flush=True)
+            return False
+        print(f"[graph-layers] diagram exported: {output_path}", flush=True)
+        return True
+    finally:
+        try:
+            tmp_path.unlink()
+        except Exception:
+            pass
+
+
 def main(argv: Optional[Iterable[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="Generate layered Mermaid flowcharts from the graph definitions.")
     parser.add_argument("--layer", choices=["execution", "execution_overlay", "inference", "stack_view"], default="", help="Print a single layer Mermaid flowchart.")
     parser.add_argument("--view", choices=["dense", "minimal", "reaction"], default="dense", help="Rendering mode for --layer output.")
     parser.add_argument("--write-readme", action="store_true", help="Update README.md generated Mermaid sections in place.")
     parser.add_argument("--readme-path", default="README.md", help="README path to update when --write-readme is set.")
+    parser.add_argument("--background-color", default="", metavar="COLOR",
+                        help="CSS color for the diagram background (e.g. '#f5f6f7' or 'white'). "
+                             "Applied to the %%%%{init}%%%% directive and, when --export-png is set, "
+                             "passed to mmdc via --backgroundColor.")
+    parser.add_argument("--export-png", action="store_true",
+                        help="Render each layer to a high-res PNG via the mmdc CLI.")
+    parser.add_argument("--export-svg", action="store_true",
+                        help="Render each layer to SVG via the mmdc CLI.")
+    parser.add_argument("--export-mmd", action="store_true",
+                        help="Write each rendered Mermaid view to .mmd source files.")
+    parser.add_argument("--png-scale", type=int, default=2,
+                        help="Pixel-density multiplier passed to mmdc (default 2 = 2x).")
+    parser.add_argument("--png-output-dir", default=".", metavar="DIR",
+                        help="Directory to write PNG files into (default: current directory).")
+    parser.add_argument("--asset-link-prefix", default="", metavar="PREFIX",
+                        help="README-relative path prefix used for artifact download links.")
     args = parser.parse_args(list(argv) if argv is not None else None)
 
     graph = build_default_graph()
     layers = build_graph_layers(graph)
+    bg = str(args.background_color or "").strip()
 
     if args.layer:
-        print(render_mermaid_flowchart(layers[args.layer], view=args.view))
+        print(render_mermaid_flowchart(layers[args.layer], view=args.view, background_color=bg))
 
     if args.write_readme:
         readme_path = Path(str(args.readme_path))
-        update_readme_flowcharts(readme_path, graph=graph)
+        prefix = str(args.asset_link_prefix or "").strip()
+        if (not prefix) and (args.export_png or args.export_svg or args.export_mmd):
+            prefix = str(args.png_output_dir).replace("\\", "/")
+        update_readme_flowcharts(readme_path, graph=graph, asset_link_prefix=prefix)
         print(f"[graph-layers] README flowcharts updated: {readme_path}")
 
-    if not args.layer and not args.write_readme:
+    if args.export_png or args.export_svg or args.export_mmd:
+        png_dir = Path(str(args.png_output_dir))
+        png_dir.mkdir(parents=True, exist_ok=True)
+        png_bg = bg or "#f5f6f7"
+        all_views = ["dense", "minimal", "reaction"]
+        for layer_id, layer in layers.items():
+            if str(layer.get("status", "") or "") not in ("active", "planned", ""):
+                continue
+            for view in all_views:
+                chart = render_mermaid_flowchart(layer, view=view, background_color=bg)
+                stem = png_dir / f"{layer_id}_{view}"
+                if args.export_png:
+                    _mmdc_export_artifact(chart, stem.with_suffix(".png"), scale=int(args.png_scale), background_color=png_bg)
+                if args.export_svg:
+                    _mmdc_export_artifact(chart, stem.with_suffix(".svg"), scale=int(args.png_scale), background_color=png_bg)
+                if args.export_mmd:
+                    stem.with_suffix(".mmd").write_text(chart, encoding="utf-8")
+                    print(f"[graph-layers] mermaid source exported: {stem.with_suffix('.mmd')}", flush=True)
+
+    if not args.layer and not args.write_readme and not args.export_png and not args.export_svg and not args.export_mmd:
         parser.print_help()
     return 0
 

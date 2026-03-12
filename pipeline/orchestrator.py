@@ -85,8 +85,8 @@ from pipeline.plan_protocol import (
 )
 
 # --- node imports ----------------------------------------------------------
-from pipeline.nodes.berkeley_classifier_node import (
-    BerkeleyClassifierConfig,
+from pipeline.nodes.classifier_node import (
+    ClassifierConfig,
     BuildClassifierNode,
     PregestationTrainNode,
     GestationTrainNode,
@@ -664,7 +664,7 @@ def build_training_graph_plan(args, output_dir: Path, *, graph: Optional[Pipelin
 # Maps the config_blobs key used in TrainingGraphPlan → the config dataclass type.
 # This is the full registry of all 15 config dataclasses used by build_pipeline_graph().
 _CONFIG_CLASS_REGISTRY = {
-    "classifier":        BerkeleyClassifierConfig,
+    "classifier":        ClassifierConfig,
     "transformer":       TransformerConfig,
     "generator":         GeneratorConfig,
     "wave":              WaveClassifierConfig,
@@ -1135,7 +1135,7 @@ def _always(ctx: PipelineContext) -> bool:
 # ---------------------------------------------------------------------------
 
 def build_pipeline_graph(
-    classifier_cfg: BerkeleyClassifierConfig,
+    classifier_cfg: ClassifierConfig,
     transformer_cfg: TransformerConfig,
     generator_cfg: GeneratorConfig,
     wave_cfg: WaveClassifierConfig,
@@ -1624,7 +1624,7 @@ def _build_configs_from_args(args) -> dict:
     def _g(*names, default=None):
         return _arg_value(args, *names, default=default)
 
-    classifier = BerkeleyClassifierConfig(
+    classifier = ClassifierConfig(
         base_ch=int(_g("classifier_base_ch", default=64)),
         max_ch=int(_g("classifier_max_ch", default=384)),
         context_blocks=int(_g("classifier_context_blocks", default=8)),

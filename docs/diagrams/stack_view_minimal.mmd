@@ -1,0 +1,168 @@
+%%{init: {'theme':'base','themeVariables':{'background':'#f5f6f7','mainBkg':'#f5f6f7'},'flowchart':{'curve':'basis','htmlLabels':true}}}%%
+flowchart LR
+    wave_pool["Wave Pool"]
+    wave_pool__should_run["Gate check"]
+    wave_pool__execute["Discover WAV files and decode to float32 streams"]
+    init_vocab["Init Vocab"]
+    init_vocab__execute["Load and assemble initial semantic vocabulary"]
+    build_classifier["Build Classifier"]
+    build_classifier__should_run["Gate check"]
+    build_classifier__execute["Instantiate TinyConvClassifier + optimizer"]
+    config_search["Config Search"]
+    config_search__should_run["Gate check"]
+    config_search__execute["Score random RenderConfig candidates via classifier feature metric"]
+    build_transformer["Build Transformer"]
+    build_transformer__should_run["Gate check"]
+    build_transformer__execute["Instantiate WavePatchTransformer + optimizer"]
+    build_gan["Build Gan"]
+    build_gan__should_run["Gate check"]
+    build_gan__execute["Instantiate ConditionalBitPlaneGenerator + Discriminator"]
+    build_wave_classifier["Build Wave Classifier"]
+    build_wave_classifier__should_run["Gate check"]
+    build_wave_classifier__execute["Instantiate wave-feedback TinyConvClassifier"]
+    vocab_churn["Vocab Churn"]
+    vocab_churn__should_run["Gate check"]
+    vocab_churn__execute["Rotate extra vocab terms (churn) on schedule"]
+    build_symbol_pool["Build Symbol Pool"]
+    build_symbol_pool__execute["Build per-term symbol image pool"]
+    build_label_embedding["Build Label Embedding"]
+    build_label_embedding__should_run["Gate check"]
+    build_label_embedding__execute["Build sentence-transformer label embedding bank"]
+    build_flashcard_rows["Build Flashcard Rows"]
+    build_flashcard_rows__should_run["Gate check"]
+    build_flashcard_rows__execute["Build per-term GAN conditioning flashcard rows"]
+    data_node["Data Node"]
+    data_node__should_run["Gate check"]
+    data_node__execute["Build/refresh all training dataloaders"]
+    stage_0_pregestation["Stage 0 Pregestation"]
+    stage_0_pregestation__should_run["Gate check"]
+    stage_0_pregestation__execute["Stage 0: pre-gestation classifier training (geometric logic)"]
+    stage_1_gestation["Stage 1 Gestation"]
+    stage_1_gestation__execute["Stage 1: gestation classifier training (bootstrap primitives)"]
+    stage_2_berkeley["Stage 2 Berkeley"]
+    stage_2_berkeley__execute["Stage 2: Berkeley SBD refresh (full multi-label classification)"]
+    stage_r_transformer["Stage R Transformer"]
+    stage_r_transformer__should_run["Gate check"]
+    stage_r_transformer__execute["Stage R: WavePatchTransformer feature-score training"]
+    stage_g_generator["Stage G Generator"]
+    stage_g_generator__should_run["Gate check"]
+    stage_g_generator__execute["Stage G: Conditional GAN training (generator + discriminator)"]
+    stage_w_wave_classifier["Stage W Wave Classifier"]
+    stage_w_wave_classifier__should_run["Gate check"]
+    stage_w_wave_classifier__execute["Stage W: Wave classifier training on transformer outputs"]
+    stage_c_lora["Stage C Lora"]
+    stage_c_lora__execute["Stage C: LoRA slot switching and per-term Berkeley training"]
+    stage_fake_feedback["Stage Fake Feedback"]
+    stage_fake_feedback__should_run["Gate check"]
+    stage_fake_feedback__execute["Fake-class feedback: train classifier to detect GAN outputs"]
+    gate_0_pregestation_eval["Gate 0 Pregestation Eval"]
+    gate_0_pregestation_eval__should_run["Gate check"]
+    gate_0_pregestation_eval__execute["Gate 0 Eval: pre-gestation validation loss"]
+    gate_1_gestation_eval["Gate 1 Gestation Eval"]
+    gate_1_gestation_eval__should_run["Gate check"]
+    gate_1_gestation_eval__execute["Gate 1 Eval: gestation validation loss"]
+    gate_berkeley["Gate Berkeley"]
+    gate_berkeley__should_run["Gate check"]
+    gate_berkeley__execute["Gate 2 Eval: semantic classifier confidence + macro-F1"]
+    gate_transformer["Gate Transformer"]
+    gate_transformer__should_run["Gate check"]
+    gate_transformer__execute["Gate R Eval: transformer feature score + entropy"]
+    gate_generator["Gate Generator"]
+    gate_generator__should_run["Gate check"]
+    gate_generator__execute["Gate G Eval: generator feature score"]
+    gate_wave["Gate Wave"]
+    gate_wave__should_run["Gate check"]
+    gate_wave__execute["Gate W Eval: wave entropy + feature score feedback"]
+    sync_gate_replica["Sync Gate Replica"]
+    sync_gate_replica__should_run["Gate check"]
+    sync_gate_replica__execute["Sync frozen CPU gate_classifier from main classifier"]
+    checkpoint_save["Checkpoint Save"]
+    checkpoint_save__should_run["Gate check"]
+    checkpoint_save__execute["Save pipeline checkpoint to disk"]
+
+    wave_pool --> wave_pool__should_run
+    wave_pool --> wave_pool__execute
+    init_vocab --> init_vocab__execute
+    build_classifier --> build_classifier__should_run
+    build_classifier --> build_classifier__execute
+    config_search --> config_search__should_run
+    config_search --> config_search__execute
+    build_transformer --> build_transformer__should_run
+    build_transformer --> build_transformer__execute
+    build_gan --> build_gan__should_run
+    build_gan --> build_gan__execute
+    build_wave_classifier --> build_wave_classifier__should_run
+    build_wave_classifier --> build_wave_classifier__execute
+    vocab_churn --> vocab_churn__should_run
+    vocab_churn --> vocab_churn__execute
+    build_symbol_pool --> build_symbol_pool__execute
+    build_label_embedding --> build_label_embedding__should_run
+    build_label_embedding --> build_label_embedding__execute
+    build_flashcard_rows --> build_flashcard_rows__should_run
+    build_flashcard_rows --> build_flashcard_rows__execute
+    data_node --> data_node__should_run
+    data_node --> data_node__execute
+    stage_0_pregestation --> stage_0_pregestation__should_run
+    stage_0_pregestation --> stage_0_pregestation__execute
+    stage_1_gestation --> stage_1_gestation__execute
+    stage_2_berkeley --> stage_2_berkeley__execute
+    stage_r_transformer --> stage_r_transformer__should_run
+    stage_r_transformer --> stage_r_transformer__execute
+    stage_g_generator --> stage_g_generator__should_run
+    stage_g_generator --> stage_g_generator__execute
+    stage_w_wave_classifier --> stage_w_wave_classifier__should_run
+    stage_w_wave_classifier --> stage_w_wave_classifier__execute
+    stage_c_lora --> stage_c_lora__execute
+    stage_fake_feedback --> stage_fake_feedback__should_run
+    stage_fake_feedback --> stage_fake_feedback__execute
+    gate_0_pregestation_eval --> gate_0_pregestation_eval__should_run
+    gate_0_pregestation_eval --> gate_0_pregestation_eval__execute
+    gate_1_gestation_eval --> gate_1_gestation_eval__should_run
+    gate_1_gestation_eval --> gate_1_gestation_eval__execute
+    gate_berkeley --> gate_berkeley__should_run
+    gate_berkeley --> gate_berkeley__execute
+    gate_transformer --> gate_transformer__should_run
+    gate_transformer --> gate_transformer__execute
+    gate_generator --> gate_generator__should_run
+    gate_generator --> gate_generator__execute
+    gate_wave --> gate_wave__should_run
+    gate_wave --> gate_wave__execute
+    sync_gate_replica --> sync_gate_replica__should_run
+    sync_gate_replica --> sync_gate_replica__execute
+    checkpoint_save --> checkpoint_save__should_run
+    checkpoint_save --> checkpoint_save__execute
+    wave_pool --> init_vocab
+    init_vocab --> build_classifier
+    build_classifier --> config_search
+    config_search --> build_transformer
+    build_transformer --> build_gan
+    wave_pool --> build_wave_classifier
+    build_classifier --> vocab_churn
+    vocab_churn --> build_symbol_pool
+    build_symbol_pool --> build_label_embedding
+    build_label_embedding --> data_node
+    data_node --> stage_0_pregestation
+    data_node --> gate_0_pregestation_eval
+    data_node --> stage_1_gestation
+    data_node --> gate_1_gestation_eval
+    data_node --> stage_2_berkeley
+    data_node --> gate_berkeley
+    data_node --> stage_g_generator
+    data_node --> build_flashcard_rows
+    stage_0_pregestation --> gate_0_pregestation_eval
+    gate_0_pregestation_eval --> stage_1_gestation
+    stage_1_gestation --> gate_1_gestation_eval
+    gate_1_gestation_eval --> stage_2_berkeley
+    stage_2_berkeley --> gate_berkeley
+    gate_berkeley --> stage_r_transformer
+    stage_r_transformer --> gate_transformer
+    gate_transformer --> stage_g_generator
+    stage_g_generator --> gate_generator
+    gate_berkeley --> stage_c_lora
+    stage_c_lora --> stage_fake_feedback
+    build_wave_classifier --> stage_w_wave_classifier
+    stage_w_wave_classifier --> gate_wave
+    gate_wave --> sync_gate_replica
+    gate_transformer --> sync_gate_replica
+    gate_berkeley --> sync_gate_replica
+    sync_gate_replica --> checkpoint_save

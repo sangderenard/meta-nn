@@ -8,7 +8,7 @@ modules = [
     "pipeline.nodes.base",
     "pipeline.nodes.vocab_node",
     "pipeline.nodes.data_nodes",
-    "pipeline.nodes.berkeley_classifier_node",
+    "pipeline.nodes.classifier_node",
     "pipeline.nodes.generator_node",
     "pipeline.nodes.transformer_node",
     "pipeline.nodes.wave_classifier_node",

@@ -48,7 +48,7 @@ from pipeline.orchestrator import (
     build_pipeline_graph,
     build_training_graph_from_plan,
 )
-from pipeline.nodes.berkeley_classifier_node import BerkeleyClassifierConfig
+from pipeline.nodes.classifier_node import ClassifierConfig
 from pipeline.nodes.transformer_node import TransformerConfig
 from pipeline.nodes.generator_node import GeneratorConfig
 from pipeline.nodes.wave_classifier_node import WaveClassifierConfig
@@ -99,7 +99,7 @@ def _assert(cond: bool, msg: str) -> None:
 def test_build_pipeline_graph():
     print("\n--- test_build_pipeline_graph ---")
     graph = build_pipeline_graph(
-        classifier_cfg=BerkeleyClassifierConfig(),
+        classifier_cfg=ClassifierConfig(),
         transformer_cfg=TransformerConfig(),
         generator_cfg=GeneratorConfig(),
         wave_cfg=WaveClassifierConfig(),

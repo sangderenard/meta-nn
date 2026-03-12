@@ -505,7 +505,7 @@ def make_model(
         )
     if model_name == "resnet18":
         if bool(enable_mask_head):
-            raise ValueError("Mask head is currently supported only for the 'tiny' Berkeley classifier.")
+            raise ValueError("Mask head is currently supported only for the 'tiny' semantic classifier.")
         from torchvision.models import resnet18
 
         m = resnet18(weights=None)

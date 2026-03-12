@@ -88,7 +88,7 @@ class PipelineContext:
     # ---- models ---------------------------------------------------------
     #  Each model slot is populated by its node's first execution.
 
-    # Main semantic / Berkeley classifier (TinyConvClassifier)
+    # Main semantic classifier (TinyConvClassifier)
     classifier: Optional[nn.Module] = None
     classifier_optimizer: Optional[torch.optim.Optimizer] = None
     classifier_lr_controller: Optional[Any] = None

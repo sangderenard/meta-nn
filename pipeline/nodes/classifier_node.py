@@ -1,8 +1,8 @@
 """
-Berkeley Classifier Node — TinyConvClassifier training across all stages.
+Classifier Node — TinyConvClassifier training across all stages.
 
 This file is the authoritative description of everything idiosyncratic to the
-semantic/Berkeley classifier in this pipeline:
+semantic classifier in this pipeline:
 
   Stage 0  Pre-gestation   — synthetic geometric direction+colour logic images
   Stage 1  Gestation       — bootstrap primitive symbol images
@@ -69,7 +69,7 @@ CLASSIFIER_SEMANTIC_COSINE_WEIGHT = 0.35
 # ---------------------------------------------------------------------------
 
 @dataclass
-class BerkeleyClassifierConfig:
+class ClassifierConfig:
     """Every hyperparameter specific to the TinyConvClassifier."""
 
     # ---- architecture ---------------------------------------------------
@@ -165,7 +165,7 @@ class BuildClassifierNode(PipelineNode):
     node_id = "build_classifier"
     description = "Instantiate TinyConvClassifier + optimizer"
 
-    def __init__(self, cfg: BerkeleyClassifierConfig) -> None:
+    def __init__(self, cfg: ClassifierConfig) -> None:
         self.cfg = cfg
         self._built = False
 
@@ -173,7 +173,7 @@ class BuildClassifierNode(PipelineNode):
         return not self._built
 
     def execute(self, ctx: PipelineContext) -> None:
-        from wav_ml_models import TinyConvClassifier, maybe_compile_module, SinusoidalLRController, SinusoidalLROptions
+        from wav_ml_models import TinyConvClassifier, maybe_compile_module
 
         n_classes = len(ctx.class_names) if ctx.class_names else 1
         model = TinyConvClassifier(
@@ -197,20 +197,9 @@ class BuildClassifierNode(PipelineNode):
             weight_decay=self.cfg.weight_decay,
         )
 
-        total_rounds = ctx.orchestration_cycles * ctx.orchestration_rounds
-        lr_ctrl = SinusoidalLRController(
-            optimizer=optimizer,
-            total_steps=max(1, total_rounds),
-            options=SinusoidalLROptions(
-                cycles=self.cfg.lr_cycles,
-                tail_fraction=self.cfg.lr_tail_fraction,
-                min_scale=self.cfg.lr_min_scale,
-            ),
-        )
-
         ctx.classifier = model
         ctx.classifier_optimizer = optimizer
-        ctx.classifier_lr_controller = lr_ctrl
+        ctx.classifier_lr_controller = None
 
         if self.cfg.amp:
             ctx.classifier_grad_scaler = make_grad_scaler(enabled=True)
@@ -246,7 +235,7 @@ class PregestationTrainNode(PipelineNode):
     node_id = "stage_0_pregestation"
     description = "Stage 0: pre-gestation classifier training (geometric logic)"
 
-    def __init__(self, cfg: BerkeleyClassifierConfig) -> None:
+    def __init__(self, cfg: ClassifierConfig) -> None:
         self.cfg = cfg
 
     def should_run(self, ctx: PipelineContext) -> bool:
@@ -254,7 +243,7 @@ class PregestationTrainNode(PipelineNode):
         return ctx.pregestation_loader is not None and ctx.classifier is not None
 
     def execute(self, ctx: PipelineContext) -> None:
-        result = _run_berkeley_refresh_epochs(
+        result = _run_classifier_refresh_epochs(
             classifier=ctx.classifier,
             optimizer=ctx.classifier_optimizer,
             loader=ctx.pregestation_loader,
@@ -295,11 +284,11 @@ class GestationTrainNode(GatedNode):
     description = "Stage 1: gestation classifier training (bootstrap primitives)"
     required_gates = ["gate_pregestation"]
 
-    def __init__(self, cfg: BerkeleyClassifierConfig) -> None:
+    def __init__(self, cfg: ClassifierConfig) -> None:
         self.cfg = cfg
 
     def execute(self, ctx: PipelineContext) -> None:
-        result = _run_berkeley_refresh_epochs(
+        result = _run_classifier_refresh_epochs(
             classifier=ctx.classifier,
             optimizer=ctx.classifier_optimizer,
             loader=ctx.gestation_loader,
@@ -339,11 +328,11 @@ class BerkeleyRefreshTrainNode(GatedNode):
     description = "Stage 2: Berkeley SBD refresh (full multi-label classification)"
     required_gates = ["gate_pregestation", "gate_gestation"]
 
-    def __init__(self, cfg: BerkeleyClassifierConfig) -> None:
+    def __init__(self, cfg: ClassifierConfig) -> None:
         self.cfg = cfg
 
     def execute(self, ctx: PipelineContext) -> None:
-        result = _run_berkeley_refresh_epochs(
+        result = _run_classifier_refresh_epochs(
             classifier=ctx.classifier,
             optimizer=ctx.classifier_optimizer,
             loader=ctx.berkeley_refresh_loader,
@@ -384,7 +373,7 @@ class LoRARoundNode(GatedNode):
     description = "Stage C: LoRA slot switching and per-term Berkeley training"
     required_gates = ["gate_pregestation", "gate_gestation", "gate_berkeley"]
 
-    def __init__(self, cfg: BerkeleyClassifierConfig) -> None:
+    def __init__(self, cfg: ClassifierConfig) -> None:
         self.cfg = cfg
 
     def execute(self, ctx: PipelineContext) -> None:
@@ -411,7 +400,7 @@ class LoRARoundNode(GatedNode):
             install_tiny_classifier_lora(ctx.classifier, slot_name=slot_name)
 
             if ctx.berkeley_refresh_loader is not None:
-                _run_berkeley_refresh_epochs(
+                _run_classifier_refresh_epochs(
                     classifier=ctx.classifier,
                     optimizer=ctx.classifier_optimizer,
                     loader=ctx.berkeley_refresh_loader,
@@ -459,7 +448,7 @@ class FakeClassFeedbackNode(GatedNode):
     description = "Fake-class feedback: train classifier to detect GAN outputs"
     required_gates = ["gate_pregestation", "gate_gestation"]
 
-    def __init__(self, cfg: BerkeleyClassifierConfig) -> None:
+    def __init__(self, cfg: ClassifierConfig) -> None:
         self.cfg = cfg
 
     def should_run(self, ctx: PipelineContext) -> bool:
@@ -505,7 +494,7 @@ class SyncGateReplicaNode(PipelineNode):
     node_id = "sync_gate_replica"
     description = "Sync frozen CPU gate_classifier from main classifier"
 
-    def __init__(self, cfg: BerkeleyClassifierConfig) -> None:
+    def __init__(self, cfg: ClassifierConfig) -> None:
         self.cfg = cfg
 
     def should_run(self, ctx: PipelineContext) -> bool:
@@ -632,7 +621,7 @@ def _apply_classifier_init(model: TinyConvClassifier, ckpt_path: str, scope: str
     }
 
 
-def _run_berkeley_refresh_epochs(
+def _run_classifier_refresh_epochs(
     classifier: nn.Module,
     loader: DataLoader,
     device: torch.device,
@@ -731,16 +720,6 @@ def _run_berkeley_refresh_epochs(
         steps_per_epoch = int(full_steps if int(max_steps) <= 0 else max(1, int(max_steps)))
         steps_per_epoch = max(int(steps_per_epoch), int(min_steps))
     updates_per_epoch = int(math.ceil(float(steps_per_epoch) / float(grad_accum_steps)))
-    lr_ctl = SinusoidalLRController(
-        optimizer=opt,
-        total_steps=max(1, int(epochs) * updates_per_epoch),
-        options=SinusoidalLROptions(
-            cycles=float(lr_sine_cycles),
-            frequency=float(lr_sine_frequency),
-            tail_fraction=float(lr_sine_tail_fraction),
-            min_scale=float(lr_sine_min_scale),
-        ),
-    )
     total_loss = 0.0
     n = 0
     t_start = time.time()
@@ -952,7 +931,6 @@ def _run_berkeley_refresh_epochs(
                         scaler.update()
                     else:
                         opt.step()
-                    lr_ctl.step()
                     opt.zero_grad(set_to_none=True)
                 total_loss += float(step_loss_value)
                 n += int(step_seen)
@@ -1124,16 +1102,6 @@ def _run_fake_class_refresh_epochs(
     n_steps = max(1, int(steps_per_epoch))
     updates_per_epoch = int(math.ceil(float(n_steps) / float(grad_accum_steps)))
     opt = torch.optim.AdamW(classifier.parameters(), lr=float(lr), weight_decay=float(weight_decay))
-    lr_ctl = SinusoidalLRController(
-        optimizer=opt,
-        total_steps=max(1, int(epochs) * max(1, int(updates_per_epoch))),
-        options=SinusoidalLROptions(
-            cycles=float(lr_sine_cycles),
-            frequency=float(lr_sine_frequency),
-            tail_fraction=float(lr_sine_tail_fraction),
-            min_scale=float(lr_sine_min_scale),
-        ),
-    )
 
     rng = np.random.default_rng(seed)
     cond_bank_cpu = _payload_condition_bank_tensor(
@@ -1260,7 +1228,6 @@ def _run_fake_class_refresh_epochs(
                     scaler.update()
                 else:
                     opt.step()
-                lr_ctl.step()
                 opt.zero_grad(set_to_none=True)
 
             total_loss += float(loss.item()) * int(xb.shape[0])

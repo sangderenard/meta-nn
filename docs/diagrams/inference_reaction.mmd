@@ -1,0 +1,35 @@
+%%{init: {'theme':'base','themeVariables':{'background':'#f5f6f7','mainBkg':'#f5f6f7'},'flowchart':{'curve':'basis','htmlLabels':true}}}%%
+flowchart LR
+    input_bus[["Input Bus"]]
+    wave_classifier_runtime["Wave Classifier"]
+    transformer_runtime["Transformer"]
+    wave_sidecar_extract["Wave Sidecar Extract"]
+    classifier_runtime["Classifier"]
+    generator_runtime["GAN Generator"]
+    discriminator_runtime["Discriminator"]
+    wave_repack["Wave Repack"]
+    output_bus[["Output Bus"]]
+
+    input_bus -- "ingress wave | bus.read" --> wave_classifier_runtime
+    wave_classifier_runtime -- "bitplane window | infer.classify_wave" --> transformer_runtime
+    transformer_runtime -- "carrier sidecar | wave.extract_sidecar" --> wave_sidecar_extract
+    transformer_runtime -- "transformed bitplane | infer.transform" --> classifier_runtime
+    classifier_runtime -- "semantic condition | infer.condition" --> generator_runtime
+    generator_runtime -- "candidate synthesis | infer.generate" --> discriminator_runtime
+    discriminator_runtime -- "reject and retry | infer.retry_loop" --> generator_runtime
+    discriminator_runtime -- "accepted candidate | infer.accept" --> wave_repack
+    wave_sidecar_extract -- "preserved wave surround | wave.sidecar_attach" --> wave_repack
+    transformer_runtime -- "bitplane pre/post transform | wave.repack" --> wave_repack
+    wave_repack -- "egress wave | bus.write" --> output_bus
+
+    linkStyle 0 stroke:#0077B6,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
+    linkStyle 1 stroke:#F4A261,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
+    linkStyle 2 stroke:#2A9D8F,stroke-width:3px,opacity:0.9,stroke-dasharray:2 2;
+    linkStyle 3 stroke:#E9C46A,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
+    linkStyle 4 stroke:#264653,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
+    linkStyle 5 stroke:#E76F51,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
+    linkStyle 6 stroke:#D62828,stroke-width:4px,opacity:0.95,stroke-dasharray:8 4;
+    linkStyle 7 stroke:#2B9348,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
+    linkStyle 8 stroke:#577590,stroke-width:3px,opacity:0.9,stroke-dasharray:4 2;
+    linkStyle 9 stroke:#7F5539,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
+    linkStyle 10 stroke:#3A86FF,stroke-width:3px,opacity:0.95,stroke-dasharray:0;

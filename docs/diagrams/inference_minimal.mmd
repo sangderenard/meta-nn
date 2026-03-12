@@ -1,0 +1,23 @@
+%%{init: {'theme':'base','themeVariables':{'background':'#f5f6f7','mainBkg':'#f5f6f7'},'flowchart':{'curve':'basis','htmlLabels':true}}}%%
+flowchart LR
+    input_bus[["Input Bus"]]
+    wave_classifier_runtime["Wave Classifier"]
+    transformer_runtime["Transformer"]
+    wave_sidecar_extract["Wave Sidecar Extract"]
+    classifier_runtime["Classifier"]
+    generator_runtime["GAN Generator"]
+    discriminator_runtime["Discriminator"]
+    wave_repack["Wave Repack"]
+    output_bus[["Output Bus"]]
+
+    input_bus --> wave_classifier_runtime
+    wave_classifier_runtime --> transformer_runtime
+    transformer_runtime --> wave_sidecar_extract
+    transformer_runtime --> classifier_runtime
+    classifier_runtime --> generator_runtime
+    generator_runtime --> discriminator_runtime
+    discriminator_runtime --> generator_runtime
+    discriminator_runtime --> wave_repack
+    wave_sidecar_extract --> wave_repack
+    transformer_runtime --> wave_repack
+    wave_repack --> output_bus

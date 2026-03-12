@@ -4,7 +4,7 @@ Wave Classifier Node — Second TinyConvClassifier for wave feedback (Stage W).
 This file is the authoritative description of everything idiosyncratic to the
 wave-feedback classifier in this pipeline.
 
-This model is distinct from the Berkeley classifier:
+This model is distinct from the semantic classifier:
   * It trains on images rendered from transformer-accepted WAV chunks
   * Its labels come from WAV folder names or spectral clustering
     (not from semantic vocabulary)

@@ -1,0 +1,59 @@
+%%{init: {'theme':'base','themeVariables':{'background':'#f5f6f7','mainBkg':'#f5f6f7'},'flowchart':{'curve':'basis','htmlLabels':true}}}%%
+flowchart LR
+    subgraph group_io[Io]
+        input_bus[["Input Bus<br/>bus / io / input_bus"]]
+        output_bus[["Output Bus<br/>bus / io / output_bus"]]
+    end
+    subgraph group_inference[Inference]
+        wave_classifier_runtime["Wave Classifier<br/>object / inference / wave_classifier"]
+        transformer_runtime["Transformer<br/>object / inference / transformer"]
+        classifier_runtime["Classifier<br/>object / inference / classifier"]
+        generator_runtime["GAN Generator<br/>object / inference / generator"]
+    end
+    subgraph group_buffer[Buffer]
+        wave_sidecar_extract["Wave Sidecar Extract<br/>object / buffer / wave_sidecar_extractor"]
+        wave_repack["Wave Repack<br/>object / buffer / wave_repacker"]
+    end
+    subgraph group_gate[Gate]
+        discriminator_runtime["Discriminator<br/>object / gate / discriminator"]
+    end
+
+    input_bus -- "ingress wave" --> wave_classifier_runtime
+    wave_classifier_runtime -- "bitplane window" --> transformer_runtime
+    transformer_runtime -- "carrier sidecar" --> wave_sidecar_extract
+    transformer_runtime -- "transformed bitplane" --> classifier_runtime
+    classifier_runtime -- "semantic condition" --> generator_runtime
+    generator_runtime -- "candidate synthesis" --> discriminator_runtime
+    discriminator_runtime -- "reject and retry" --> generator_runtime
+    discriminator_runtime -- "accepted candidate" --> wave_repack
+    wave_sidecar_extract -- "preserved wave surround" --> wave_repack
+    transformer_runtime -- "bitplane pre/post transform" --> wave_repack
+    wave_repack -- "egress wave" --> output_bus
+
+    classDef faculty_bootstrap fill:#E9F1F7,stroke:#4B6B88,color:#102A43,stroke-width:2px;
+    classDef faculty_build fill:#F8EFE5,stroke:#B07219,color:#40210F,stroke-width:2px;
+    classDef faculty_vocab fill:#FFF7CC,stroke:#9A7D0A,color:#3D3100,stroke-width:2px;
+    classDef faculty_data fill:#DFF6F5,stroke:#127475,color:#053B3C,stroke-width:2px;
+    classDef faculty_train fill:#FFE8D6,stroke:#C05621,color:#4A1D05,stroke-width:2px;
+    classDef faculty_gates fill:#FDE2E4,stroke:#C0392B,color:#4A0F13,stroke-width:2px;
+    classDef faculty_housekeeping fill:#E8F5E9,stroke:#2E7D32,color:#102A12,stroke-width:2px;
+    classDef faculty_io fill:#DDEBFF,stroke:#2563EB,color:#0F172A,stroke-width:2px;
+    classDef faculty_inference fill:#F4F1DE,stroke:#3D405B,color:#1B1F2A,stroke-width:2px;
+    classDef faculty_buffer fill:#E0FBFC,stroke:#006D77,color:#00313A,stroke-width:2px;
+    classDef faculty_gate fill:#FDE2E4,stroke:#C0392B,color:#4A0F13,stroke-width:2px;
+    classDef faculty_other fill:#F3F4F6,stroke:#6B7280,color:#111827,stroke-width:2px;
+    class input_bus,output_bus faculty_io;
+    class wave_classifier_runtime,transformer_runtime,classifier_runtime,generator_runtime faculty_inference;
+    class wave_sidecar_extract,wave_repack faculty_buffer;
+    class discriminator_runtime faculty_gate;
+    linkStyle 0 stroke:#0077B6,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
+    linkStyle 1 stroke:#F4A261,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
+    linkStyle 2 stroke:#2A9D8F,stroke-width:3px,opacity:0.9,stroke-dasharray:2 2;
+    linkStyle 3 stroke:#E9C46A,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
+    linkStyle 4 stroke:#264653,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
+    linkStyle 5 stroke:#E76F51,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
+    linkStyle 6 stroke:#D62828,stroke-width:4px,opacity:0.95,stroke-dasharray:8 4;
+    linkStyle 7 stroke:#2B9348,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
+    linkStyle 8 stroke:#577590,stroke-width:3px,opacity:0.9,stroke-dasharray:4 2;
+    linkStyle 9 stroke:#7F5539,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
+    linkStyle 10 stroke:#3A86FF,stroke-width:3px,opacity:0.95,stroke-dasharray:0;

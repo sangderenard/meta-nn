@@ -41,7 +41,7 @@ def _gate_eval_model(ctx: PipelineContext, *, channels_last: bool = False) -> tu
     model = getattr(ctx, "classifier", None)
     if model is not None:
         try:
-            from pipeline.nodes.berkeley_classifier_node import _sync_gate_classifier_replica
+            from pipeline.nodes.classifier_node import _sync_gate_classifier_replica
 
             ctx.gate_classifier, _info = _sync_gate_classifier_replica(
                 source_classifier=model,
@@ -195,7 +195,7 @@ class BerkeleyGateNode(GatedNode):
     """
 
     node_id = "gate_berkeley"
-    description = "Gate 2 Eval: Berkeley classifier confidence + macro-F1"
+    description = "Gate 2 Eval: semantic classifier confidence + macro-F1"
     required_gates = ["gate_pregestation", "gate_gestation"]
 
     def __init__(self, cfg: BerkeleyGateConfig) -> None:

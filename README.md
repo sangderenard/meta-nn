@@ -115,17 +115,17 @@ flowchart TD
     build_wave_classifier -- "3" --> build_classifier
     build_classifier -- "4" --> decision_004_stage_w_wave_classifier
     decision_004_stage_w_wave_classifier -- "4.1" --> stage_w_wave_classifier
-    decision_004_stage_w_wave_classifier -- "4.0" --> program_hold
+    decision_004_stage_w_wave_classifier -- "4.0" --> config_search
     stage_w_wave_classifier -- "5" --> config_search
     config_search -- "6" --> vocab_churn
     vocab_churn -- "7" --> decision_007_gate_wave
     decision_007_gate_wave -- "7.1" --> gate_wave
-    decision_007_gate_wave -- "7.0" --> program_hold
+    decision_007_gate_wave -- "7.0" --> build_transformer
     gate_wave -- "8" --> build_transformer
     build_transformer -- "9" --> build_symbol_pool
     build_symbol_pool -- "10" --> decision_010_build_gan
     decision_010_build_gan -- "10.1" --> build_gan
-    decision_010_build_gan -- "10.0" --> program_hold
+    decision_010_build_gan -- "10.0" --> build_label_embedding
     build_gan -- "11" --> build_label_embedding
     build_label_embedding -- "12" --> data_node
     data_node -- "13" --> stage_0_pregestation
@@ -133,35 +133,35 @@ flowchart TD
     build_flashcard_rows -- "15" --> gate_0_pregestation_eval
     gate_0_pregestation_eval -- "16" --> decision_016_stage_1_gestation
     decision_016_stage_1_gestation -- "16.1" --> stage_1_gestation
-    decision_016_stage_1_gestation -- "16.0" --> program_hold
+    decision_016_stage_1_gestation -- "16.0" --> gate_1_gestation_eval
     stage_1_gestation -- "17" --> decision_017_gate_1_gestation_eval
     decision_017_gate_1_gestation_eval -- "17.1" --> gate_1_gestation_eval
-    decision_017_gate_1_gestation_eval -- "17.0" --> program_hold
+    decision_017_gate_1_gestation_eval -- "17.0" --> stage_2_berkeley
     gate_1_gestation_eval -- "18" --> decision_018_stage_2_berkeley
     decision_018_stage_2_berkeley -- "18.1" --> stage_2_berkeley
-    decision_018_stage_2_berkeley -- "18.0" --> program_hold
+    decision_018_stage_2_berkeley -- "18.0" --> gate_berkeley
     stage_2_berkeley -- "19" --> decision_019_gate_berkeley
     decision_019_gate_berkeley -- "19.1" --> gate_berkeley
-    decision_019_gate_berkeley -- "19.0" --> program_hold
+    decision_019_gate_berkeley -- "19.0" --> stage_r_transformer
     gate_berkeley -- "20" --> decision_020_stage_r_transformer
     decision_020_stage_r_transformer -- "20.1" --> stage_r_transformer
-    decision_020_stage_r_transformer -- "20.0" --> program_hold
+    decision_020_stage_r_transformer -- "20.0" --> stage_c_lora
     stage_r_transformer -- "21" --> decision_021_stage_c_lora
     decision_021_stage_c_lora -- "21.1" --> stage_c_lora
-    decision_021_stage_c_lora -- "21.0" --> program_hold
+    decision_021_stage_c_lora -- "21.0" --> gate_transformer
     stage_c_lora -- "22" --> decision_022_gate_transformer
     decision_022_gate_transformer -- "22.1" --> gate_transformer
-    decision_022_gate_transformer -- "22.0" --> program_hold
+    decision_022_gate_transformer -- "22.0" --> stage_fake_feedback
     gate_transformer -- "23" --> decision_023_stage_fake_feedback
     decision_023_stage_fake_feedback -- "23.1" --> stage_fake_feedback
-    decision_023_stage_fake_feedback -- "23.0" --> program_hold
+    decision_023_stage_fake_feedback -- "23.0" --> stage_g_generator
     stage_fake_feedback -- "24" --> decision_024_stage_g_generator
     decision_024_stage_g_generator -- "24.1" --> stage_g_generator
-    decision_024_stage_g_generator -- "24.0" --> program_hold
+    decision_024_stage_g_generator -- "24.0" --> sync_gate_replica
     stage_g_generator -- "25" --> sync_gate_replica
     sync_gate_replica -- "26" --> decision_026_gate_generator
     decision_026_gate_generator -- "26.1" --> gate_generator
-    decision_026_gate_generator -- "26.0" --> program_hold
+    decision_026_gate_generator -- "26.0" --> checkpoint_save
     gate_generator -- "27" --> checkpoint_save
 
     classDef faculty_bootstrap fill:#E9F1F7,stroke:#4B6B88,color:#102A43,stroke-width:2px;
@@ -272,6 +272,8 @@ flowchart TD
     linkStyle 86 stroke:#111111,stroke-width:2px,opacity:0.95,stroke-dasharray:6 3;
     linkStyle 87 stroke:#111111,stroke-width:3px,opacity:0.98,stroke-dasharray:0;
 ```
+
+Downloads: [PNG](docs/diagrams/execution_overlay_dense.png) | [SVG](docs/diagrams/execution_overlay_dense.svg) | [MMD](docs/diagrams/execution_overlay_dense.mmd)
 
 The colored edges retain topology and data/reaction structure. The black numbered edges show scheduler order, while diamond nodes expose the explicit guard checks that gate later stages.
 
@@ -415,6 +417,8 @@ flowchart TD
     linkStyle 34 stroke:#2B9348,stroke-width:3px,opacity:0.9,stroke-dasharray:4 2;
 ```
 
+Downloads: [PNG](docs/diagrams/execution_dense.png) | [SVG](docs/diagrams/execution_dense.svg) | [MMD](docs/diagrams/execution_dense.mmd)
+
 Node colors group bootstrap, build, vocab, data, train, gate, and housekeeping faculties. Edge colors separate startup, per-round, data-provision, gated progression, and end-of-round reactions.
 
 <details>
@@ -491,6 +495,8 @@ flowchart TD
     gate_berkeley --> sync_gate_replica
     sync_gate_replica --> checkpoint_save
 ```
+
+Downloads: [PNG](docs/diagrams/execution_minimal.png) | [SVG](docs/diagrams/execution_minimal.svg) | [MMD](docs/diagrams/execution_minimal.mmd)
 
 </details>
 
@@ -605,6 +611,8 @@ flowchart TD
     linkStyle 34 stroke:#2B9348,stroke-width:3px,opacity:0.9,stroke-dasharray:4 2;
 ```
 
+Downloads: [PNG](docs/diagrams/execution_reaction.png) | [SVG](docs/diagrams/execution_reaction.svg) | [MMD](docs/diagrams/execution_reaction.mmd)
+
 </details>
 <!-- END:GENERATED_EXECUTION_LAYER -->
 
@@ -675,6 +683,8 @@ flowchart LR
     linkStyle 10 stroke:#3A86FF,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
 ```
 
+Downloads: [PNG](docs/diagrams/inference_dense.png) | [SVG](docs/diagrams/inference_dense.svg) | [MMD](docs/diagrams/inference_dense.mmd)
+
 Node colors group buses, inference objects, buffers, and acceptance gates. Edge colors separate ingress, interpretation, synthesis, retry-loop, repack, and egress paths.
 
 <details>
@@ -708,6 +718,8 @@ flowchart LR
     transformer_runtime --> wave_repack
     wave_repack --> output_bus
 ```
+
+Downloads: [PNG](docs/diagrams/inference_minimal.png) | [SVG](docs/diagrams/inference_minimal.svg) | [MMD](docs/diagrams/inference_minimal.mmd)
 
 </details>
 
@@ -754,6 +766,8 @@ flowchart LR
     linkStyle 9 stroke:#7F5539,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
     linkStyle 10 stroke:#3A86FF,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
 ```
+
+Downloads: [PNG](docs/diagrams/inference_reaction.png) | [SVG](docs/diagrams/inference_reaction.svg) | [MMD](docs/diagrams/inference_reaction.mmd)
 
 </details>
 <!-- END:GENERATED_INFERENCE_LAYER -->
@@ -828,7 +842,7 @@ flowchart LR
         gate_1_gestation_eval__execute["Gate 1 Eval: gestation validation loss<br/>object / other / execute"]
         gate_berkeley["Gate Berkeley<br/>object / other / BerkeleyGateNode"]
         gate_berkeley__should_run["Gate check<br/>object / other / gate_check"]
-        gate_berkeley__execute["Gate 2 Eval: Berkeley classifier confidence + macro-F1<br/>object / other / execute"]
+        gate_berkeley__execute["Gate 2 Eval: semantic classifier confidence + macro-F1<br/>object / other / execute"]
         gate_transformer["Gate Transformer<br/>object / other / TransformerGateNode"]
         gate_transformer__should_run["Gate check<br/>object / other / gate_check"]
         gate_transformer__execute["Gate R Eval: transformer feature score + entropy<br/>object / other / execute"]
@@ -1034,6 +1048,8 @@ flowchart LR
     linkStyle 85 stroke:#2B9348,stroke-width:3px,opacity:0.9,stroke-dasharray:4 2;
 ```
 
+Downloads: [PNG](docs/diagrams/stack_view_dense.png) | [SVG](docs/diagrams/stack_view_dense.svg) | [MMD](docs/diagrams/stack_view_dense.mmd)
+
 Node colors group bootstrap, build, vocab, data, train, gate, and housekeeping faculties. Edge colors separate startup, per-round, data-provision, gated progression, and end-of-round reactions.
 
 <details>
@@ -1108,7 +1124,7 @@ flowchart LR
     gate_1_gestation_eval__execute["Gate 1 Eval: gestation validation loss"]
     gate_berkeley["Gate Berkeley"]
     gate_berkeley__should_run["Gate check"]
-    gate_berkeley__execute["Gate 2 Eval: Berkeley classifier confidence + macro-F1"]
+    gate_berkeley__execute["Gate 2 Eval: semantic classifier confidence + macro-F1"]
     gate_transformer["Gate Transformer"]
     gate_transformer__should_run["Gate check"]
     gate_transformer__execute["Gate R Eval: transformer feature score + entropy"]
@@ -1213,6 +1229,8 @@ flowchart LR
     sync_gate_replica --> checkpoint_save
 ```
 
+Downloads: [PNG](docs/diagrams/stack_view_minimal.png) | [SVG](docs/diagrams/stack_view_minimal.svg) | [MMD](docs/diagrams/stack_view_minimal.mmd)
+
 </details>
 
 <details>
@@ -1287,7 +1305,7 @@ flowchart LR
     gate_1_gestation_eval__execute["Gate 1 Eval: gestation validation loss"]
     gate_berkeley["Gate Berkeley"]
     gate_berkeley__should_run["Gate check"]
-    gate_berkeley__execute["Gate 2 Eval: Berkeley classifier confidence + macro-F1"]
+    gate_berkeley__execute["Gate 2 Eval: semantic classifier confidence + macro-F1"]
     gate_transformer["Gate Transformer"]
     gate_transformer__should_run["Gate check"]
     gate_transformer__execute["Gate R Eval: transformer feature score + entropy"]
@@ -1478,6 +1496,8 @@ flowchart LR
     linkStyle 84 stroke:#2B9348,stroke-width:3px,opacity:0.9,stroke-dasharray:4 2;
     linkStyle 85 stroke:#2B9348,stroke-width:3px,opacity:0.9,stroke-dasharray:4 2;
 ```
+
+Downloads: [PNG](docs/diagrams/stack_view_reaction.png) | [SVG](docs/diagrams/stack_view_reaction.svg) | [MMD](docs/diagrams/stack_view_reaction.mmd)
 
 </details>
 <!-- END:GENERATED_STACK_VIEW_LAYER -->
