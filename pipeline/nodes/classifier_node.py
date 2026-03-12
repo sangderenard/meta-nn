@@ -163,6 +163,10 @@ class ClassifierConfig:
     fake_class_batch_size: int = 16
     fake_class_disc_weight: float = 1.0   # discriminator-confidence weighting
 
+    # ---- Progress logging (applies to all _run_classifier_refresh_epochs calls) --
+    # 0 = silent; N = print one progress line every N steps
+    log_every: int = 50
+
     # ---- Gate replica sync cadence -------------------------------------
     gate_replica_sync_every_n_rounds: int = 1
 
@@ -272,6 +276,7 @@ class PregestationTrainNode(PipelineNode):
         return ctx.pregestation_loader is not None and ctx.classifier is not None
 
     def execute(self, ctx: PipelineContext) -> None:
+        from pipeline.nodes.base import make_training_progress_callback
         result = _run_classifier_refresh_epochs(
             classifier=ctx.classifier,
             optimizer=ctx.classifier_optimizer,
@@ -286,6 +291,9 @@ class PregestationTrainNode(PipelineNode):
             grad_scaler=ctx.classifier_grad_scaler,
             channels_last=self.cfg.channels_last,
             stage_label="stage0_pregestation",
+            log_every=self.cfg.log_every,
+            progress_callback=make_training_progress_callback(ctx, self.node_id, "stage0_pregestation"),
+            stop_requested=ctx.stop_requested,
             args=ctx.args,
         )
 
@@ -318,6 +326,7 @@ class GestationTrainNode(GatedNode):
         self.cfg = cfg
 
     def execute(self, ctx: PipelineContext) -> None:
+        from pipeline.nodes.base import make_training_progress_callback
         result = _run_classifier_refresh_epochs(
             classifier=ctx.classifier,
             optimizer=ctx.classifier_optimizer,
@@ -332,6 +341,9 @@ class GestationTrainNode(GatedNode):
             grad_scaler=ctx.classifier_grad_scaler,
             channels_last=self.cfg.channels_last,
             stage_label="stage1_gestation",
+            log_every=self.cfg.log_every,
+            progress_callback=make_training_progress_callback(ctx, self.node_id, "stage1_gestation"),
+            stop_requested=ctx.stop_requested,
             args=ctx.args,
         )
 
@@ -363,6 +375,7 @@ class BerkeleyRefreshTrainNode(GatedNode):
         self.cfg = cfg
 
     def execute(self, ctx: PipelineContext) -> None:
+        from pipeline.nodes.base import make_training_progress_callback
         result = _run_classifier_refresh_epochs(
             classifier=ctx.classifier,
             optimizer=ctx.classifier_optimizer,
@@ -377,6 +390,9 @@ class BerkeleyRefreshTrainNode(GatedNode):
             grad_scaler=ctx.classifier_grad_scaler,
             channels_last=self.cfg.channels_last,
             stage_label="stage2_berkeley",
+            log_every=self.cfg.log_every,
+            progress_callback=make_training_progress_callback(ctx, self.node_id, "stage2_berkeley"),
+            stop_requested=ctx.stop_requested,
             args=ctx.args,
         )
 
@@ -690,6 +706,7 @@ def _run_classifier_refresh_epochs(
     target_label_knockout_max_drop_frac: float = 0.5,
     target_label_knockout_seed: int = 0,
     step_preview_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+    progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
     stop_requested: Optional[Callable[[], bool]] = None,
     grad_clip: float = 1.0,
     semantic_soft_target_max: float = 0.0,
@@ -973,11 +990,22 @@ def _run_classifier_refresh_epochs(
                 if int(log_every) > 0 and (global_step % int(log_every) == 0):
                     elapsed = max(1e-6, time.time() - t_start)
                     ips = float(n) / elapsed
+                    _cur_loss = total_loss / max(1, n)
                     print(
                         f"[berkeley-refresh] step={global_step}/{total_target_steps} "
-                        f"loss={total_loss / max(1, n):.4f} samples={n} samp_per_sec={ips:.1f}",
+                        f"loss={_cur_loss:.4f} samples={n} samp_per_sec={ips:.1f}",
                         flush=True,
                     )
+                    if progress_callback is not None:
+                        try:
+                            progress_callback({
+                                "global_step": int(global_step),
+                                "total_steps": int(total_target_steps),
+                                "loss": float(_cur_loss),
+                                "samples_per_sec": float(ips),
+                            })
+                        except Exception:
+                            pass
                 if step_preview_callback is not None and len(preview_items) > 0:
                     _avg_loss = float(total_loss / max(1, n))
                     _cb_batch = []
@@ -1001,6 +1029,7 @@ def _run_classifier_refresh_epochs(
                         _log(f"[stage-opengl] C-step callback failed: {e}")
                 if xb is not None:
                     del xb, yb, mb
+                batch_meta = None  # drop mask_stack refs so pinned CUDA memory can be reclaimed
                 if use_cache:
                     del idx
                 if float(max_seconds) > 0.0 and (time.time() - t_start) >= float(max_seconds):

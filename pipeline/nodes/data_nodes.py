@@ -448,6 +448,65 @@ class DataNode(PipelineNode):
         # Counting every tensor/array precisely is not worth the complexity.
         return 0
 
+    def declare_subnodes(self) -> List[Dict[str, Any]]:
+        return [
+            {
+                "subnode_id": "data_node::image_generator",
+                "kind": "data_prep",
+                "label": "Image Generator",
+                "callable_ref": "DataNode.provide_pregestation",
+                "order": 0,
+                "metadata": {
+                    "role": "creation",
+                    "description": "Build geometric and cached source images before mask composition.",
+                },
+            },
+            {
+                "subnode_id": "data_node::creation_masks",
+                "kind": "data_prep",
+                "label": "Creation Masks",
+                "callable_ref": "DataNode.provide_pregestation",
+                "order": 1,
+                "metadata": {
+                    "role": "creation",
+                    "description": "Opaque per-label source masks from authored geometry or dataset annotations.",
+                },
+            },
+            {
+                "subnode_id": "data_node::distortion_masks",
+                "kind": "data_prep",
+                "label": "Distortion Masks",
+                "callable_ref": "DataNode.provide_berkeley_data",
+                "order": 2,
+                "metadata": {
+                    "role": "distortion",
+                    "description": "Greyscale delta masks for deterministic degradation and synthetic distortion passes.",
+                },
+            },
+            {
+                "subnode_id": "data_node::heuristic_eye",
+                "kind": "data_prep",
+                "label": "Heuristic Eye",
+                "callable_ref": "DataNode.provide_berkeley_data",
+                "order": 3,
+                "metadata": {
+                    "role": "heuristic",
+                    "description": "Appearance-driven masks from deterministic visual inspection without label dependence.",
+                },
+            },
+            {
+                "subnode_id": "data_node::mask_flatten",
+                "kind": "data_prep",
+                "label": "Mask Flatten",
+                "callable_ref": "DataNode.provide_berkeley_data",
+                "order": 4,
+                "metadata": {
+                    "role": "flatten",
+                    "description": "Flatten all mask instances into label stacks and normalized composites for cache materialization.",
+                },
+            },
+        ]
+
     # ------------------------------------------------------------------
     # Node protocol
     # ------------------------------------------------------------------
@@ -546,18 +605,11 @@ class DataNode(PipelineNode):
                         y[int(idx)] = 1.0
                 all_targets.append(y)
 
-        ctx.pregestation_logic_rows = {
-            "images": all_images, "masks": all_masks, "mask_stacks": all_mask_stacks,
-            "targets": all_targets, "terms": all_term_rows,
-        }
         if not all_images:
             _log("[data-node] WARNING: no pregestation images built")
             return
 
         # ---- Precompute per-label mask stacks from per-element stacks ----
-        # This converts spatial element masks (bg, disk, cross) into
-        # label-indexed stacks so __getitem__ and the training loop never
-        # need to recompute anything.
         all_label_stacks: list = []
         all_label_indices: list = []
         for i in range(len(all_images)):
@@ -589,6 +641,17 @@ class DataNode(PipelineNode):
                     dataset.base_mask_stacks[i] = np.asarray(all_mask_stacks[i], dtype=np.float32)
                 if all_label_indices[i] is not None:
                     dataset.base_mask_stack_indices[i] = np.asarray(all_label_indices[i], dtype=np.int64)
+
+        ctx.pregestation_logic_rows = {
+            "images": all_images,
+            "masks": all_masks,
+            "mask_stacks": all_mask_stacks,
+            "element_mask_stacks": all_mask_stacks,
+            "label_mask_stacks": all_label_stacks,
+            "label_mask_indices": all_label_indices,
+            "targets": all_targets,
+            "terms": all_term_rows,
+        }
 
         train_idx, val_idx = _orphan_free_split(
             targets=all_targets, seed=self.preg_cfg.seed,
@@ -942,6 +1005,7 @@ def _prevectorize_deformations(
             rows=list(rows), image_size=int(image_size),
             return_masks=True, return_mask_stack=False,
             degrade=False, degrade_seed=int(seed),
+            class_names=_default_class_names(),
         )
         return ds, n_src
 
@@ -959,6 +1023,7 @@ def _prevectorize_deformations(
         rows=used_rows, image_size=int(image_size),
         return_masks=True, return_mask_stack=False,
         degrade=False, degrade_seed=int(seed),
+        class_names=_default_class_names(),
     )
 
     # Variant passes — each with degrade=True at a distinct seed.
@@ -971,6 +1036,7 @@ def _prevectorize_deformations(
             return_masks=True, return_mask_stack=False,
             degrade=True,
             degrade_seed=int(seed) + (v + 1) * 7919,
+            class_names=_default_class_names(),
         )
         variant_datasets.append(variant_ds)
 
@@ -991,6 +1057,7 @@ class _LazyDiskSemanticPayloadBank:
             return_mask_stack=False,
             degrade=False,
             degrade_seed=int(seed),
+            class_names=_default_class_names(),
         )
 
     def __len__(self) -> int:
@@ -1626,6 +1693,7 @@ def _build_berkeley_gate_val_loader(
         return_mask_stack=bool(return_mask_stack),
         degrade=False,
         degrade_seed=int(seed),
+        class_names=_default_class_names(),
     )
     sampler = None
     shuffle = False
@@ -2254,6 +2322,7 @@ def _build_payload_validation_gate_dataset(
         return_mask_stack=bool(return_mask_stack),
         degrade=False,
         degrade_seed=int(seed),
+        class_names=_default_class_names(),
     )
     refresh_rows_total = int(sum(int(v.get("refresh_selected", 0)) for v in source_stats.values()))
     refresh_rows_berkeley_train = int(source_stats.get("berkeley_sbd_train", {}).get("refresh_selected", 0))
@@ -2506,11 +2575,24 @@ def _expand_semantic_mask_supervision_batch(
                 stack_t = stack_t.unsqueeze(0)
             n_pairs = min(int(stack_t.shape[0]), int(idx_t.numel()))
             for si in range(int(n_pairs)):
-                stack_lookup[int(idx_t[si].item())] = stack_t[si]
+                cls_idx = int(idx_t[si].item())
+                existing = stack_lookup.get(cls_idx)
+                if existing is None:
+                    stack_lookup[cls_idx] = stack_t[si]
+                else:
+                    combined = existing + stack_t[si]
+                    vmax = torch.amax(combined)
+                    if bool(torch.isfinite(vmax)) and float(vmax.item()) > 1e-8:
+                        combined = combined / vmax
+                    stack_lookup[cls_idx] = torch.clamp(combined, 0.0, 1.0)
         for lbl in active.tolist():
             y_single = torch.zeros_like(y_row)
             y_single[int(lbl)] = 1.0
-            mask_single = stack_lookup.get(int(lbl), mb[bi])
+            if int(lbl) not in stack_lookup:
+                raise RuntimeError(
+                    f"{str(context)} single_label_passes requires a label-specific mask for label index {int(lbl)}"
+                )
+            mask_single = stack_lookup[int(lbl)]
             if int(mask_single.ndim) == 2:
                 mask_single = mask_single.unsqueeze(0)
             x_rows.append(xb[bi])

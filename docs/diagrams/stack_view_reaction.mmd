@@ -32,8 +32,11 @@ flowchart LR
     build_flashcard_rows__should_run["Gate check"]
     build_flashcard_rows__execute["Build per-term GAN conditioning flashcard rows"]
     data_node["Data Node"]
-    data_node__should_run["Gate check"]
-    data_node__execute["Build/refresh all training dataloaders"]
+    data_node__image_generator["Image Generator"]
+    data_node__creation_masks["Creation Masks"]
+    data_node__distortion_masks["Distortion Masks"]
+    data_node__heuristic_eye["Heuristic Eye"]
+    data_node__mask_flatten["Mask Flatten"]
     stage_0_pregestation["Stage 0 Pregestation"]
     stage_0_pregestation__should_run["Gate check"]
     stage_0_pregestation__execute["Stage 0: pre-gestation classifier training (geometric logic)"]
@@ -100,8 +103,11 @@ flowchart LR
     build_label_embedding -- "execute | node.owns" --> build_label_embedding__execute
     build_flashcard_rows -- "gate_check | node.owns" --> build_flashcard_rows__should_run
     build_flashcard_rows -- "execute | node.owns" --> build_flashcard_rows__execute
-    data_node -- "gate_check | node.owns" --> data_node__should_run
-    data_node -- "execute | node.owns" --> data_node__execute
+    data_node -- "data_prep | node.owns" --> data_node__image_generator
+    data_node -- "data_prep | node.owns" --> data_node__creation_masks
+    data_node -- "data_prep | node.owns" --> data_node__distortion_masks
+    data_node -- "data_prep | node.owns" --> data_node__heuristic_eye
+    data_node -- "data_prep | node.owns" --> data_node__mask_flatten
     stage_0_pregestation -- "gate_check | node.owns" --> stage_0_pregestation__should_run
     stage_0_pregestation -- "execute | node.owns" --> stage_0_pregestation__execute
     stage_1_gestation -- "execute | node.owns" --> stage_1_gestation__execute
@@ -218,38 +224,41 @@ flowchart LR
     linkStyle 48 stroke:#8B5CF6,stroke-width:2px,opacity:0.85,stroke-dasharray:4 2;
     linkStyle 49 stroke:#8B5CF6,stroke-width:2px,opacity:0.85,stroke-dasharray:4 2;
     linkStyle 50 stroke:#8B5CF6,stroke-width:2px,opacity:0.85,stroke-dasharray:4 2;
-    linkStyle 51 stroke:#2A9D8F,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
-    linkStyle 52 stroke:#2A9D8F,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
-    linkStyle 53 stroke:#2A9D8F,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
+    linkStyle 51 stroke:#8B5CF6,stroke-width:2px,opacity:0.85,stroke-dasharray:4 2;
+    linkStyle 52 stroke:#8B5CF6,stroke-width:2px,opacity:0.85,stroke-dasharray:4 2;
+    linkStyle 53 stroke:#8B5CF6,stroke-width:2px,opacity:0.85,stroke-dasharray:4 2;
     linkStyle 54 stroke:#2A9D8F,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
-    linkStyle 55 stroke:#577590,stroke-width:3px,opacity:0.85,stroke-dasharray:8 3;
+    linkStyle 55 stroke:#2A9D8F,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
     linkStyle 56 stroke:#2A9D8F,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
-    linkStyle 57 stroke:#E9C46A,stroke-width:3px,opacity:0.9,stroke-dasharray:2 2;
-    linkStyle 58 stroke:#E9C46A,stroke-width:3px,opacity:0.9,stroke-dasharray:2 2;
-    linkStyle 59 stroke:#E9C46A,stroke-width:3px,opacity:0.9,stroke-dasharray:2 2;
+    linkStyle 57 stroke:#2A9D8F,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
+    linkStyle 58 stroke:#577590,stroke-width:3px,opacity:0.85,stroke-dasharray:8 3;
+    linkStyle 59 stroke:#2A9D8F,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
     linkStyle 60 stroke:#E9C46A,stroke-width:3px,opacity:0.9,stroke-dasharray:2 2;
-    linkStyle 61 stroke:#1D70A2,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
-    linkStyle 62 stroke:#1D70A2,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
-    linkStyle 63 stroke:#1D70A2,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
+    linkStyle 61 stroke:#E9C46A,stroke-width:3px,opacity:0.9,stroke-dasharray:2 2;
+    linkStyle 62 stroke:#E9C46A,stroke-width:3px,opacity:0.9,stroke-dasharray:2 2;
+    linkStyle 63 stroke:#E9C46A,stroke-width:3px,opacity:0.9,stroke-dasharray:2 2;
     linkStyle 64 stroke:#1D70A2,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
     linkStyle 65 stroke:#1D70A2,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
     linkStyle 66 stroke:#1D70A2,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
     linkStyle 67 stroke:#1D70A2,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
     linkStyle 68 stroke:#1D70A2,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
-    linkStyle 69 stroke:#F4A261,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
-    linkStyle 70 stroke:#F4A261,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
-    linkStyle 71 stroke:#F4A261,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
+    linkStyle 69 stroke:#1D70A2,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
+    linkStyle 70 stroke:#1D70A2,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
+    linkStyle 71 stroke:#1D70A2,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
     linkStyle 72 stroke:#F4A261,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
     linkStyle 73 stroke:#F4A261,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
     linkStyle 74 stroke:#F4A261,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
     linkStyle 75 stroke:#F4A261,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
-    linkStyle 76 stroke:#E76F51,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
-    linkStyle 77 stroke:#E76F51,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
-    linkStyle 78 stroke:#E76F51,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
+    linkStyle 76 stroke:#F4A261,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
+    linkStyle 77 stroke:#F4A261,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
+    linkStyle 78 stroke:#F4A261,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
     linkStyle 79 stroke:#E76F51,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
-    linkStyle 80 stroke:#B56576,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
-    linkStyle 81 stroke:#B56576,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
-    linkStyle 82 stroke:#2B9348,stroke-width:3px,opacity:0.9,stroke-dasharray:4 2;
-    linkStyle 83 stroke:#2B9348,stroke-width:3px,opacity:0.9,stroke-dasharray:4 2;
-    linkStyle 84 stroke:#2B9348,stroke-width:3px,opacity:0.9,stroke-dasharray:4 2;
+    linkStyle 80 stroke:#E76F51,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
+    linkStyle 81 stroke:#E76F51,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
+    linkStyle 82 stroke:#E76F51,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
+    linkStyle 83 stroke:#B56576,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
+    linkStyle 84 stroke:#B56576,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
     linkStyle 85 stroke:#2B9348,stroke-width:3px,opacity:0.9,stroke-dasharray:4 2;
+    linkStyle 86 stroke:#2B9348,stroke-width:3px,opacity:0.9,stroke-dasharray:4 2;
+    linkStyle 87 stroke:#2B9348,stroke-width:3px,opacity:0.9,stroke-dasharray:4 2;
+    linkStyle 88 stroke:#2B9348,stroke-width:3px,opacity:0.9,stroke-dasharray:4 2;

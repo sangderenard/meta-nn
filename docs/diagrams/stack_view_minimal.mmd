@@ -32,8 +32,11 @@ flowchart LR
     build_flashcard_rows__should_run["Gate check"]
     build_flashcard_rows__execute["Build per-term GAN conditioning flashcard rows"]
     data_node["Data Node"]
-    data_node__should_run["Gate check"]
-    data_node__execute["Build/refresh all training dataloaders"]
+    data_node__image_generator["Image Generator"]
+    data_node__creation_masks["Creation Masks"]
+    data_node__distortion_masks["Distortion Masks"]
+    data_node__heuristic_eye["Heuristic Eye"]
+    data_node__mask_flatten["Mask Flatten"]
     stage_0_pregestation["Stage 0 Pregestation"]
     stage_0_pregestation__should_run["Gate check"]
     stage_0_pregestation__execute["Stage 0: pre-gestation classifier training (geometric logic)"]
@@ -100,8 +103,11 @@ flowchart LR
     build_label_embedding --> build_label_embedding__execute
     build_flashcard_rows --> build_flashcard_rows__should_run
     build_flashcard_rows --> build_flashcard_rows__execute
-    data_node --> data_node__should_run
-    data_node --> data_node__execute
+    data_node --> data_node__image_generator
+    data_node --> data_node__creation_masks
+    data_node --> data_node__distortion_masks
+    data_node --> data_node__heuristic_eye
+    data_node --> data_node__mask_flatten
     stage_0_pregestation --> stage_0_pregestation__should_run
     stage_0_pregestation --> stage_0_pregestation__execute
     stage_1_gestation --> stage_1_gestation__execute

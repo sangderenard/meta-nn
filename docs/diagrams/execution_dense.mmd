@@ -47,7 +47,7 @@ flowchart TD
     init_vocab -- "startup" --> build_classifier
     build_classifier -- "startup" --> config_search
     config_search -- "startup" --> build_transformer
-    build_transformer -- "if_gan_mode" --> build_gan
+    build_transformer -- "if_gan_mode [orchestration_mode CONTAINS 'g']" --> build_gan
     wave_pool -- "startup" --> build_wave_classifier
     build_classifier -- "per_round" --> vocab_churn
     vocab_churn -- "per_round" --> build_symbol_pool
@@ -55,25 +55,25 @@ flowchart TD
     build_label_embedding -- "per_round" --> data_node
     data_node -- "provides:pregestation_loader" --> stage_0_pregestation
     data_node -- "provides:pregestation_eval_loader" --> gate_0_pregestation_eval
-    data_node -- "provides:gestation_loader" --> stage_1_gestation
-    data_node -- "provides:gestation_eval_loader" --> gate_1_gestation_eval
-    data_node -- "provides:berkeley_refresh_loader" --> stage_2_berkeley
-    data_node -- "provides:gate_val_loader+payload_val_loader" --> gate_berkeley
-    data_node -- "provides:payload_bank" --> stage_g_generator
+    data_node -- "provides:gestation_loader [GATE_OVERRIDE OR gate_pregestation.passed]" --> stage_1_gestation
+    data_node -- "provides:gestation_eval_loader [GATE_OVERRIDE OR gate_pregestation.passed]" --> gate_1_gestation_eval
+    data_node -- "provides:berkeley_refresh_loader [GATE_OVERRIDE OR early_gates_passed]" --> stage_2_berkeley
+    data_node -- "provides:gate_val_loader+payload_val_loader [GATE_OVERRIDE OR early_gates_passed]" --> gate_berkeley
+    data_node -- "provides:payload_bank [GATE_OVERRIDE OR all_base_gates_passed]" --> stage_g_generator
     data_node -- "provides:payload_images" --> build_flashcard_rows
     stage_0_pregestation -- "after_stage0" --> gate_0_pregestation_eval
-    gate_0_pregestation_eval -- "after_gate0" --> stage_1_gestation
-    stage_1_gestation -- "after_stage1" --> gate_1_gestation_eval
-    gate_1_gestation_eval -- "after_gate1" --> stage_2_berkeley
-    stage_2_berkeley -- "after_gate1" --> gate_berkeley
-    gate_berkeley -- "after_gate1" --> stage_r_transformer
-    stage_r_transformer -- "after_gate1" --> gate_transformer
-    gate_transformer -- "after_all_gates" --> stage_g_generator
-    stage_g_generator -- "after_all_gates" --> gate_generator
-    gate_berkeley -- "after_all_gates" --> stage_c_lora
-    stage_c_lora -- "after_all_gates" --> stage_fake_feedback
-    build_wave_classifier -- "after_transformer_gate" --> stage_w_wave_classifier
-    stage_w_wave_classifier -- "after_transformer_gate" --> gate_wave
+    gate_0_pregestation_eval -- "after_gate0 [GATE_OVERRIDE OR gate_pregestation.passed]" --> stage_1_gestation
+    stage_1_gestation -- "after_stage1 [GATE_OVERRIDE OR gate_pregestation.passed]" --> gate_1_gestation_eval
+    gate_1_gestation_eval -- "after_gate1 [GATE_OVERRIDE OR early_gates_passed]" --> stage_2_berkeley
+    stage_2_berkeley -- "after_gate1 [GATE_OVERRIDE OR early_gates_passed]" --> gate_berkeley
+    gate_berkeley -- "after_gate1 [GATE_OVERRIDE OR early_gates_passed]" --> stage_r_transformer
+    stage_r_transformer -- "after_gate1 [GATE_OVERRIDE OR early_gates_passed]" --> gate_transformer
+    gate_transformer -- "after_all_gates [GATE_OVERRIDE OR all_base_gates_passed]" --> stage_g_generator
+    stage_g_generator -- "after_all_gates [GATE_OVERRIDE OR all_base_gates_passed]" --> gate_generator
+    gate_berkeley -- "after_all_gates [GATE_OVERRIDE OR all_base_gates_passed]" --> stage_c_lora
+    stage_c_lora -- "after_all_gates [GATE_OVERRIDE OR all_base_gates_passed]" --> stage_fake_feedback
+    build_wave_classifier -- "after_transformer_gate [(GATE_OVERRIDE AND transformer IS_NOT_NONE) OR wave_stage_ready]" --> stage_w_wave_classifier
+    stage_w_wave_classifier -- "after_transformer_gate [(GATE_OVERRIDE AND transformer IS_NOT_NONE) OR wave_stage_ready]" --> gate_wave
     gate_wave -- "end_of_round" --> sync_gate_replica
     gate_transformer -- "end_of_round" --> sync_gate_replica
     gate_berkeley -- "end_of_round" --> sync_gate_replica

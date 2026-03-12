@@ -237,6 +237,55 @@ def _log_residence(msg: str) -> None:
     print(f"[gpu-residence] {msg}", flush=True)
 
 
+def make_training_progress_callback(
+    ctx: "PipelineContext",
+    node_id: str,
+    stage_label: str,
+) -> Optional[Callable]:
+    """Return a callback that fires every *log_every* steps and sends a live
+    progress event to ``ctx.viewer_proxy`` (the GUI), if one is connected.
+
+    The callback signature is ``callback(info: dict)`` where *info* contains
+    ``global_step``, ``total_steps``, and ``loss``.  It is safe to pass the
+    result to ``_run_classifier_refresh_epochs`` regardless of whether the
+    viewer is present — a ``None`` return means no-op.
+    """
+    viewer = getattr(ctx, "viewer_proxy", None)
+    if viewer is None:
+        return None
+    send_fn = getattr(viewer, "send_execution_event", None)
+    if not callable(send_fn):
+        return None
+
+    from pipeline.plan_protocol import ExecutionEventPayload
+    import uuid as _uuid
+
+    def _callback(info: Dict[str, Any]) -> None:
+        step = int(info.get("global_step", 0))
+        total = int(info.get("total_steps", 0))
+        loss = float(info.get("loss", 0.0))
+        sps = float(info.get("samples_per_sec", 0.0))
+        msg = (
+            f"[{stage_label}] step {step}/{total}  loss={loss:.4f}"
+            + (f"  {sps:.0f} samp/s" if sps > 0 else "")
+        )
+        try:
+            send_fn(ExecutionEventPayload(
+                event_id=str(_uuid.uuid4()),
+                node_id=str(node_id),
+                kind="training_progress",
+                phase="running",
+                status="running",
+                ts=time.time(),
+                message=msg,
+                metrics={"step": step, "total_steps": total, "loss": loss},
+            ))
+        except Exception:
+            pass
+
+    return _callback
+
+
 @contextmanager
 def gpu_resident(ctx: "PipelineContext", models: List[Tuple[nn.Module, str]]):
     """Pin *models* on ``ctx.device`` for the duration of the block.

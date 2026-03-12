@@ -36,6 +36,8 @@ import tempfile
 import types
 from pathlib import Path
 
+import numpy as np
+
 # ── path bootstrap ────────────────────────────────────────────────────────────
 _HERE = Path(__file__).parent
 _ROOT = _HERE.parent
@@ -1256,6 +1258,75 @@ def test_condition_expr_mermaid_roundtrip(graph):
     _ok("condition_expr appears in Mermaid and roundtrips through editable edit")
 
 
+def test_mask_instance_duplication_and_fallback():
+    print("\n--- test_mask_instance_duplication_and_fallback ---")
+    from semantic_dataset_loaders import elem_stacks_to_label_stacks
+
+    elem_stack = np.stack(
+        [
+            np.pad(np.ones((4, 2), dtype=np.float32), ((0, 0), (0, 2))),
+            np.pad(np.ones((4, 2), dtype=np.float32), ((0, 0), (2, 0))),
+        ],
+        axis=0,
+    )
+    elem_term_lists = [["signal"], ["signal"]]
+    label_vec = np.asarray([1.0, 1.0], dtype=np.float32)
+    stack, indices = elem_stacks_to_label_stacks(
+        elem_stack=elem_stack,
+        elem_term_lists=elem_term_lists,
+        label_vec=label_vec,
+        term_to_idx={"signal": 0},
+    )
+    _assert(int(stack.shape[0]) == 3, f"duplicate label instances preserved with fallback row ({int(stack.shape[0])})")
+    _assert(indices.tolist().count(0) == 2, f"label 0 retains both instances ({indices.tolist()})")
+    fallback_hits = np.where(indices == 1)[0].tolist()
+    _assert(len(fallback_hits) == 1, "missing positive label gets exactly one fallback creation mask")
+    fallback_mask = np.asarray(stack[int(fallback_hits[0])], dtype=np.float32)
+    _assert(bool(np.allclose(fallback_mask, np.ones_like(fallback_mask))), "missing label fallback is full-image creation mask")
+
+
+def test_single_label_passes_combine_duplicate_masks():
+    print("\n--- test_single_label_passes_combine_duplicate_masks ---")
+    from pipeline.nodes.data_nodes import _expand_semantic_mask_supervision_batch
+
+    xb = torch.zeros((1, 3, 4, 4), dtype=torch.float32)
+    yb = torch.tensor([[1.0]], dtype=torch.float32)
+    mb = torch.zeros((1, 1, 4, 4), dtype=torch.float32)
+    left = torch.zeros((4, 4), dtype=torch.float32)
+    right = torch.zeros((4, 4), dtype=torch.float32)
+    left[:, :2] = 1.0
+    right[:, 2:] = 1.0
+    out_x, out_y, out_m = _expand_semantic_mask_supervision_batch(
+        xb=xb,
+        yb=yb,
+        mb=mb,
+        batch_meta={
+            "mask_stacks": [torch.stack([left, right], dim=0)],
+            "mask_indices": [torch.tensor([0, 0], dtype=torch.long)],
+        },
+        mode="single_label_passes",
+        context="smoke",
+    )
+    _assert(tuple(out_x.shape) == (1, 3, 4, 4), f"expanded batch keeps one row for one active label: {tuple(out_x.shape)}")
+    _assert(tuple(out_y.shape) == (1, 1), f"expanded labels shape correct: {tuple(out_y.shape)}")
+    _assert(bool(torch.allclose(out_m[0, 0], torch.ones((4, 4), dtype=torch.float32))), "duplicate label instances collapse to one normalized mask")
+
+
+def test_data_node_mask_subnodes_exported(plan):
+    print("\n--- test_data_node_mask_subnodes_exported ---")
+    data_node = next((node for node in plan.nodes if node.node_id == "data_node"), None)
+    _assert(data_node is not None, "plan includes data_node for mask subnode export")
+    subnode_labels = {str(sn.label) for sn in (data_node.subnodes or [])}
+    _assert("Image Generator" in subnode_labels, "data_node exports Image Generator subnode")
+    _assert("Distortion Masks" in subnode_labels, "data_node exports Distortion Masks subnode")
+    _assert("Heuristic Eye" in subnode_labels, "data_node exports Heuristic Eye subnode")
+    stack_view = dict((plan.graph_layers or {}).get("stack_view", {}) or {})
+    stack_labels = {str(node.get("label", "")) for node in list(stack_view.get("nodes", []) or [])}
+    _assert("Image Generator" in stack_labels, "stack view includes Image Generator")
+    _assert("Distortion Masks" in stack_labels, "stack view includes Distortion Masks")
+    _assert("Heuristic Eye" in stack_labels, "stack view includes Heuristic Eye")
+
+
 def main():
     print("=== Smoke test: plan round-trip ===")
     graph, node_count, edge_count = test_build_pipeline_graph()
@@ -1284,6 +1355,9 @@ def main():
     test_condition_expr_evaluator()
     test_condition_expr_plan_roundtrip(graph)
     test_condition_expr_mermaid_roundtrip(graph)
+    test_mask_instance_duplication_and_fallback()
+    test_single_label_passes_combine_duplicate_masks()
+    test_data_node_mask_subnodes_exported(reloaded_plan)
     print("\n=== All checks passed ===")
 
 

@@ -33,8 +33,11 @@ flowchart LR
         build_flashcard_rows__should_run["Gate check<br/>object / other / gate_check"]
         build_flashcard_rows__execute["Build per-term GAN conditioning flashcard rows<br/>object / other / execute"]
         data_node["Data Node<br/>object / other / DataNode"]
-        data_node__should_run["Gate check<br/>object / other / gate_check"]
-        data_node__execute["Build/refresh all training dataloaders<br/>object / other / execute"]
+        data_node__image_generator["Image Generator<br/>object / other / data_prep"]
+        data_node__creation_masks["Creation Masks<br/>object / other / data_prep"]
+        data_node__distortion_masks["Distortion Masks<br/>object / other / data_prep"]
+        data_node__heuristic_eye["Heuristic Eye<br/>object / other / data_prep"]
+        data_node__mask_flatten["Mask Flatten<br/>object / other / data_prep"]
         stage_0_pregestation["Stage 0 Pregestation<br/>object / other / PregestationTrainNode"]
         stage_0_pregestation__should_run["Gate check<br/>object / other / gate_check"]
         stage_0_pregestation__execute["Stage 0: pre-gestation classifier training (geometric logic)<br/>object / other / execute"]
@@ -102,8 +105,11 @@ flowchart LR
     build_label_embedding -- "execute" --> build_label_embedding__execute
     build_flashcard_rows -- "gate_check" --> build_flashcard_rows__should_run
     build_flashcard_rows -- "execute" --> build_flashcard_rows__execute
-    data_node -- "gate_check" --> data_node__should_run
-    data_node -- "execute" --> data_node__execute
+    data_node -- "data_prep" --> data_node__image_generator
+    data_node -- "data_prep" --> data_node__creation_masks
+    data_node -- "data_prep" --> data_node__distortion_masks
+    data_node -- "data_prep" --> data_node__heuristic_eye
+    data_node -- "data_prep" --> data_node__mask_flatten
     stage_0_pregestation -- "gate_check" --> stage_0_pregestation__should_run
     stage_0_pregestation -- "execute" --> stage_0_pregestation__execute
     stage_1_gestation -- "execute" --> stage_1_gestation__execute
@@ -181,7 +187,7 @@ flowchart LR
     classDef faculty_buffer fill:#E0FBFC,stroke:#006D77,color:#00313A,stroke-width:2px;
     classDef faculty_gate fill:#FDE2E4,stroke:#C0392B,color:#4A0F13,stroke-width:2px;
     classDef faculty_other fill:#F3F4F6,stroke:#6B7280,color:#111827,stroke-width:2px;
-    class wave_pool,wave_pool__should_run,wave_pool__execute,init_vocab,init_vocab__execute,build_classifier,build_classifier__should_run,build_classifier__execute,config_search,config_search__should_run,config_search__execute,build_transformer,build_transformer__should_run,build_transformer__execute,build_gan,build_gan__should_run,build_gan__execute,build_wave_classifier,build_wave_classifier__should_run,build_wave_classifier__execute,vocab_churn,vocab_churn__should_run,vocab_churn__execute,build_symbol_pool,build_symbol_pool__execute,build_label_embedding,build_label_embedding__should_run,build_label_embedding__execute,build_flashcard_rows,build_flashcard_rows__should_run,build_flashcard_rows__execute,data_node,data_node__should_run,data_node__execute,stage_0_pregestation,stage_0_pregestation__should_run,stage_0_pregestation__execute,stage_1_gestation,stage_1_gestation__execute,stage_2_berkeley,stage_2_berkeley__execute,stage_r_transformer,stage_r_transformer__should_run,stage_r_transformer__execute,stage_g_generator,stage_g_generator__should_run,stage_g_generator__execute,stage_w_wave_classifier,stage_w_wave_classifier__should_run,stage_w_wave_classifier__execute,stage_c_lora,stage_c_lora__execute,stage_fake_feedback,stage_fake_feedback__should_run,stage_fake_feedback__execute,gate_0_pregestation_eval,gate_0_pregestation_eval__should_run,gate_0_pregestation_eval__execute,gate_1_gestation_eval,gate_1_gestation_eval__should_run,gate_1_gestation_eval__execute,gate_berkeley,gate_berkeley__should_run,gate_berkeley__execute,gate_transformer,gate_transformer__should_run,gate_transformer__execute,gate_generator,gate_generator__should_run,gate_generator__execute,gate_wave,gate_wave__should_run,gate_wave__execute,sync_gate_replica,sync_gate_replica__should_run,sync_gate_replica__execute,checkpoint_save,checkpoint_save__should_run,checkpoint_save__execute faculty_other;
+    class wave_pool,wave_pool__should_run,wave_pool__execute,init_vocab,init_vocab__execute,build_classifier,build_classifier__should_run,build_classifier__execute,config_search,config_search__should_run,config_search__execute,build_transformer,build_transformer__should_run,build_transformer__execute,build_gan,build_gan__should_run,build_gan__execute,build_wave_classifier,build_wave_classifier__should_run,build_wave_classifier__execute,vocab_churn,vocab_churn__should_run,vocab_churn__execute,build_symbol_pool,build_symbol_pool__execute,build_label_embedding,build_label_embedding__should_run,build_label_embedding__execute,build_flashcard_rows,build_flashcard_rows__should_run,build_flashcard_rows__execute,data_node,data_node__image_generator,data_node__creation_masks,data_node__distortion_masks,data_node__heuristic_eye,data_node__mask_flatten,stage_0_pregestation,stage_0_pregestation__should_run,stage_0_pregestation__execute,stage_1_gestation,stage_1_gestation__execute,stage_2_berkeley,stage_2_berkeley__execute,stage_r_transformer,stage_r_transformer__should_run,stage_r_transformer__execute,stage_g_generator,stage_g_generator__should_run,stage_g_generator__execute,stage_w_wave_classifier,stage_w_wave_classifier__should_run,stage_w_wave_classifier__execute,stage_c_lora,stage_c_lora__execute,stage_fake_feedback,stage_fake_feedback__should_run,stage_fake_feedback__execute,gate_0_pregestation_eval,gate_0_pregestation_eval__should_run,gate_0_pregestation_eval__execute,gate_1_gestation_eval,gate_1_gestation_eval__should_run,gate_1_gestation_eval__execute,gate_berkeley,gate_berkeley__should_run,gate_berkeley__execute,gate_transformer,gate_transformer__should_run,gate_transformer__execute,gate_generator,gate_generator__should_run,gate_generator__execute,gate_wave,gate_wave__should_run,gate_wave__execute,sync_gate_replica,sync_gate_replica__should_run,sync_gate_replica__execute,checkpoint_save,checkpoint_save__should_run,checkpoint_save__execute faculty_other;
     linkStyle 0 stroke:#8B5CF6,stroke-width:2px,opacity:0.85,stroke-dasharray:4 2;
     linkStyle 1 stroke:#8B5CF6,stroke-width:2px,opacity:0.85,stroke-dasharray:4 2;
     linkStyle 2 stroke:#8B5CF6,stroke-width:2px,opacity:0.85,stroke-dasharray:4 2;
@@ -233,38 +239,41 @@ flowchart LR
     linkStyle 48 stroke:#8B5CF6,stroke-width:2px,opacity:0.85,stroke-dasharray:4 2;
     linkStyle 49 stroke:#8B5CF6,stroke-width:2px,opacity:0.85,stroke-dasharray:4 2;
     linkStyle 50 stroke:#8B5CF6,stroke-width:2px,opacity:0.85,stroke-dasharray:4 2;
-    linkStyle 51 stroke:#2A9D8F,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
-    linkStyle 52 stroke:#2A9D8F,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
-    linkStyle 53 stroke:#2A9D8F,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
+    linkStyle 51 stroke:#8B5CF6,stroke-width:2px,opacity:0.85,stroke-dasharray:4 2;
+    linkStyle 52 stroke:#8B5CF6,stroke-width:2px,opacity:0.85,stroke-dasharray:4 2;
+    linkStyle 53 stroke:#8B5CF6,stroke-width:2px,opacity:0.85,stroke-dasharray:4 2;
     linkStyle 54 stroke:#2A9D8F,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
-    linkStyle 55 stroke:#577590,stroke-width:3px,opacity:0.85,stroke-dasharray:8 3;
+    linkStyle 55 stroke:#2A9D8F,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
     linkStyle 56 stroke:#2A9D8F,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
-    linkStyle 57 stroke:#E9C46A,stroke-width:3px,opacity:0.9,stroke-dasharray:2 2;
-    linkStyle 58 stroke:#E9C46A,stroke-width:3px,opacity:0.9,stroke-dasharray:2 2;
-    linkStyle 59 stroke:#E9C46A,stroke-width:3px,opacity:0.9,stroke-dasharray:2 2;
+    linkStyle 57 stroke:#2A9D8F,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
+    linkStyle 58 stroke:#577590,stroke-width:3px,opacity:0.85,stroke-dasharray:8 3;
+    linkStyle 59 stroke:#2A9D8F,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
     linkStyle 60 stroke:#E9C46A,stroke-width:3px,opacity:0.9,stroke-dasharray:2 2;
-    linkStyle 61 stroke:#1D70A2,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
-    linkStyle 62 stroke:#1D70A2,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
-    linkStyle 63 stroke:#1D70A2,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
+    linkStyle 61 stroke:#E9C46A,stroke-width:3px,opacity:0.9,stroke-dasharray:2 2;
+    linkStyle 62 stroke:#E9C46A,stroke-width:3px,opacity:0.9,stroke-dasharray:2 2;
+    linkStyle 63 stroke:#E9C46A,stroke-width:3px,opacity:0.9,stroke-dasharray:2 2;
     linkStyle 64 stroke:#1D70A2,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
     linkStyle 65 stroke:#1D70A2,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
     linkStyle 66 stroke:#1D70A2,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
     linkStyle 67 stroke:#1D70A2,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
     linkStyle 68 stroke:#1D70A2,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
-    linkStyle 69 stroke:#F4A261,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
-    linkStyle 70 stroke:#F4A261,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
-    linkStyle 71 stroke:#F4A261,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
+    linkStyle 69 stroke:#1D70A2,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
+    linkStyle 70 stroke:#1D70A2,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
+    linkStyle 71 stroke:#1D70A2,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
     linkStyle 72 stroke:#F4A261,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
     linkStyle 73 stroke:#F4A261,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
     linkStyle 74 stroke:#F4A261,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
     linkStyle 75 stroke:#F4A261,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
-    linkStyle 76 stroke:#E76F51,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
-    linkStyle 77 stroke:#E76F51,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
-    linkStyle 78 stroke:#E76F51,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
+    linkStyle 76 stroke:#F4A261,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
+    linkStyle 77 stroke:#F4A261,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
+    linkStyle 78 stroke:#F4A261,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
     linkStyle 79 stroke:#E76F51,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
-    linkStyle 80 stroke:#B56576,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
-    linkStyle 81 stroke:#B56576,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
-    linkStyle 82 stroke:#2B9348,stroke-width:3px,opacity:0.9,stroke-dasharray:4 2;
-    linkStyle 83 stroke:#2B9348,stroke-width:3px,opacity:0.9,stroke-dasharray:4 2;
-    linkStyle 84 stroke:#2B9348,stroke-width:3px,opacity:0.9,stroke-dasharray:4 2;
+    linkStyle 80 stroke:#E76F51,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
+    linkStyle 81 stroke:#E76F51,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
+    linkStyle 82 stroke:#E76F51,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
+    linkStyle 83 stroke:#B56576,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
+    linkStyle 84 stroke:#B56576,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
     linkStyle 85 stroke:#2B9348,stroke-width:3px,opacity:0.9,stroke-dasharray:4 2;
+    linkStyle 86 stroke:#2B9348,stroke-width:3px,opacity:0.9,stroke-dasharray:4 2;
+    linkStyle 87 stroke:#2B9348,stroke-width:3px,opacity:0.9,stroke-dasharray:4 2;
+    linkStyle 88 stroke:#2B9348,stroke-width:3px,opacity:0.9,stroke-dasharray:4 2;
