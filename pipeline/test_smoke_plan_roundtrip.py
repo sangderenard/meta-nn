@@ -305,6 +305,10 @@ old
 <!-- BEGIN:GENERATED_STACK_VIEW_LAYER -->
 old
 <!-- END:GENERATED_STACK_VIEW_LAYER -->
+
+<!-- BEGIN:GENERATED_PROVENANCE_LAYER -->
+old
+<!-- END:GENERATED_PROVENANCE_LAYER -->
 """,
             encoding="utf-8",
         )
@@ -735,6 +739,65 @@ def test_action_subnode_roundtrip(plan: TrainingGraphPlan):
     _assert(len(stack_view.get("edges", [])) > 0, "stack_view has edges")
     _ok("stack_view layer materialized with subnodes")
 
+
+def test_gpu_models_roundtrip(plan: TrainingGraphPlan):
+    print("\n--- test_gpu_models_roundtrip ---")
+    # At least some nodes should declare gpu_models
+    nodes_with_models = [n for n in plan.nodes if n.gpu_models]
+    _assert(len(nodes_with_models) > 0, f"{len(nodes_with_models)} nodes declare gpu_models")
+
+    # Spot-check known nodes
+    build_classifier = next((n for n in plan.nodes if n.node_id == "build_classifier"), None)
+    _assert(build_classifier is not None, "plan includes build_classifier node")
+    _assert("classifier" in build_classifier.gpu_models, "build_classifier declares 'classifier' in gpu_models")
+
+    build_gan = next((n for n in plan.nodes if n.node_id == "build_gan"), None)
+    _assert(build_gan is not None, "plan includes build_gan node")
+
+    stage_g = next((n for n in plan.nodes if n.node_id == "stage_g_generator"), None)
+    _assert(stage_g is not None, "plan includes stage_g_generator node")
+    _assert("generator" in stage_g.gpu_models, "stage_g_generator declares 'generator' in gpu_models")
+
+    # JSON round-trip preserves gpu_models
+    with tempfile.TemporaryDirectory() as td:
+        path = Path(td) / "gpu_models_roundtrip.json"
+        plan.save_json(path)
+        reloaded = TrainingGraphPlan.load_json(path)
+        for orig_node in plan.nodes:
+            reloaded_node = next((n for n in reloaded.nodes if n.node_id == orig_node.node_id), None)
+            _assert(reloaded_node is not None, f"node {orig_node.node_id} survives roundtrip")
+            _assert(reloaded_node.gpu_models == orig_node.gpu_models,
+                    f"node {orig_node.node_id} gpu_models survive roundtrip ({orig_node.gpu_models})")
+    _ok("gpu_models survive JSON round-trip for all nodes")
+
+
+def test_provenance_layer(graph):
+    print("\n--- test_provenance_layer ---")
+    layers = build_graph_layers(graph)
+    provenance = layers.get("provenance", {})
+    _assert(provenance.get("status") == "active", "provenance layer is active")
+    _assert(len(provenance.get("nodes", [])) > 0, "provenance layer has nodes")
+    _assert(len(provenance.get("edges", [])) > 0, "provenance layer has edges")
+
+    # Should have model resource nodes
+    resource_nodes = [n for n in provenance["nodes"] if n.get("node_id", "").startswith("model::")]
+    _assert(len(resource_nodes) > 0, f"provenance has {len(resource_nodes)} model resource nodes")
+
+    # Should have 'classifier' as a resource
+    classifier_resource = next((n for n in resource_nodes if n["node_id"] == "model::classifier"), None)
+    _assert(classifier_resource is not None, "provenance includes model::classifier resource")
+
+    # Edges should link pipeline nodes to resources
+    residency_edges = [e for e in provenance["edges"] if e.get("reaction_name") == "residency.acquire"]
+    _assert(len(residency_edges) > 0, f"provenance has {len(residency_edges)} residency edges")
+
+    # Mermaid renders without error
+    from pipeline.graph_layers import render_mermaid_flowchart
+    chart = render_mermaid_flowchart(provenance, view="dense")
+    _assert("model__classifier" in chart or "classifier" in chart.lower(), "provenance Mermaid mentions classifier model")
+    _ok("provenance layer is populated and renderable")
+
+
 def main():
     print("=== Smoke test: plan round-trip ===")
     graph, node_count, edge_count = test_build_pipeline_graph()
@@ -753,6 +816,8 @@ def main():
     test_execution_program_flow_visits_decision_and_hold()
     test_execution_program_flow_supports_cycles()
     test_action_subnode_roundtrip(reloaded_plan)
+    test_gpu_models_roundtrip(plan)
+    test_provenance_layer(graph)
     print("\n=== All checks passed ===")
 
 

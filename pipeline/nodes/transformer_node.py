@@ -44,7 +44,7 @@ import torch
 
 from pipeline.context import PipelineContext
 from pipeline.graph import PipelineNode
-from pipeline.nodes.base import GatedNode, make_grad_scaler
+from pipeline.nodes.base import GatedNode, autocast_context, make_grad_scaler, resolve_amp_dtype
 import json
 
 
@@ -143,6 +143,7 @@ class ConfigSearchNode(PipelineNode):
 
     node_id = "config_search"
     description = "Score random RenderConfig candidates via classifier feature metric"
+    gpu_models = ["classifier"]
 
     def __init__(self, cfg: TransformerConfig) -> None:
         self.cfg = cfg
@@ -222,6 +223,7 @@ class BuildTransformerNode(PipelineNode):
 
     node_id = "build_transformer"
     description = "Instantiate WavePatchTransformer + optimizer"
+    gpu_models = ["transformer"]
 
     def __init__(self, cfg: TransformerConfig) -> None:
         self.cfg = cfg
@@ -308,6 +310,7 @@ class TransformerTrainNode(GatedNode):
     node_id = "stage_r_transformer"
     description = "Stage R: WavePatchTransformer feature-score training"
     required_gates = ["gate_pregestation", "gate_gestation"]
+    gpu_models = ["transformer", "classifier"]
 
     def __init__(self, cfg: TransformerConfig) -> None:
         self.cfg = cfg
@@ -467,7 +470,7 @@ def _score_config_with_classifier(
         }
 
     logits_all = []
-    amp_dtype_t = _resolve_amp_dtype(amp_dtype) if amp_enabled else torch.float16
+    amp_dtype_t = resolve_amp_dtype(amp_dtype) if amp_enabled else torch.float16
     for i in range(0, len(indices), max(1, int(batch_size))):
         batch_idx = indices[i : i + max(1, int(batch_size))]
         xb = []
@@ -477,7 +480,7 @@ def _score_config_with_classifier(
         x = torch.stack(xb, dim=0).to(device, non_blocking=True)
         if channels_last:
             x = x.contiguous(memory_format=torch.channels_last)
-        with _autocast_context(device=device, enabled=amp_enabled, amp_dtype_t=amp_dtype_t):
+        with autocast_context(device=device, enabled=amp_enabled, amp_dtype=amp_dtype_t):
             logits = classifier(x)
             if int(active_classes) > 0 and int(logits.shape[1]) > int(active_classes):
                 logits = logits[:, : int(active_classes)]

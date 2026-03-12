@@ -52,6 +52,25 @@ from pipeline.nodes.base import (
     module_device,
     resolve_amp_dtype,
     unwrap_compiled,
+    _extract_state_dict,
+    _strip_module_prefix,
+    _torch_load_cpu,
+    _try_partial_classifier_head_load,
+)
+from pipeline.nodes.data_nodes import (
+    _auto_berkeley_refresh_batch_size,
+    _expand_semantic_mask_supervision_batch,
+    _forward_classifier_outputs_require_mask,
+    _payload_condition_bank_tensor,
+    _semantic_mask_bce_loss,
+    _unpack_masked_semantic_batch,
+)
+from pipeline.nodes.vocab_node import _label_knockout_tensor_batch
+from pipeline.utils import (
+    _classifier_supervision_loss,
+    _cuda_mem_diag,
+    _refresh_cache_is_staging_safe,
+    _unwrap_module_for_replica,
 )
 import gc
 import math
@@ -77,7 +96,7 @@ class ClassifierConfig:
     max_ch: int = 384
     context_blocks: int = 8
     context_dropout: float = 0.05
-    mask_decoder_channels: int = 0       # 0 = disabled
+    mask_decoder_channels: int = -1      # -1 = auto (max(32, base_ch//2)); 0 = disabled
 
     # ---- label embedding ------------------------------------------------
     label_embedding_backend: str = "sentence_transformers"
@@ -164,6 +183,7 @@ class BuildClassifierNode(PipelineNode):
 
     node_id = "build_classifier"
     description = "Instantiate TinyConvClassifier + optimizer"
+    gpu_models = ["classifier"]
 
     def __init__(self, cfg: ClassifierConfig) -> None:
         self.cfg = cfg
@@ -176,13 +196,16 @@ class BuildClassifierNode(PipelineNode):
         from wav_ml_models import TinyConvClassifier, maybe_compile_module
 
         n_classes = len(ctx.class_names) if ctx.class_names else 1
+        mask_ch = self.cfg.mask_decoder_channels
+        if mask_ch < 0:
+            mask_ch = max(32, int(self.cfg.base_ch) // 2)
         model = TinyConvClassifier(
             num_classes=n_classes,
             base_ch=self.cfg.base_ch,
             max_ch=self.cfg.max_ch,
             context_blocks=self.cfg.context_blocks,
             context_dropout=self.cfg.context_dropout,
-            mask_decoder_channels=self.cfg.mask_decoder_channels,
+            mask_decoder_channels=mask_ch,
         ).to(ctx.device)
 
         if self.cfg.channels_last:
@@ -215,7 +238,8 @@ class BuildClassifierNode(PipelineNode):
 
         _log(f"[classifier] built: n_classes={n_classes} "
              f"base_ch={self.cfg.base_ch} max_ch={self.cfg.max_ch} "
-             f"context_blocks={self.cfg.context_blocks}")
+             f"context_blocks={self.cfg.context_blocks} "
+             f"mask_decoder_channels={mask_ch}")
         self._built = True
 
 
@@ -234,6 +258,7 @@ class PregestationTrainNode(PipelineNode):
 
     node_id = "stage_0_pregestation"
     description = "Stage 0: pre-gestation classifier training (geometric logic)"
+    gpu_models = ["classifier"]
 
     def __init__(self, cfg: ClassifierConfig) -> None:
         self.cfg = cfg
@@ -283,6 +308,7 @@ class GestationTrainNode(GatedNode):
     node_id = "stage_1_gestation"
     description = "Stage 1: gestation classifier training (bootstrap primitives)"
     required_gates = ["gate_pregestation"]
+    gpu_models = ["classifier"]
 
     def __init__(self, cfg: ClassifierConfig) -> None:
         self.cfg = cfg
@@ -327,6 +353,7 @@ class BerkeleyRefreshTrainNode(GatedNode):
     node_id = "stage_2_berkeley"
     description = "Stage 2: Berkeley SBD refresh (full multi-label classification)"
     required_gates = ["gate_pregestation", "gate_gestation"]
+    gpu_models = ["classifier"]
 
     def __init__(self, cfg: ClassifierConfig) -> None:
         self.cfg = cfg
@@ -372,6 +399,7 @@ class LoRARoundNode(GatedNode):
     node_id = "stage_c_lora"
     description = "Stage C: LoRA slot switching and per-term Berkeley training"
     required_gates = ["gate_pregestation", "gate_gestation", "gate_berkeley"]
+    gpu_models = ["classifier"]
 
     def __init__(self, cfg: ClassifierConfig) -> None:
         self.cfg = cfg
@@ -447,6 +475,7 @@ class FakeClassFeedbackNode(GatedNode):
     node_id = "stage_fake_feedback"
     description = "Fake-class feedback: train classifier to detect GAN outputs"
     required_gates = ["gate_pregestation", "gate_gestation"]
+    gpu_models = ["classifier", "generator", "discriminator"]
 
     def __init__(self, cfg: ClassifierConfig) -> None:
         self.cfg = cfg
@@ -493,6 +522,7 @@ class SyncGateReplicaNode(PipelineNode):
 
     node_id = "sync_gate_replica"
     description = "Sync frozen CPU gate_classifier from main classifier"
+    gpu_models = ["classifier"]
 
     def __init__(self, cfg: ClassifierConfig) -> None:
         self.cfg = cfg

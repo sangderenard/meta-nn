@@ -460,6 +460,7 @@ class DataNode(PipelineNode):
           2. Log storage tier and build count.
           3. Age N-pass entries for pregestation/gestation and enforce cap.
         """
+        any_expired = False
         for name, poss in self.possessions.items():
             if not poss.built:
                 continue
@@ -469,6 +470,7 @@ class DataNode(PipelineNode):
                     if hasattr(ctx, attr):
                         setattr(ctx, attr, None)
                 poss.mark_expired()
+                any_expired = True
                 _log(f"[data-node] possession '{name}' expired — will rebuild on next traverse")
                 continue
             # N-pass cap enforcement (pregestation / gestation)
@@ -481,6 +483,10 @@ class DataNode(PipelineNode):
         built_names = [n for n, p in self.possessions.items() if p.built]
         if built_names:
             _log(f"[data-node] housekeeping: active={built_names}")
+        # Prompt GC after expiring possessions to release tensor/array memory
+        if any_expired:
+            import gc
+            gc.collect()
 
     # ------------------------------------------------------------------
     # Edge-traversal providers  (assigned as on_traverse on outgoing edges)
@@ -490,6 +496,12 @@ class DataNode(PipelineNode):
         current_hash = hash(tuple(ctx.class_names))
         if current_hash == self._preg_vocab_hash and ctx.pregestation_loader is not None:
             return
+
+        # Release stale loaders before rebuild
+        ctx.pregestation_loader = None
+        ctx.pregestation_eval_loader = None
+        ctx.pregestation_dataset = None
+        ctx.pregestation_eval_dataset = None
 
         from pipeline.nodes.vocab_node import _build_pregestation_logic_rows
         from semantic_dataset_loaders import (
@@ -589,6 +601,12 @@ class DataNode(PipelineNode):
         if current_hash == self._gest_vocab_hash and ctx.gestation_loader is not None:
             return
 
+        # Release stale loaders before rebuild
+        ctx.gestation_loader = None
+        ctx.gestation_eval_loader = None
+        ctx.gestation_dataset = None
+        ctx.gestation_eval_dataset = None
+
         from semantic_dataset_loaders import (
             BootstrapDynamicDataset,
             build_loader_from_manifest,
@@ -662,6 +680,11 @@ class DataNode(PipelineNode):
             needs_build = rounds_since >= self.bdata_cfg.rebuild_every_n_rounds
         if not needs_build:
             return
+
+        # Release old loaders/cache before building replacements
+        ctx.berkeley_refresh_loader = None
+        ctx.berkeley_gate_val_loader = None
+        ctx.berkeley_cache = None
 
         data_root = (
             str(self.bdata_cfg.berkeley_data_root).strip()
@@ -1008,6 +1031,49 @@ def _bootstrap_latent_wav_pool(
     pool_dir = out_root / 'latent_wave_pool'
     noise_dir = pool_dir / 'noise'
     mix_dir = pool_dir / 'mix'
+
+    # ------------------------------------------------------------------
+    # Filesystem hygiene: skip regeneration if pool already exists with
+    # matching parameters.  The manifest.json written at the end of a
+    # previous build encodes every generation parameter, so a simple
+    # JSON comparison suffices.
+    # ------------------------------------------------------------------
+    manifest_path = pool_dir / 'manifest.json'
+    expected_params = {
+        'seed': int(seed),
+        'count': int(count),
+        'framerate': int(framerate),
+        'seconds': float(seconds),
+        'sample_count': int(sample_count),
+        'noise_std': float(noise_std),
+        'reinject_ratio': float(reinject_ratio),
+        'reinject_copy_gain': float(reinject_copy_gain),
+        'reinject_noise_gain': float(reinject_noise_gain),
+        'structured_ratio': float(structured_ratio),
+        'structured_gain': float(structured_gain),
+        'structured_noise_gain': float(structured_noise_gain),
+    }
+    if manifest_path.exists():
+        try:
+            existing = json.loads(manifest_path.read_text(encoding='utf-8'))
+            if all(existing.get(k) == v for k, v in expected_params.items()):
+                index_path = pool_dir / 'index.jsonl'
+                if index_path.exists():
+                    _log(f"[wave-pool] latent pool cache hit — reusing {pool_dir}")
+                    return {
+                        'pool_dir': str(pool_dir),
+                        'manifest': str(manifest_path),
+                        'count': int(count),
+                        'reinject_dir': str(Path(reinject_dir) if reinject_dir else out_root / 'accepted_wave_library'),
+                        'reinject_candidates': 0,
+                        'mixed_count': int(existing.get('mixed_count', 0)),
+                        'structured_count': int(existing.get('structured_count', 0)),
+                        'index': str(index_path),
+                        'noise_profiles': existing.get('noise_profiles', {}),
+                    }
+        except (json.JSONDecodeError, OSError):
+            pass  # stale/corrupt manifest — regenerate
+
     noise_dir.mkdir(parents=True, exist_ok=True)
     mix_dir.mkdir(parents=True, exist_ok=True)
 

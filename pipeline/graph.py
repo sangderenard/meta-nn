@@ -142,6 +142,21 @@ class PipelineNode(ABC):
         """
         return []
 
+    @property
+    def gpu_models(self) -> List[str]:
+        """Context attribute names of ``nn.Module`` objects this node accesses.
+
+        Override in subclasses that use GPU models so the graph executor
+        can pin them via the :class:`GPUResidenceManager` before calling
+        :meth:`execute` and release them afterwards.
+
+        Example::
+
+            gpu_models = ["classifier"]           # uses ctx.classifier
+            gpu_models = ["transformer", "classifier"]  # uses both
+        """
+        return []
+
     def __repr__(self) -> str:  # pragma: no cover
         return f"<{type(self).__name__} id={self.node_id!r}>"
 
@@ -851,7 +866,7 @@ class PipelineGraph:
             if verbose:
                 _log(f"[graph] RUN  {step_index:02d} {node_id!r}  ({node.description}){frame_suffix}")
             try:
-                node.execute(ctx)
+                _execute_with_residence(node, ctx)
                 statuses[node_id] = "ran"
                 trace.append(
                     {
@@ -925,6 +940,37 @@ class PipelineGraph:
 
 def _log(msg: str) -> None:
     print(msg, flush=True)
+
+
+def _execute_with_residence(node: PipelineNode, ctx: "PipelineContext") -> None:
+    """Execute *node* with GPU residence management when available.
+
+    If ``ctx.gpu_residence`` is active and the node declares :attr:`gpu_models`,
+    the listed models are pinned on ``ctx.device`` for the duration of
+    ``node.execute(ctx)`` and released (eviction-eligible) afterwards.
+    """
+    mgr = getattr(ctx, "gpu_residence", None)
+    model_names = node.gpu_models
+    if mgr is None or not getattr(mgr, "enabled", False) or not model_names:
+        node.execute(ctx)
+        return
+
+    device = ctx.device or __import__("torch").device("cpu")
+    models = []
+    for attr_name in model_names:
+        module = getattr(ctx, attr_name, None)
+        if module is not None and hasattr(module, "parameters"):
+            models.append((module, attr_name))
+
+    if not models:
+        node.execute(ctx)
+        return
+
+    mgr.require_many(models, device)
+    try:
+        node.execute(ctx)
+    finally:
+        mgr.release_many([name for _, name in models])
 
 
 def _gate_status_snapshot(ctx: "PipelineContext") -> Dict[str, bool]:  # noqa: F821

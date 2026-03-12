@@ -20,17 +20,39 @@ Gates in this pipeline
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Any, Dict, Optional
-
-from pipeline.context import PipelineContext
-from pipeline.graph import PipelineNode
-from pipeline.nodes.base import GatedNode
 import copy
 import json
 import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Sequence, Tuple
+
 import numpy as np
 import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader
+
+from pipeline.context import PipelineContext
+from pipeline.graph import PipelineNode
+from pipeline.nodes.base import (
+    GatedNode,
+    autocast_context,
+    cuda_supports_dtype,
+    resolve_amp_dtype,
+    _save_pipeline_checkpoint,
+)
+from pipeline.nodes.data_nodes import (
+    _expand_semantic_mask_supervision_batch,
+    _forward_classifier_outputs_require_mask,
+    _semantic_mask_bce_loss,
+    _unpack_masked_semantic_batch,
+)
+from pipeline.utils import (
+    _classifier_supervision_loss,
+    _is_cuda_backend_engine_error,
+    _snapshot_classifier_lora,
+)
+from wav_ml_core import RenderConfig
 
 # Module-level constants (originally in wav_config_transformer_pipeline)
 CLASSIFIER_LOSS_SCALE = 1.0
@@ -89,6 +111,7 @@ class PregestationEvalNode(PipelineNode):
 
     node_id = "gate_0_pregestation_eval"
     description = "Gate 0 Eval: pre-gestation validation loss"
+    gpu_models = ["classifier"]
 
     def __init__(self, cfg: Any) -> None:
         self.cfg = cfg
@@ -126,6 +149,7 @@ class GestationEvalNode(GatedNode):
     node_id = "gate_1_gestation_eval"
     description = "Gate 1 Eval: gestation validation loss"
     required_gates = ["gate_pregestation"]
+    gpu_models = ["classifier"]
 
     def __init__(self, cfg: Any) -> None:
         self.cfg = cfg
@@ -197,6 +221,7 @@ class BerkeleyGateNode(GatedNode):
     node_id = "gate_berkeley"
     description = "Gate 2 Eval: semantic classifier confidence + macro-F1"
     required_gates = ["gate_pregestation", "gate_gestation"]
+    gpu_models = ["classifier"]
 
     def __init__(self, cfg: BerkeleyGateConfig) -> None:
         self.cfg = cfg
@@ -292,6 +317,7 @@ class TransformerGateNode(GatedNode):
     node_id = "gate_transformer"
     description = "Gate R Eval: transformer feature score + entropy"
     required_gates = ["gate_pregestation", "gate_gestation"]
+    gpu_models = ["classifier"]
 
     def __init__(self, cfg: TransformerGateConfig) -> None:
         self.cfg = cfg
@@ -366,6 +392,7 @@ class GeneratorGateNode(GatedNode):
     node_id = "gate_generator"
     description = "Gate G Eval: generator feature score"
     required_gates = ["gate_pregestation", "gate_gestation", "gate_berkeley"]
+    gpu_models = ["generator", "classifier"]
 
     def __init__(self, cfg: GeneratorGateConfig) -> None:
         self.cfg = cfg
@@ -429,6 +456,7 @@ class WaveGateNode(GatedNode):
     node_id = "gate_wave"
     description = "Gate W Eval: wave entropy + feature score feedback"
     required_gates = ["gate_pregestation", "gate_gestation", "gate_transformer"]
+    gpu_models = ["classifier"]
 
     def __init__(self, cfg: WaveGateConfig) -> None:
         self.cfg = cfg
@@ -707,10 +735,10 @@ def _evaluate_berkeley_classifier_gate(
     semantic_cosine_weight: float = CLASSIFIER_SEMANTIC_COSINE_WEIGHT,
 ):
     classifier.eval()
-    amp_dtype_t = _resolve_amp_dtype(amp_dtype) if amp_enabled else torch.float16
+    amp_dtype_t = resolve_amp_dtype(amp_dtype) if amp_enabled else torch.float16
     runtime_amp_enabled = bool(amp_enabled and device.type == "cuda")
     runtime_channels_last = bool(channels_last)
-    if bool(runtime_amp_enabled) and not _cuda_device_supports_amp_dtype(device=device, amp_dtype_t=amp_dtype_t):
+    if bool(runtime_amp_enabled) and not cuda_supports_dtype(device=device, dtype=amp_dtype_t):
         print(
             f"[berkeley-gate] disabling AMP on device={device} because amp_dtype={amp_dtype} is unsupported there",
             flush=True,
@@ -768,7 +796,7 @@ def _evaluate_berkeley_classifier_gate(
                     if mb_part.device != device:
                         mb_part = mb_part.to(device, non_blocking=True)
                     with torch.no_grad():
-                        with _autocast_context(device=device, enabled=runtime_amp_enabled, amp_dtype_t=amp_dtype_t):
+                        with autocast_context(device=device, enabled=runtime_amp_enabled, amp_dtype=amp_dtype_t):
                             out = _forward_classifier_outputs_require_mask(
                                 classifier=classifier,
                                 xb=xb_part,

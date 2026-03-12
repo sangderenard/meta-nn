@@ -4,13 +4,16 @@ Base helpers shared across all pipeline nodes.
 Provides:
   - GatedNode  — skip automatically until a set of GateState flags are True
   - OneShotNode — run exactly once, skip on subsequent rounds
+  - GPUResidenceManager — VRAM budget enforcer that parks idle models to CPU
   - _resolve_amp / _make_scaler — AMP helpers used by every training node
 """
 from __future__ import annotations
 
+import gc
 import json
 import os
-from contextlib import nullcontext
+import time
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
@@ -19,6 +22,254 @@ import torch.nn as nn
 
 from pipeline.graph import PipelineNode
 from pipeline.context import PipelineContext, GateState
+
+
+# ---------------------------------------------------------------------------
+# GPU residence manager — enforces a VRAM model budget
+# ---------------------------------------------------------------------------
+
+def _model_byte_size(module: nn.Module) -> int:
+    """Rough total bytes for all parameters + buffers of *module*."""
+    total = 0
+    seen: set = set()
+    for p in module.parameters():
+        pid = p.data_ptr()
+        if pid not in seen:
+            seen.add(pid)
+            total += p.nelement() * p.element_size()
+    for b in module.buffers():
+        bid = b.data_ptr()
+        if bid not in seen:
+            seen.add(bid)
+            total += b.nelement() * b.element_size()
+    return total
+
+
+class _ResidentEntry:
+    """Bookkeeping for one model managed by :class:`GPUResidenceManager`."""
+
+    __slots__ = ("name", "module", "byte_size", "last_use_ts")
+
+    def __init__(self, name: str, module: nn.Module, byte_size: int) -> None:
+        self.name = name
+        self.module = module
+        self.byte_size = byte_size
+        self.last_use_ts: float = time.monotonic()
+
+    def touch(self) -> None:
+        self.last_use_ts = time.monotonic()
+
+
+class GPUResidenceManager:
+    """Enforce a VRAM budget by parking idle models on CPU.
+
+    Usage from training nodes::
+
+        with ctx.gpu_residence.require(ctx.classifier, "classifier", device):
+            # classifier is guaranteed on *device*; others may have been evicted
+            train_one_epoch(ctx.classifier, ...)
+        # after the context-manager exits, the model is still on GPU but eligible
+        # for eviction the next time another model needs the budget.
+
+    Construction parameters:
+
+    *max_models*
+        Hard cap on number of models allowed on GPU simultaneously.
+        If only one model fits in the byte budget the cap is forced to 1.
+    *max_bytes*
+        Soft VRAM budget in bytes.  0 = unlimited (no eviction).
+    *empty_cache*
+        When True, call ``gc.collect()`` + ``torch.cuda.empty_cache()``
+        after evicting a model.
+    """
+
+    def __init__(
+        self,
+        max_models: int = 0,
+        max_bytes: int = 0,
+        empty_cache: bool = False,
+    ) -> None:
+        self.max_models = max(0, int(max_models))
+        self.max_bytes = max(0, int(max_bytes))
+        self.empty_cache = bool(empty_cache)
+        self._residents: Dict[str, _ResidentEntry] = {}
+        self._pinned: set[str] = set()  # names currently inside a require() block
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    @contextmanager
+    def require(
+        self,
+        module: nn.Module,
+        name: str,
+        device: torch.device,
+    ):
+        """Context-manager that guarantees *module* is on *device*.
+
+        While inside the block the model is *pinned* — it will not be
+        evicted even if another ``require()`` needs to free space.
+        On exit the model stays on the GPU but becomes eviction-eligible.
+        """
+        self._ensure_resident(module, name, device)
+        self._pinned.add(name)
+        try:
+            yield module
+        finally:
+            self._pinned.discard(name)
+
+    def require_many(
+        self,
+        models: List[Tuple[nn.Module, str]],
+        device: torch.device,
+    ):
+        """Pin several models at once (e.g. generator + discriminator + classifier)."""
+        for module, name in models:
+            self._ensure_resident(module, name, device)
+            self._pinned.add(name)
+
+    def release_many(self, names: List[str]) -> None:
+        """Un-pin models previously pinned via :meth:`require_many`."""
+        for name in names:
+            self._pinned.discard(name)
+
+    def park(self, name: str) -> None:
+        """Force-evict a specific model to CPU immediately."""
+        entry = self._residents.pop(name, None)
+        if entry is not None:
+            entry.module.to(torch.device("cpu"))
+            _log_residence(f"parked {name} → CPU")
+            if self.empty_cache:
+                self._flush_cache()
+
+    def park_all(self) -> None:
+        """Move every resident model to CPU."""
+        for name in list(self._residents):
+            if name not in self._pinned:
+                self.park(name)
+
+    @property
+    def enabled(self) -> bool:
+        return self.max_models > 0 or self.max_bytes > 0
+
+    def stats(self) -> Dict[str, Any]:
+        return {
+            "resident_count": len(self._residents),
+            "resident_bytes": sum(e.byte_size for e in self._residents.values()),
+            "resident_names": sorted(self._residents.keys()),
+            "pinned_names": sorted(self._pinned),
+            "max_models": self.max_models,
+            "max_bytes": self.max_bytes,
+        }
+
+    # ------------------------------------------------------------------
+    # Internals
+    # ------------------------------------------------------------------
+
+    def _ensure_resident(
+        self,
+        module: nn.Module,
+        name: str,
+        device: torch.device,
+    ) -> None:
+        """Bring *module* onto *device*, evicting LRU models if needed."""
+        if not self.enabled:
+            # No budget — just move and return.
+            if module_device(module) != device:
+                module.to(device)
+            return
+
+        entry = self._residents.get(name)
+        if entry is not None:
+            # Already tracked — make sure it's on the right device.
+            if module_device(entry.module) != device:
+                entry.module.to(device)
+            entry.touch()
+            return
+
+        byte_size = _model_byte_size(module)
+
+        # Evict until we meet both the model-count and byte-budget limits.
+        self._evict_until_fits(byte_size)
+
+        module.to(device)
+        self._residents[name] = _ResidentEntry(name, module, byte_size)
+        _log_residence(
+            f"loaded {name} → {device} "
+            f"({byte_size / 1048576:.1f} MB, "
+            f"{len(self._residents)}/{self.max_models or '∞'} models)"
+        )
+
+    def _evict_until_fits(self, incoming_bytes: int) -> None:
+        """Evict LRU unpinned models until budget allows *incoming_bytes*."""
+        while True:
+            count_ok = self.max_models <= 0 or len(self._residents) < self.max_models
+            bytes_ok = self.max_bytes <= 0 or (
+                sum(e.byte_size for e in self._residents.values()) + incoming_bytes
+                <= self.max_bytes
+            )
+            if count_ok and bytes_ok:
+                return
+            victim = self._pick_lru_victim()
+            if victim is None:
+                return  # all remaining are pinned; best-effort
+            self.park(victim)
+
+    def _pick_lru_victim(self) -> Optional[str]:
+        candidates = [
+            (name, entry)
+            for name, entry in self._residents.items()
+            if name not in self._pinned
+        ]
+        if not candidates:
+            return None
+        candidates.sort(key=lambda pair: pair[1].last_use_ts)
+        return candidates[0][0]
+
+    def _flush_cache(self) -> None:
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+
+def _log_residence(msg: str) -> None:
+    print(f"[gpu-residence] {msg}", flush=True)
+
+
+@contextmanager
+def gpu_resident(ctx: "PipelineContext", models: List[Tuple[nn.Module, str]]):
+    """Pin *models* on ``ctx.device`` for the duration of the block.
+
+    If ``ctx.gpu_residence`` is ``None`` (offload disabled) the models are
+    simply moved to ``ctx.device`` if needed, with no tracking or eviction.
+
+    *models* is a list of ``(module, name)`` pairs where *name* is the
+    context attribute name (e.g. ``"classifier"``).
+
+    Usage::
+
+        with gpu_resident(ctx, [(ctx.classifier, "classifier")]):
+            train_one_epoch(ctx.classifier, ...)
+    """
+    mgr = getattr(ctx, "gpu_residence", None)
+    device = ctx.device or torch.device("cpu")
+    if mgr is not None and mgr.enabled:
+        names = []
+        for module, name in models:
+            if module is not None:
+                mgr._ensure_resident(module, name, device)
+                mgr._pinned.add(name)
+                names.append(name)
+        try:
+            yield
+        finally:
+            mgr.release_many(names)
+    else:
+        for module, _name in models:
+            if module is not None and module_device(module) != device:
+                module.to(device)
+        yield
 
 
 # ---------------------------------------------------------------------------

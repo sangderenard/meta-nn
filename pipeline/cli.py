@@ -165,6 +165,18 @@ def parse_args():
         help="Run gc.collect()+torch.cuda.empty_cache() after staged CPU offload transitions.",
     )
     p.add_argument("--no-stage-module-offload-empty-cache", dest="stage_module_offload_empty_cache", action="store_false")
+    p.add_argument(
+        "--vram-limit-mb",
+        type=int,
+        default=0,
+        help="VRAM budget in MB for model residence.  0 = unlimited.  Implies --stage-module-offload.",
+    )
+    p.add_argument(
+        "--max-resident-models",
+        type=int,
+        default=0,
+        help="Maximum number of models allowed on the GPU at once.  0 = auto (4).  Implies --stage-module-offload.",
+    )
     p.add_argument("--no-cudnn-benchmark", dest="cudnn_benchmark", action="store_false")
     p.add_argument("--no-tf32", dest="allow_tf32", action="store_false")
     p.add_argument("--matmul-precision", choices=["high", "medium", "highest"], default="high")

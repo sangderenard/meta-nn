@@ -205,6 +205,7 @@ class GraphNodeRecord:
     metadata: Dict[str, Any] = field(default_factory=dict)
     subnodes: list[SubnodeRecord] = field(default_factory=list)
     owned_action_ids: list[str] = field(default_factory=list)
+    gpu_models: list[str] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -222,6 +223,7 @@ class GraphNodeRecord:
             "metadata": _jsonable(self.metadata),
             "subnodes": [sn.to_dict() for sn in self.subnodes],
             "owned_action_ids": [str(aid) for aid in self.owned_action_ids],
+            "gpu_models": [str(m) for m in self.gpu_models],
         }
 
     @classmethod
@@ -245,6 +247,7 @@ class GraphNodeRecord:
                 if isinstance(sn, dict)
             ],
             owned_action_ids=[str(aid) for aid in data.get("owned_action_ids", [])],
+            gpu_models=[str(m) for m in data.get("gpu_models", [])],
         )
 
 
@@ -1073,6 +1076,14 @@ def plan_from_pipeline_graph(
         record_meta.update(dict(meta.get("metadata", {})))
         record_meta.setdefault("description", str(getattr(node, "description", "") or ""))
         record_meta.setdefault("node_class", type(node).__name__)
+        gpu_models_raw = getattr(node, "gpu_models", [])
+        if callable(gpu_models_raw):
+            try:
+                gpu_models_raw = gpu_models_raw.fget(node) if isinstance(gpu_models_raw, property) else gpu_models_raw
+            except Exception:
+                gpu_models_raw = []
+        if not isinstance(gpu_models_raw, (list, tuple)):
+            gpu_models_raw = []
         node_records.append(
             GraphNodeRecord(
                 node_id=str(node_id),
@@ -1087,6 +1098,7 @@ def plan_from_pipeline_graph(
                 layer=str(meta.get("layer", getattr(runtime_shape, "layer", "execution"))),
                 enabled=bool(meta.get("enabled", True)),
                 metadata=_jsonable(record_meta),
+                gpu_models=[str(m) for m in gpu_models_raw],
             )
         )
 

@@ -1402,6 +1402,25 @@ def run(args, output_dir: Path, initial_plan=None) -> None:
 
     _restore_context_from_resume(ctx)
 
+    # -- GPU residence manager (VRAM budget enforcement) ------------------
+    stage_offload = bool(_arg_value(args, "stage_module_offload", default=False))
+    offload_empty_cache = bool(_arg_value(args, "stage_module_offload_empty_cache", default=False))
+    vram_limit = int(_arg_value(args, "vram_limit_mb", default=0) or 0)
+    max_resident = int(_arg_value(args, "max_resident_models", default=0) or 0)
+    if stage_offload or vram_limit > 0 or max_resident > 0:
+        from pipeline.nodes.base import GPUResidenceManager
+        ctx.gpu_residence = GPUResidenceManager(
+            max_models=max_resident if max_resident > 0 else 4,
+            max_bytes=vram_limit * 1048576 if vram_limit > 0 else 0,
+            empty_cache=offload_empty_cache,
+        )
+        _log(
+            f"[orchestrator] GPU residence manager: "
+            f"max_models={ctx.gpu_residence.max_models} "
+            f"max_bytes={ctx.gpu_residence.max_bytes} "
+            f"empty_cache={ctx.gpu_residence.empty_cache}"
+        )
+
     # -- Node configs / orchestration parameters --------------------------
     plan_hints = dict(getattr(initial_plan, "worker_hints", {}) or {}) if initial_plan is not None else {}
     cfg = _build_configs_from_args(args)
@@ -1629,7 +1648,7 @@ def _build_configs_from_args(args) -> dict:
         max_ch=int(_g("classifier_max_ch", default=384)),
         context_blocks=int(_g("classifier_context_blocks", default=8)),
         context_dropout=float(_g("classifier_context_dropout", default=0.05)),
-        mask_decoder_channels=int(_g("mask_decoder_channels", default=0)),
+        mask_decoder_channels=int(_g("mask_decoder_channels", default=-1)),
         label_embedding_backend=str(_g("label_embedding_backend", default="sentence_transformers")),
         label_embedding_model=str(_g("label_embedding_model", default="sentence-transformers/all-MiniLM-L6-v2")),
         label_embedding_dim=int(_g("label_embedding_dim", default=384)),

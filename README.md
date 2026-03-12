@@ -1502,6 +1502,9 @@ Downloads: [PNG](docs/diagrams/stack_view_reaction.png) | [SVG](docs/diagrams/st
 </details>
 <!-- END:GENERATED_STACK_VIEW_LAYER -->
 
+<!-- BEGIN:GENERATED_PROVENANCE_LAYER -->
+<!-- END:GENERATED_PROVENANCE_LAYER -->
+
 ## Node Roles
 
 - `InitVocabNode`: establishes the current term inventory and semantic target space.

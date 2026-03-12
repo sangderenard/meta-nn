@@ -75,6 +75,7 @@ class BuildLabelEmbeddingNode(PipelineNode):
 
     node_id = "build_label_embedding"
     description = "Build sentence-transformer label embedding bank"
+    gpu_models = ["classifier"]
 
     def __init__(self, cfg: LabelEmbeddingConfig) -> None:
         self.cfg = cfg

@@ -132,6 +132,7 @@ class BuildWaveClassifierNode(PipelineNode):
 
     node_id = "build_wave_classifier"
     description = "Instantiate wave-feedback TinyConvClassifier"
+    gpu_models = ["wave_classifier"]
 
     def __init__(self, cfg: WaveClassifierConfig) -> None:
         self.cfg = cfg
@@ -193,6 +194,7 @@ class WaveClassifierTrainNode(GatedNode):
     node_id = "stage_w_wave_classifier"
     description = "Stage W: Wave classifier training on transformer outputs"
     required_gates = ["gate_pregestation", "gate_gestation", "gate_transformer"]
+    gpu_models = ["wave_classifier", "transformer", "classifier"]
 
     def __init__(self, cfg: WaveClassifierConfig) -> None:
         self.cfg = cfg
@@ -684,7 +686,8 @@ def _evaluate_zero_shot_queries_on_images(
     max_samples: int = 128,
     max_report_samples: int = 8,
 ) -> Dict[str, Any]:
-    from wav_ml_models import TinyConvClassifier, _autocast_context, _resolve_amp_dtype
+    from wav_ml_models import TinyConvClassifier
+    from pipeline.nodes.base import autocast_context, resolve_amp_dtype
 
     if not isinstance(classifier, TinyConvClassifier):
         return {"ran": False, "reason": f"unsupported_classifier:{type(classifier).__name__}"}
@@ -712,7 +715,7 @@ def _evaluate_zero_shot_queries_on_images(
         }
 
     use_amp = bool(amp_enabled and device.type == "cuda")
-    amp_dtype_t = _resolve_amp_dtype(amp_dtype) if use_amp else torch.float16
+    amp_dtype_t = resolve_amp_dtype(amp_dtype) if use_amp else torch.float16
     q_bank = torch.from_numpy(q_np).to(device=device, dtype=torch.float32)
     n_all = int(x.shape[0])
     n_use = int(n_all if int(max_samples) <= 0 else min(n_all, max(1, int(max_samples))))
@@ -732,7 +735,7 @@ def _evaluate_zero_shot_queries_on_images(
         xb = x[i : i + bsz].to(device, non_blocking=True)
         if channels_last:
             xb = xb.contiguous(memory_format=torch.channels_last)
-        with _autocast_context(device=device, use_amp=use_amp, amp_dtype_t=amp_dtype_t):
+        with autocast_context(device=device, enabled=use_amp, amp_dtype=amp_dtype_t):
             feat = classifier.extract_features(xb)
             sims = classifier.semantic_logits_from_features(
                 feat=feat,
@@ -831,7 +834,7 @@ def _build_wave_classifier_dataset_from_transformer(
     semantic_label_bank: Optional[np.ndarray] = None,
     stream_target_labels: Optional[Sequence[Any]] = None,
 ):
-    from wav_ml_models import _autocast_context, _resolve_amp_dtype
+    from pipeline.nodes.base import autocast_context, resolve_amp_dtype
 
     rng = np.random.default_rng(rng_seed)
     x_all = []
@@ -839,7 +842,7 @@ def _build_wave_classifier_dataset_from_transformer(
     accepted_rows = []
     transformer.eval()
     berkeley_classifier.eval()
-    amp_dtype_t = _resolve_amp_dtype(amp_dtype) if amp_enabled else torch.float16
+    amp_dtype_t = resolve_amp_dtype(amp_dtype) if amp_enabled else torch.float16
 
     target_samples = max(1, int(total_samples))
     accepted_only = bool(accepted_only)
@@ -870,7 +873,7 @@ def _build_wave_classifier_dataset_from_transformer(
             xb = xb.pin_memory()
         xb = xb.to(device, non_blocking=True)
         with torch.no_grad():
-            with _autocast_context(device=device, use_amp=amp_enabled, amp_dtype_t=amp_dtype_t):
+            with autocast_context(device=device, enabled=amp_enabled, amp_dtype=amp_dtype_t):
                 xh = transformer(xb)
                 imgs = render_mono_wave_to_tensor(xh, cfg=cfg, image_hw=image_hw, sample_bits=sample_bits)
                 if channels_last:

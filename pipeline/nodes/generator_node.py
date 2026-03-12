@@ -237,6 +237,7 @@ class GeneratorTrainNode(GatedNode):
     node_id = "stage_g_generator"
     description = "Stage G: Conditional GAN training (generator + discriminator)"
     required_gates = ["gate_pregestation", "gate_gestation", "gate_berkeley"]
+    gpu_models = ["generator", "discriminator", "classifier"]
 
     def __init__(self, cfg: GeneratorConfig) -> None:
         self.cfg = cfg

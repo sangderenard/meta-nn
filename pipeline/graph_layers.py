@@ -21,6 +21,8 @@ README_INFERENCE_START = "<!-- BEGIN:GENERATED_INFERENCE_LAYER -->"
 README_INFERENCE_END = "<!-- END:GENERATED_INFERENCE_LAYER -->"
 README_STACK_VIEW_START = "<!-- BEGIN:GENERATED_STACK_VIEW_LAYER -->"
 README_STACK_VIEW_END = "<!-- END:GENERATED_STACK_VIEW_LAYER -->"
+README_PROVENANCE_START = "<!-- BEGIN:GENERATED_PROVENANCE_LAYER -->"
+README_PROVENANCE_END = "<!-- END:GENERATED_PROVENANCE_LAYER -->"
 
 NODE_STYLE_MAP: Dict[str, Dict[str, str]] = {
     "bootstrap": {"fill": "#E9F1F7", "stroke": "#4B6B88", "color": "#102A43"},
@@ -99,6 +101,110 @@ def _layer_edge(
     }
 
 
+MODEL_LABELS: Dict[str, str] = {
+    "classifier": "Classifier Model",
+    "transformer": "Transformer Model",
+    "generator": "GAN Generator",
+    "discriminator": "Discriminator Model",
+    "wave_classifier": "Wave Classifier Model",
+    "deskew_prefilter": "Deskew Pre-filter",
+    "label_embedding": "Label Embedding Bank",
+}
+
+PROVENANCE_FACULTY_ORDER = [
+    "build",
+    "data",
+    "train",
+    "gates",
+    "housekeeping",
+    "other",
+]
+
+
+def _build_provenance_layer(
+    nodes: Iterable[GraphNodeRecord],
+) -> Dict[str, Any]:
+    """Build provenance layer showing GPU model residency ownership.
+
+    Creates a resource node for each distinct model name found in any
+    pipeline node's ``gpu_models`` list, then draws an edge from every
+    pipeline node to the model resources it requires.
+    """
+    node_list = list(nodes)
+    model_owners: Dict[str, List[GraphNodeRecord]] = {}
+    for node in node_list:
+        for model in getattr(node, "gpu_models", []) or []:
+            model_owners.setdefault(str(model), []).append(node)
+
+    if not model_owners:
+        return {
+            "layer_id": "provenance",
+            "label": "GPU Model Provenance",
+            "description": "No gpu_models declared by any pipeline node.",
+            "status": "active",
+            "mermaid_direction": "LR",
+            "nodes": [],
+            "edges": [],
+        }
+
+    layer_nodes: List[Dict[str, Any]] = []
+    layer_edges: List[Dict[str, Any]] = []
+    seen_pipeline_nodes: set[str] = set()
+
+    # Add model-resource nodes
+    for model_name in sorted(model_owners):
+        resource_id = f"model::{model_name}"
+        layer_nodes.append(
+            _layer_node(
+                resource_id,
+                MODEL_LABELS.get(model_name, model_name.replace("_", " ").title()),
+                object_type="resource",
+                faculty="inference",
+                archetype="gpu_model",
+                shape="cylinder",
+                metadata={"model_name": model_name},
+            )
+        )
+
+    # Add pipeline nodes and ownership edges
+    for model_name in sorted(model_owners):
+        resource_id = f"model::{model_name}"
+        for node in model_owners[model_name]:
+            nid = str(node.node_id)
+            if nid not in seen_pipeline_nodes:
+                seen_pipeline_nodes.add(nid)
+                layer_nodes.append(
+                    _layer_node(
+                        nid,
+                        str(node.label or nid),
+                        faculty=str(node.faculty or "other"),
+                        archetype=str(node.archetype or node.kind or "node"),
+                        metadata={"node_id": nid},
+                    )
+                )
+            layer_edges.append(
+                _layer_edge(
+                    nid,
+                    resource_id,
+                    label="requires",
+                    readme_label=f"gpu-resident {model_name}",
+                    reaction_name="residency.acquire",
+                    target_function="GPUResidenceManager.ensure_resident",
+                    metadata={"model_name": model_name, "style_role": "residency"},
+                )
+            )
+
+    return {
+        "layer_id": "provenance",
+        "label": "GPU Model Provenance",
+        "description": "Ownership and GPU-residency relationships between pipeline nodes and model resources.",
+        "status": "active",
+        "mermaid_direction": "LR",
+        "nodes": layer_nodes,
+        "edges": layer_edges,
+    }
+
+
 def build_graph_layers(graph: PipelineGraph) -> Dict[str, Dict[str, Any]]:
     execution_layer = _build_execution_layer(graph)
     execution_program = build_execution_program(graph)
@@ -114,19 +220,12 @@ def build_graph_layers(graph: PipelineGraph) -> Dict[str, Dict[str, Any]]:
         if bool(getattr(e, "enabled", True))
         and str(getattr(e, "layer", "execution") or "execution") == "execution"
     ]
+    all_nodes = list(getattr(_plan, "nodes", []) or [])
     return {
         "execution": execution_layer,
         "execution_overlay": build_execution_overlay_layer(execution_layer, execution_program),
         "inference": _build_inference_layer(),
-        "provenance": {
-            "layer_id": "provenance",
-            "label": "Provenance layer",
-            "description": "Reserved layer for ownership, storage residency, and lineage edges.",
-            "status": "planned",
-            "mermaid_direction": "TD",
-            "nodes": [],
-            "edges": [],
-        },
+        "provenance": _build_provenance_layer(all_nodes),
         "stack_view": _build_stack_view_layer(execution_nodes, execution_edges),
     }
 
@@ -973,16 +1072,20 @@ def update_readme_flowcharts(
     execution_block = render_readme_execution_section(layers, asset_link_prefix=asset_link_prefix)
     inference_block = render_readme_layer_section(layers["inference"], asset_link_prefix=asset_link_prefix)
     stack_view_block = render_readme_layer_section(layers["stack_view"], asset_link_prefix=asset_link_prefix) if layers.get("stack_view", {}).get("status") == "active" else ""
+    provenance_layer = layers.get("provenance", {}) or {}
+    provenance_block = render_readme_layer_section(provenance_layer, asset_link_prefix=asset_link_prefix) if provenance_layer.get("status") == "active" and provenance_layer.get("nodes") else ""
 
     text = readme_path.read_text(encoding="utf-8")
     text = _replace_marked_block(text, README_EXECUTION_START, README_EXECUTION_END, execution_block)
     text = _replace_marked_block(text, README_INFERENCE_START, README_INFERENCE_END, inference_block)
     text = _replace_marked_block(text, README_STACK_VIEW_START, README_STACK_VIEW_END, stack_view_block)
+    text = _replace_marked_block(text, README_PROVENANCE_START, README_PROVENANCE_END, provenance_block)
     readme_path.write_text(text, encoding="utf-8")
     return {
         "execution": execution_block,
         "inference": inference_block,
         "stack_view": stack_view_block,
+        "provenance": provenance_block,
     }
 
 
@@ -1549,7 +1652,7 @@ def _mmdc_export_artifact(
 
 def main(argv: Optional[Iterable[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="Generate layered Mermaid flowcharts from the graph definitions.")
-    parser.add_argument("--layer", choices=["execution", "execution_overlay", "inference", "stack_view"], default="", help="Print a single layer Mermaid flowchart.")
+    parser.add_argument("--layer", choices=["execution", "execution_overlay", "inference", "provenance", "stack_view"], default="", help="Print a single layer Mermaid flowchart.")
     parser.add_argument("--view", choices=["dense", "minimal", "reaction"], default="dense", help="Rendering mode for --layer output.")
     parser.add_argument("--write-readme", action="store_true", help="Update README.md generated Mermaid sections in place.")
     parser.add_argument("--readme-path", default="README.md", help="README path to update when --write-readme is set.")

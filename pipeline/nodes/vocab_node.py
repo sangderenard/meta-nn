@@ -44,6 +44,7 @@ import torch.nn.functional as F
 from pipeline.context import PipelineContext
 from pipeline.graph import PipelineNode
 from pipeline.nodes.base import OneTimeNode
+from semantic_dataset_loaders import _semantic_color_score_maps
 
 
 # ---------------------------------------------------------------------------
@@ -2678,6 +2679,10 @@ def _build_pregestation_logic_rows(
 # Recognized color term names whose score maps can be extracted by
 # _semantic_color_score_maps.  "grey" is an alias for "gray" and both are
 # included so either spelling in the term list triggers mask extraction.
+_PREGESTATION_OBSERVED_COLOR_TERMS: Tuple[str, ...] = (
+    "red", "orange", "green", "blue", "yellow", "cyan",
+    "magenta", "brown", "black", "white", "gray", "grey",
+)
 
 
 def _normalize_attention_map(mask: Any, gamma: float = 1.0, blur_kernel: int = 0) -> np.ndarray:
@@ -2766,9 +2771,6 @@ def _enrich_pregestation_stack_with_observed_color_masks(
     observed_np = np.stack(observed, axis=0)  # [k', H, W]
     extended = np.concatenate([elem_stack, observed_np], axis=0)  # [k + k', H, W]
     return extended, _composite_mask_stack(extended)
-
-
-from pipeline.nodes.vocab_node import _build_reference_flashcard_payload_rows  # migration shim
 
 
 def _rotate_active_extra_terms(
