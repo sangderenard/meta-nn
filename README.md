@@ -273,7 +273,7 @@ flowchart TD
     linkStyle 87 stroke:#111111,stroke-width:3px,opacity:0.98,stroke-dasharray:0;
 ```
 
-Downloads: [PNG](docs/diagrams/execution_overlay_dense.png) | [SVG](docs/diagrams/execution_overlay_dense.svg) | [MMD](docs/diagrams/execution_overlay_dense.mmd)
+Downloads: [SVG](docs/diagrams/execution_overlay_dense.svg) | [MMD](docs/diagrams/execution_overlay_dense.mmd)
 
 The colored edges retain topology and data/reaction structure. The black numbered edges show scheduler order, while diamond nodes expose the explicit guard checks that gate later stages.
 
@@ -417,7 +417,7 @@ flowchart TD
     linkStyle 34 stroke:#2B9348,stroke-width:3px,opacity:0.9,stroke-dasharray:4 2;
 ```
 
-Downloads: [PNG](docs/diagrams/execution_dense.png) | [SVG](docs/diagrams/execution_dense.svg) | [MMD](docs/diagrams/execution_dense.mmd)
+Downloads: [SVG](docs/diagrams/execution_dense.svg) | [MMD](docs/diagrams/execution_dense.mmd)
 
 Node colors group bootstrap, build, vocab, data, train, gate, and housekeeping faculties. Edge colors separate startup, per-round, data-provision, gated progression, and end-of-round reactions.
 
@@ -496,7 +496,7 @@ flowchart TD
     sync_gate_replica --> checkpoint_save
 ```
 
-Downloads: [PNG](docs/diagrams/execution_minimal.png) | [SVG](docs/diagrams/execution_minimal.svg) | [MMD](docs/diagrams/execution_minimal.mmd)
+Downloads: [SVG](docs/diagrams/execution_minimal.svg) | [MMD](docs/diagrams/execution_minimal.mmd)
 
 </details>
 
@@ -611,7 +611,7 @@ flowchart TD
     linkStyle 34 stroke:#2B9348,stroke-width:3px,opacity:0.9,stroke-dasharray:4 2;
 ```
 
-Downloads: [PNG](docs/diagrams/execution_reaction.png) | [SVG](docs/diagrams/execution_reaction.svg) | [MMD](docs/diagrams/execution_reaction.mmd)
+Downloads: [SVG](docs/diagrams/execution_reaction.svg) | [MMD](docs/diagrams/execution_reaction.mmd)
 
 </details>
 <!-- END:GENERATED_EXECUTION_LAYER -->
@@ -683,7 +683,7 @@ flowchart LR
     linkStyle 10 stroke:#3A86FF,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
 ```
 
-Downloads: [PNG](docs/diagrams/inference_dense.png) | [SVG](docs/diagrams/inference_dense.svg) | [MMD](docs/diagrams/inference_dense.mmd)
+Downloads: [SVG](docs/diagrams/inference_dense.svg) | [MMD](docs/diagrams/inference_dense.mmd)
 
 Node colors group buses, inference objects, buffers, and acceptance gates. Edge colors separate ingress, interpretation, synthesis, retry-loop, repack, and egress paths.
 
@@ -719,7 +719,7 @@ flowchart LR
     wave_repack --> output_bus
 ```
 
-Downloads: [PNG](docs/diagrams/inference_minimal.png) | [SVG](docs/diagrams/inference_minimal.svg) | [MMD](docs/diagrams/inference_minimal.mmd)
+Downloads: [SVG](docs/diagrams/inference_minimal.svg) | [MMD](docs/diagrams/inference_minimal.mmd)
 
 </details>
 
@@ -767,7 +767,7 @@ flowchart LR
     linkStyle 10 stroke:#3A86FF,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
 ```
 
-Downloads: [PNG](docs/diagrams/inference_reaction.png) | [SVG](docs/diagrams/inference_reaction.svg) | [MMD](docs/diagrams/inference_reaction.mmd)
+Downloads: [SVG](docs/diagrams/inference_reaction.svg) | [MMD](docs/diagrams/inference_reaction.mmd)
 
 </details>
 <!-- END:GENERATED_INFERENCE_LAYER -->
@@ -1048,7 +1048,7 @@ flowchart LR
     linkStyle 85 stroke:#2B9348,stroke-width:3px,opacity:0.9,stroke-dasharray:4 2;
 ```
 
-Downloads: [PNG](docs/diagrams/stack_view_dense.png) | [SVG](docs/diagrams/stack_view_dense.svg) | [MMD](docs/diagrams/stack_view_dense.mmd)
+Downloads: [SVG](docs/diagrams/stack_view_dense.svg) | [MMD](docs/diagrams/stack_view_dense.mmd)
 
 Node colors group bootstrap, build, vocab, data, train, gate, and housekeeping faculties. Edge colors separate startup, per-round, data-provision, gated progression, and end-of-round reactions.
 
@@ -1229,7 +1229,7 @@ flowchart LR
     sync_gate_replica --> checkpoint_save
 ```
 
-Downloads: [PNG](docs/diagrams/stack_view_minimal.png) | [SVG](docs/diagrams/stack_view_minimal.svg) | [MMD](docs/diagrams/stack_view_minimal.mmd)
+Downloads: [SVG](docs/diagrams/stack_view_minimal.svg) | [MMD](docs/diagrams/stack_view_minimal.mmd)
 
 </details>
 
@@ -1497,7 +1497,7 @@ flowchart LR
     linkStyle 85 stroke:#2B9348,stroke-width:3px,opacity:0.9,stroke-dasharray:4 2;
 ```
 
-Downloads: [PNG](docs/diagrams/stack_view_reaction.png) | [SVG](docs/diagrams/stack_view_reaction.svg) | [MMD](docs/diagrams/stack_view_reaction.mmd)
+Downloads: [SVG](docs/diagrams/stack_view_reaction.svg) | [MMD](docs/diagrams/stack_view_reaction.mmd)
 
 </details>
 <!-- END:GENERATED_STACK_VIEW_LAYER -->

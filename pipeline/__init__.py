@@ -7,7 +7,12 @@ from .plan_protocol import (
     TrainingGraphPlan,
     ProtocolEnvelope,
 )
-from .orchestrator import build_training_graph_from_plan
+
+
+def build_training_graph_from_plan(*args, **kwargs):
+    from .orchestrator import build_training_graph_from_plan as _impl
+
+    return _impl(*args, **kwargs)
 
 __all__ = [
     "PipelineNode",

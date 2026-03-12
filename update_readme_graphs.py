@@ -9,7 +9,6 @@ if __name__ == "__main__":  # pragma: no cover
         main(
             [
                 "--write-readme",
-                "--export-png",
                 "--export-svg",
                 "--export-mmd",
                 "--png-scale",
