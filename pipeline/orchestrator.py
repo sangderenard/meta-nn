@@ -1483,6 +1483,22 @@ def run(args, output_dir: Path, initial_plan=None) -> None:
         except Exception as exc:
             _log(f"[orchestrator] WARNING: could not write training graph plan: {exc}")
 
+    # -- IR-authoritative: instantiate CycleGate from plan's cycle edges --
+    # The cycle edges in the IR *cause* CycleGate objects to exist.
+    # These objects own iteration state and make the repeat/exhaust
+    # decision — no hardcoded loop counters anywhere.
+    from pipeline.graph import CycleGate
+    _cycle_gates = CycleGate.from_plan(ctx.graph_plan)
+    ctx.cycle_gates = _cycle_gates
+    if _cycle_gates:
+        _gate = _cycle_gates[0]
+        cycles = _gate.cycles
+        rounds_per_cycle = _gate.rounds_per_cycle
+        ctx.orchestration_cycles = cycles
+        ctx.orchestration_rounds = rounds_per_cycle
+        default_cycle_ids = [int(i) for i in range(1, cycles + 1)]
+        _log(f"[orchestrator] CycleGate instantiated from IR: {_gate!r}")
+
     _send_viewer_bootstrap(ctx)
 
     _log(graph.summary())
@@ -1513,12 +1529,27 @@ def run(args, output_dir: Path, initial_plan=None) -> None:
         },
     )
 
-    # -- Outer orchestration loop -----------------------------------------
+    # -- Outer orchestration loop — driven by CycleGate objects -----------
+    # The IR cycle edges caused CycleGate objects to be instantiated above.
+    # Those objects own the iteration decision.  The orchestrator consults
+    # them rather than counting with hardcoded for-ranges.
     stop_requested = False
+    _primary_gate = _cycle_gates[0] if _cycle_gates else None
 
-    for cycle_idx in range(1, cycles + 1):
+    while True:
+        # Ask the CycleGate whether to continue.  When no gate exists
+        # (legacy plan without cycle edges), we do zero iterations here
+        # because the init pass above already executed the graph once.
+        if _primary_gate is None:
+            break
+        branch = _primary_gate.evaluate(ctx)
+        if branch == "exhaust":
+            break
+        cycle_idx = ctx.cycle
+        round_idx = ctx.round_id
+
         if ctx.stop_requested():
-            _log("[orchestrator] GUI requested stop before next cycle; stopping run")
+            _log("[orchestrator] GUI requested stop before next iteration; stopping run")
             stop_requested = True
             break
 
@@ -1537,6 +1568,10 @@ def run(args, output_dir: Path, initial_plan=None) -> None:
                     ctx.graph_plan = apply_payload.plan
                     ctx.plan_id = str(apply_payload.plan.plan_id)
                     ctx.graph_layers = dict(getattr(apply_payload.plan, "graph_layers", {}) or {})
+                    # Re-instantiate CycleGate from the new plan's IR.
+                    _cycle_gates = CycleGate.from_plan(apply_payload.plan)
+                    ctx.cycle_gates = _cycle_gates
+                    _primary_gate = _cycle_gates[0] if _cycle_gates else None
                     if ctx.graph_plan_path is not None:
                         try:
                             apply_payload.plan.save_json(ctx.graph_plan_path)
@@ -1548,8 +1583,6 @@ def run(args, output_dir: Path, initial_plan=None) -> None:
                     _log(f"[orchestrator] ERROR: plan_apply failed — keeping existing graph: {apply_exc}")
 
         if not ctx.is_cycle_selected(cycle_idx):
-            ctx.cycle = cycle_idx
-            ctx.round_id = 0
             deselected = {node_id: "skipped:cycle_deselected" for node_id in sequence}
             ctx.last_node_statuses = dict(deselected)
             _log(f"[orchestrator] cycle={cycle_idx}/{cycles} skipped by GUI selection")
@@ -1566,46 +1599,36 @@ def run(args, output_dir: Path, initial_plan=None) -> None:
                 metrics={"cycle": int(cycle_idx)},
             )
             continue
-        ctx.cycle = cycle_idx
-        for round_idx in range(1, rounds_per_cycle + 1):
-            if ctx.stop_requested():
-                _log("[orchestrator] GUI requested stop; stopping run")
-                stop_requested = True
-                break
-            ctx.round_id = round_idx
-            ctx.total_rounds_completed += 1
 
-            _log(f"\n{'=' * 60}")
-            _log(f"[orchestrator] cycle={cycle_idx}/{cycles}  round={round_idx}/{rounds_per_cycle}"
-                 f"  total={ctx.total_rounds_completed}")
-            _log(f"{'=' * 60}")
+        _log(f"\n{'=' * 60}")
+        _log(f"[orchestrator] cycle={cycle_idx}/{cycles}  round={round_idx}/{rounds_per_cycle}"
+             f"  total={ctx.total_rounds_completed}")
+        _log(f"{'=' * 60}")
 
-            statuses = _execute_runtime_pass(graph, ctx, sequence=sequence)
-            ctx.last_node_statuses = dict(statuses)
-            _log_statuses(f"c{cycle_idx}r{round_idx}", statuses)
-            _save_runtime_snapshot(
-                ctx,
-                _build_runtime_snapshot(ctx, statuses, "running", default_cycle_ids=default_cycle_ids),
-            )
-            _emit_execution_event(
-                ctx,
-                event_id=f"{ctx.session_id}:cycle:{cycle_idx}:round:{round_idx}",
-                phase="round",
-                status="ok",
-                message=f"Executed cycle {cycle_idx} round {round_idx}.",
-                metrics={
-                    "cycle": int(cycle_idx),
-                    "round": int(round_idx),
-                    "ran": sum(1 for s in statuses.values() if s == "ran"),
-                    "skipped": sum(1 for s in statuses.values() if str(s).startswith("skipped")),
-                    "failed": sum(1 for s in statuses.values() if str(s).startswith("failed")),
-                },
-            )
+        statuses = _execute_runtime_pass(graph, ctx, sequence=sequence)
+        ctx.last_node_statuses = dict(statuses)
+        _log_statuses(f"c{cycle_idx}r{round_idx}", statuses)
+        _save_runtime_snapshot(
+            ctx,
+            _build_runtime_snapshot(ctx, statuses, "running", default_cycle_ids=default_cycle_ids),
+        )
+        _emit_execution_event(
+            ctx,
+            event_id=f"{ctx.session_id}:cycle:{cycle_idx}:round:{round_idx}",
+            phase="round",
+            status="ok",
+            message=f"Executed cycle {cycle_idx} round {round_idx}.",
+            metrics={
+                "cycle": int(cycle_idx),
+                "round": int(round_idx),
+                "ran": sum(1 for s in statuses.values() if s == "ran"),
+                "skipped": sum(1 for s in statuses.values() if str(s).startswith("skipped")),
+                "failed": sum(1 for s in statuses.values() if str(s).startswith("failed")),
+            },
+        )
 
-            if ctx.vocab_rotation_cycle == 0:
-                ctx.vocab_rotation_cycle = 1
-        if stop_requested:
-            break
+        if ctx.vocab_rotation_cycle == 0:
+            ctx.vocab_rotation_cycle = 1
 
     # -- Final summary ----------------------------------------------------
     summary_path = output_dir / "pipeline_run_summary.json"

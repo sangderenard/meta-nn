@@ -202,6 +202,8 @@ class GraphNodeRecord:
     archetype: str = ""
     layer: str = "execution"
     enabled: bool = True
+    execution_policy: str = "always"  # always | once | gated | periodic
+    execution_policy_config: Dict[str, Any] = field(default_factory=dict)
     metadata: Dict[str, Any] = field(default_factory=dict)
     subnodes: list[SubnodeRecord] = field(default_factory=list)
     owned_action_ids: list[str] = field(default_factory=list)
@@ -220,6 +222,8 @@ class GraphNodeRecord:
             "archetype": str(self.archetype),
             "layer": str(self.layer),
             "enabled": bool(self.enabled),
+            "execution_policy": str(self.execution_policy),
+            "execution_policy_config": _jsonable(self.execution_policy_config),
             "metadata": _jsonable(self.metadata),
             "subnodes": [sn.to_dict() for sn in self.subnodes],
             "owned_action_ids": [str(aid) for aid in self.owned_action_ids],
@@ -240,6 +244,8 @@ class GraphNodeRecord:
             archetype=str(data.get("archetype", "")),
             layer=str(data.get("layer", "execution")),
             enabled=bool(data.get("enabled", True)),
+            execution_policy=str(data.get("execution_policy", "always")),
+            execution_policy_config=dict(data.get("execution_policy_config", {})),
             metadata=dict(data.get("metadata", {})),
             subnodes=[
                 SubnodeRecord.from_dict(dict(sn))
@@ -265,6 +271,7 @@ class GraphEdgeRecord:
     enabled: bool = True
     metadata: Dict[str, Any] = field(default_factory=dict)
     action_id: str = ""
+    cycle_control: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -280,6 +287,7 @@ class GraphEdgeRecord:
             "enabled": bool(self.enabled),
             "metadata": _jsonable(self.metadata),
             "action_id": str(self.action_id),
+            "cycle_control": _jsonable(self.cycle_control),
         }
 
     @classmethod
@@ -297,6 +305,7 @@ class GraphEdgeRecord:
             enabled=bool(data.get("enabled", True)),
             metadata=dict(data.get("metadata", {})),
             action_id=str(data.get("action_id", "")),
+            cycle_control=dict(data.get("cycle_control", {})),
         )
 
 
@@ -381,6 +390,8 @@ class TrainingGraphPlan:
         for edge in self.edges:
             if not edge.enabled:
                 continue
+            if edge.layer == "cycle" or edge.cycle_control:
+                continue  # cycle edges are intentional back-edges; skip DAG check
             in_degree[edge.target_node_id] += 1
             children[edge.source_node_id].append(edge.target_node_id)
 
@@ -394,7 +405,7 @@ class TrainingGraphPlan:
                 if in_degree[child] == 0:
                     ready.append(child)
         if visited != len(known_nodes):
-            raise ValueError("TrainingGraphPlan contains a cycle.")
+            raise ValueError("TrainingGraphPlan contains a cycle in its non-cycle edges.")
 
         action_ids = [action.action_id for action in self.actions]
         if len(set(action_ids)) != len(action_ids):
@@ -847,10 +858,40 @@ def save_protocol_message(path: str | Path, envelope: ProtocolEnvelope) -> None:
     )
 
 
+def _topological_sort_node_ids(
+    node_ids: List[str], edges: List[GraphEdgeRecord],
+) -> List[str]:
+    """Return node IDs in topological order, excluding cycle edges."""
+    ids = list(node_ids)
+    children: Dict[str, List[str]] = {nid: [] for nid in ids}
+    in_deg: Dict[str, int] = {nid: 0 for nid in ids}
+    for edge in edges:
+        if not edge.enabled or edge.layer == "cycle" or edge.cycle_control:
+            continue
+        if edge.source_node_id in children and edge.target_node_id in in_deg:
+            children[edge.source_node_id].append(edge.target_node_id)
+            in_deg[edge.target_node_id] += 1
+    ready = deque(sorted(nid for nid, d in in_deg.items() if d == 0))
+    order: List[str] = []
+    while ready:
+        nid = ready.popleft()
+        order.append(nid)
+        for child in children.get(nid, []):
+            in_deg[child] -= 1
+            if in_deg[child] == 0:
+                ready.append(child)
+    # Append any remaining (shouldn't happen in a valid DAG, but be safe).
+    remaining = [nid for nid in ids if nid not in set(order)]
+    order.extend(sorted(remaining))
+    return order
+
+
 def _root_node_ids(node_ids: Iterable[str], edges: List[GraphEdgeRecord]) -> List[str]:
     in_degree = {node_id: 0 for node_id in node_ids}
     for edge in edges:
-        if edge.enabled and edge.target_node_id in in_degree:
+        if not edge.enabled or edge.layer == "cycle" or edge.cycle_control:
+            continue
+        if edge.target_node_id in in_degree:
             in_degree[edge.target_node_id] += 1
     return sorted(node_id for node_id, deg in in_degree.items() if deg == 0)
 
@@ -864,6 +905,8 @@ def build_layout_from_records(
     in_degree: Dict[str, int] = {node_id: 0 for node_id in node_ids}
 
     for edge in edges:
+        if edge.layer == "cycle" or edge.cycle_control:
+            continue
         if edge.source_node_id not in children or edge.target_node_id not in children:
             continue
         children[edge.source_node_id].append(edge.target_node_id)
@@ -1084,6 +1127,21 @@ def plan_from_pipeline_graph(
                 gpu_models_raw = []
         if not isinstance(gpu_models_raw, (list, tuple)):
             gpu_models_raw = []
+
+        # Execution policy — the IR must record *why* a node may skip itself.
+        _exec_policy_raw = getattr(node, "runtime_execution_policy", None)
+        if callable(_exec_policy_raw) and not isinstance(_exec_policy_raw, property):
+            try:
+                _exec_policy_raw = _exec_policy_raw()
+            except Exception:
+                _exec_policy_raw = None
+        if isinstance(_exec_policy_raw, (tuple, list)) and len(_exec_policy_raw) >= 2:
+            _exec_policy_name = str(_exec_policy_raw[0])
+            _exec_policy_cfg = dict(_exec_policy_raw[1]) if isinstance(_exec_policy_raw[1], dict) else {}
+        else:
+            _exec_policy_name = "always"
+            _exec_policy_cfg = {}
+
         node_records.append(
             GraphNodeRecord(
                 node_id=str(node_id),
@@ -1097,6 +1155,8 @@ def plan_from_pipeline_graph(
                 archetype=str(meta.get("archetype", getattr(runtime_shape, "archetype", type(node).__name__))),
                 layer=str(meta.get("layer", getattr(runtime_shape, "layer", "execution"))),
                 enabled=bool(meta.get("enabled", True)),
+                execution_policy=_exec_policy_name,
+                execution_policy_config=_jsonable(_exec_policy_cfg),
                 metadata=_jsonable(record_meta),
                 gpu_models=[str(m) for m in gpu_models_raw],
             )
@@ -1155,6 +1215,56 @@ def plan_from_pipeline_graph(
     serialized_conditions = serialize_config_blobs(dict(condition_blobs or {}))
     serialized_layers = _jsonable(dict(graph_layers or {}))
     serialized_execution_program = _jsonable(dict(execution_program or {}))
+
+    # ── synthesize cycle edges from orchestrator loop metadata ────────────
+    _hints = dict(worker_hints or {})
+    _orch_cycles = int(_hints.get("orchestration_cycles", 0) or 0)
+    _orch_rounds = int(_hints.get("orchestration_rounds", 0) or 0)
+    if _orch_cycles > 0 and _orch_rounds > 0:
+        # Determine topological ends: entry (root) and terminal (sink) nodes
+        # among the *non-cycle* edges built so far.
+        _all_node_ids = {nr.node_id for nr in node_records}
+        _sources = {e.source_node_id for e in edge_records if e.enabled}
+        _targets = {e.target_node_id for e in edge_records if e.enabled}
+        _sink_ids = sorted(_all_node_ids & _sources - _targets | {nid for nid in _all_node_ids if nid not in _sources and nid not in _targets})
+        _root_ids = sorted(_all_node_ids - _targets)
+        # Prefer well-known node names when available.
+        _cycle_source = "checkpoint_save" if "checkpoint_save" in _all_node_ids else (_sink_ids[0] if _sink_ids else None)
+        _cycle_target = "wave_pool" if "wave_pool" in _all_node_ids else (_root_ids[0] if _root_ids else None)
+        if _cycle_source and _cycle_target and _cycle_source != _cycle_target:
+            _total_iters = _orch_cycles * _orch_rounds
+            # Compute topological stride (distance) from target back to source.
+            _topo_order = _topological_sort_node_ids([nr.node_id for nr in node_records], edge_records)
+            _topo_idx = {nid: idx for idx, nid in enumerate(_topo_order)}
+            _stride = abs(_topo_idx.get(_cycle_source, 0) - _topo_idx.get(_cycle_target, 0))
+            edge_records.append(
+                GraphEdgeRecord(
+                    edge_id="cycle::round_return",
+                    kind="cycle_return",
+                    source_node_id=_cycle_source,
+                    target_node_id=_cycle_target,
+                    condition_id="",
+                    layer="cycle",
+                    target_function="",
+                    reaction_name="round_return",
+                    reaction_defaults={},
+                    enabled=True,
+                    metadata={
+                        "style_role": "cycle",
+                        "label": f"round return ({_total_iters}x)",
+                        "description": (
+                            f"Orchestrator repeats the graph for "
+                            f"{_orch_cycles} cycle(s) x {_orch_rounds} round(s) = {_total_iters} iterations."
+                        ),
+                    },
+                    cycle_control={
+                        "stride": int(_stride),
+                        "max_iterations": int(_total_iters),
+                        "cycles": int(_orch_cycles),
+                        "rounds_per_cycle": int(_orch_rounds),
+                    },
+                )
+            )
 
     # ── build unified action records ─────────────────────────────────────
     action_records: list[ActionRecord] = []

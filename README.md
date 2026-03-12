@@ -19,17 +19,17 @@ Run `python update_readme_graphs.py` after changing graph layers.
 %%{init: {'theme':'base','flowchart':{'curve':'basis','htmlLabels':true}}}%%
 flowchart TD
     subgraph group_bootstrap[Bootstrap]
-        wave_pool["Wave Pool<br/>object / bootstrap / seed"]
+        wave_pool["Wave Pool<br/>object / bootstrap / seed  [once]"]
     end
     subgraph group_build[Build]
-        build_classifier["Build Classifier<br/>object / build / builder"]
-        config_search["Config Search<br/>object / build / node"]
-        build_transformer["Build Transformer<br/>object / build / builder"]
-        build_gan["Build GAN<br/>object / build / builder"]
+        build_classifier["Build Classifier<br/>object / build / builder  [once]"]
+        config_search["Config Search<br/>object / build / node  [once]"]
+        build_transformer["Build Transformer<br/>object / build / builder  [once]"]
+        build_gan["Build GAN<br/>object / build / builder  [once]"]
         build_wave_classifier["Build Wave Classifier<br/>object / build / builder"]
     end
     subgraph group_vocab[Vocab]
-        init_vocab["Init Vocab<br/>object / vocab / seed"]
+        init_vocab["Init Vocab<br/>object / vocab / seed  [once]"]
         vocab_churn["Vocab Churn<br/>object / vocab / seed"]
         build_symbol_pool["Build Symbol Pool<br/>object / vocab / builder"]
         build_label_embedding["Build Label Embedding<br/>object / vocab / builder"]
@@ -40,21 +40,21 @@ flowchart TD
     end
     subgraph group_train[Train]
         stage_0_pregestation["Pregestation Train<br/>object / train / stage"]
-        stage_1_gestation["Gestation Train<br/>object / train / stage"]
-        stage_2_berkeley["Berkeley Refresh Train<br/>object / train / stage"]
-        stage_r_transformer["Transformer Train<br/>object / train / stage"]
-        stage_g_generator["Generator Train<br/>object / train / stage"]
-        stage_w_wave_classifier["Wave Classifier Train<br/>object / train / stage"]
-        stage_c_lora["LoRA Round<br/>object / train / stage"]
-        stage_fake_feedback["Fake Class Feedback<br/>object / train / stage"]
+        stage_1_gestation["Gestation Train<br/>object / train / stage  [gated]"]
+        stage_2_berkeley["Berkeley Refresh Train<br/>object / train / stage  [gated]"]
+        stage_r_transformer["Transformer Train<br/>object / train / stage  [gated]"]
+        stage_g_generator["Generator Train<br/>object / train / stage  [gated]"]
+        stage_w_wave_classifier["Wave Classifier Train<br/>object / train / stage  [gated]"]
+        stage_c_lora["LoRA Round<br/>object / train / stage  [gated]"]
+        stage_fake_feedback["Fake Class Feedback<br/>object / train / stage  [gated]"]
     end
     subgraph group_gates[Gates]
         gate_0_pregestation_eval["Pregestation Eval<br/>object / gates / gate"]
-        gate_1_gestation_eval["Gestation Eval<br/>object / gates / gate"]
-        gate_berkeley["Berkeley Gate<br/>object / gates / gate"]
-        gate_transformer["Transformer Gate<br/>object / gates / gate"]
-        gate_generator["Generator Gate<br/>object / gates / gate"]
-        gate_wave["Wave Gate<br/>object / gates / gate"]
+        gate_1_gestation_eval["Gestation Eval<br/>object / gates / gate  [gated]"]
+        gate_berkeley["Berkeley Gate<br/>object / gates / gate  [gated]"]
+        gate_transformer["Transformer Gate<br/>object / gates / gate  [gated]"]
+        gate_generator["Generator Gate<br/>object / gates / gate  [gated]"]
+        gate_wave["Wave Gate<br/>object / gates / gate  [gated]"]
         decision_004_stage_w_wave_classifier{"Wave stage ready?<br/>control / gates / decision"}
         decision_007_gate_wave{"Wave stage ready?<br/>control / gates / decision"}
         decision_010_build_gan{"GAN mode?<br/>control / gates / decision"}
@@ -71,7 +71,7 @@ flowchart TD
     end
     subgraph group_housekeeping[Housekeeping]
         sync_gate_replica["Sync Gate Replica<br/>object / housekeeping / housekeeping"]
-        checkpoint_save["Checkpoint Save<br/>object / housekeeping / housekeeping"]
+        checkpoint_save["Checkpoint Save<br/>object / housekeeping / housekeeping  [periodic]"]
         program_hold(["Hold / next round<br/>control / housekeeping / hold"])
     end
 
@@ -283,17 +283,17 @@ The colored edges retain topology and data/reaction structure. The black numbere
 %%{init: {'theme':'base','flowchart':{'curve':'basis','htmlLabels':true}}}%%
 flowchart TD
     subgraph group_bootstrap[Bootstrap]
-        wave_pool["Wave Pool<br/>object / bootstrap / seed"]
+        wave_pool["Wave Pool<br/>object / bootstrap / seed  [once]"]
     end
     subgraph group_build[Build]
-        build_classifier["Build Classifier<br/>object / build / builder"]
-        config_search["Config Search<br/>object / build / node"]
-        build_transformer["Build Transformer<br/>object / build / builder"]
-        build_gan["Build GAN<br/>object / build / builder"]
+        build_classifier["Build Classifier<br/>object / build / builder  [once]"]
+        config_search["Config Search<br/>object / build / node  [once]"]
+        build_transformer["Build Transformer<br/>object / build / builder  [once]"]
+        build_gan["Build GAN<br/>object / build / builder  [once]"]
         build_wave_classifier["Build Wave Classifier<br/>object / build / builder"]
     end
     subgraph group_vocab[Vocab]
-        init_vocab["Init Vocab<br/>object / vocab / seed"]
+        init_vocab["Init Vocab<br/>object / vocab / seed  [once]"]
         vocab_churn["Vocab Churn<br/>object / vocab / seed"]
         build_symbol_pool["Build Symbol Pool<br/>object / vocab / builder"]
         build_label_embedding["Build Label Embedding<br/>object / vocab / builder"]
@@ -304,25 +304,25 @@ flowchart TD
     end
     subgraph group_train[Train]
         stage_0_pregestation["Pregestation Train<br/>object / train / stage"]
-        stage_1_gestation["Gestation Train<br/>object / train / stage"]
-        stage_2_berkeley["Berkeley Refresh Train<br/>object / train / stage"]
-        stage_r_transformer["Transformer Train<br/>object / train / stage"]
-        stage_g_generator["Generator Train<br/>object / train / stage"]
-        stage_w_wave_classifier["Wave Classifier Train<br/>object / train / stage"]
-        stage_c_lora["LoRA Round<br/>object / train / stage"]
-        stage_fake_feedback["Fake Class Feedback<br/>object / train / stage"]
+        stage_1_gestation["Gestation Train<br/>object / train / stage  [gated]"]
+        stage_2_berkeley["Berkeley Refresh Train<br/>object / train / stage  [gated]"]
+        stage_r_transformer["Transformer Train<br/>object / train / stage  [gated]"]
+        stage_g_generator["Generator Train<br/>object / train / stage  [gated]"]
+        stage_w_wave_classifier["Wave Classifier Train<br/>object / train / stage  [gated]"]
+        stage_c_lora["LoRA Round<br/>object / train / stage  [gated]"]
+        stage_fake_feedback["Fake Class Feedback<br/>object / train / stage  [gated]"]
     end
     subgraph group_gates[Gates]
         gate_0_pregestation_eval["Pregestation Eval<br/>object / gates / gate"]
-        gate_1_gestation_eval["Gestation Eval<br/>object / gates / gate"]
-        gate_berkeley["Berkeley Gate<br/>object / gates / gate"]
-        gate_transformer["Transformer Gate<br/>object / gates / gate"]
-        gate_generator["Generator Gate<br/>object / gates / gate"]
-        gate_wave["Wave Gate<br/>object / gates / gate"]
+        gate_1_gestation_eval["Gestation Eval<br/>object / gates / gate  [gated]"]
+        gate_berkeley["Berkeley Gate<br/>object / gates / gate  [gated]"]
+        gate_transformer["Transformer Gate<br/>object / gates / gate  [gated]"]
+        gate_generator["Generator Gate<br/>object / gates / gate  [gated]"]
+        gate_wave["Wave Gate<br/>object / gates / gate  [gated]"]
     end
     subgraph group_housekeeping[Housekeeping]
         sync_gate_replica["Sync Gate Replica<br/>object / housekeeping / housekeeping"]
-        checkpoint_save["Checkpoint Save<br/>object / housekeeping / housekeeping"]
+        checkpoint_save["Checkpoint Save<br/>object / housekeeping / housekeeping  [periodic]"]
     end
 
     wave_pool -- "startup" --> init_vocab
@@ -1503,6 +1503,284 @@ Downloads: [PNG](docs/diagrams/stack_view_reaction.png) | [SVG](docs/diagrams/st
 <!-- END:GENERATED_STACK_VIEW_LAYER -->
 
 <!-- BEGIN:GENERATED_PROVENANCE_LAYER -->
+**GPU Model Provenance Dense Infographic**
+
+```mermaid
+%%{init: {'theme':'base','flowchart':{'curve':'basis','htmlLabels':true}}}%%
+flowchart LR
+    subgraph group_other[Other]
+        build_classifier["Build Classifier<br/>object / other / BuildClassifierNode"]
+        config_search["Config Search<br/>object / other / ConfigSearchNode"]
+        build_label_embedding["Build Label Embedding<br/>object / other / BuildLabelEmbeddingNode"]
+        stage_0_pregestation["Stage 0 Pregestation<br/>object / other / PregestationTrainNode"]
+        stage_1_gestation["Stage 1 Gestation<br/>object / other / GestationTrainNode"]
+        stage_2_berkeley["Stage 2 Berkeley<br/>object / other / BerkeleyRefreshTrainNode"]
+        stage_r_transformer["Stage R Transformer<br/>object / other / TransformerTrainNode"]
+        stage_g_generator["Stage G Generator<br/>object / other / GeneratorTrainNode"]
+        stage_w_wave_classifier["Stage W Wave Classifier<br/>object / other / WaveClassifierTrainNode"]
+        stage_c_lora["Stage C Lora<br/>object / other / LoRARoundNode"]
+        stage_fake_feedback["Stage Fake Feedback<br/>object / other / FakeClassFeedbackNode"]
+        gate_0_pregestation_eval["Gate 0 Pregestation Eval<br/>object / other / PregestationEvalNode"]
+        gate_1_gestation_eval["Gate 1 Gestation Eval<br/>object / other / GestationEvalNode"]
+        gate_berkeley["Gate Berkeley<br/>object / other / BerkeleyGateNode"]
+        gate_transformer["Gate Transformer<br/>object / other / TransformerGateNode"]
+        gate_generator["Gate Generator<br/>object / other / GeneratorGateNode"]
+        gate_wave["Gate Wave<br/>object / other / WaveGateNode"]
+        sync_gate_replica["Sync Gate Replica<br/>object / other / SyncGateReplicaNode"]
+        build_transformer["Build Transformer<br/>object / other / BuildTransformerNode"]
+        build_wave_classifier["Build Wave Classifier<br/>object / other / BuildWaveClassifierNode"]
+    end
+    subgraph group_inference[Inference]
+        model__classifier["Classifier Model<br/>resource / inference / gpu_model"]
+        model__discriminator["Discriminator Model<br/>resource / inference / gpu_model"]
+        model__generator["GAN Generator<br/>resource / inference / gpu_model"]
+        model__transformer["Transformer Model<br/>resource / inference / gpu_model"]
+        model__wave_classifier["Wave Classifier Model<br/>resource / inference / gpu_model"]
+    end
+
+    build_classifier -- "gpu-resident classifier" --> model__classifier
+    config_search -- "gpu-resident classifier" --> model__classifier
+    build_label_embedding -- "gpu-resident classifier" --> model__classifier
+    stage_0_pregestation -- "gpu-resident classifier" --> model__classifier
+    stage_1_gestation -- "gpu-resident classifier" --> model__classifier
+    stage_2_berkeley -- "gpu-resident classifier" --> model__classifier
+    stage_r_transformer -- "gpu-resident classifier" --> model__classifier
+    stage_g_generator -- "gpu-resident classifier" --> model__classifier
+    stage_w_wave_classifier -- "gpu-resident classifier" --> model__classifier
+    stage_c_lora -- "gpu-resident classifier" --> model__classifier
+    stage_fake_feedback -- "gpu-resident classifier" --> model__classifier
+    gate_0_pregestation_eval -- "gpu-resident classifier" --> model__classifier
+    gate_1_gestation_eval -- "gpu-resident classifier" --> model__classifier
+    gate_berkeley -- "gpu-resident classifier" --> model__classifier
+    gate_transformer -- "gpu-resident classifier" --> model__classifier
+    gate_generator -- "gpu-resident classifier" --> model__classifier
+    gate_wave -- "gpu-resident classifier" --> model__classifier
+    sync_gate_replica -- "gpu-resident classifier" --> model__classifier
+    stage_g_generator -- "gpu-resident discriminator" --> model__discriminator
+    stage_fake_feedback -- "gpu-resident discriminator" --> model__discriminator
+    stage_g_generator -- "gpu-resident generator" --> model__generator
+    stage_fake_feedback -- "gpu-resident generator" --> model__generator
+    gate_generator -- "gpu-resident generator" --> model__generator
+    build_transformer -- "gpu-resident transformer" --> model__transformer
+    stage_r_transformer -- "gpu-resident transformer" --> model__transformer
+    stage_w_wave_classifier -- "gpu-resident transformer" --> model__transformer
+    build_wave_classifier -- "gpu-resident wave_classifier" --> model__wave_classifier
+    stage_w_wave_classifier -- "gpu-resident wave_classifier" --> model__wave_classifier
+
+    classDef faculty_bootstrap fill:#E9F1F7,stroke:#4B6B88,color:#102A43,stroke-width:2px;
+    classDef faculty_build fill:#F8EFE5,stroke:#B07219,color:#40210F,stroke-width:2px;
+    classDef faculty_vocab fill:#FFF7CC,stroke:#9A7D0A,color:#3D3100,stroke-width:2px;
+    classDef faculty_data fill:#DFF6F5,stroke:#127475,color:#053B3C,stroke-width:2px;
+    classDef faculty_train fill:#FFE8D6,stroke:#C05621,color:#4A1D05,stroke-width:2px;
+    classDef faculty_gates fill:#FDE2E4,stroke:#C0392B,color:#4A0F13,stroke-width:2px;
+    classDef faculty_housekeeping fill:#E8F5E9,stroke:#2E7D32,color:#102A12,stroke-width:2px;
+    classDef faculty_io fill:#DDEBFF,stroke:#2563EB,color:#0F172A,stroke-width:2px;
+    classDef faculty_inference fill:#F4F1DE,stroke:#3D405B,color:#1B1F2A,stroke-width:2px;
+    classDef faculty_buffer fill:#E0FBFC,stroke:#006D77,color:#00313A,stroke-width:2px;
+    classDef faculty_gate fill:#FDE2E4,stroke:#C0392B,color:#4A0F13,stroke-width:2px;
+    classDef faculty_other fill:#F3F4F6,stroke:#6B7280,color:#111827,stroke-width:2px;
+    class model__classifier,model__discriminator,model__generator,model__transformer,model__wave_classifier faculty_inference;
+    class build_classifier,config_search,build_label_embedding,stage_0_pregestation,stage_1_gestation,stage_2_berkeley,stage_r_transformer,stage_g_generator,stage_w_wave_classifier,stage_c_lora,stage_fake_feedback,gate_0_pregestation_eval,gate_1_gestation_eval,gate_berkeley,gate_transformer,gate_generator,gate_wave,sync_gate_replica,build_transformer,build_wave_classifier faculty_other;
+    linkStyle 0 stroke:#6B7280,stroke-width:2px,opacity:0.75,stroke-dasharray:0;
+    linkStyle 1 stroke:#6B7280,stroke-width:2px,opacity:0.75,stroke-dasharray:0;
+    linkStyle 2 stroke:#6B7280,stroke-width:2px,opacity:0.75,stroke-dasharray:0;
+    linkStyle 3 stroke:#6B7280,stroke-width:2px,opacity:0.75,stroke-dasharray:0;
+    linkStyle 4 stroke:#6B7280,stroke-width:2px,opacity:0.75,stroke-dasharray:0;
+    linkStyle 5 stroke:#6B7280,stroke-width:2px,opacity:0.75,stroke-dasharray:0;
+    linkStyle 6 stroke:#6B7280,stroke-width:2px,opacity:0.75,stroke-dasharray:0;
+    linkStyle 7 stroke:#6B7280,stroke-width:2px,opacity:0.75,stroke-dasharray:0;
+    linkStyle 8 stroke:#6B7280,stroke-width:2px,opacity:0.75,stroke-dasharray:0;
+    linkStyle 9 stroke:#6B7280,stroke-width:2px,opacity:0.75,stroke-dasharray:0;
+    linkStyle 10 stroke:#6B7280,stroke-width:2px,opacity:0.75,stroke-dasharray:0;
+    linkStyle 11 stroke:#6B7280,stroke-width:2px,opacity:0.75,stroke-dasharray:0;
+    linkStyle 12 stroke:#6B7280,stroke-width:2px,opacity:0.75,stroke-dasharray:0;
+    linkStyle 13 stroke:#6B7280,stroke-width:2px,opacity:0.75,stroke-dasharray:0;
+    linkStyle 14 stroke:#6B7280,stroke-width:2px,opacity:0.75,stroke-dasharray:0;
+    linkStyle 15 stroke:#6B7280,stroke-width:2px,opacity:0.75,stroke-dasharray:0;
+    linkStyle 16 stroke:#6B7280,stroke-width:2px,opacity:0.75,stroke-dasharray:0;
+    linkStyle 17 stroke:#6B7280,stroke-width:2px,opacity:0.75,stroke-dasharray:0;
+    linkStyle 18 stroke:#6B7280,stroke-width:2px,opacity:0.75,stroke-dasharray:0;
+    linkStyle 19 stroke:#6B7280,stroke-width:2px,opacity:0.75,stroke-dasharray:0;
+    linkStyle 20 stroke:#6B7280,stroke-width:2px,opacity:0.75,stroke-dasharray:0;
+    linkStyle 21 stroke:#6B7280,stroke-width:2px,opacity:0.75,stroke-dasharray:0;
+    linkStyle 22 stroke:#6B7280,stroke-width:2px,opacity:0.75,stroke-dasharray:0;
+    linkStyle 23 stroke:#6B7280,stroke-width:2px,opacity:0.75,stroke-dasharray:0;
+    linkStyle 24 stroke:#6B7280,stroke-width:2px,opacity:0.75,stroke-dasharray:0;
+    linkStyle 25 stroke:#6B7280,stroke-width:2px,opacity:0.75,stroke-dasharray:0;
+    linkStyle 26 stroke:#6B7280,stroke-width:2px,opacity:0.75,stroke-dasharray:0;
+    linkStyle 27 stroke:#6B7280,stroke-width:2px,opacity:0.75,stroke-dasharray:0;
+```
+
+Downloads: [PNG](docs/diagrams/provenance_dense.png) | [SVG](docs/diagrams/provenance_dense.svg) | [MMD](docs/diagrams/provenance_dense.mmd)
+
+Node colors group bootstrap, build, vocab, data, train, gate, and housekeeping faculties. Edge colors separate startup, per-round, data-provision, gated progression, and end-of-round reactions.
+
+<details>
+
+<summary>Minimal schematic view</summary>
+
+
+
+```mermaid
+%%{init: {'theme':'base','flowchart':{'curve':'basis','htmlLabels':true}}}%%
+flowchart LR
+    model__classifier["Classifier Model"]
+    model__discriminator["Discriminator Model"]
+    model__generator["GAN Generator"]
+    model__transformer["Transformer Model"]
+    model__wave_classifier["Wave Classifier Model"]
+    build_classifier["Build Classifier"]
+    config_search["Config Search"]
+    build_label_embedding["Build Label Embedding"]
+    stage_0_pregestation["Stage 0 Pregestation"]
+    stage_1_gestation["Stage 1 Gestation"]
+    stage_2_berkeley["Stage 2 Berkeley"]
+    stage_r_transformer["Stage R Transformer"]
+    stage_g_generator["Stage G Generator"]
+    stage_w_wave_classifier["Stage W Wave Classifier"]
+    stage_c_lora["Stage C Lora"]
+    stage_fake_feedback["Stage Fake Feedback"]
+    gate_0_pregestation_eval["Gate 0 Pregestation Eval"]
+    gate_1_gestation_eval["Gate 1 Gestation Eval"]
+    gate_berkeley["Gate Berkeley"]
+    gate_transformer["Gate Transformer"]
+    gate_generator["Gate Generator"]
+    gate_wave["Gate Wave"]
+    sync_gate_replica["Sync Gate Replica"]
+    build_transformer["Build Transformer"]
+    build_wave_classifier["Build Wave Classifier"]
+
+    build_classifier --> model__classifier
+    config_search --> model__classifier
+    build_label_embedding --> model__classifier
+    stage_0_pregestation --> model__classifier
+    stage_1_gestation --> model__classifier
+    stage_2_berkeley --> model__classifier
+    stage_r_transformer --> model__classifier
+    stage_g_generator --> model__classifier
+    stage_w_wave_classifier --> model__classifier
+    stage_c_lora --> model__classifier
+    stage_fake_feedback --> model__classifier
+    gate_0_pregestation_eval --> model__classifier
+    gate_1_gestation_eval --> model__classifier
+    gate_berkeley --> model__classifier
+    gate_transformer --> model__classifier
+    gate_generator --> model__classifier
+    gate_wave --> model__classifier
+    sync_gate_replica --> model__classifier
+    stage_g_generator --> model__discriminator
+    stage_fake_feedback --> model__discriminator
+    stage_g_generator --> model__generator
+    stage_fake_feedback --> model__generator
+    gate_generator --> model__generator
+    build_transformer --> model__transformer
+    stage_r_transformer --> model__transformer
+    stage_w_wave_classifier --> model__transformer
+    build_wave_classifier --> model__wave_classifier
+    stage_w_wave_classifier --> model__wave_classifier
+```
+
+Downloads: [PNG](docs/diagrams/provenance_minimal.png) | [SVG](docs/diagrams/provenance_minimal.svg) | [MMD](docs/diagrams/provenance_minimal.mmd)
+
+</details>
+
+<details>
+
+<summary>Reaction-colored view</summary>
+
+
+
+```mermaid
+%%{init: {'theme':'base','flowchart':{'curve':'basis','htmlLabels':true}}}%%
+flowchart LR
+    model__classifier["Classifier Model"]
+    model__discriminator["Discriminator Model"]
+    model__generator["GAN Generator"]
+    model__transformer["Transformer Model"]
+    model__wave_classifier["Wave Classifier Model"]
+    build_classifier["Build Classifier"]
+    config_search["Config Search"]
+    build_label_embedding["Build Label Embedding"]
+    stage_0_pregestation["Stage 0 Pregestation"]
+    stage_1_gestation["Stage 1 Gestation"]
+    stage_2_berkeley["Stage 2 Berkeley"]
+    stage_r_transformer["Stage R Transformer"]
+    stage_g_generator["Stage G Generator"]
+    stage_w_wave_classifier["Stage W Wave Classifier"]
+    stage_c_lora["Stage C Lora"]
+    stage_fake_feedback["Stage Fake Feedback"]
+    gate_0_pregestation_eval["Gate 0 Pregestation Eval"]
+    gate_1_gestation_eval["Gate 1 Gestation Eval"]
+    gate_berkeley["Gate Berkeley"]
+    gate_transformer["Gate Transformer"]
+    gate_generator["Gate Generator"]
+    gate_wave["Gate Wave"]
+    sync_gate_replica["Sync Gate Replica"]
+    build_transformer["Build Transformer"]
+    build_wave_classifier["Build Wave Classifier"]
+
+    build_classifier -- "gpu-resident classifier | residency.acquire" --> model__classifier
+    config_search -- "gpu-resident classifier | residency.acquire" --> model__classifier
+    build_label_embedding -- "gpu-resident classifier | residency.acquire" --> model__classifier
+    stage_0_pregestation -- "gpu-resident classifier | residency.acquire" --> model__classifier
+    stage_1_gestation -- "gpu-resident classifier | residency.acquire" --> model__classifier
+    stage_2_berkeley -- "gpu-resident classifier | residency.acquire" --> model__classifier
+    stage_r_transformer -- "gpu-resident classifier | residency.acquire" --> model__classifier
+    stage_g_generator -- "gpu-resident classifier | residency.acquire" --> model__classifier
+    stage_w_wave_classifier -- "gpu-resident classifier | residency.acquire" --> model__classifier
+    stage_c_lora -- "gpu-resident classifier | residency.acquire" --> model__classifier
+    stage_fake_feedback -- "gpu-resident classifier | residency.acquire" --> model__classifier
+    gate_0_pregestation_eval -- "gpu-resident classifier | residency.acquire" --> model__classifier
+    gate_1_gestation_eval -- "gpu-resident classifier | residency.acquire" --> model__classifier
+    gate_berkeley -- "gpu-resident classifier | residency.acquire" --> model__classifier
+    gate_transformer -- "gpu-resident classifier | residency.acquire" --> model__classifier
+    gate_generator -- "gpu-resident classifier | residency.acquire" --> model__classifier
+    gate_wave -- "gpu-resident classifier | residency.acquire" --> model__classifier
+    sync_gate_replica -- "gpu-resident classifier | residency.acquire" --> model__classifier
+    stage_g_generator -- "gpu-resident discriminator | residency.acquire" --> model__discriminator
+    stage_fake_feedback -- "gpu-resident discriminator | residency.acquire" --> model__discriminator
+    stage_g_generator -- "gpu-resident generator | residency.acquire" --> model__generator
+    stage_fake_feedback -- "gpu-resident generator | residency.acquire" --> model__generator
+    gate_generator -- "gpu-resident generator | residency.acquire" --> model__generator
+    build_transformer -- "gpu-resident transformer | residency.acquire" --> model__transformer
+    stage_r_transformer -- "gpu-resident transformer | residency.acquire" --> model__transformer
+    stage_w_wave_classifier -- "gpu-resident transformer | residency.acquire" --> model__transformer
+    build_wave_classifier -- "gpu-resident wave_classifier | residency.acquire" --> model__wave_classifier
+    stage_w_wave_classifier -- "gpu-resident wave_classifier | residency.acquire" --> model__wave_classifier
+
+    linkStyle 0 stroke:#6B7280,stroke-width:2px,opacity:0.75,stroke-dasharray:0;
+    linkStyle 1 stroke:#6B7280,stroke-width:2px,opacity:0.75,stroke-dasharray:0;
+    linkStyle 2 stroke:#6B7280,stroke-width:2px,opacity:0.75,stroke-dasharray:0;
+    linkStyle 3 stroke:#6B7280,stroke-width:2px,opacity:0.75,stroke-dasharray:0;
+    linkStyle 4 stroke:#6B7280,stroke-width:2px,opacity:0.75,stroke-dasharray:0;
+    linkStyle 5 stroke:#6B7280,stroke-width:2px,opacity:0.75,stroke-dasharray:0;
+    linkStyle 6 stroke:#6B7280,stroke-width:2px,opacity:0.75,stroke-dasharray:0;
+    linkStyle 7 stroke:#6B7280,stroke-width:2px,opacity:0.75,stroke-dasharray:0;
+    linkStyle 8 stroke:#6B7280,stroke-width:2px,opacity:0.75,stroke-dasharray:0;
+    linkStyle 9 stroke:#6B7280,stroke-width:2px,opacity:0.75,stroke-dasharray:0;
+    linkStyle 10 stroke:#6B7280,stroke-width:2px,opacity:0.75,stroke-dasharray:0;
+    linkStyle 11 stroke:#6B7280,stroke-width:2px,opacity:0.75,stroke-dasharray:0;
+    linkStyle 12 stroke:#6B7280,stroke-width:2px,opacity:0.75,stroke-dasharray:0;
+    linkStyle 13 stroke:#6B7280,stroke-width:2px,opacity:0.75,stroke-dasharray:0;
+    linkStyle 14 stroke:#6B7280,stroke-width:2px,opacity:0.75,stroke-dasharray:0;
+    linkStyle 15 stroke:#6B7280,stroke-width:2px,opacity:0.75,stroke-dasharray:0;
+    linkStyle 16 stroke:#6B7280,stroke-width:2px,opacity:0.75,stroke-dasharray:0;
+    linkStyle 17 stroke:#6B7280,stroke-width:2px,opacity:0.75,stroke-dasharray:0;
+    linkStyle 18 stroke:#6B7280,stroke-width:2px,opacity:0.75,stroke-dasharray:0;
+    linkStyle 19 stroke:#6B7280,stroke-width:2px,opacity:0.75,stroke-dasharray:0;
+    linkStyle 20 stroke:#6B7280,stroke-width:2px,opacity:0.75,stroke-dasharray:0;
+    linkStyle 21 stroke:#6B7280,stroke-width:2px,opacity:0.75,stroke-dasharray:0;
+    linkStyle 22 stroke:#6B7280,stroke-width:2px,opacity:0.75,stroke-dasharray:0;
+    linkStyle 23 stroke:#6B7280,stroke-width:2px,opacity:0.75,stroke-dasharray:0;
+    linkStyle 24 stroke:#6B7280,stroke-width:2px,opacity:0.75,stroke-dasharray:0;
+    linkStyle 25 stroke:#6B7280,stroke-width:2px,opacity:0.75,stroke-dasharray:0;
+    linkStyle 26 stroke:#6B7280,stroke-width:2px,opacity:0.75,stroke-dasharray:0;
+    linkStyle 27 stroke:#6B7280,stroke-width:2px,opacity:0.75,stroke-dasharray:0;
+```
+
+Downloads: [PNG](docs/diagrams/provenance_reaction.png) | [SVG](docs/diagrams/provenance_reaction.svg) | [MMD](docs/diagrams/provenance_reaction.mmd)
+
+</details>
 <!-- END:GENERATED_PROVENANCE_LAYER -->
 
 ## Node Roles

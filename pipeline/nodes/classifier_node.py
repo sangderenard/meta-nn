@@ -189,6 +189,10 @@ class BuildClassifierNode(PipelineNode):
         self.cfg = cfg
         self._built = False
 
+    @property
+    def runtime_execution_policy(self) -> tuple:
+        return ("once", {})
+
     def should_run(self, ctx: PipelineContext) -> bool:
         return not self._built
 

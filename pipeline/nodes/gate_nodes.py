@@ -518,6 +518,10 @@ class CheckpointSaveNode(PipelineNode):
     def __init__(self, save_every_n_rounds: int = 1) -> None:
         self.save_every_n_rounds = max(1, int(save_every_n_rounds))
 
+    @property
+    def runtime_execution_policy(self) -> tuple:
+        return ("periodic", {"period": self.save_every_n_rounds})
+
     def should_run(self, ctx: PipelineContext) -> bool:
         return (ctx.round_id % self.save_every_n_rounds) == 0
 

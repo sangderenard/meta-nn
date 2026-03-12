@@ -144,6 +144,10 @@ class WavePoolNode(PipelineNode):
         self.cfg = cfg
         self._done = False
 
+    @property
+    def runtime_execution_policy(self) -> tuple:
+        return ("once", {})
+
     def should_run(self, ctx: PipelineContext) -> bool:
         return not self._done
 

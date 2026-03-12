@@ -1,17 +1,17 @@
 %%{init: {'theme':'base','themeVariables':{'background':'#f5f6f7','mainBkg':'#f5f6f7'},'flowchart':{'curve':'basis','htmlLabels':true}}}%%
 flowchart TD
     subgraph group_bootstrap[Bootstrap]
-        wave_pool["Wave Pool<br/>object / bootstrap / seed"]
+        wave_pool["Wave Pool<br/>object / bootstrap / seed  [once]"]
     end
     subgraph group_build[Build]
-        build_classifier["Build Classifier<br/>object / build / builder"]
-        config_search["Config Search<br/>object / build / node"]
-        build_transformer["Build Transformer<br/>object / build / builder"]
-        build_gan["Build GAN<br/>object / build / builder"]
+        build_classifier["Build Classifier<br/>object / build / builder  [once]"]
+        config_search["Config Search<br/>object / build / node  [once]"]
+        build_transformer["Build Transformer<br/>object / build / builder  [once]"]
+        build_gan["Build GAN<br/>object / build / builder  [once]"]
         build_wave_classifier["Build Wave Classifier<br/>object / build / builder"]
     end
     subgraph group_vocab[Vocab]
-        init_vocab["Init Vocab<br/>object / vocab / seed"]
+        init_vocab["Init Vocab<br/>object / vocab / seed  [once]"]
         vocab_churn["Vocab Churn<br/>object / vocab / seed"]
         build_symbol_pool["Build Symbol Pool<br/>object / vocab / builder"]
         build_label_embedding["Build Label Embedding<br/>object / vocab / builder"]
@@ -22,21 +22,21 @@ flowchart TD
     end
     subgraph group_train[Train]
         stage_0_pregestation["Pregestation Train<br/>object / train / stage"]
-        stage_1_gestation["Gestation Train<br/>object / train / stage"]
-        stage_2_berkeley["Berkeley Refresh Train<br/>object / train / stage"]
-        stage_r_transformer["Transformer Train<br/>object / train / stage"]
-        stage_g_generator["Generator Train<br/>object / train / stage"]
-        stage_w_wave_classifier["Wave Classifier Train<br/>object / train / stage"]
-        stage_c_lora["LoRA Round<br/>object / train / stage"]
-        stage_fake_feedback["Fake Class Feedback<br/>object / train / stage"]
+        stage_1_gestation["Gestation Train<br/>object / train / stage  [gated]"]
+        stage_2_berkeley["Berkeley Refresh Train<br/>object / train / stage  [gated]"]
+        stage_r_transformer["Transformer Train<br/>object / train / stage  [gated]"]
+        stage_g_generator["Generator Train<br/>object / train / stage  [gated]"]
+        stage_w_wave_classifier["Wave Classifier Train<br/>object / train / stage  [gated]"]
+        stage_c_lora["LoRA Round<br/>object / train / stage  [gated]"]
+        stage_fake_feedback["Fake Class Feedback<br/>object / train / stage  [gated]"]
     end
     subgraph group_gates[Gates]
         gate_0_pregestation_eval["Pregestation Eval<br/>object / gates / gate"]
-        gate_1_gestation_eval["Gestation Eval<br/>object / gates / gate"]
-        gate_berkeley["Berkeley Gate<br/>object / gates / gate"]
-        gate_transformer["Transformer Gate<br/>object / gates / gate"]
-        gate_generator["Generator Gate<br/>object / gates / gate"]
-        gate_wave["Wave Gate<br/>object / gates / gate"]
+        gate_1_gestation_eval["Gestation Eval<br/>object / gates / gate  [gated]"]
+        gate_berkeley["Berkeley Gate<br/>object / gates / gate  [gated]"]
+        gate_transformer["Transformer Gate<br/>object / gates / gate  [gated]"]
+        gate_generator["Generator Gate<br/>object / gates / gate  [gated]"]
+        gate_wave["Wave Gate<br/>object / gates / gate  [gated]"]
         decision_004_stage_w_wave_classifier{"Wave stage ready?<br/>control / gates / decision"}
         decision_007_gate_wave{"Wave stage ready?<br/>control / gates / decision"}
         decision_010_build_gan{"GAN mode?<br/>control / gates / decision"}
@@ -53,7 +53,7 @@ flowchart TD
     end
     subgraph group_housekeeping[Housekeeping]
         sync_gate_replica["Sync Gate Replica<br/>object / housekeeping / housekeeping"]
-        checkpoint_save["Checkpoint Save<br/>object / housekeeping / housekeeping"]
+        checkpoint_save["Checkpoint Save<br/>object / housekeeping / housekeeping  [periodic]"]
         program_hold(["Hold / next round<br/>control / housekeeping / hold"])
     end
 

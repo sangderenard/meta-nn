@@ -22,6 +22,8 @@ Checks:
  15. execution_program guards can directly control runtime execution
  16. execution_program decision and hold steps are traversed explicitly
  17. execution_program traversal can revisit cyclic paths before halting
+ 18. execution_policy fields survive plan export and JSON round-trip
+ 19. execution_policy badges appear in dense Mermaid rendering
 """
 from __future__ import annotations
 
@@ -798,6 +800,298 @@ def test_provenance_layer(graph):
     _ok("provenance layer is populated and renderable")
 
 
+def test_cycle_edges_roundtrip(graph):
+    """Verify cycle edges are synthesized, survive JSON round-trip, and render in Mermaid."""
+    print("\n--- test_cycle_edges_roundtrip ---")
+    plan = plan_from_pipeline_graph(
+        graph,
+        name="Cycle Test Plan",
+        revision=1,
+        worker_hints={
+            "output_dir": "/tmp/smoke_cycle",
+            "orchestration_cycles": 3,
+            "orchestration_rounds": 4,
+            "capabilities": ["plan_apply"],
+        },
+        graph_layers=build_graph_layers(graph),
+        execution_program=build_execution_program(graph),
+    )
+    # Cycle edge should exist
+    cycle_edges = [e for e in plan.edges if e.layer == "cycle"]
+    _assert(len(cycle_edges) >= 1, f"plan has {len(cycle_edges)} cycle edge(s)")
+    ce = cycle_edges[0]
+    _assert(ce.kind == "cycle_return", f"cycle edge kind is {ce.kind!r}")
+    _assert(bool(ce.cycle_control), "cycle edge has cycle_control dict")
+    _assert(ce.cycle_control.get("max_iterations") == 12, f"max_iterations = {ce.cycle_control.get('max_iterations')}")
+    _assert(ce.cycle_control.get("cycles") == 3, f"cycles = {ce.cycle_control.get('cycles')}")
+    _assert(ce.cycle_control.get("rounds_per_cycle") == 4, f"rounds_per_cycle = {ce.cycle_control.get('rounds_per_cycle')}")
+    _assert(ce.cycle_control.get("stride", 0) > 0, f"stride = {ce.cycle_control.get('stride')}")
+    _assert(str(ce.metadata.get("style_role", "")) == "cycle", "cycle edge metadata has style_role='cycle'")
+
+    # Validate() should pass (cycle edges excluded from DAG check)
+    plan.validate()
+    _ok("plan.validate() passes with cycle edges present")
+
+    # JSON round-trip
+    with tempfile.TemporaryDirectory() as td:
+        path = Path(td) / "cycle_plan.json"
+        plan.save_json(path)
+        reloaded = TrainingGraphPlan.load_json(path)
+    reloaded_cycle = [e for e in reloaded.edges if e.layer == "cycle"]
+    _assert(len(reloaded_cycle) == len(cycle_edges), "cycle edges survive JSON round-trip")
+    _assert(reloaded_cycle[0].cycle_control == ce.cycle_control, "cycle_control dict round-trips")
+
+    # Mermaid rendering — cycle edge should use dotted arrow
+    from pipeline.graph_layers import build_graph_layers_from_plan, render_mermaid_flowchart
+    layers = build_graph_layers_from_plan(reloaded)
+    execution_layer = layers.get("execution", {})
+    cycle_layer_edges = [
+        e for e in execution_layer.get("edges", [])
+        if str(dict(e.get("metadata", {}) or {}).get("style_role", "")) == "cycle"
+    ]
+    _assert(len(cycle_layer_edges) >= 1, f"execution layer includes {len(cycle_layer_edges)} cycle edge(s)")
+    mermaid = render_mermaid_flowchart(execution_layer, view="dense")
+    _assert(".->" in mermaid, "Mermaid uses dotted arrow for cycle edge")
+    _assert("round return" in mermaid.lower(), "Mermaid shows cycle edge label")
+    _ok("cycle edges synthesized, round-tripped, and rendered in Mermaid")
+
+
+def test_cycle_gate_instantiation_from_ir(graph):
+    """Verify that IR cycle edges cause CycleGate objects to be instantiated,
+    and that those objects own the iteration logic."""
+    print("\n--- test_cycle_gate_instantiation_from_ir ---")
+    from pipeline.graph import CycleGate
+
+    # Build a plan with cycle edges (3 cycles × 2 rounds = 6 iterations).
+    plan = plan_from_pipeline_graph(
+        graph,
+        name="CycleGate Instantiation Test",
+        revision=1,
+        worker_hints={
+            "output_dir": "/tmp/smoke_cycle_gate",
+            "orchestration_cycles": 3,
+            "orchestration_rounds": 2,
+            "capabilities": ["plan_apply"],
+        },
+        graph_layers=build_graph_layers(graph),
+        execution_program=build_execution_program(graph),
+    )
+
+    # The IR cycle edges must cause CycleGate objects to exist.
+    gates = CycleGate.from_plan(plan)
+    _assert(len(gates) >= 1, f"CycleGate.from_plan produced {len(gates)} gate(s)")
+    gate = gates[0]
+    _assert(gate.max_iterations == 6, f"gate.max_iterations={gate.max_iterations} (expected 6)")
+    _assert(gate.cycles == 3, f"gate.cycles={gate.cycles} (expected 3)")
+    _assert(gate.rounds_per_cycle == 2, f"gate.rounds_per_cycle={gate.rounds_per_cycle} (expected 2)")
+    _assert(gate.iteration == 0, "gate starts at iteration 0")
+    _assert(not gate.exhausted, "gate is not exhausted at start")
+
+    # The gate object owns the repeat/exhaust decision.
+    results = []
+    for _ in range(6):
+        results.append(gate.evaluate())
+    _assert(results[:5] == ["repeat"] * 5, f"first 5 evaluations are 'repeat': {results[:5]}")
+    _assert(results[5] == "exhaust", f"6th evaluation is 'exhaust': {results[5]}")
+    _assert(gate.exhausted, "gate is exhausted after max_iterations evaluations")
+    _assert(gate.iteration == 6, f"gate.iteration={gate.iteration} after exhaustion")
+
+    # Legacy plan without cycle edges → no gates.
+    plan_no_cycle = plan_from_pipeline_graph(
+        graph,
+        name="No Cycle Plan",
+        revision=1,
+        worker_hints={
+            "output_dir": "/tmp/smoke_no_cycle",
+            "orchestration_cycles": 0,
+            "orchestration_rounds": 0,
+        },
+        graph_layers=build_graph_layers(graph),
+        execution_program=build_execution_program(graph),
+    )
+    gates_empty = CycleGate.from_plan(plan_no_cycle)
+    _assert(len(gates_empty) == 0, f"legacy plan produces 0 gates, got {len(gates_empty)}")
+    _ok("CycleGate objects instantiated from IR; they own iteration state")
+
+
+def test_cycle_gate_drives_interpreter(graph):
+    """Verify the interpreter uses CycleGate objects from ctx to loop,
+    with no cycle-specific steps in the execution program."""
+    print("\n--- test_cycle_gate_drives_interpreter ---")
+    from pipeline.graph import CycleGate
+
+    # Build a minimal graph with one node.
+    mini_graph = PipelineGraph(name="cycle_gate_interp")
+
+    class _Counter(PipelineNode):
+        @property
+        def node_id(self) -> str:
+            return "counter"
+        def execute(self, ctx) -> None:
+            ctx.label_embedding_info["n"] = int(ctx.label_embedding_info.get("n", 0)) + 1
+            ctx.last_node_statuses[self.node_id] = "ran"
+
+    mini_graph.add_node(_Counter())
+
+    # A plain forward-only program — NO cycle_decision steps, NO cycle
+    # transitions.  The program is just: node → hold.
+    mini_program = {
+        "entry_step_id": "step_counter",
+        "halt_step_ids": ["program_hold"],
+        "steps": [
+            {"step_id": "step_counter", "kind": "node", "node_id": "counter",
+             "call_ref": "Counter.execute", "display_order": 10,
+             "guard_condition_ids": [], "frame_keys": []},
+            {"step_id": "program_hold", "kind": "hold",
+             "label": "Hold", "call_ref": "scheduler.hold",
+             "display_order": 20, "guard_condition_ids": [], "frame_keys": []},
+        ],
+        "transitions": [
+            {"transition_id": "t1", "from_step_id": "step_counter",
+             "to_step_id": "program_hold", "ordinal": 1, "label": "1",
+             "kind": "sequence", "call_ref": "scheduler.advance"},
+        ],
+    }
+
+    max_iter = 4
+
+    # CycleGate on ctx — this is the object caused by the IR cycle edge.
+    # The interpreter consults it at the hold point.
+    gate = CycleGate(
+        edge_id="test::cycle_return",
+        source_node_id="counter",
+        target_node_id="counter",
+        cycle_control={
+            "max_iterations": max_iter,
+            "cycles": 1,
+            "rounds_per_cycle": max_iter,
+            "stride": 1,
+        },
+    )
+
+    ctx = PipelineContext()
+    ctx.cycle_gates = [gate]
+
+    statuses = mini_graph.execute_program(ctx, mini_program, verbose=False)
+    runs = int(ctx.label_embedding_info.get("n", 0))
+    _assert(runs == max_iter, f"interpreter executed node {runs} times (expected {max_iter})")
+
+    # The program trace should show cycle_gate entries from the CycleGate.
+    gate_entries = [e for e in ctx.last_program_trace if e.get("kind") == "cycle_gate"]
+    _assert(len(gate_entries) == max_iter - 1, f"{len(gate_entries)} cycle_gate trace entries (expected {max_iter - 1} repeats)")
+    _assert(all(e.get("status") == "repeat" for e in gate_entries), "all gate trace entries are 'repeat'")
+
+    # Final entry should be a hold (the last evaluate returned 'exhaust').
+    hold_entries = [e for e in ctx.last_program_trace if e.get("kind") == "hold"]
+    _assert(len(hold_entries) == 1, "exactly 1 hold entry at end")
+
+    # ctx.total_rounds_completed updated by the gate object.
+    _assert(ctx.total_rounds_completed == max_iter, f"ctx.total_rounds_completed={ctx.total_rounds_completed}")
+
+    # Without a CycleGate, no looping — single pass.
+    ctx2 = PipelineContext()
+    mini_graph2 = PipelineGraph(name="no_gate")
+    mini_graph2.add_node(_Counter())
+    mini_graph2.execute_program(ctx2, mini_program, verbose=False)
+    runs2 = int(ctx2.label_embedding_info.get("n", 0))
+    _assert(runs2 == 1, f"without CycleGate, node runs {runs2} time(s) (expected 1)")
+
+    _ok("CycleGate objects on ctx drive the interpreter loop; no cycle steps in program")
+
+
+def test_execution_policy_roundtrip(graph):
+    """Verify execution_policy fields survive plan export and JSON round-trip."""
+    print("\n--- test_execution_policy_roundtrip ---")
+    plan = plan_from_pipeline_graph(
+        graph,
+        name="Policy Test Plan",
+        revision=1,
+        worker_hints={"output_dir": "/tmp/smoke_policy", "capabilities": ["plan_apply"]},
+        graph_layers=build_graph_layers(graph),
+        execution_program=build_execution_program(graph),
+    )
+
+    # Check specific nodes for expected policies.
+    _by_id = {n.node_id: n for n in plan.nodes}
+
+    wave_pool = _by_id.get("wave_pool")
+    _assert(wave_pool is not None, "wave_pool node present")
+    _assert(wave_pool.execution_policy == "once", f"wave_pool policy={wave_pool.execution_policy!r}")
+
+    build_cls = _by_id.get("build_classifier")
+    _assert(build_cls is not None, "build_classifier node present")
+    _assert(build_cls.execution_policy == "once", f"build_classifier policy={build_cls.execution_policy!r}")
+
+    config_srch = _by_id.get("config_search")
+    _assert(config_srch is not None, "config_search node present")
+    _assert(config_srch.execution_policy == "once", f"config_search policy={config_srch.execution_policy!r}")
+
+    build_tx = _by_id.get("build_transformer")
+    _assert(build_tx is not None, "build_transformer node present")
+    _assert(build_tx.execution_policy == "once", f"build_transformer policy={build_tx.execution_policy!r}")
+
+    build_gan = _by_id.get("build_gan")
+    _assert(build_gan is not None, "build_gan node present")
+    _assert(build_gan.execution_policy == "once", f"build_gan policy={build_gan.execution_policy!r}")
+
+    ckpt = _by_id.get("checkpoint_save")
+    _assert(ckpt is not None, "checkpoint_save node present")
+    _assert(ckpt.execution_policy == "periodic", f"checkpoint_save policy={ckpt.execution_policy!r}")
+    _assert(isinstance(ckpt.execution_policy_config, dict), "checkpoint_save has policy config dict")
+    _assert(ckpt.execution_policy_config.get("period", 0) >= 1, "checkpoint_save period >= 1")
+
+    # A gated node should report "gated".
+    gest_eval = _by_id.get("gate_1_gestation_eval")
+    _assert(gest_eval is not None, "gate_1_gestation_eval node present")
+    _assert(gest_eval.execution_policy == "gated", f"gate_1_gestation_eval policy={gest_eval.execution_policy!r}")
+    _assert(isinstance(gest_eval.execution_policy_config.get("gate_ids"), list), "gated node has gate_ids list")
+
+    # A plain node should default to "always".
+    preg_eval = _by_id.get("gate_0_pregestation_eval")
+    _assert(preg_eval is not None, "gate_0_pregestation_eval node present")
+    _assert(preg_eval.execution_policy == "always", f"gate_0_pregestation_eval policy={preg_eval.execution_policy!r}")
+
+    # JSON round-trip preserves fields.
+    with tempfile.TemporaryDirectory() as td:
+        path = Path(td) / "policy_plan.json"
+        plan.save_json(path)
+        reloaded = TrainingGraphPlan.load_json(path)
+    _by_id2 = {n.node_id: n for n in reloaded.nodes}
+    _assert(_by_id2["wave_pool"].execution_policy == "once", "wave_pool policy survives round-trip")
+    _assert(_by_id2["checkpoint_save"].execution_policy == "periodic", "checkpoint_save policy survives round-trip")
+    _assert(_by_id2["checkpoint_save"].execution_policy_config.get("period", 0) >= 1, "checkpoint_save config survives round-trip")
+    _assert(_by_id2["gate_1_gestation_eval"].execution_policy == "gated", "gated policy survives round-trip")
+    _ok("execution_policy fields survive plan export and JSON round-trip")
+
+
+def test_execution_policy_mermaid_badges(graph):
+    """Verify execution_policy badges appear in dense Mermaid rendering."""
+    print("\n--- test_execution_policy_mermaid_badges ---")
+    plan = plan_from_pipeline_graph(
+        graph,
+        name="Badge Test Plan",
+        revision=1,
+        worker_hints={"output_dir": "/tmp/smoke_badge", "capabilities": ["plan_apply"]},
+        graph_layers=build_graph_layers(graph),
+        execution_program=build_execution_program(graph),
+    )
+    from pipeline.graph_layers import build_graph_layers_from_plan
+    layers = build_graph_layers_from_plan(plan)
+    execution_layer = layers.get("execution", {})
+
+    # Dense rendering should show badges for non-"always" policies.
+    mermaid = render_mermaid_flowchart(execution_layer, view="dense")
+    _assert("[once]" in mermaid, "dense Mermaid contains [once] badge")
+    _assert("[periodic]" in mermaid, "dense Mermaid contains [periodic] badge")
+    _assert("[gated]" in mermaid, "dense Mermaid contains [gated] badge")
+
+    # Minimal view should NOT contain badges.
+    mermaid_min = render_mermaid_flowchart(execution_layer, view="minimal")
+    _assert("[once]" not in mermaid_min, "minimal Mermaid does NOT contain [once] badge")
+
+    _ok("execution_policy badges render correctly in dense Mermaid")
+
+
 def main():
     print("=== Smoke test: plan round-trip ===")
     graph, node_count, edge_count = test_build_pipeline_graph()
@@ -818,6 +1112,11 @@ def main():
     test_action_subnode_roundtrip(reloaded_plan)
     test_gpu_models_roundtrip(plan)
     test_provenance_layer(graph)
+    test_cycle_edges_roundtrip(graph)
+    test_cycle_gate_instantiation_from_ir(graph)
+    test_cycle_gate_drives_interpreter(graph)
+    test_execution_policy_roundtrip(graph)
+    test_execution_policy_mermaid_badges(graph)
     print("\n=== All checks passed ===")
 
 

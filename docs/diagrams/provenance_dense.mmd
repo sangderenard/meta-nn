@@ -1,5 +1,63 @@
 %%{init: {'theme':'base','themeVariables':{'background':'#f5f6f7','mainBkg':'#f5f6f7'},'flowchart':{'curve':'basis','htmlLabels':true}}}%%
-flowchart TD
+flowchart LR
+    subgraph group_other[Other]
+        build_classifier["Build Classifier<br/>object / other / BuildClassifierNode"]
+        config_search["Config Search<br/>object / other / ConfigSearchNode"]
+        build_label_embedding["Build Label Embedding<br/>object / other / BuildLabelEmbeddingNode"]
+        stage_0_pregestation["Stage 0 Pregestation<br/>object / other / PregestationTrainNode"]
+        stage_1_gestation["Stage 1 Gestation<br/>object / other / GestationTrainNode"]
+        stage_2_berkeley["Stage 2 Berkeley<br/>object / other / BerkeleyRefreshTrainNode"]
+        stage_r_transformer["Stage R Transformer<br/>object / other / TransformerTrainNode"]
+        stage_g_generator["Stage G Generator<br/>object / other / GeneratorTrainNode"]
+        stage_w_wave_classifier["Stage W Wave Classifier<br/>object / other / WaveClassifierTrainNode"]
+        stage_c_lora["Stage C Lora<br/>object / other / LoRARoundNode"]
+        stage_fake_feedback["Stage Fake Feedback<br/>object / other / FakeClassFeedbackNode"]
+        gate_0_pregestation_eval["Gate 0 Pregestation Eval<br/>object / other / PregestationEvalNode"]
+        gate_1_gestation_eval["Gate 1 Gestation Eval<br/>object / other / GestationEvalNode"]
+        gate_berkeley["Gate Berkeley<br/>object / other / BerkeleyGateNode"]
+        gate_transformer["Gate Transformer<br/>object / other / TransformerGateNode"]
+        gate_generator["Gate Generator<br/>object / other / GeneratorGateNode"]
+        gate_wave["Gate Wave<br/>object / other / WaveGateNode"]
+        sync_gate_replica["Sync Gate Replica<br/>object / other / SyncGateReplicaNode"]
+        build_transformer["Build Transformer<br/>object / other / BuildTransformerNode"]
+        build_wave_classifier["Build Wave Classifier<br/>object / other / BuildWaveClassifierNode"]
+    end
+    subgraph group_inference[Inference]
+        model__classifier["Classifier Model<br/>resource / inference / gpu_model"]
+        model__discriminator["Discriminator Model<br/>resource / inference / gpu_model"]
+        model__generator["GAN Generator<br/>resource / inference / gpu_model"]
+        model__transformer["Transformer Model<br/>resource / inference / gpu_model"]
+        model__wave_classifier["Wave Classifier Model<br/>resource / inference / gpu_model"]
+    end
+
+    build_classifier -- "gpu-resident classifier" --> model__classifier
+    config_search -- "gpu-resident classifier" --> model__classifier
+    build_label_embedding -- "gpu-resident classifier" --> model__classifier
+    stage_0_pregestation -- "gpu-resident classifier" --> model__classifier
+    stage_1_gestation -- "gpu-resident classifier" --> model__classifier
+    stage_2_berkeley -- "gpu-resident classifier" --> model__classifier
+    stage_r_transformer -- "gpu-resident classifier" --> model__classifier
+    stage_g_generator -- "gpu-resident classifier" --> model__classifier
+    stage_w_wave_classifier -- "gpu-resident classifier" --> model__classifier
+    stage_c_lora -- "gpu-resident classifier" --> model__classifier
+    stage_fake_feedback -- "gpu-resident classifier" --> model__classifier
+    gate_0_pregestation_eval -- "gpu-resident classifier" --> model__classifier
+    gate_1_gestation_eval -- "gpu-resident classifier" --> model__classifier
+    gate_berkeley -- "gpu-resident classifier" --> model__classifier
+    gate_transformer -- "gpu-resident classifier" --> model__classifier
+    gate_generator -- "gpu-resident classifier" --> model__classifier
+    gate_wave -- "gpu-resident classifier" --> model__classifier
+    sync_gate_replica -- "gpu-resident classifier" --> model__classifier
+    stage_g_generator -- "gpu-resident discriminator" --> model__discriminator
+    stage_fake_feedback -- "gpu-resident discriminator" --> model__discriminator
+    stage_g_generator -- "gpu-resident generator" --> model__generator
+    stage_fake_feedback -- "gpu-resident generator" --> model__generator
+    gate_generator -- "gpu-resident generator" --> model__generator
+    build_transformer -- "gpu-resident transformer" --> model__transformer
+    stage_r_transformer -- "gpu-resident transformer" --> model__transformer
+    stage_w_wave_classifier -- "gpu-resident transformer" --> model__transformer
+    build_wave_classifier -- "gpu-resident wave_classifier" --> model__wave_classifier
+    stage_w_wave_classifier -- "gpu-resident wave_classifier" --> model__wave_classifier
 
     classDef faculty_bootstrap fill:#E9F1F7,stroke:#4B6B88,color:#102A43,stroke-width:2px;
     classDef faculty_build fill:#F8EFE5,stroke:#B07219,color:#40210F,stroke-width:2px;
@@ -13,3 +71,33 @@ flowchart TD
     classDef faculty_buffer fill:#E0FBFC,stroke:#006D77,color:#00313A,stroke-width:2px;
     classDef faculty_gate fill:#FDE2E4,stroke:#C0392B,color:#4A0F13,stroke-width:2px;
     classDef faculty_other fill:#F3F4F6,stroke:#6B7280,color:#111827,stroke-width:2px;
+    class model__classifier,model__discriminator,model__generator,model__transformer,model__wave_classifier faculty_inference;
+    class build_classifier,config_search,build_label_embedding,stage_0_pregestation,stage_1_gestation,stage_2_berkeley,stage_r_transformer,stage_g_generator,stage_w_wave_classifier,stage_c_lora,stage_fake_feedback,gate_0_pregestation_eval,gate_1_gestation_eval,gate_berkeley,gate_transformer,gate_generator,gate_wave,sync_gate_replica,build_transformer,build_wave_classifier faculty_other;
+    linkStyle 0 stroke:#6B7280,stroke-width:2px,opacity:0.75,stroke-dasharray:0;
+    linkStyle 1 stroke:#6B7280,stroke-width:2px,opacity:0.75,stroke-dasharray:0;
+    linkStyle 2 stroke:#6B7280,stroke-width:2px,opacity:0.75,stroke-dasharray:0;
+    linkStyle 3 stroke:#6B7280,stroke-width:2px,opacity:0.75,stroke-dasharray:0;
+    linkStyle 4 stroke:#6B7280,stroke-width:2px,opacity:0.75,stroke-dasharray:0;
+    linkStyle 5 stroke:#6B7280,stroke-width:2px,opacity:0.75,stroke-dasharray:0;
+    linkStyle 6 stroke:#6B7280,stroke-width:2px,opacity:0.75,stroke-dasharray:0;
+    linkStyle 7 stroke:#6B7280,stroke-width:2px,opacity:0.75,stroke-dasharray:0;
+    linkStyle 8 stroke:#6B7280,stroke-width:2px,opacity:0.75,stroke-dasharray:0;
+    linkStyle 9 stroke:#6B7280,stroke-width:2px,opacity:0.75,stroke-dasharray:0;
+    linkStyle 10 stroke:#6B7280,stroke-width:2px,opacity:0.75,stroke-dasharray:0;
+    linkStyle 11 stroke:#6B7280,stroke-width:2px,opacity:0.75,stroke-dasharray:0;
+    linkStyle 12 stroke:#6B7280,stroke-width:2px,opacity:0.75,stroke-dasharray:0;
+    linkStyle 13 stroke:#6B7280,stroke-width:2px,opacity:0.75,stroke-dasharray:0;
+    linkStyle 14 stroke:#6B7280,stroke-width:2px,opacity:0.75,stroke-dasharray:0;
+    linkStyle 15 stroke:#6B7280,stroke-width:2px,opacity:0.75,stroke-dasharray:0;
+    linkStyle 16 stroke:#6B7280,stroke-width:2px,opacity:0.75,stroke-dasharray:0;
+    linkStyle 17 stroke:#6B7280,stroke-width:2px,opacity:0.75,stroke-dasharray:0;
+    linkStyle 18 stroke:#6B7280,stroke-width:2px,opacity:0.75,stroke-dasharray:0;
+    linkStyle 19 stroke:#6B7280,stroke-width:2px,opacity:0.75,stroke-dasharray:0;
+    linkStyle 20 stroke:#6B7280,stroke-width:2px,opacity:0.75,stroke-dasharray:0;
+    linkStyle 21 stroke:#6B7280,stroke-width:2px,opacity:0.75,stroke-dasharray:0;
+    linkStyle 22 stroke:#6B7280,stroke-width:2px,opacity:0.75,stroke-dasharray:0;
+    linkStyle 23 stroke:#6B7280,stroke-width:2px,opacity:0.75,stroke-dasharray:0;
+    linkStyle 24 stroke:#6B7280,stroke-width:2px,opacity:0.75,stroke-dasharray:0;
+    linkStyle 25 stroke:#6B7280,stroke-width:2px,opacity:0.75,stroke-dasharray:0;
+    linkStyle 26 stroke:#6B7280,stroke-width:2px,opacity:0.75,stroke-dasharray:0;
+    linkStyle 27 stroke:#6B7280,stroke-width:2px,opacity:0.75,stroke-dasharray:0;

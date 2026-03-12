@@ -58,6 +58,15 @@ INFERENCE_FACULTY_ORDER = [
     "other",
 ]
 
+# Execution-policy badges rendered in the dense Mermaid node label.
+# Maps execution_policy string → short human-readable suffix.
+_EXECUTION_POLICY_BADGES: Dict[str, str] = {
+    "once": "[once]",
+    "gated": "[gated]",
+    "periodic": "[periodic]",
+    # "always" → no badge (default, no annotation needed)
+}
+
 
 def _layer_node(
     node_id: str,
@@ -218,12 +227,17 @@ def build_graph_layers(graph: PipelineGraph) -> Dict[str, Dict[str, Any]]:
     execution_edges = [
         e for e in list(getattr(_plan, "edges", []) or [])
         if bool(getattr(e, "enabled", True))
-        and str(getattr(e, "layer", "execution") or "execution") == "execution"
+        and str(getattr(e, "layer", "execution") or "execution") in ("execution", "cycle")
+    ]
+    _cycle_edges = [
+        e for e in list(getattr(_plan, "edges", []) or [])
+        if bool(getattr(e, "enabled", True))
+        and str(getattr(e, "layer", "") or "") == "cycle"
     ]
     all_nodes = list(getattr(_plan, "nodes", []) or [])
     return {
         "execution": execution_layer,
-        "execution_overlay": build_execution_overlay_layer(execution_layer, execution_program),
+        "execution_overlay": build_execution_overlay_layer(execution_layer, execution_program, cycle_edges=_cycle_edges),
         "inference": _build_inference_layer(),
         "provenance": _build_provenance_layer(all_nodes),
         "stack_view": _build_stack_view_layer(execution_nodes, execution_edges),
@@ -259,6 +273,8 @@ def build_execution_layer_from_records(
                     "class_name": str(node.kind or ""),
                     "description": str(metadata.get("description", "") or ""),
                     "subnodes": subnodes_info,
+                    "execution_policy": str(getattr(node, "execution_policy", "always") or "always"),
+                    "execution_policy_config": dict(getattr(node, "execution_policy_config", {}) or {}),
                 },
             )
         )
@@ -307,13 +323,18 @@ def build_graph_layers_from_plan(plan: TrainingGraphPlan) -> Dict[str, Dict[str,
         edge
         for edge in list(getattr(plan, "edges", []) or [])
         if bool(getattr(edge, "enabled", True))
-        and str(getattr(edge, "layer", "execution") or "execution") == "execution"
+        and str(getattr(edge, "layer", "execution") or "execution") in ("execution", "cycle")
     ]
     if execution_nodes:
         execution_layer = build_execution_layer_from_records(execution_nodes, execution_edges)
         execution_program = build_execution_program_from_plan(plan)
+        _cycle_edges = [
+            edge for edge in list(getattr(plan, "edges", []) or [])
+            if bool(getattr(edge, "enabled", True))
+            and str(getattr(edge, "layer", "") or "") == "cycle"
+        ]
         layers["execution"] = execution_layer
-        layers["execution_overlay"] = build_execution_overlay_layer(execution_layer, execution_program)
+        layers["execution_overlay"] = build_execution_overlay_layer(execution_layer, execution_program, cycle_edges=_cycle_edges)
     layers.setdefault("inference", _build_inference_layer())
     layers.setdefault(
         "provenance",
@@ -481,7 +502,12 @@ def build_execution_program_from_plan(plan: TrainingGraphPlan) -> Dict[str, Any]
     )
 
 
-def build_execution_overlay_layer(execution_layer: Dict[str, Any], execution_program: Dict[str, Any]) -> Dict[str, Any]:
+def build_execution_overlay_layer(
+    execution_layer: Dict[str, Any],
+    execution_program: Dict[str, Any],
+    *,
+    cycle_edges: Optional[List[Any]] = None,
+) -> Dict[str, Any]:
     overlay_nodes = [dict(node) for node in list(execution_layer.get("nodes", []) or [])]
     overlay_edges = [dict(edge) for edge in list(execution_layer.get("edges", []) or [])]
     step_records = {
@@ -538,6 +564,71 @@ def build_execution_overlay_layer(execution_layer: Dict[str, Any], execution_pro
                     "overlay_kind": str(transition.get("kind", "sequence") or "sequence"),
                     "overlay_branch": str(transition.get("branch", "") or ""),
                     "call_ref": call_ref,
+                },
+            )
+        )
+
+    # -- CycleGate diamond: the IR's cycle edges cause a visible decision
+    #    node in the overlay, with a return edge to the entry node.
+    _cycle_edge_list = list(cycle_edges or [])
+    for _ce in _cycle_edge_list:
+        _ce_dict = _ce if isinstance(_ce, dict) else (dict(getattr(_ce, "__dict__", {})) if hasattr(_ce, "edge_id") else {})
+        _edge_id = str(_ce_dict.get("edge_id", getattr(_ce, "edge_id", "")) or "")
+        _cc = dict(_ce_dict.get("cycle_control", getattr(_ce, "cycle_control", {})) or {})
+        _src = str(_ce_dict.get("source_node_id", getattr(_ce, "source_node_id", "")) or "")
+        _tgt = str(_ce_dict.get("target_node_id", getattr(_ce, "target_node_id", "")) or "")
+        _max_iter = int(_cc.get("max_iterations", 0) or 0)
+        if not _edge_id or _max_iter <= 0:
+            continue
+        _gate_node_id = f"cycle_gate__{_edge_id.replace('::', '_').replace(':', '_')}"
+        _label = f"CycleGate ({_max_iter}x)"
+        overlay_nodes.append(
+            _layer_node(
+                _gate_node_id,
+                _label,
+                object_type="control",
+                faculty="housekeeping",
+                archetype="cycle_gate",
+                shape="decision",
+                metadata={
+                    "edge_id": _edge_id,
+                    "cycle_control": _cc,
+                    "call_ref": "CycleGate.evaluate",
+                },
+            )
+        )
+        # Hold → CycleGate diamond
+        overlay_edges.append(
+            _layer_edge(
+                "program_hold",
+                _gate_node_id,
+                label="evaluate",
+                readme_label="evaluate",
+                reaction_name="CycleGate.evaluate",
+                target_function="CycleGate.evaluate",
+                metadata={
+                    "edge_id": f"{_edge_id}::hold_to_gate",
+                    "style_role": "overlay",
+                    "overlay_kind": "sequence",
+                    "call_ref": "CycleGate.evaluate",
+                },
+            )
+        )
+        # CycleGate diamond → entry node (repeat branch)
+        overlay_edges.append(
+            _layer_edge(
+                _gate_node_id,
+                _tgt,
+                label="repeat",
+                readme_label="repeat",
+                reaction_name="CycleGate.repeat",
+                target_function="CycleGate.repeat",
+                metadata={
+                    "edge_id": f"{_edge_id}::repeat",
+                    "style_role": "cycle",
+                    "overlay_kind": "branch",
+                    "overlay_branch": "repeat",
+                    "call_ref": "CycleGate.repeat",
                 },
             )
         )
@@ -857,6 +948,14 @@ def _build_execution_layer(graph: PipelineGraph) -> Dict[str, Any]:
         archetype = str(getattr(shape, "archetype", "") or "").strip()
         if not archetype or archetype == type(node).__name__:
             archetype = _node_archetype(node_id) or type(node).__name__
+        _ep_raw = getattr(node, "runtime_execution_policy", None)
+        if callable(_ep_raw):
+            _ep_raw = _ep_raw()
+        if isinstance(_ep_raw, tuple) and len(_ep_raw) == 2:
+            _ep_name, _ep_cfg = str(_ep_raw[0]), dict(_ep_raw[1] or {})
+        else:
+            _ep_name, _ep_cfg = "always", {}
+
         nodes.append(
             _layer_node(
                 node_id,
@@ -868,6 +967,8 @@ def _build_execution_layer(graph: PipelineGraph) -> Dict[str, Any]:
                     "node_id": str(node_id),
                     "class_name": type(node).__name__,
                     "description": str(getattr(node, "description", "") or ""),
+                    "execution_policy": _ep_name,
+                    "execution_policy_config": _ep_cfg,
                 },
             )
         )
@@ -982,12 +1083,16 @@ def render_mermaid_flowchart(
         if emit_identity_comments and edge_id:
             lines.append(f"    %% edge_id:{edge_id}")
         edge_label = _edge_label(edge, view=view)
+        _is_cycle = str(dict(edge.get("metadata", {}) or {}).get("style_role", "") or "") == "cycle"
+        _arrow = "-.->" if _is_cycle else "-->"
         if edge_label:
             lines.append(
+                f'    {alias_map[source_id]} -. "{_escape_mermaid(edge_label)}" .-> {alias_map[target_id]}'
+                if _is_cycle else
                 f'    {alias_map[source_id]} -- "{_escape_mermaid(edge_label)}" --> {alias_map[target_id]}'
             )
         else:
-            lines.append(f"    {alias_map[source_id]} --> {alias_map[target_id]}")
+            lines.append(f"    {alias_map[source_id]} {_arrow} {alias_map[target_id]}")
 
     if view == "dense":
         lines.append("")
@@ -1444,6 +1549,12 @@ def _dense_node_label(node: Dict[str, Any]) -> str:
     faculty = str(node.get("faculty", "other") or "other").strip()
     archetype = str(node.get("archetype", "node") or "node").strip()
     detail = " / ".join(part for part in [object_type, faculty, archetype] if part)
+    # Execution policy badge — makes the IR-declared skip semantics visible.
+    _meta = dict(node.get("metadata", {}) or {})
+    _exec_policy = str(_meta.get("execution_policy", "") or "").strip()
+    _policy_badge = _EXECUTION_POLICY_BADGES.get(_exec_policy, "")
+    if _policy_badge:
+        detail = f"{detail}  {_policy_badge}" if detail else _policy_badge
     label = f"{base}<br/>{detail}" if detail else base
     subnodes = list(dict(node.get("metadata", {}) or {}).get("subnodes", []) or [])
     if subnodes:
@@ -1466,6 +1577,8 @@ def _edge_style(layer_id: str, edge: Dict[str, Any]) -> Dict[str, str]:
         return {"stroke": "#111111", "width": "3px", "opacity": "0.98", "dasharray": "0"}
     if str(metadata.get("style_role", "") or "") == "ownership":
         return {"stroke": "#8B5CF6", "width": "2px", "opacity": "0.85", "dasharray": "4 2"}
+    if str(metadata.get("style_role", "") or "") == "cycle":
+        return {"stroke": "#9333EA", "width": "3px", "opacity": "0.90", "dasharray": "10 4"}
 
     label = str(edge.get("label", "") or "").strip().lower()
     readme_label = str(edge.get("readme_label", "") or "").strip().lower()

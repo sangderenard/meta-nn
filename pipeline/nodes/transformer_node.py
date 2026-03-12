@@ -149,6 +149,10 @@ class ConfigSearchNode(PipelineNode):
         self.cfg = cfg
         self._done = False
 
+    @property
+    def runtime_execution_policy(self) -> tuple:
+        return ("once", {})
+
     def should_run(self, ctx: PipelineContext) -> bool:
         if self._done:
             return False
@@ -228,6 +232,10 @@ class BuildTransformerNode(PipelineNode):
     def __init__(self, cfg: TransformerConfig) -> None:
         self.cfg = cfg
         self._built = False
+
+    @property
+    def runtime_execution_policy(self) -> tuple:
+        return ("once", {})
 
     def should_run(self, ctx: PipelineContext) -> bool:
         return not self._built and ctx.render_config is not None

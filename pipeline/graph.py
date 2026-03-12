@@ -120,6 +120,22 @@ class PipelineNode(ABC):
             archetype=self.runtime_archetype,
         )
 
+    @property
+    def runtime_execution_policy(self) -> tuple:
+        """Return ``(policy_name, config_dict)`` describing skip semantics.
+
+        The IR records this so Mermaid diagrams and plan consumers can see
+        *why* a node may be skipped without inspecting the Python source.
+
+        Built-in policies:
+
+        * ``"always"``   — runs every round (default).
+        * ``"once"``     — runs once per pipeline lifetime (OneTimeNode).
+        * ``"gated"``    — runs only after named gates pass (GatedNode).
+        * ``"periodic"`` — runs every *N*-th round (e.g. CheckpointSaveNode).
+        """
+        return ("always", {})
+
     def should_run(self, ctx: "PipelineContext") -> bool:  # noqa: F821
         """Return True if this node should execute this round.
 
@@ -570,6 +586,36 @@ class PipelineGraph:
                 continue
 
             if step_kind == "hold":
+                # Consult CycleGate objects from ctx — the IR cycle edges
+                # caused these objects to exist; they own the iteration
+                # decision, not hardcoded counters.
+                _cycle_gates = list(getattr(ctx, "cycle_gates", None) or [])
+                _repeat_gate = None
+                for _gate in _cycle_gates:
+                    branch = _gate.evaluate(ctx)
+                    if branch == "repeat":
+                        _repeat_gate = _gate
+                        break
+                if _repeat_gate is not None:
+                    program_trace.append(
+                        {
+                            "tick": int(len(program_trace) + 1),
+                            "entry_kind": "step",
+                            "step_id": str(current_step_id),
+                            "kind": "cycle_gate",
+                            "label": step_label,
+                            "call_ref": "CycleGate.evaluate",
+                            "edge_id": str(_repeat_gate.edge_id),
+                            "iteration": int(_repeat_gate.iteration),
+                            "max_iterations": int(_repeat_gate.max_iterations),
+                            "frame_keys": list(frame_keys),
+                            "status": "repeat",
+                        }
+                    )
+                    # Jump back to the program entry — the CycleGate decided.
+                    current_step_id = entry_step_id
+                    continue
+                # All gates exhausted (or none exist) — halt.
                 program_trace.append(
                     {
                         "tick": int(len(program_trace) + 1),
@@ -997,6 +1043,98 @@ def _program_has_control_flow(execution_program: Optional[Dict[str, Any]]) -> bo
     if not steps:
         return False
     return bool(transitions) or any(str(step.get("kind", "node") or "node") != "node" for step in steps)
+
+
+# ---------------------------------------------------------------------------
+# CycleGate — runtime object instantiated from IR cycle edges
+# ---------------------------------------------------------------------------
+
+class CycleGate:
+    """Runtime object caused into existence by an IR cycle edge.
+
+    The plan's ``layer="cycle"`` edges carry ``cycle_control`` dicts that
+    fully describe the desired repetition.  When the orchestrator (or any
+    execution driver) reads the plan, each such edge **causes** a CycleGate
+    to be instantiated.  That object — not hardcoded loop counters — owns
+    the iteration state and decides when to repeat or exhaust.
+    """
+
+    def __init__(
+        self,
+        edge_id: str,
+        source_node_id: str,
+        target_node_id: str,
+        cycle_control: Dict[str, Any],
+    ):
+        self.edge_id = str(edge_id)
+        self.source_node_id = str(source_node_id)
+        self.target_node_id = str(target_node_id)
+        self.max_iterations = int(cycle_control.get("max_iterations", 1) or 1)
+        self.cycles = int(cycle_control.get("cycles", 1) or 1)
+        self.rounds_per_cycle = int(cycle_control.get("rounds_per_cycle", 1) or 1)
+        self.stride = int(cycle_control.get("stride", 0) or 0)
+        self.iteration = 0
+
+    # -- primary interface ------------------------------------------------
+
+    def evaluate(self, ctx: Optional[Any] = None) -> str:
+        """Advance iteration and return ``'repeat'`` or ``'exhaust'``.
+
+        When *ctx* is supplied, ``ctx.cycle``, ``ctx.round_id`` and
+        ``ctx.total_rounds_completed`` are updated so that the rest of
+        the runtime sees the current position without any external counter.
+        """
+        self.iteration += 1
+        if ctx is not None:
+            rpc = self.rounds_per_cycle if self.rounds_per_cycle > 0 else 1
+            ctx.cycle = (self.iteration - 1) // rpc + 1
+            ctx.round_id = (self.iteration - 1) % rpc + 1
+            ctx.total_rounds_completed = getattr(ctx, "total_rounds_completed", 0)
+            if ctx.total_rounds_completed < self.iteration:
+                ctx.total_rounds_completed = self.iteration
+        if self.iteration < self.max_iterations:
+            return "repeat"
+        return "exhaust"
+
+    @property
+    def exhausted(self) -> bool:
+        return self.iteration >= self.max_iterations
+
+    # -- factory ----------------------------------------------------------
+
+    @classmethod
+    def from_plan(cls, plan: Any) -> List["CycleGate"]:
+        """Instantiate CycleGate objects from every cycle edge in *plan*.
+
+        This is the mechanism by which IR cycle edges *cause* runtime
+        objects to exist.  No sniffing, no hardcoded wiring — the edge's
+        ``cycle_control`` dict is the complete specification.
+        """
+        gates: List["CycleGate"] = []
+        for edge in list(getattr(plan, "edges", []) or []):
+            if str(getattr(edge, "layer", "") or "") != "cycle":
+                continue
+            if not bool(getattr(edge, "enabled", True)):
+                continue
+            cc = dict(getattr(edge, "cycle_control", {}) or {})
+            if int(cc.get("max_iterations", 0) or 0) <= 0:
+                continue
+            gates.append(
+                cls(
+                    edge_id=str(getattr(edge, "edge_id", "") or ""),
+                    source_node_id=str(getattr(edge, "source_node_id", "") or ""),
+                    target_node_id=str(getattr(edge, "target_node_id", "") or ""),
+                    cycle_control=cc,
+                )
+            )
+        return gates
+
+    def __repr__(self) -> str:
+        return (
+            f"CycleGate(edge_id={self.edge_id!r}, "
+            f"iteration={self.iteration}/{self.max_iterations}, "
+            f"cycles={self.cycles}, rounds_per_cycle={self.rounds_per_cycle})"
+        )
 
 
 def _program_ordered_steps(execution_program: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:

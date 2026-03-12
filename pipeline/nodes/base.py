@@ -291,6 +291,10 @@ class GatedNode(PipelineNode):
 
     required_gates: Sequence[str] = []
 
+    @property
+    def runtime_execution_policy(self) -> tuple:
+        return ("gated", {"gate_ids": list(self.required_gates)})
+
     def should_run(self, ctx: PipelineContext) -> bool:
         for gate_attr in self.required_gates:
             gate: GateState = getattr(ctx, gate_attr, None)
@@ -312,6 +316,10 @@ class OneTimeNode(PipelineNode):
 
     def __init__(self) -> None:
         self._done = False
+
+    @property
+    def runtime_execution_policy(self) -> tuple:
+        return ("once", {})
 
     def should_run(self, ctx: PipelineContext) -> bool:
         return not self._done

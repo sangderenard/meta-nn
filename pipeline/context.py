@@ -224,6 +224,11 @@ class PipelineContext:
     orchestration_cycles: int = 1
     orchestration_rounds: int = 1
 
+    # ---- cycle gates (IR-driven) ----------------------------------------
+    #  Populated by the orchestrator from plan cycle edges via CycleGate.from_plan().
+    #  The interpreter consults these at hold points for repeat/exhaust decisions.
+    cycle_gates: List[Any] = field(default_factory=list)
+
     # ---- viewer / preview -----------------------------------------------
     viewer_proxy: Optional[Any] = None
     loss_logger: Optional[Any] = None

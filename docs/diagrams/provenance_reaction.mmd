@@ -1,2 +1,85 @@
 %%{init: {'theme':'base','themeVariables':{'background':'#f5f6f7','mainBkg':'#f5f6f7'},'flowchart':{'curve':'basis','htmlLabels':true}}}%%
-flowchart TD
+flowchart LR
+    model__classifier["Classifier Model"]
+    model__discriminator["Discriminator Model"]
+    model__generator["GAN Generator"]
+    model__transformer["Transformer Model"]
+    model__wave_classifier["Wave Classifier Model"]
+    build_classifier["Build Classifier"]
+    config_search["Config Search"]
+    build_label_embedding["Build Label Embedding"]
+    stage_0_pregestation["Stage 0 Pregestation"]
+    stage_1_gestation["Stage 1 Gestation"]
+    stage_2_berkeley["Stage 2 Berkeley"]
+    stage_r_transformer["Stage R Transformer"]
+    stage_g_generator["Stage G Generator"]
+    stage_w_wave_classifier["Stage W Wave Classifier"]
+    stage_c_lora["Stage C Lora"]
+    stage_fake_feedback["Stage Fake Feedback"]
+    gate_0_pregestation_eval["Gate 0 Pregestation Eval"]
+    gate_1_gestation_eval["Gate 1 Gestation Eval"]
+    gate_berkeley["Gate Berkeley"]
+    gate_transformer["Gate Transformer"]
+    gate_generator["Gate Generator"]
+    gate_wave["Gate Wave"]
+    sync_gate_replica["Sync Gate Replica"]
+    build_transformer["Build Transformer"]
+    build_wave_classifier["Build Wave Classifier"]
+
+    build_classifier -- "gpu-resident classifier | residency.acquire" --> model__classifier
+    config_search -- "gpu-resident classifier | residency.acquire" --> model__classifier
+    build_label_embedding -- "gpu-resident classifier | residency.acquire" --> model__classifier
+    stage_0_pregestation -- "gpu-resident classifier | residency.acquire" --> model__classifier
+    stage_1_gestation -- "gpu-resident classifier | residency.acquire" --> model__classifier
+    stage_2_berkeley -- "gpu-resident classifier | residency.acquire" --> model__classifier
+    stage_r_transformer -- "gpu-resident classifier | residency.acquire" --> model__classifier
+    stage_g_generator -- "gpu-resident classifier | residency.acquire" --> model__classifier
+    stage_w_wave_classifier -- "gpu-resident classifier | residency.acquire" --> model__classifier
+    stage_c_lora -- "gpu-resident classifier | residency.acquire" --> model__classifier
+    stage_fake_feedback -- "gpu-resident classifier | residency.acquire" --> model__classifier
+    gate_0_pregestation_eval -- "gpu-resident classifier | residency.acquire" --> model__classifier
+    gate_1_gestation_eval -- "gpu-resident classifier | residency.acquire" --> model__classifier
+    gate_berkeley -- "gpu-resident classifier | residency.acquire" --> model__classifier
+    gate_transformer -- "gpu-resident classifier | residency.acquire" --> model__classifier
+    gate_generator -- "gpu-resident classifier | residency.acquire" --> model__classifier
+    gate_wave -- "gpu-resident classifier | residency.acquire" --> model__classifier
+    sync_gate_replica -- "gpu-resident classifier | residency.acquire" --> model__classifier
+    stage_g_generator -- "gpu-resident discriminator | residency.acquire" --> model__discriminator
+    stage_fake_feedback -- "gpu-resident discriminator | residency.acquire" --> model__discriminator
+    stage_g_generator -- "gpu-resident generator | residency.acquire" --> model__generator
+    stage_fake_feedback -- "gpu-resident generator | residency.acquire" --> model__generator
+    gate_generator -- "gpu-resident generator | residency.acquire" --> model__generator
+    build_transformer -- "gpu-resident transformer | residency.acquire" --> model__transformer
+    stage_r_transformer -- "gpu-resident transformer | residency.acquire" --> model__transformer
+    stage_w_wave_classifier -- "gpu-resident transformer | residency.acquire" --> model__transformer
+    build_wave_classifier -- "gpu-resident wave_classifier | residency.acquire" --> model__wave_classifier
+    stage_w_wave_classifier -- "gpu-resident wave_classifier | residency.acquire" --> model__wave_classifier
+
+    linkStyle 0 stroke:#6B7280,stroke-width:2px,opacity:0.75,stroke-dasharray:0;
+    linkStyle 1 stroke:#6B7280,stroke-width:2px,opacity:0.75,stroke-dasharray:0;
+    linkStyle 2 stroke:#6B7280,stroke-width:2px,opacity:0.75,stroke-dasharray:0;
+    linkStyle 3 stroke:#6B7280,stroke-width:2px,opacity:0.75,stroke-dasharray:0;
+    linkStyle 4 stroke:#6B7280,stroke-width:2px,opacity:0.75,stroke-dasharray:0;
+    linkStyle 5 stroke:#6B7280,stroke-width:2px,opacity:0.75,stroke-dasharray:0;
+    linkStyle 6 stroke:#6B7280,stroke-width:2px,opacity:0.75,stroke-dasharray:0;
+    linkStyle 7 stroke:#6B7280,stroke-width:2px,opacity:0.75,stroke-dasharray:0;
+    linkStyle 8 stroke:#6B7280,stroke-width:2px,opacity:0.75,stroke-dasharray:0;
+    linkStyle 9 stroke:#6B7280,stroke-width:2px,opacity:0.75,stroke-dasharray:0;
+    linkStyle 10 stroke:#6B7280,stroke-width:2px,opacity:0.75,stroke-dasharray:0;
+    linkStyle 11 stroke:#6B7280,stroke-width:2px,opacity:0.75,stroke-dasharray:0;
+    linkStyle 12 stroke:#6B7280,stroke-width:2px,opacity:0.75,stroke-dasharray:0;
+    linkStyle 13 stroke:#6B7280,stroke-width:2px,opacity:0.75,stroke-dasharray:0;
+    linkStyle 14 stroke:#6B7280,stroke-width:2px,opacity:0.75,stroke-dasharray:0;
+    linkStyle 15 stroke:#6B7280,stroke-width:2px,opacity:0.75,stroke-dasharray:0;
+    linkStyle 16 stroke:#6B7280,stroke-width:2px,opacity:0.75,stroke-dasharray:0;
+    linkStyle 17 stroke:#6B7280,stroke-width:2px,opacity:0.75,stroke-dasharray:0;
+    linkStyle 18 stroke:#6B7280,stroke-width:2px,opacity:0.75,stroke-dasharray:0;
+    linkStyle 19 stroke:#6B7280,stroke-width:2px,opacity:0.75,stroke-dasharray:0;
+    linkStyle 20 stroke:#6B7280,stroke-width:2px,opacity:0.75,stroke-dasharray:0;
+    linkStyle 21 stroke:#6B7280,stroke-width:2px,opacity:0.75,stroke-dasharray:0;
+    linkStyle 22 stroke:#6B7280,stroke-width:2px,opacity:0.75,stroke-dasharray:0;
+    linkStyle 23 stroke:#6B7280,stroke-width:2px,opacity:0.75,stroke-dasharray:0;
+    linkStyle 24 stroke:#6B7280,stroke-width:2px,opacity:0.75,stroke-dasharray:0;
+    linkStyle 25 stroke:#6B7280,stroke-width:2px,opacity:0.75,stroke-dasharray:0;
+    linkStyle 26 stroke:#6B7280,stroke-width:2px,opacity:0.75,stroke-dasharray:0;
+    linkStyle 27 stroke:#6B7280,stroke-width:2px,opacity:0.75,stroke-dasharray:0;
