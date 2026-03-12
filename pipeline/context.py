@@ -6,12 +6,59 @@ inside main().  It now lives in one place so every node can read/write it cleanl
 """
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
+
+
+_LOSS_STAGE_CLASSIFIER = 0
+_LOSS_STAGE_GENERATOR = 1
+_LOSS_STAGE_DISCRIMINATOR = 2
+_LOSS_STAGE_TRANSFORMER = 3
+_LOSS_STAGE_WAVE_CLASSIFIER = 4
+_LOSS_STAGE_WAVE_CLASSIFIER_EVAL = 5
+
+
+def _loss_stage_for_node(node_id: str) -> Optional[int]:
+    key = str(node_id or "").strip().lower()
+    if key in {
+        "stage_0_pregestation",
+        "stage_1_gestation",
+        "stage_2_berkeley",
+        "gate_0_pregestation_eval",
+        "gate_1_gestation_eval",
+        "gate_berkeley",
+    }:
+        return _LOSS_STAGE_CLASSIFIER
+    if key == "stage_r_transformer":
+        return _LOSS_STAGE_TRANSFORMER
+    if key == "stage_g_generator":
+        return _LOSS_STAGE_GENERATOR
+    if key == "stage_w_wave_classifier":
+        return _LOSS_STAGE_WAVE_CLASSIFIER
+    return None
+
+
+def _loss_stage_for_metric(stage: str, key: str) -> Optional[int]:
+    stage_key = str(stage or "").strip().lower()
+    metric_key = str(key or "").strip().lower()
+    if metric_key == "loss" and stage_key in {"stage0", "stage1", "stage2", "gate0", "gate1", "gate2"}:
+        return _LOSS_STAGE_CLASSIFIER
+    if stage_key == "stageg" and metric_key == "g_loss":
+        return _LOSS_STAGE_GENERATOR
+    if stage_key == "stageg" and metric_key == "d_loss":
+        return _LOSS_STAGE_DISCRIMINATOR
+    if stage_key == "stager" and metric_key == "loss":
+        return _LOSS_STAGE_TRANSFORMER
+    if stage_key == "stagew" and metric_key in {"loss", "train_loss"}:
+        return _LOSS_STAGE_WAVE_CLASSIFIER
+    if stage_key == "stagew" and metric_key == "val_loss":
+        return _LOSS_STAGE_WAVE_CLASSIFIER_EVAL
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -330,7 +377,43 @@ class PipelineContext:
         except Exception:
             return False
 
+    def publish_loss(self, stage_id: int, loss: float, aux: float = 0.0) -> None:
+        stage = int(stage_id)
+        value = float(loss)
+        aux_value = float(aux)
+
+        logger = self.loss_logger
+        if logger is not None:
+            try:
+                logger.log(int(self.round_id), stage, value, aux=aux_value)
+                flush = getattr(logger, "flush", None)
+                if callable(flush):
+                    flush()
+            except Exception:
+                pass
+
+        proxy = self.viewer_proxy
+        if proxy is None:
+            return
+        fn = getattr(proxy, "update_loss", None)
+        if not callable(fn):
+            return
+        try:
+            fn(stage, value, aux_value, time.time())
+        except Exception:
+            pass
+
+    def publish_node_progress(self, node_id: str, loss: float, aux: float = 0.0) -> None:
+        stage_id = _loss_stage_for_node(node_id)
+        if stage_id is None:
+            return
+        self.publish_loss(stage_id, float(loss), aux=float(aux))
+
     def log_metric(self, stage: str, key: str, value: float) -> None:
+        value_f = float(value)
         self.metrics_history.append(
-            {"cycle": self.cycle, "round": self.round_id, "stage": stage, "key": key, "value": float(value)}
+            {"cycle": self.cycle, "round": self.round_id, "stage": stage, "key": key, "value": value_f}
         )
+        stage_id = _loss_stage_for_metric(stage, key)
+        if stage_id is not None:
+            self.publish_loss(stage_id, value_f)

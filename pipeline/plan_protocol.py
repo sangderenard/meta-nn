@@ -1101,6 +1101,71 @@ def _synthesize_node_run_expr(node: Any) -> str:
         return ""
 
 
+def _extract_training_mechanics(node: Any) -> Dict[str, Any]:
+    """Return a JSON-stable training-mechanics declaration for *node*."""
+    declare_fn = getattr(node, "declare_training_mechanics", None)
+    if not callable(declare_fn):
+        return {}
+    try:
+        raw = declare_fn()
+    except Exception:
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    if not raw:
+        return {}
+
+    def _norm_item(item: Any) -> Dict[str, Any]:
+        data = dict(item) if isinstance(item, dict) else {}
+        return {
+            "id": str(data.get("id", "") or "").strip(),
+            "label": str(data.get("label", "") or "").strip(),
+            "kind": str(data.get("kind", "state") or "state").strip(),
+            "detail": str(data.get("detail", "") or "").strip(),
+            "role": str(data.get("role", "") or "").strip(),
+        }
+
+    def _norm_flow(item: Any) -> Dict[str, Any]:
+        data = dict(item) if isinstance(item, dict) else {}
+        return {
+            "source": str(data.get("source", "") or "").strip(),
+            "target": str(data.get("target", "") or "").strip(),
+            "label": str(data.get("label", "") or "").strip(),
+            "kind": str(data.get("kind", "flow") or "flow").strip(),
+        }
+
+    return {
+        "enabled": bool(raw.get("enabled", True)),
+        "module_family": str(raw.get("module_family", "trainer") or "trainer").strip(),
+        "module_label": str(raw.get("module_label", "") or "").strip(),
+        "summary": str(raw.get("summary", "") or "").strip(),
+        "inputs": [item for item in (_norm_item(x) for x in list(raw.get("inputs", []) or [])) if item["id"]],
+        "losses": [item for item in (_norm_item(x) for x in list(raw.get("losses", []) or [])) if item["id"]],
+        "outputs": [item for item in (_norm_item(x) for x in list(raw.get("outputs", []) or [])) if item["id"]],
+        "flows": [
+            flow
+            for flow in (_norm_flow(x) for x in list(raw.get("flows", []) or []))
+            if flow["source"] and flow["target"]
+        ],
+    }
+
+
+def _extract_ir_node_contract(node: Any) -> Dict[str, Any]:
+    """Return a JSON-stable executable-contract declaration for *node*."""
+    declare_fn = getattr(node, "declare_ir_node_contract", None)
+    if not callable(declare_fn):
+        return {}
+    try:
+        raw = declare_fn()
+    except Exception:
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    if not raw:
+        return {}
+    return _jsonable(dict(raw))
+
+
 def plan_from_pipeline_graph(
     graph: "PipelineGraph",
     *,
@@ -1142,6 +1207,12 @@ def plan_from_pipeline_graph(
         record_meta.update(dict(meta.get("metadata", {})))
         record_meta.setdefault("description", str(getattr(node, "description", "") or ""))
         record_meta.setdefault("node_class", type(node).__name__)
+        training_mechanics = _extract_training_mechanics(node)
+        if training_mechanics:
+            record_meta["training_mechanics"] = _jsonable(training_mechanics)
+        ir_node_contract = _extract_ir_node_contract(node)
+        if ir_node_contract:
+            record_meta["ir_node_contract"] = _jsonable(ir_node_contract)
         gpu_models_raw = getattr(node, "gpu_models", [])
         if callable(gpu_models_raw):
             try:

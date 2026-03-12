@@ -1,0 +1,998 @@
+from __future__ import annotations
+
+import hashlib
+import json
+import math
+import shutil
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Sequence, Tuple
+
+import numpy as np
+import torch
+import torch.nn.functional as F
+from PIL import Image
+from torch.utils.data import Dataset, Sampler
+
+from semantic_dataset_loaders import (
+    SemanticDiskRow,
+    _blend_attention_maps,
+    _composite_mask_stack,
+    _norm_txt,
+    _normalize_attention_map,
+    build_creation_label_mask_stack,
+    build_label_mask_stack,
+    build_layout_mask,
+    build_term_mask_stack_from_image,
+    combine_label_mask_stacks,
+    infer_semantic_support_mask,
+    normalize_vocab_terms,
+    term_mask_map_to_label_stack,
+)
+
+
+def _sanitize_component(name: str) -> str:
+    txt = str(name).strip().lower()
+    txt = "".join(ch if ch.isalnum() or ch in ("_", "-") else "_" for ch in txt)
+    while "__" in txt:
+        txt = txt.replace("__", "_")
+    return txt.strip("_") or "wheel"
+
+
+def _fit_pil_to_square(im: Image.Image, image_size: int, fill: int = 0) -> Image.Image:
+    size = max(8, int(image_size))
+    src_w, src_h = im.size
+    if src_w <= 0 or src_h <= 0:
+        return Image.new(im.mode, (size, size), color=fill)
+    scale = 1.0
+    if int(src_w) > int(size) or int(src_h) > int(size):
+        scale = min(float(size) / float(src_w), float(size) / float(src_h))
+    new_w = max(1, int(round(float(src_w) * float(scale))))
+    new_h = max(1, int(round(float(src_h) * float(scale))))
+    if int(new_w) != int(src_w) or int(new_h) != int(src_h):
+        resample = Image.BILINEAR if im.mode != "L" else Image.NEAREST
+        im = im.resize((int(new_w), int(new_h)), resample=resample)
+    out = Image.new(im.mode, (size, size), color=fill)
+    left = max(0, int((size - int(new_w)) // 2))
+    top = max(0, int((size - int(new_h)) // 2))
+    out.paste(im, (left, top))
+    return out
+
+
+def _load_fit_rgb_u8(path: str, image_size: int) -> np.ndarray:
+    with Image.open(str(path)) as im:
+        rgb = _fit_pil_to_square(im.convert("RGB"), image_size=int(image_size), fill=0)
+        arr = np.asarray(rgb, dtype=np.uint8)
+    return np.transpose(arr, (2, 0, 1)).astype(np.uint8, copy=False)
+
+
+def _fit_mask_array_u8(mask: np.ndarray, image_size: int) -> np.ndarray:
+    arr = np.asarray(mask, dtype=np.float32)
+    if int(arr.ndim) == 3:
+        arr = np.mean(arr, axis=0).astype(np.float32, copy=False)
+    arr_u8 = np.clip(np.rint(np.clip(arr, 0.0, 1.0) * 255.0), 0.0, 255.0).astype(np.uint8)
+    pil = Image.fromarray(arr_u8, mode="L")
+    fitted = _fit_pil_to_square(pil, image_size=int(image_size), fill=0)
+    return np.asarray(fitted, dtype=np.uint8)
+
+
+def _encode_mask_u8(mask: Any) -> np.ndarray:
+    arr = np.asarray(mask, dtype=np.float32)
+    return np.clip(np.rint(np.clip(arr, 0.0, 1.0) * 255.0), 0.0, 255.0).astype(np.uint8, copy=False)
+
+
+def _decode_mask_u8(mask: np.ndarray) -> np.ndarray:
+    return np.clip(np.asarray(mask, dtype=np.float32) / 255.0, 0.0, 1.0).astype(np.float32, copy=False)
+
+
+def _positive_label_bits(label_vec: np.ndarray) -> np.ndarray:
+    return (np.asarray(label_vec, dtype=np.float32).reshape(-1) >= 0.5).astype(np.uint8, copy=False)
+
+
+def _row_creation_mask_u8(row: SemanticDiskRow, image_size: int) -> Optional[np.ndarray]:
+    size = max(8, int(image_size))
+    if row.mask_array is not None:
+        return _fit_mask_array_u8(np.asarray(row.mask_array, dtype=np.float32), image_size=size)
+    if str(row.mask_path).strip():
+        mask_path = Path(str(row.mask_path))
+        if mask_path.exists():
+            if str(mask_path.suffix).strip().lower() in (".mat", ".npz"):
+                npz_path = mask_path.with_suffix(".npz")
+                mat_path = mask_path.with_suffix(".mat")
+                seg = None
+                try:
+                    if npz_path.exists():
+                        with np.load(str(npz_path), allow_pickle=False) as z:
+                            seg = np.asarray(z["segmentation"], dtype=np.float32)
+                    elif mat_path.exists():
+                        from scipy.io import loadmat
+
+                        blob = loadmat(str(mat_path), squeeze_me=False, struct_as_record=False)
+                        gtcls = blob.get("GTcls", None)
+                        try:
+                            seg = np.asarray(gtcls[0, 0].Segmentation, dtype=np.float32)
+                        except Exception:
+                            try:
+                                seg = np.asarray(gtcls.Segmentation[0, 0], dtype=np.float32)
+                            except Exception:
+                                seg = None
+                except Exception:
+                    seg = None
+                if seg is not None:
+                    seg01 = (np.asarray(seg, dtype=np.float32) > 0.0).astype(np.float32, copy=False)
+                    return _fit_mask_array_u8(seg01, image_size=size)
+            try:
+                with Image.open(str(mask_path)) as im:
+                    gray = _fit_pil_to_square(im.convert("L"), image_size=size, fill=0)
+                    return np.asarray(gray, dtype=np.uint8)
+            except Exception:
+                pass
+    if isinstance(row.layout, dict):
+        return _encode_mask_u8(
+            _normalize_attention_map(
+                build_layout_mask(row.layout, height=size, width=size),
+                gamma=0.95,
+                blur_kernel=1,
+            )
+        )
+    return None
+
+
+def _apply_degrade(
+    x: np.ndarray,
+    mask: Optional[np.ndarray],
+    idx: int,
+    seed: int,
+    degrade_config: Optional[Dict[str, Any]] = None,
+) -> Tuple[np.ndarray, Optional[np.ndarray], Dict[str, np.ndarray]]:
+    cfg = dict(degrade_config) if isinstance(degrade_config, dict) else {}
+    cfg_use = {
+        "blur_prob": float(cfg.get("blur_prob", 0.55)),
+        "stride_skew_prob": float(cfg.get("stride_skew_prob", 0.40)),
+        "dropout_prob": float(cfg.get("dropout_prob", 0.25)),
+        "quantization_prob": float(cfg.get("quantization_prob", 0.30)),
+        "noise_prob": float(cfg.get("noise_prob", 0.55)),
+        "noise_std_min": float(cfg.get("noise_std_min", 0.01)),
+        "noise_std_max": float(cfg.get("noise_std_max", 0.08)),
+    }
+    rng = np.random.default_rng(int(seed) + (int(idx) * 104729))
+    out = np.asarray(x, dtype=np.float32).copy()
+    mask_out = None if mask is None else np.asarray(mask, dtype=np.float32).copy()
+    c, h, w = int(out.shape[0]), int(out.shape[1]), int(out.shape[2])
+    touch = np.zeros((int(h), int(w)), dtype=np.float32)
+    term_masks: Dict[str, np.ndarray] = {}
+
+    def _accumulate_touch(delta: Any, scale: float = 1.0, gamma: float = 1.0) -> Optional[np.ndarray]:
+        nonlocal touch
+        norm = _normalize_attention_map(delta, gamma=float(gamma), blur_kernel=3)
+        if float(np.max(norm)) <= 1e-8:
+            return None
+        touch = np.asarray(touch, dtype=np.float32) + (float(scale) * norm)
+        return np.asarray(norm, dtype=np.float32)
+
+    def _accumulate_term_mask(terms: Sequence[str], delta: Any, scale: float = 1.0, gamma: float = 1.0) -> None:
+        norm = _accumulate_touch(delta, scale=float(scale), gamma=float(gamma))
+        if norm is None or float(np.max(norm)) <= 1e-8:
+            return
+        for term in normalize_vocab_terms([str(t) for t in list(terms)]):
+            tk = _norm_txt(term)
+            prev = np.asarray(term_masks.get(tk, np.zeros((int(h), int(w)), dtype=np.float32)), dtype=np.float32)
+            term_masks[tk] = np.maximum(prev, np.asarray(norm, dtype=np.float32)).astype(np.float32, copy=False)
+
+    def _mark_diff(prev_x: np.ndarray, next_x: np.ndarray, scale: float = 1.0) -> None:
+        prev_g = np.mean(np.asarray(prev_x, dtype=np.float32), axis=0)
+        next_g = np.mean(np.asarray(next_x, dtype=np.float32), axis=0)
+        _accumulate_touch(np.abs(next_g - prev_g).astype(np.float32, copy=False), scale=float(scale), gamma=0.95)
+
+    if float(rng.random()) < float(cfg_use["blur_prob"]):
+        prev = np.asarray(out, dtype=np.float32).copy()
+        k = int(rng.choice(np.asarray([3, 5, 7], dtype=np.int32)))
+        t = torch.from_numpy(out[None, ...])
+        t = F.avg_pool2d(t, kernel_size=int(k), stride=1, padding=int(k // 2))
+        out = np.asarray(t[0].cpu().numpy(), dtype=np.float32)
+        _accumulate_term_mask(
+            ["blur damage", "signal"],
+            np.abs(np.mean(out[:3], axis=0) - np.mean(prev[:3], axis=0)),
+            scale=0.85,
+            gamma=0.95,
+        )
+    if float(rng.random()) < float(cfg_use["stride_skew_prob"]):
+        prev = np.asarray(out, dtype=np.float32).copy()
+        odd_shift = int(rng.integers(1, 8))
+        out[:, 1::2, :] = np.roll(out[:, 1::2, :], shift=odd_shift, axis=2)
+        stripe = np.zeros((h, w), dtype=np.float32)
+        stripe[1::2, :] = 1.0
+        _mark_diff(prev, out, scale=0.75)
+        _accumulate_term_mask(["stride skew damage", "signal"], stripe, scale=0.35, gamma=1.10)
+        if mask_out is not None:
+            mask_out[1::2, :] = np.roll(mask_out[1::2, :], shift=odd_shift, axis=1)
+    if float(rng.random()) < float(cfg_use["dropout_prob"]):
+        keep = float(rng.uniform(0.78, 0.96))
+        keep_mask = (rng.random((h, w), dtype=np.float32) < keep).astype(np.float32, copy=False)
+        out = out * keep_mask[None, :, :]
+        _accumulate_term_mask(["dropout damage", "signal"], 1.0 - keep_mask, scale=1.0, gamma=0.90)
+    if float(rng.random()) < float(cfg_use["quantization_prob"]):
+        prev = np.asarray(out, dtype=np.float32).copy()
+        lv = int(rng.choice(np.asarray([4, 6, 8, 12], dtype=np.int32)))
+        out = np.round(out * float(lv - 1)) / float(max(1, lv - 1))
+        _accumulate_term_mask(
+            ["quantization damage", "signal"],
+            np.abs(np.mean(out[:3], axis=0) - np.mean(prev[:3], axis=0)),
+            scale=0.75,
+            gamma=0.95,
+        )
+    if float(rng.random()) < float(cfg_use["noise_prob"]):
+        prev = np.asarray(out, dtype=np.float32).copy()
+        std = float(rng.uniform(float(cfg_use["noise_std_min"]), float(cfg_use["noise_std_max"])))
+        out = out + (std * rng.standard_normal((c, h, w), dtype=np.float32)).astype(np.float32, copy=False)
+        _accumulate_term_mask(
+            ["noise damage", "noise", "mixed noise and signal", "signal"],
+            np.abs(np.mean(out[:3], axis=0) - np.mean(prev[:3], axis=0)),
+            scale=0.90,
+            gamma=0.90,
+        )
+    out = np.clip(out, 0.0, 1.0).astype(np.float32, copy=False)
+    if mask_out is not None:
+        touch = _normalize_attention_map(touch, gamma=1.05, blur_kernel=5)
+        if float(np.max(touch)) > 1e-8:
+            mask_out = _blend_attention_maps(
+                [np.asarray(mask_out, dtype=np.float32), np.asarray(touch, dtype=np.float32)],
+                weights=[0.55, 1.15],
+                gamma=0.98,
+            ).astype(np.float32, copy=False)
+        else:
+            mask_out = _normalize_attention_map(mask_out, gamma=0.95, blur_kernel=3)
+    term_masks = {
+        str(k): _normalize_attention_map(v, gamma=0.90, blur_kernel=1)
+        for k, v in term_masks.items()
+        if float(np.max(v)) > 1e-8
+    }
+    return out, mask_out, term_masks
+
+
+def _build_clean_entry(
+    row: SemanticDiskRow,
+    image_size: int,
+    idx_to_term: Dict[int, str],
+) -> Dict[str, Any]:
+    size = max(8, int(image_size))
+    image_u8 = _load_fit_rgb_u8(row.image_path, image_size=size)
+    image = np.clip(np.asarray(image_u8, dtype=np.float32) / 255.0, 0.0, 1.0).astype(np.float32, copy=False)
+    label_vec = np.asarray(row.label_vec, dtype=np.float32).reshape(-1)
+    creation_mask_u8 = _row_creation_mask_u8(row, image_size=size)
+    creation_mask = _decode_mask_u8(creation_mask_u8) if creation_mask_u8 is not None else None
+    creation_stack = np.zeros((0, size, size), dtype=np.float32)
+    creation_idx = np.zeros((0,), dtype=np.int64)
+    if creation_mask is not None:
+        creation_stack, creation_idx = build_creation_label_mask_stack(
+            label_vec=label_vec,
+            height=size,
+            width=size,
+            creation_mask=np.asarray(creation_mask, dtype=np.float32),
+        )
+    heuristic_stack, heuristic_idx = build_term_mask_stack_from_image(
+        image=image,
+        label_vec=label_vec,
+        idx_to_term=idx_to_term,
+    )
+    mask_stack, mask_indices = combine_label_mask_stacks(
+        label_vec,
+        (creation_stack, creation_idx),
+        (heuristic_stack, heuristic_idx),
+        height=size,
+        width=size,
+        fallback_creation_mask=creation_mask,
+    )
+    if int(mask_stack.shape[0]) <= 0 or int(mask_indices.size) <= 0:
+        mask_stack, mask_indices = build_creation_label_mask_stack(
+            label_vec=label_vec,
+            height=size,
+            width=size,
+            creation_mask=np.asarray(creation_mask, dtype=np.float32) if creation_mask is not None else None,
+        )
+    mixed_mask = _composite_mask_stack(mask_stack) if int(mask_stack.shape[0]) > 0 else infer_semantic_support_mask(image=image, terms=row.terms)
+    mixed_mask = _normalize_attention_map(np.asarray(mixed_mask, dtype=np.float32), gamma=0.92, blur_kernel=5)
+    return {
+        "image_u8": np.asarray(image_u8, dtype=np.uint8),
+        "label_vec_u8": _positive_label_bits(label_vec),
+        "mixed_mask_u8": _encode_mask_u8(mixed_mask),
+        "mask_stack_u8": _encode_mask_u8(mask_stack) if int(mask_stack.size) > 0 else np.zeros((0, size, size), dtype=np.uint8),
+        "mask_indices": np.asarray(mask_indices, dtype=np.int32).reshape(-1),
+    }
+
+
+def _build_deformed_entry(
+    clean_entry: Dict[str, Any],
+    variant_idx: int,
+    base_row_position: int,
+    seed: int,
+    term_to_idx: Dict[str, int],
+    degrade_config: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    image = np.clip(np.asarray(clean_entry["image_u8"], dtype=np.float32) / 255.0, 0.0, 1.0).astype(np.float32, copy=False)
+    base_mask = _decode_mask_u8(np.asarray(clean_entry["mixed_mask_u8"], dtype=np.uint8))
+    x, mask_out, term_masks = _apply_degrade(
+        x=image,
+        mask=base_mask,
+        idx=int(base_row_position),
+        seed=int(seed) + (int(variant_idx) + 1) * 7919,
+        degrade_config=degrade_config,
+    )
+    label_vec = np.asarray(clean_entry["label_vec_u8"], dtype=np.uint8).astype(np.float32, copy=False)
+    for term in normalize_vocab_terms(list(term_masks.keys())):
+        ti = int(term_to_idx.get(_norm_txt(term), -1))
+        if 0 <= int(ti) < int(label_vec.size):
+            label_vec[int(ti)] = 1.0
+    size = int(x.shape[1])
+    base_stack = _decode_mask_u8(np.asarray(clean_entry["mask_stack_u8"], dtype=np.uint8))
+    base_idx = np.asarray(clean_entry["mask_indices"], dtype=np.int64).reshape(-1)
+    distortion_stack, distortion_idx = term_mask_map_to_label_stack(
+        term_masks,
+        label_vec,
+        term_to_idx=term_to_idx,
+        height=size,
+        width=size,
+    )
+    mask_stack, mask_indices = combine_label_mask_stacks(
+        label_vec,
+        (base_stack, base_idx),
+        (distortion_stack, distortion_idx),
+        height=size,
+        width=size,
+        fallback_creation_mask=(mask_out if mask_out is not None else base_mask),
+    )
+    if int(mask_stack.shape[0]) <= 0 or int(mask_indices.size) <= 0:
+        mask_stack, mask_indices = build_label_mask_stack(
+            mixed_mask=(mask_out if mask_out is not None else base_mask),
+            label_vec=label_vec,
+            treat_mixed_mask_as_creation=False,
+        )
+    mixed_mask = _composite_mask_stack(mask_stack) if int(mask_stack.shape[0]) > 0 else (
+        np.asarray(mask_out, dtype=np.float32) if mask_out is not None else base_mask
+    )
+    mixed_mask = _normalize_attention_map(np.asarray(mixed_mask, dtype=np.float32), gamma=0.92, blur_kernel=5)
+    return {
+        "image_u8": np.clip(np.rint(np.clip(x, 0.0, 1.0) * 255.0), 0.0, 255.0).astype(np.uint8, copy=False),
+        "label_vec_u8": _positive_label_bits(label_vec),
+        "mixed_mask_u8": _encode_mask_u8(mixed_mask),
+        "mask_stack_u8": _encode_mask_u8(mask_stack) if int(mask_stack.size) > 0 else np.zeros((0, size, size), dtype=np.uint8),
+        "mask_indices": np.asarray(mask_indices, dtype=np.int32).reshape(-1),
+    }
+
+
+def _row_weight_map(rows: Sequence[SemanticDiskRow], candidate_indices: Sequence[int]) -> Dict[int, float]:
+    term_freq: Dict[str, int] = {}
+    for row_idx in candidate_indices:
+        row = rows[int(row_idx)]
+        keys = {
+            _norm_txt(term)
+            for term in normalize_vocab_terms([str(x) for x in list(row.terms)])
+            if str(term).strip()
+        }
+        for key in keys:
+            term_freq[str(key)] = int(term_freq.get(str(key), 0)) + 1
+    out: Dict[int, float] = {}
+    for row_idx in candidate_indices:
+        row = rows[int(row_idx)]
+        keys = {
+            _norm_txt(term)
+            for term in normalize_vocab_terms([str(x) for x in list(row.terms)])
+            if str(term).strip()
+        }
+        weight = 1.0
+        for key in keys:
+            weight += 1.0 / float(max(1, int(term_freq.get(str(key), 1))))
+        out[int(row_idx)] = float(max(weight, 1e-4))
+    return out
+
+
+def _candidate_signature(rows: Sequence[SemanticDiskRow], candidate_indices: Sequence[int]) -> str:
+    hasher = hashlib.sha256()
+    for row_idx in candidate_indices:
+        row = rows[int(row_idx)]
+        payload = {
+            "image_path": str(row.image_path),
+            "mask_path": str(row.mask_path or ""),
+            "terms": list(normalize_vocab_terms([str(x) for x in list(row.terms)])),
+            "source": str(row.source),
+        }
+        hasher.update(json.dumps(payload, sort_keys=True, ensure_ascii=True).encode("utf-8"))
+        hasher.update(_positive_label_bits(np.asarray(row.label_vec, dtype=np.float32)).tobytes())
+    return str(hasher.hexdigest())
+
+
+def _weighted_deck_order(
+    rows: Sequence[SemanticDiskRow],
+    candidate_indices: Sequence[int],
+    seed: int,
+    epoch: int,
+) -> List[int]:
+    items = [int(i) for i in candidate_indices]
+    if len(items) <= 1:
+        return items
+    weights = _row_weight_map(rows=rows, candidate_indices=items)
+    rng = np.random.default_rng(max(0, int(seed)) + (int(epoch) * 104729))
+    u = np.clip(rng.random(len(items), dtype=np.float64), 1e-9, 1.0)
+    keys = []
+    for pos, row_idx in enumerate(items):
+        w = float(max(1e-6, float(weights.get(int(row_idx), 1.0))))
+        keys.append(float(math.log(float(u[int(pos)])) / w))
+    order = np.argsort(np.asarray(keys, dtype=np.float64))[::-1].astype(np.int64).tolist()
+    return [int(items[int(i)]) for i in order]
+
+
+def _load_json(path: Path, default: Dict[str, Any]) -> Dict[str, Any]:
+    if not path.exists():
+        return dict(default)
+    try:
+        blob = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(blob, dict):
+            return blob
+    except Exception:
+        pass
+    return dict(default)
+
+
+def _store_json(path: Path, payload: Dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+
+
+def _wheel_signature(config_blob: Dict[str, Any]) -> str:
+    return str(hashlib.sha256(json.dumps(config_blob, sort_keys=True, ensure_ascii=True).encode("utf-8")).hexdigest())
+
+
+def _chunk_payload(entries: Sequence[Dict[str, Any]], label_dim: int, image_size: int) -> Tuple[Dict[str, np.ndarray], Dict[str, Any]]:
+    n = int(len(entries))
+    if int(n) <= 0:
+        raise RuntimeError("semantic wheel chunk payload requires at least one entry")
+    size = max(8, int(image_size))
+    images = np.stack([np.asarray(entry["image_u8"], dtype=np.uint8) for entry in entries], axis=0).astype(np.uint8, copy=False)
+    mixed_masks = np.stack([np.asarray(entry["mixed_mask_u8"], dtype=np.uint8) for entry in entries], axis=0).astype(np.uint8, copy=False)
+    label_bank_rows: List[np.ndarray] = []
+    label_bank_lut: Dict[bytes, int] = {}
+    label_refs: List[int] = []
+    mask_bank_rows: List[np.ndarray] = []
+    mask_bank_lut: Dict[bytes, int] = {}
+    assoc_offsets: List[int] = [0]
+    assoc_mask_ids: List[int] = []
+    assoc_label_indices: List[int] = []
+    for entry in entries:
+        label_vec = np.asarray(entry["label_vec_u8"], dtype=np.uint8).reshape(-1)
+        if int(label_vec.size) != int(label_dim):
+            raise RuntimeError(f"semantic wheel label width mismatch: got={int(label_vec.size)} expected={int(label_dim)}")
+        label_key = bytes(label_vec.tobytes())
+        label_id = label_bank_lut.get(label_key, -1)
+        if int(label_id) < 0:
+            label_id = int(len(label_bank_rows))
+            label_bank_lut[label_key] = int(label_id)
+            label_bank_rows.append(np.asarray(label_vec, dtype=np.uint8))
+        label_refs.append(int(label_id))
+
+        stack_u8 = np.asarray(entry["mask_stack_u8"], dtype=np.uint8)
+        stack_idx = np.asarray(entry["mask_indices"], dtype=np.int32).reshape(-1)
+        if int(stack_u8.ndim) == 2:
+            stack_u8 = stack_u8[None, ...]
+        if int(stack_u8.ndim) != 3:
+            stack_u8 = np.zeros((0, size, size), dtype=np.uint8)
+        pair_count = min(int(stack_u8.shape[0]), int(stack_idx.size))
+        for pos in range(int(pair_count)):
+            mask_u8 = np.asarray(stack_u8[int(pos)], dtype=np.uint8)
+            mask_key = bytes(mask_u8.tobytes())
+            mask_id = mask_bank_lut.get(mask_key, -1)
+            if int(mask_id) < 0:
+                mask_id = int(len(mask_bank_rows))
+                mask_bank_lut[mask_key] = int(mask_id)
+                mask_bank_rows.append(np.asarray(mask_u8, dtype=np.uint8))
+            assoc_mask_ids.append(int(mask_id))
+            assoc_label_indices.append(int(stack_idx[int(pos)]))
+        assoc_offsets.append(int(len(assoc_mask_ids)))
+
+    label_bank = np.stack(label_bank_rows, axis=0).astype(np.uint8, copy=False) if len(label_bank_rows) > 0 else np.zeros((0, int(label_dim)), dtype=np.uint8)
+    mask_bank = np.stack(mask_bank_rows, axis=0).astype(np.uint8, copy=False) if len(mask_bank_rows) > 0 else np.zeros((0, size, size), dtype=np.uint8)
+    payload = {
+        "images": images,
+        "mixed_masks": mixed_masks,
+        "label_bank": label_bank,
+        "label_refs": np.asarray(label_refs, dtype=np.int32),
+        "mask_bank": mask_bank,
+        "assoc_offsets": np.asarray(assoc_offsets, dtype=np.int64),
+        "assoc_mask_ids": np.asarray(assoc_mask_ids, dtype=np.int32),
+        "assoc_label_indices": np.asarray(assoc_label_indices, dtype=np.int32),
+    }
+    raw_bytes = int(sum(int(arr.nbytes) for arr in payload.values()))
+    info = {
+        "rows": int(n),
+        "unique_labels": int(label_bank.shape[0]),
+        "unique_masks": int(mask_bank.shape[0]),
+        "associations": int(len(assoc_mask_ids)),
+        "raw_bytes": int(raw_bytes),
+    }
+    return payload, info
+
+
+def _write_chunk(path: Path, payload: Dict[str, np.ndarray]) -> int:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(str(path), **payload)
+    return int(path.stat().st_size) if path.exists() else 0
+
+
+@dataclass
+class SemanticWheelConfig:
+    purpose: str
+    cache_root: str
+    image_size: int
+    batch_size: int
+    lookahead_batches: int
+    seed: int
+    deformations_per_clean: int = 0
+    include_clean: bool = True
+    explicit_max_bytes: int = 0
+    sanity_cap_bytes: int = 8 * 1024 * 1024 * 1024
+    allow_large_override: bool = False
+    expiry_uses: int = 1
+    max_base_rows: int = 0
+    use_rare_term_deck: bool = True
+    degrade_config: Optional[Dict[str, Any]] = None
+    force_rebuild: bool = False
+
+
+class SemanticWheelDataset(Dataset):
+    def __init__(self, cache_dir: str, return_mask_stack: bool = False):
+        self.cache_dir = Path(str(cache_dir))
+        manifest_path = self.cache_dir / "manifest.json"
+        if not manifest_path.exists():
+            raise RuntimeError(f"semantic wheel manifest is missing: {manifest_path}")
+        self.manifest = _load_json(manifest_path, default={})
+        self.return_mask_stack = bool(return_mask_stack)
+        self.use_semantic_mask_stack_collate = bool(self.return_mask_stack)
+        self.image_size = int(self.manifest.get("image_size", 0))
+        self.label_dim = int(self.manifest.get("label_dim", 0))
+        self.chunk_rows = [int(x) for x in list(self.manifest.get("chunk_rows", []))]
+        self.chunk_offsets: List[int] = [0]
+        for count in self.chunk_rows:
+            self.chunk_offsets.append(int(self.chunk_offsets[-1] + int(count)))
+        self.total_rows = int(self.chunk_offsets[-1])
+        self.lookahead_batches = int(self.manifest.get("lookahead_batches", 0))
+        self._chunk_cache: Dict[int, Dict[str, np.ndarray]] = {}
+        self._chunk_lru: List[int] = []
+        self._max_cached_chunks = max(2, int(self.lookahead_batches) + 1)
+
+    def __len__(self) -> int:
+        return int(self.total_rows)
+
+    def _chunk_path(self, chunk_idx: int) -> Path:
+        return self.cache_dir / f"chunk_{int(chunk_idx):04d}.npz"
+
+    def _load_chunk(self, chunk_idx: int) -> Dict[str, np.ndarray]:
+        key = int(chunk_idx)
+        cached = self._chunk_cache.get(int(key))
+        if isinstance(cached, dict):
+            if int(key) in self._chunk_lru:
+                self._chunk_lru.remove(int(key))
+            self._chunk_lru.append(int(key))
+            return cached
+        path = self._chunk_path(int(key))
+        if not path.exists():
+            raise RuntimeError(f"semantic wheel chunk is missing: {path}")
+        with np.load(str(path), allow_pickle=False) as z:
+            payload = {str(name): np.asarray(z[str(name)]) for name in z.files}
+        self._chunk_cache[int(key)] = payload
+        self._chunk_lru.append(int(key))
+        while int(len(self._chunk_lru)) > int(self._max_cached_chunks):
+            victim = int(self._chunk_lru.pop(0))
+            self._chunk_cache.pop(int(victim), None)
+        return payload
+
+    def _locate(self, index: int) -> Tuple[int, int]:
+        idx = int(index)
+        if idx < 0:
+            idx = int(self.total_rows) + idx
+        if idx < 0 or idx >= int(self.total_rows):
+            raise IndexError(idx)
+        for chunk_idx in range(int(len(self.chunk_rows))):
+            start = int(self.chunk_offsets[int(chunk_idx)])
+            stop = int(self.chunk_offsets[int(chunk_idx) + 1])
+            if int(start) <= int(idx) < int(stop):
+                return int(chunk_idx), int(idx - start)
+        raise IndexError(idx)
+
+    def read_numpy_entry(self, index: int) -> Dict[str, np.ndarray]:
+        chunk_idx, row_offset = self._locate(int(index))
+        payload = self._load_chunk(int(chunk_idx))
+        images = np.asarray(payload["images"], dtype=np.uint8)
+        mixed_masks = np.asarray(payload["mixed_masks"], dtype=np.uint8)
+        label_bank = np.asarray(payload["label_bank"], dtype=np.uint8)
+        label_refs = np.asarray(payload["label_refs"], dtype=np.int32).reshape(-1)
+        mask_bank = np.asarray(payload["mask_bank"], dtype=np.uint8)
+        assoc_offsets = np.asarray(payload["assoc_offsets"], dtype=np.int64).reshape(-1)
+        assoc_mask_ids = np.asarray(payload["assoc_mask_ids"], dtype=np.int32).reshape(-1)
+        assoc_label_indices = np.asarray(payload["assoc_label_indices"], dtype=np.int32).reshape(-1)
+        label_ref = int(label_refs[int(row_offset)]) if 0 <= int(row_offset) < int(label_refs.size) else -1
+        label_vec = (
+            np.asarray(label_bank[int(label_ref)], dtype=np.uint8)
+            if 0 <= int(label_ref) < int(label_bank.shape[0])
+            else np.zeros((int(self.label_dim),), dtype=np.uint8)
+        )
+        a0 = int(assoc_offsets[int(row_offset)]) if int(row_offset) < int(assoc_offsets.size) else 0
+        a1 = int(assoc_offsets[int(row_offset) + 1]) if int(row_offset + 1) < int(assoc_offsets.size) else int(a0)
+        mask_ids = np.asarray(assoc_mask_ids[int(a0): int(a1)], dtype=np.int32)
+        label_indices = np.asarray(assoc_label_indices[int(a0): int(a1)], dtype=np.int32)
+        stack_u8 = (
+            np.asarray(mask_bank[mask_ids.tolist()], dtype=np.uint8)
+            if int(mask_ids.size) > 0 and int(mask_bank.shape[0]) > 0
+            else np.zeros((0, int(self.image_size), int(self.image_size)), dtype=np.uint8)
+        )
+        return {
+            "image_u8": np.asarray(images[int(row_offset)], dtype=np.uint8),
+            "label_vec_u8": np.asarray(label_vec, dtype=np.uint8),
+            "mixed_mask_u8": np.asarray(mixed_masks[int(row_offset)], dtype=np.uint8),
+            "mask_stack_u8": np.asarray(stack_u8, dtype=np.uint8),
+            "mask_indices": np.asarray(label_indices, dtype=np.int32),
+        }
+
+    def __getitem__(self, index: int):
+        item = self.read_numpy_entry(int(index))
+        x_t = torch.from_numpy(np.asarray(item["image_u8"], dtype=np.float32) / 255.0)
+        y_t = torch.from_numpy(np.asarray(item["label_vec_u8"], dtype=np.float32))
+        mask_t = torch.from_numpy(np.asarray(item["mixed_mask_u8"], dtype=np.uint8)[None, ...])
+        if bool(self.return_mask_stack):
+            stack_t = torch.from_numpy(np.asarray(item["mask_stack_u8"], dtype=np.uint8))
+            idx_t = torch.from_numpy(np.asarray(item["mask_indices"], dtype=np.int64))
+            return x_t, y_t, mask_t, stack_t, idx_t
+        return x_t, y_t, mask_t
+
+
+class SemanticWheelPayloadBank:
+    def __init__(self, dataset: SemanticWheelDataset):
+        self.dataset = dataset
+
+    def __len__(self) -> int:
+        return int(len(self.dataset))
+
+    def get_image(self, index: int) -> np.ndarray:
+        item = self.dataset.read_numpy_entry(int(index))
+        return (np.asarray(item["image_u8"], dtype=np.float32) / 255.0).astype(np.float32, copy=False)
+
+    def get_mask(self, index: int) -> np.ndarray:
+        item = self.dataset.read_numpy_entry(int(index))
+        return (np.asarray(item["mixed_mask_u8"], dtype=np.float32) / 255.0).astype(np.float32, copy=False)
+
+
+class SemanticWheelPayloadView(Sequence[np.ndarray]):
+    def __init__(self, bank: SemanticWheelPayloadBank, kind: str):
+        self.bank = bank
+        self.kind = str(kind).strip().lower()
+
+    def __len__(self) -> int:
+        return int(len(self.bank))
+
+    def __getitem__(self, index: int) -> np.ndarray:
+        if str(self.kind) == "image":
+            return self.bank.get_image(int(index))
+        if str(self.kind) == "mask":
+            return self.bank.get_mask(int(index))
+        raise KeyError(self.kind)
+
+
+class StatefulSequentialDeckSampler(Sampler[int]):
+    def __init__(self, length: int):
+        self.length = max(0, int(length))
+        self.cursor = 0
+
+    def __iter__(self):
+        emitted = 0
+        while int(emitted) < int(self.length):
+            idx = int((int(self.cursor) + int(emitted)) % max(1, int(self.length)))
+            emitted += 1
+            self.cursor = int((idx + 1) % max(1, int(self.length)))
+            yield int(idx)
+
+    def __len__(self) -> int:
+        return int(self.length)
+
+
+def ensure_semantic_wheel_cache(
+    rows: Sequence[SemanticDiskRow],
+    candidate_indices: Sequence[int],
+    class_names: Sequence[str],
+    config: SemanticWheelConfig,
+) -> Dict[str, Any]:
+    if len(rows) <= 0 or len(candidate_indices) <= 0:
+        raise RuntimeError(f"{str(config.purpose)} requires non-empty semantic rows")
+    cache_root = Path(str(config.cache_root).strip())
+    cache_root.mkdir(parents=True, exist_ok=True)
+    purpose_key = _sanitize_component(config.purpose)
+    build_config = {
+        "purpose": str(config.purpose),
+        "image_size": int(config.image_size),
+        "batch_size": int(config.batch_size),
+        "lookahead_batches": int(config.lookahead_batches),
+        "deformations_per_clean": int(config.deformations_per_clean),
+        "include_clean": bool(config.include_clean),
+        "label_dim": int(len(class_names)),
+    }
+    signature = _wheel_signature(build_config)
+    wheel_dir = cache_root / f"{purpose_key}_{str(signature)[:24]}"
+    manifest_path = wheel_dir / "manifest.json"
+    deck_state_path = wheel_dir / "deck_state.json"
+    candidate_sig = _candidate_signature(rows=rows, candidate_indices=candidate_indices)
+    manifest = _load_json(manifest_path, default={})
+    manifest_ok = bool(
+        not bool(config.force_rebuild)
+        and
+        manifest
+        and str(manifest.get("signature", "")) == str(signature)
+        and str(manifest.get("candidate_signature", "")) == str(candidate_sig)
+        and int(manifest.get("label_dim", 0)) == int(len(class_names))
+        and int(manifest.get("image_size", 0)) == int(config.image_size)
+    )
+    uses = int(manifest.get("use_count", 0)) if manifest_ok else 0
+    expiry_uses = max(1, int(config.expiry_uses))
+    if bool(manifest_ok) and int(uses) < int(expiry_uses):
+        manifest["cache_hit"] = True
+        manifest["use_count"] = int(uses) + 1
+        manifest["lookahead_batches"] = int(config.lookahead_batches)
+        _store_json(manifest_path, manifest)
+        return {
+            "cache_dir": str(wheel_dir),
+            "manifest": str(manifest_path),
+            "cache_hit": True,
+            "dataset": SemanticWheelDataset(cache_dir=str(wheel_dir), return_mask_stack=True),
+            "base_row_indices": [int(x) for x in list(manifest.get("base_row_indices", []))],
+            "info": dict(manifest),
+        }
+
+    wheel_dir.mkdir(parents=True, exist_ok=True)
+    deck_state = _load_json(deck_state_path, default={})
+    state_sig = str(deck_state.get("candidate_signature", ""))
+    order = [int(x) for x in list(deck_state.get("order", []))] if state_sig == str(candidate_sig) else []
+    epoch = int(deck_state.get("epoch", 0)) if state_sig == str(candidate_sig) else 0
+    cursor = int(deck_state.get("cursor", 0)) if state_sig == str(candidate_sig) else 0
+    candidate_list = [int(x) for x in list(candidate_indices)]
+    if len(order) != int(len(candidate_list)) or sorted(order) != sorted(candidate_list):
+        if bool(config.use_rare_term_deck):
+            order = _weighted_deck_order(rows=rows, candidate_indices=candidate_list, seed=int(config.seed), epoch=int(epoch))
+        else:
+            rng = np.random.default_rng(max(0, int(config.seed)) + (int(epoch) * 104729))
+            order = [int(x) for x in rng.permutation(np.asarray(candidate_list, dtype=np.int64)).tolist()]
+        cursor = 0
+    ordered_candidates = order[int(cursor):] + order[: int(cursor)]
+    if int(config.max_base_rows) > 0:
+        ordered_candidates = ordered_candidates[: int(config.max_base_rows)]
+    if len(ordered_candidates) <= 0:
+        raise RuntimeError(f"{str(config.purpose)} deck selection is empty")
+
+    term_to_idx = {_norm_txt(str(name)): int(i) for i, name in enumerate(class_names) if str(name).strip()}
+    idx_to_term = {int(i): str(name) for i, name in enumerate(class_names) if str(name).strip()}
+    entries_per_clean = int(config.deformations_per_clean) + (1 if bool(config.include_clean) else 0)
+    if int(entries_per_clean) <= 0:
+        raise RuntimeError("semantic wheel requires at least one entry per clean row")
+
+    def _entry_group(base_row_idx: int, base_row_pos: int) -> List[Dict[str, Any]]:
+        row = rows[int(base_row_idx)]
+        clean = _build_clean_entry(row=row, image_size=int(config.image_size), idx_to_term=idx_to_term)
+        out: List[Dict[str, Any]] = []
+        if bool(config.include_clean):
+            out.append(dict(clean))
+        for variant_idx in range(int(config.deformations_per_clean)):
+            out.append(
+                _build_deformed_entry(
+                    clean_entry=clean,
+                    variant_idx=int(variant_idx),
+                    base_row_position=int(base_row_pos),
+                    seed=int(config.seed),
+                    term_to_idx=term_to_idx,
+                    degrade_config=config.degrade_config,
+                )
+            )
+        return out
+
+    def _projection_only(limit_bytes: int) -> Dict[str, Any]:
+        selected_base_rows: List[int] = []
+        current_entries: List[Dict[str, Any]] = []
+        total_unique_labels = 0
+        total_unique_masks = 0
+        total_associations = 0
+        total_raw_bytes = 0
+        chunk_infos: List[Dict[str, Any]] = []
+        for base_pos, base_row_idx in enumerate(ordered_candidates):
+            pending_before = list(current_entries)
+            group = _entry_group(base_row_idx=int(base_row_idx), base_row_pos=int(base_pos))
+            current_entries.extend(group)
+            temp_infos: List[Dict[str, Any]] = []
+            working = list(current_entries)
+            while int(len(working)) >= int(config.batch_size):
+                _payload_unused, chunk_info = _chunk_payload(
+                    working[: int(config.batch_size)],
+                    label_dim=int(len(class_names)),
+                    image_size=int(config.image_size),
+                )
+                temp_infos.append(dict(chunk_info))
+                working = working[int(config.batch_size):]
+            partial_bytes = 0
+            partial_info: Optional[Dict[str, Any]] = None
+            if len(working) > 0:
+                _payload_unused, partial_info = _chunk_payload(
+                    working,
+                    label_dim=int(len(class_names)),
+                    image_size=int(config.image_size),
+                )
+                partial_bytes = int(partial_info.get("raw_bytes", 0))
+            tentative_total = int(total_raw_bytes)
+            tentative_unique_labels = int(total_unique_labels)
+            tentative_unique_masks = int(total_unique_masks)
+            tentative_associations = int(total_associations)
+            for chunk_info in temp_infos:
+                tentative_total += int(chunk_info.get("raw_bytes", 0))
+                tentative_unique_labels += int(chunk_info.get("unique_labels", 0))
+                tentative_unique_masks += int(chunk_info.get("unique_masks", 0))
+                tentative_associations += int(chunk_info.get("associations", 0))
+            if isinstance(partial_info, dict):
+                tentative_total += int(partial_bytes)
+                tentative_unique_labels += int(partial_info.get("unique_labels", 0))
+                tentative_unique_masks += int(partial_info.get("unique_masks", 0))
+                tentative_associations += int(partial_info.get("associations", 0))
+            if int(limit_bytes) > 0 and int(tentative_total) > int(limit_bytes):
+                current_entries = list(pending_before)
+                break
+            selected_base_rows.append(int(base_row_idx))
+            current_entries = list(working)
+            for chunk_info in temp_infos:
+                chunk_infos.append(dict(chunk_info))
+                total_raw_bytes += int(chunk_info.get("raw_bytes", 0))
+                total_unique_labels += int(chunk_info.get("unique_labels", 0))
+                total_unique_masks += int(chunk_info.get("unique_masks", 0))
+                total_associations += int(chunk_info.get("associations", 0))
+        if len(current_entries) > 0:
+            _payload_unused, partial_info = _chunk_payload(
+                current_entries,
+                label_dim=int(len(class_names)),
+                image_size=int(config.image_size),
+            )
+            chunk_infos.append(dict(partial_info))
+            total_raw_bytes += int(partial_info.get("raw_bytes", 0))
+            total_unique_labels += int(partial_info.get("unique_labels", 0))
+            total_unique_masks += int(partial_info.get("unique_masks", 0))
+            total_associations += int(partial_info.get("associations", 0))
+        return {
+            "base_row_indices": [int(x) for x in selected_base_rows],
+            "chunk_infos": list(chunk_infos),
+            "total_raw_bytes": int(total_raw_bytes),
+            "total_unique_labels": int(total_unique_labels),
+            "total_unique_masks": int(total_unique_masks),
+            "total_associations": int(total_associations),
+        }
+
+    full_projection = _projection_only(limit_bytes=0)
+    full_raw_bytes = int(full_projection.get("total_raw_bytes", 0))
+    effective_limit = int(config.explicit_max_bytes)
+    if int(effective_limit) > int(config.sanity_cap_bytes) and not bool(config.allow_large_override):
+        raise RuntimeError(
+            f"{str(config.purpose)} requested wheel cap {float(effective_limit) / (1024.0 * 1024.0):.1f} MB "
+            f"exceeds sanity cap {float(config.sanity_cap_bytes) / (1024.0 * 1024.0):.1f} MB. "
+            "Enable the large-cache override to allow caps above the sanity guard."
+        )
+    if int(effective_limit) <= 0:
+        effective_limit = int(config.sanity_cap_bytes)
+        if int(full_raw_bytes) > int(effective_limit) and not bool(config.allow_large_override):
+            raise RuntimeError(
+                f"{str(config.purpose)} projected semantic wheel size {float(full_raw_bytes) / (1024.0 * 1024.0):.1f} MB "
+                f"exceeds sanity cap {float(effective_limit) / (1024.0 * 1024.0):.1f} MB. "
+                "Set an explicit wheel cap or enable the large-cache override."
+            )
+        if bool(config.allow_large_override):
+            effective_limit = int(full_raw_bytes)
+
+    limited_projection = _projection_only(limit_bytes=int(effective_limit))
+    selected_base_rows = [int(x) for x in list(limited_projection.get("base_row_indices", []))]
+    if len(selected_base_rows) <= 0:
+        raise RuntimeError(
+            f"{str(config.purpose)} wheel cap is too small to fit one row group at image_size={int(config.image_size)} "
+            f"batch_size={int(config.batch_size)}"
+        )
+
+    temp_dir = wheel_dir.with_name(f"{wheel_dir.name}_tmp")
+    if temp_dir.exists():
+        shutil.rmtree(str(temp_dir), ignore_errors=True)
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    chunk_rows: List[int] = []
+    chunk_bytes: List[int] = []
+    total_unique_labels = 0
+    total_unique_masks = 0
+    total_associations = 0
+    current_entries: List[Dict[str, Any]] = []
+    chunk_idx = 0
+
+    def _flush_chunk(entries_to_flush: Sequence[Dict[str, Any]]) -> None:
+        nonlocal chunk_idx, total_unique_labels, total_unique_masks, total_associations
+        if len(entries_to_flush) <= 0:
+            return
+        payload, chunk_info = _chunk_payload(
+            entries_to_flush,
+            label_dim=int(len(class_names)),
+            image_size=int(config.image_size),
+        )
+        on_disk = _write_chunk(temp_dir / f"chunk_{int(chunk_idx):04d}.npz", payload)
+        chunk_rows.append(int(len(entries_to_flush)))
+        chunk_bytes.append(int(on_disk))
+        total_unique_labels += int(chunk_info.get("unique_labels", 0))
+        total_unique_masks += int(chunk_info.get("unique_masks", 0))
+        total_associations += int(chunk_info.get("associations", 0))
+        chunk_idx += 1
+
+    for base_pos, base_row_idx in enumerate(selected_base_rows):
+        group = _entry_group(base_row_idx=int(base_row_idx), base_row_pos=int(base_pos))
+        current_entries.extend(group)
+        while int(len(current_entries)) >= int(config.batch_size):
+            _flush_chunk(current_entries[: int(config.batch_size)])
+            current_entries = current_entries[int(config.batch_size):]
+    if len(current_entries) > 0:
+        _flush_chunk(current_entries)
+
+    final_manifest = {
+        "version": 1,
+        "signature": str(signature),
+        "purpose": str(config.purpose),
+        "candidate_signature": str(candidate_sig),
+        "image_size": int(config.image_size),
+        "label_dim": int(len(class_names)),
+        "batch_size": int(config.batch_size),
+        "lookahead_batches": int(config.lookahead_batches),
+        "deformations_per_clean": int(config.deformations_per_clean),
+        "include_clean": bool(config.include_clean),
+        "entries_per_clean": int(entries_per_clean),
+        "cache_hit": False,
+        "use_count": 1,
+        "expiry_uses": int(expiry_uses),
+        "explicit_max_bytes": int(config.explicit_max_bytes),
+        "effective_max_bytes": int(effective_limit),
+        "sanity_cap_bytes": int(config.sanity_cap_bytes),
+        "allow_large_override": bool(config.allow_large_override),
+        "projected_full_raw_bytes": int(full_raw_bytes),
+        "projected_selected_raw_bytes": int(limited_projection.get("total_raw_bytes", 0)),
+        "chunk_rows": [int(x) for x in chunk_rows],
+        "chunk_bytes": [int(x) for x in chunk_bytes],
+        "chunk_count": int(len(chunk_rows)),
+        "total_rows": int(sum(chunk_rows)),
+        "base_row_count": int(len(selected_base_rows)),
+        "base_row_indices": [int(x) for x in selected_base_rows],
+        "total_unique_labels": int(total_unique_labels),
+        "total_unique_masks": int(total_unique_masks),
+        "total_associations": int(total_associations),
+        "deck_epoch_start": int(epoch),
+        "deck_cursor_start": int(cursor),
+        "deck_use_rare_terms": bool(config.use_rare_term_deck),
+    }
+    _store_json(temp_dir / "manifest.json", final_manifest)
+    if wheel_dir.exists():
+        shutil.rmtree(str(wheel_dir), ignore_errors=True)
+    temp_dir.replace(wheel_dir)
+
+    new_cursor = int(cursor + len(selected_base_rows))
+    new_epoch = int(epoch)
+    new_order = list(order)
+    if int(len(order)) > 0 and int(new_cursor) >= int(len(order)):
+        new_epoch = int(epoch) + 1
+        new_cursor = int(new_cursor % int(len(order)))
+        if bool(config.use_rare_term_deck):
+            new_order = _weighted_deck_order(rows=rows, candidate_indices=candidate_list, seed=int(config.seed), epoch=int(new_epoch))
+        else:
+            rng = np.random.default_rng(max(0, int(config.seed)) + (int(new_epoch) * 104729))
+            new_order = [int(x) for x in rng.permutation(np.asarray(candidate_list, dtype=np.int64)).tolist()]
+    deck_state_out = {
+        "candidate_signature": str(candidate_sig),
+        "epoch": int(new_epoch),
+        "cursor": int(new_cursor),
+        "order": [int(x) for x in new_order],
+    }
+    _store_json(deck_state_path, deck_state_out)
+
+    return {
+        "cache_dir": str(wheel_dir),
+        "manifest": str(wheel_dir / "manifest.json"),
+        "cache_hit": False,
+        "dataset": SemanticWheelDataset(cache_dir=str(wheel_dir), return_mask_stack=True),
+        "base_row_indices": [int(x) for x in selected_base_rows],
+        "info": dict(final_manifest),
+    }

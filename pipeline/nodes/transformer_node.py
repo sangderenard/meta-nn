@@ -44,7 +44,15 @@ import torch
 
 from pipeline.context import PipelineContext
 from pipeline.graph import PipelineNode
-from pipeline.nodes.base import GatedNode, autocast_context, make_grad_scaler, resolve_amp_dtype
+from pipeline.nodes.base import (
+    IRLossTermSpec,
+    IRStateSpec,
+    IRTrainingNode,
+    IRTensorPortSpec,
+    autocast_context,
+    make_grad_scaler,
+    resolve_amp_dtype,
+)
 import json
 
 
@@ -301,7 +309,7 @@ class BuildTransformerNode(PipelineNode):
 # Stage R — Transformer training node
 # ---------------------------------------------------------------------------
 
-class TransformerTrainNode(GatedNode):
+class TransformerTrainNode(IRTrainingNode):
     """Stage R: Train WavePatchTransformer to produce classifier-scoring outputs.
 
     Requires Gate 0 + Gate 1 (early gates).  The transformer generates image
@@ -319,9 +327,110 @@ class TransformerTrainNode(GatedNode):
     description = "Stage R: WavePatchTransformer feature-score training"
     required_gates = ["gate_pregestation", "gate_gestation"]
     gpu_models = ["transformer", "classifier"]
+    model_attr = "transformer"
+    extra_model_attrs = ["classifier"]
+    optimizer_attrs = ["transformer_optimizer"]
 
     def __init__(self, cfg: TransformerConfig) -> None:
         self.cfg = cfg
+
+    def ir_input_ports(self) -> List[IRTensorPortSpec]:
+        return [
+            IRTensorPortSpec(
+                "wave_chunk_batch",
+                "Wave chunk batch",
+                io="input",
+                dtype="float32",
+                shape="B x chunk_samples",
+                semantic="wave_chunk_batch",
+                detail="decoded waveform chunks selected from the float-stream pool",
+            ),
+        ]
+
+    def ir_output_ports(self) -> List[IRTensorPortSpec]:
+        return [
+            IRTensorPortSpec(
+                "rendered_wave_images",
+                "Rendered wave images",
+                io="output",
+                dtype="float32",
+                shape="B x 3 x H x W",
+                semantic="rendered_image_batch",
+                detail="classifier-scoring bitplane renderings emitted by the transformer",
+            ),
+            IRTensorPortSpec(
+                "reconstructed_wave_chunks",
+                "Reconstructed wave chunks",
+                io="output",
+                dtype="float32",
+                shape="B x chunk_samples",
+                semantic="wave_reconstruction",
+                detail="reconstruction path used by the waveform-fidelity terms",
+            ),
+        ]
+
+    def ir_loss_terms(self) -> List[IRLossTermSpec]:
+        return [
+            IRLossTermSpec(
+                "stage_r_transformer_loss",
+                "Stage R transformer objective",
+                kind="feature_score+rank+spurious+entropy+bitplane+wave_l1",
+                optimizer_targets=["transformer_optimizer"],
+                source_ports=[
+                    "wave_chunk_batch",
+                    "rendered_wave_images",
+                    "reconstructed_wave_chunks",
+                ],
+                detail="Composite objective balancing classifier score, diversity, entropy, bitplane structure, and waveform fidelity",
+            ),
+        ]
+
+    def ir_state_inputs(self) -> List[IRStateSpec]:
+        return [
+            IRStateSpec(
+                "render_config",
+                "Render config",
+                role="render_geometry",
+                detail="bitplane and patch-layout parameters used to rasterize wave chunks",
+            ),
+        ]
+
+    def ir_contract_notes(self) -> str:
+        return (
+            "PyTorch Stage-R trainer. The current implementation delegates the inner "
+            "loop and LR schedule to train_transformer_feature_metric(), but the IR "
+            "contract fixes the tensor, model, loss, and gate-facing surfaces."
+        )
+
+    def declare_training_mechanics(self) -> Dict[str, Any]:
+        return {
+            "module_family": "transformer",
+            "module_label": "Stage R Transformer",
+            "summary": "Wave chunks are rendered into classifier-scoring images while preserving bitplane and waveform structure.",
+            "inputs": [
+                {"id": "wave_stream_batch", "label": "Wave stream batch", "kind": "dataset", "detail": "decoded float streams and chunk windows"},
+                {"id": "transformer_model", "label": "WavePatchTransformer", "kind": "model", "detail": "renderer from wave chunks to image patches"},
+                {"id": "classifier_model", "label": "Classifier teacher", "kind": "model", "detail": "scores semantic quality of rendered images"},
+                {"id": "render_config", "label": "Render config", "kind": "state", "detail": "bitplane and patch-layout rendering parameters"},
+            ],
+            "losses": [
+                {"id": "loss_stage_r_transformer", "label": "feature + rank + entropy + bitplane + wave L1", "kind": "loss", "detail": "composite transformer objective"},
+            ],
+            "outputs": [
+                {"id": "transformer_model", "label": "WavePatchTransformer", "kind": "model", "detail": "updated render model weights"},
+            ],
+            "flows": [
+                {"source": "wave_stream_batch", "target": "self", "label": "wave chunks", "kind": "consume"},
+                {"source": "transformer_model", "target": "self", "label": "trainable weights", "kind": "consume"},
+                {"source": "classifier_model", "target": "self", "label": "semantic teacher", "kind": "condition"},
+                {"source": "render_config", "target": "self", "label": "render parameters", "kind": "condition"},
+                {"source": "self", "target": "loss_stage_r_transformer", "label": "rendered images + reconstructions", "kind": "predict"},
+                {"source": "wave_stream_batch", "target": "loss_stage_r_transformer", "label": "wave targets", "kind": "supervise"},
+                {"source": "classifier_model", "target": "loss_stage_r_transformer", "label": "feature-score teacher", "kind": "supervise"},
+                {"source": "render_config", "target": "loss_stage_r_transformer", "label": "bitplane geometry", "kind": "supervise"},
+                {"source": "loss_stage_r_transformer", "target": "transformer_model", "label": "optimizer step", "kind": "optimize"},
+            ],
+        }
 
     def should_run(self, ctx: PipelineContext) -> bool:
         if not super().should_run(ctx):

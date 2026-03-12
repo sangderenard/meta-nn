@@ -611,6 +611,81 @@ class _TransformerStatusOpenGLViewer:
         """Register the preview work queue so the cache map can read its depth."""
         self._preview_work_queue_ref = work_queue
 
+    def _history_snap_count(self) -> int:
+        return max(
+            len(self._weight_snapshot_deque),
+            len(self._played_frames_deque),
+            len(self._loss_count_at_snap_deque),
+        )
+
+    def _clone_history_frame(self, frame: Optional[dict]) -> Optional[dict]:
+        if not isinstance(frame, dict):
+            return None
+        images = frame.get("images", None)
+        if not isinstance(images, list) or len(images) != 3:
+            return None
+        out_images: List[np.ndarray] = []
+        for img in images:
+            if img is None:
+                return None
+            out_images.append(np.ascontiguousarray(np.asarray(img, dtype=np.uint8)).copy())
+        return {
+            "images": out_images,
+            "caption": str(frame.get("caption", "")),
+            "titles": [str(x) for x in frame.get("titles", self._panel_titles)],
+            "rows": [list(r) for r in frame.get("rows", self._panel_rows)],
+        }
+
+    def _record_history_frame(self, frame: Optional[dict]) -> None:
+        history_frame = self._clone_history_frame(frame)
+        if history_frame is None:
+            return
+        self._played_frames_deque.append(history_frame)
+        self._loss_count_at_snap_deque.append(
+            {sid: len(dq) for sid, dq in self._loss_graph_data.items()}
+        )
+        self._weight_snapshot_deque.append(
+            {"weight_map": np.ascontiguousarray(np.asarray(self._weight_map_rgb, dtype=np.uint8)).copy()}
+        )
+
+    def _history_frame_at_offset(self, offset: int) -> Optional[dict]:
+        history = list(self._played_frames_deque)
+        hlen = len(history)
+        if hlen <= 0:
+            return None
+        off = max(1, min(hlen, int(offset)))
+        idx = max(0, min(hlen - 1, hlen - off))
+        return history[idx]
+
+    def _history_weight_map_at_offset(self, offset: int) -> Optional[np.ndarray]:
+        snaps = list(self._weight_snapshot_deque)
+        slen = len(snaps)
+        if slen <= 0:
+            return None
+        off = max(1, min(slen, int(offset)))
+        idx = max(0, min(slen - 1, slen - off))
+        blob = snaps[idx]
+        if not isinstance(blob, dict):
+            return None
+        weight_map = blob.get("weight_map", None)
+        if weight_map is None:
+            return None
+        return np.ascontiguousarray(np.asarray(weight_map, dtype=np.uint8))
+
+    def _apply_frame_to_display(self, frame: Optional[dict]) -> None:
+        if not isinstance(frame, dict):
+            return
+        imgs = frame.get("images", None)
+        if isinstance(imgs, list) and len(imgs) == 3 and self._textures is not None:
+            for i, tid in enumerate(self._textures["img"]):
+                self._upload_texture(int(tid), np.asarray(imgs[i], dtype=np.uint8))
+        self._caption = str(frame.get("caption", ""))
+        self._panel_titles = [str(x) for x in frame.get("titles", self._panel_titles)]
+        self._panel_rows = [list(r) for r in frame.get("rows", self._panel_rows)]
+        self._panel_text_dirty = True
+        self._top_bar_dirty = True
+        self._last_displayed_frame = frame
+
     def set_training_graph_worker_hello(self, payload: Dict[str, Any]) -> None:
         self._graph_worker_hello = dict(payload or {})
         self._top_bar_dirty = True
@@ -628,6 +703,7 @@ class _TransformerStatusOpenGLViewer:
     def append_training_graph_event(self, payload: Dict[str, Any]) -> None:
         self._graph_execution_events.append(dict(payload or {}))
         self._top_bar_dirty = True
+        self._graph_dirty = True
 
     def set_weight_model_refs(
         self,
@@ -818,13 +894,14 @@ class _TransformerStatusOpenGLViewer:
             )
             # Status info
             y_info = btn_y1 + 6
-            total = len(self._weight_snapshot_deque)
+            total = self._history_snap_count()
+            can_restore = callable(self._on_restore_state)
             if scrubbing:
                 draw.text((4, y_info),      f"scrub: -{self._scrub_offset} / {total}",
                           fill=(180, 160, 220), font=font)
                 draw.text((4, y_info + 12), "wheel \u2191\u2193 to navigate",
                           fill=(110, 100, 140), font=font)
-                draw.text((4, y_info + 24), "click btn to restore & run",
+                draw.text((4, y_info + 24), "click btn to restore & run" if can_restore else "restore unavailable",
                           fill=(110, 100, 140), font=font)
             else:
                 draw.text((4, y_info),      f"live  (history: {total})",
@@ -838,7 +915,7 @@ class _TransformerStatusOpenGLViewer:
 
     def _render_scrub_dial(self) -> np.ndarray:
         """Left sidebar bottom panel: circular dial showing scrub offset."""
-        total = max(1, len(self._weight_snapshot_deque))
+        total = max(1, self._history_snap_count())
         offset = int(self._scrub_offset)
         fill_frac = float(offset) / float(total)
         color = (170, 80, 220) if offset > 0 else (60, 80, 110)
@@ -1025,32 +1102,20 @@ class _TransformerStatusOpenGLViewer:
                 break
             for sid, lv in last_frame.get("losses", {}).items():
                 self.update_loss(int(sid), float(lv))
+            self._record_history_frame(last_frame)
             self._last_anim_t += self._anim_frame_dt
-        if last_frame is not None:
-            imgs = last_frame.get("images", None)
-            if isinstance(imgs, list) and len(imgs) == 3:
-                for i, tid in enumerate(self._textures["img"]):
-                    self._upload_texture(int(tid), np.asarray(imgs[i], dtype=np.uint8))
-            self._caption = str(last_frame.get("caption", ""))
-            self._panel_titles = [str(x) for x in last_frame.get("titles", self._panel_titles)]
-            self._panel_rows = [list(r) for r in last_frame.get("rows", self._panel_rows)]
-            self._panel_text_dirty = True
-            self._top_bar_dirty = True
-            self._last_displayed_frame = last_frame
+        if self._scrub_offset == 0:
+            if last_frame is not None:
+                self._apply_frame_to_display(last_frame)
+        else:
+            history_frame = self._history_frame_at_offset(self._scrub_offset)
+            if history_frame is not None:
+                self._apply_frame_to_display(history_frame)
 
         # Sidebar: btn_panel + scrub_dial every pump (cheap); weight snap is count-driven.
         self._cache_map_rgb  = self._render_btn_panel()
         self._frame_knob_rgb = self._render_scrub_dial()
         if self._scrub_offset == 0:
-            _snap_imgs = (
-                self._last_displayed_frame.get("images", None)
-                if self._last_displayed_frame is not None else None
-            )
-            # Record loss series lengths so the graph can map this snap → x-pixel.
-            self._loss_count_at_snap_deque.append(
-                {sid: len(dq) for sid, dq in self._loss_graph_data.items()}
-            )
-            self._played_frames_deque.append({"images": _snap_imgs})
             # Collect finished background snap if ready.
             if (self._weight_snap_thread is not None
                     and not self._weight_snap_thread.is_alive()
@@ -1061,7 +1126,10 @@ class _TransformerStatusOpenGLViewer:
                 _wmap = _res.get("weight_map")
                 if _wmap is not None:
                     self._weight_map_rgb = _wmap
-                    self._weight_snapshot_deque.append({"weight_map": _wmap.copy()})
+                    if self._weight_snapshot_deque:
+                        self._weight_snapshot_deque[-1] = {"weight_map": _wmap.copy()}
+                    else:
+                        self._weight_snapshot_deque.append({"weight_map": _wmap.copy()})
                 _sst = _res.get("states")
                 if _sst:
                     # Delete the file for the entry about to be evicted before it's gone.
@@ -1136,13 +1204,9 @@ class _TransformerStatusOpenGLViewer:
         else:
             # Frozen: show the snapshot at the chosen offset.
             # _scrub_offset 1 = most-recent snapshot; _slen = oldest.
-            _snaps  = list(self._weight_snapshot_deque)
-            _slen   = len(_snaps)
-            if _slen > 0:
-                _off = min(int(self._scrub_offset), _slen)  # clamp: allow reaching index 0
-                _idx = _slen - _off                          # 0 = oldest, _slen-1 = newest
-                _idx = max(0, min(_slen - 1, _idx))         # hard safety clamp
-                self._weight_map_rgb = np.asarray(_snaps[_idx]["weight_map"], dtype=np.uint8)
+            weight_map = self._history_weight_map_at_offset(self._scrub_offset)
+            if weight_map is not None:
+                self._weight_map_rgb = weight_map
         self._sidebar_dirty = True
 
         dirty = bool(self._top_bar_dirty or self._panel_text_dirty or self._graph_dirty or self._sidebar_dirty)
@@ -1248,7 +1312,7 @@ class _TransformerStatusOpenGLViewer:
                 # Mouse-wheel: scrub weight / preview history.
                 if event.type == self._pygame.MOUSEWHEEL:
                     delta = int(getattr(event, "y", 0))
-                    _snap_len = len(self._weight_snapshot_deque)
+                    _snap_len = self._history_snap_count()
                     if _snap_len > 0:
                         # Upper bound is _snap_len (not _snap_len-1) so the oldest
                         # snapshot at index 0 is reachable (idx = _slen - _slen = 0).
@@ -1272,11 +1336,12 @@ class _TransformerStatusOpenGLViewer:
                                         self._on_restore_state(int(self._scrub_offset))
                                     except Exception:
                                         pass
-                                self._scrub_offset = 0
-                                self._weight_snapshot_deque.clear()
-                                self._played_frames_deque.clear()
-                                self._sidebar_dirty = True
-                                self._present(force=True)
+                                    self._scrub_offset = 0
+                                    self._weight_snapshot_deque.clear()
+                                    self._played_frames_deque.clear()
+                                    self._loss_count_at_snap_deque.clear()
+                                    self._sidebar_dirty = True
+                                    self._present(force=True)
                                 continue
                         # Top-bar toggle controls.
                         if self._handle_click(xi, yi):
@@ -1659,8 +1724,10 @@ class _TransformerStatusOpenGLViewer:
 
             _STATUS_COLORS = {
                 "active":    (0,   190, 220),
+                "running":   (0,   190, 220),
                 "ran":       (52,  168,  83),
                 "completed": (52,  168,  83),
+                "ok":        (52,  168,  83),
                 "failed":    (210,  50,  50),
                 "skipped":   (55,   62,  74),
                 "pending":   (70,   80,  95),

@@ -1,0 +1,91 @@
+from __future__ import annotations
+
+from typing import Any, Dict, List
+
+from pipeline.context import PipelineContext
+from pipeline.nodes.base import (
+    IRLossTermSpec,
+    IRStateSpec,
+    IRTrainingNode,
+    IRTensorPortSpec,
+)
+
+
+class ${ClassName}(IRTrainingNode):
+    """IR-backed PyTorch training node template.
+
+    Required sections:
+      1. Declare ownership: node_id, description, model_attr, optimizer_attrs.
+      2. Declare IR contract: tensor ports, state inputs, loss terms.
+      3. Implement execute(): keep custom math here, but follow the declared
+         tensor/loss contract so the plan and future codegen stay aligned.
+    """
+
+    node_id = "${node_id}"
+    description = "${description}"
+    model_attr = "${model_attr}"
+    optimizer_attrs = ["${optimizer_attr}"]
+    required_gates = ${required_gates}
+    gpu_models = ${gpu_models}
+
+    def ir_input_ports(self) -> List[IRTensorPortSpec]:
+        return [
+            IRTensorPortSpec(
+                port_id="${input_port_id}",
+                label="${input_port_label}",
+                io="input",
+                dtype="${input_dtype}",
+                shape="${input_shape}",
+                semantic="${input_semantic}",
+                detail="${input_detail}",
+            ),
+        ]
+
+    def ir_output_ports(self) -> List[IRTensorPortSpec]:
+        return [
+            IRTensorPortSpec(
+                port_id="${output_port_id}",
+                label="${output_port_label}",
+                io="output",
+                dtype="${output_dtype}",
+                shape="${output_shape}",
+                semantic="${output_semantic}",
+                detail="${output_detail}",
+            ),
+        ]
+
+    def ir_loss_terms(self) -> List[IRLossTermSpec]:
+        return [
+            IRLossTermSpec(
+                loss_id="${loss_id}",
+                label="${loss_label}",
+                kind="${loss_kind}",
+                optimizer_targets=["${model_attr}"],
+                source_ports=["${input_port_id}", "${output_port_id}"],
+                detail="${loss_detail}",
+            ),
+        ]
+
+    def ir_state_inputs(self) -> List[IRStateSpec]:
+        return [
+            IRStateSpec(
+                state_id="${state_id}",
+                label="${state_label}",
+                role="${state_role}",
+                detail="${state_detail}",
+            ),
+        ]
+
+    def execute(self, ctx: PipelineContext) -> None:
+        model = self._get_model(ctx)
+        optimizer = getattr(ctx, "${optimizer_attr}", None)
+        if optimizer is None:
+            raise RuntimeError(f"{type(self).__name__}: missing optimizer ctx.${optimizer_attr}")
+
+        # Template contract:
+        #   1. Read tensors from ctx according to ir_input_ports().
+        #   2. Run forward pass on `model`.
+        #   3. Compute the loss terms declared in ir_loss_terms().
+        #   4. Backpropagate and step `optimizer`.
+        #   5. Write outputs back to ctx using ir_output_ports() as the guide.
+        raise NotImplementedError("Fill in node-specific PyTorch training math.")

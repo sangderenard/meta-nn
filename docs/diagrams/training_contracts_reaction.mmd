@@ -1,0 +1,277 @@
+%%{init: {'theme':'base','themeVariables':{'background':'#f5f6f7','mainBkg':'#f5f6f7'},'flowchart':{'curve':'basis','htmlLabels':true}}}%%
+flowchart LR
+    training_resource__contract__model__classifier["Classifier"]
+    training_resource__contract__model__discriminator["Discriminator"]
+    training_resource__contract__model__generator["Generator"]
+    training_resource__contract__model__transformer["Transformer"]
+    training_resource__contract__model__wave_classifier["Wave Classifier"]
+    training_resource__contract__stage_0_pregestation__input__pregestation_images[["Pregestation images"]]
+    training_resource__contract__stage_0_pregestation__input__pregestation_masks[["Pregestation masks"]]
+    training_resource__contract__stage_0_pregestation__input__pregestation_targets[["Pregestation targets"]]
+    training_resource__contract__stage_0_pregestation__loss__stage0_classifier_loss(["Stage 0 classifier objective"])
+    training_resource__contract__stage_0_pregestation__output__classifier_logits(["Classifier logits"])
+    training_resource__contract__stage_0_pregestation__output__classifier_mask_logits(["Mask logits"])
+    training_resource__contract__stage_1_gestation__input__gestation_images[["Gestation images"]]
+    training_resource__contract__stage_1_gestation__input__gestation_masks[["Gestation masks"]]
+    training_resource__contract__stage_1_gestation__input__gestation_targets[["Gestation targets"]]
+    training_resource__contract__stage_1_gestation__loss__stage1_classifier_loss(["Stage 1 classifier objective"])
+    training_resource__contract__stage_1_gestation__output__classifier_logits(["Classifier logits"])
+    training_resource__contract__stage_1_gestation__output__classifier_mask_logits(["Mask logits"])
+    training_resource__contract__stage_2_berkeley__input__berkeley_images[["Berkeley images"]]
+    training_resource__contract__stage_2_berkeley__input__berkeley_masks[["Berkeley masks"]]
+    training_resource__contract__stage_2_berkeley__input__berkeley_targets[["Berkeley targets"]]
+    training_resource__contract__stage_2_berkeley__loss__stage2_classifier_loss(["Stage 2 classifier objective"])
+    training_resource__contract__stage_2_berkeley__output__classifier_logits(["Classifier logits"])
+    training_resource__contract__stage_2_berkeley__output__classifier_mask_logits(["Mask logits"])
+    training_resource__contract__stage_c_lora__input__berkeley_images[["Berkeley images"]]
+    training_resource__contract__stage_c_lora__input__berkeley_masks[["Berkeley masks"]]
+    training_resource__contract__stage_c_lora__input__berkeley_targets[["Berkeley targets"]]
+    training_resource__contract__stage_c_lora__loss__stagec_lora_loss(["Stage C LoRA objective"])
+    training_resource__contract__stage_c_lora__output__classifier_logits(["Classifier logits"])
+    training_resource__contract__stage_c_lora__output__classifier_lora_state(["LoRA slot state"])
+    training_resource__contract__stage_fake_feedback__input__discriminator_confidence[["Discriminator confidence"]]
+    training_resource__contract__stage_fake_feedback__input__fake_condition_targets[["Condition targets"]]
+    training_resource__contract__stage_fake_feedback__input__fake_images[["Generated images"]]
+    training_resource__contract__stage_fake_feedback__loss__fake_class_loss(["Fake-class objective"])
+    training_resource__contract__stage_fake_feedback__output__classifier_fake_logits(["Fake-class logits"])
+    training_resource__contract__stage_g_generator__input__payload_conditions[["Payload conditions"]]
+    training_resource__contract__stage_g_generator__input__payload_images[["Payload images"]]
+    training_resource__contract__stage_g_generator__input__payload_masks[["Payload masks"]]
+    training_resource__contract__stage_g_generator__loss__stage_g_discriminator_loss(["Stage G discriminator objective"])
+    training_resource__contract__stage_g_generator__loss__stage_g_generator_loss(["Stage G generator objective"])
+    training_resource__contract__stage_g_generator__output__discriminator_patch_logits(["Discriminator patch logits"])
+    training_resource__contract__stage_g_generator__output__generated_images(["Generated images"])
+    training_resource__contract__stage_r_transformer__input__wave_chunk_batch[["Wave chunk batch"]]
+    training_resource__contract__stage_r_transformer__loss__stage_r_transformer_loss(["Stage R transformer objective"])
+    training_resource__contract__stage_r_transformer__output__reconstructed_wave_chunks(["Reconstructed wave chunks"])
+    training_resource__contract__stage_r_transformer__output__rendered_wave_images(["Rendered wave images"])
+    training_resource__contract__stage_w_wave_classifier__input__accepted_wave_images[["Accepted wave images"]]
+    training_resource__contract__stage_w_wave_classifier__input__accepted_wave_targets[["Accepted wave targets"]]
+    training_resource__contract__stage_w_wave_classifier__input__candidate_wave_chunks[["Candidate wave chunks"]]
+    training_resource__contract__stage_w_wave_classifier__loss__stage_w_classifier_loss(["Stage W classifier objective"])
+    training_resource__contract__stage_w_wave_classifier__output__wave_classifier_logits(["Wave-classifier logits"])
+    training_resource__contract__state__active_churn_terms["Active churn terms"]
+    training_resource__contract__state__label_embedding_bank["Label embedding bank"]
+    training_resource__contract__state__payload_conditions["Semantic condition bank"]
+    training_resource__contract__state__render_config["Render config"]
+    training_resource__contract__state__vocab_snapshot_library["Vocab snapshot library"]
+    training_module__stage_0_pregestation["Stage 0 Pregestation"]
+    training_module__stage_1_gestation["Stage 1 Gestation"]
+    training_module__stage_2_berkeley["Stage 2 Berkeley Refresh"]
+    training_module__stage_r_transformer["Stage R Transformer"]
+    training_module__stage_g_generator["Stage G Generator"]
+    training_module__stage_w_wave_classifier["Stage W Wave Classifier"]
+    training_module__stage_c_lora["Stage C LoRA Round"]
+    training_module__stage_fake_feedback["Fake-Class Feedback"]
+
+    training_resource__contract__model__classifier -- "Classifier | training.consume_model" --> training_module__stage_0_pregestation
+    training_resource__contract__state__label_embedding_bank -- "Label Embedding Bank | training.condition_state" --> training_module__stage_0_pregestation
+    training_resource__contract__stage_0_pregestation__input__pregestation_images -- "Pregestation Images | training.consume_tensor" --> training_module__stage_0_pregestation
+    training_resource__contract__stage_0_pregestation__input__pregestation_targets -- "Pregestation Targets | training.consume_tensor" --> training_module__stage_0_pregestation
+    training_resource__contract__stage_0_pregestation__input__pregestation_masks -- "Pregestation Masks | training.consume_tensor" --> training_module__stage_0_pregestation
+    training_module__stage_0_pregestation -- "Classifier Logits | training.emit_tensor" --> training_resource__contract__stage_0_pregestation__output__classifier_logits
+    training_module__stage_0_pregestation -- "Classifier Mask Logits | training.emit_tensor" --> training_resource__contract__stage_0_pregestation__output__classifier_mask_logits
+    training_resource__contract__stage_0_pregestation__input__pregestation_images -- "Pregestation Images | training.supervise_tensor" --> training_resource__contract__stage_0_pregestation__loss__stage0_classifier_loss
+    training_resource__contract__stage_0_pregestation__input__pregestation_targets -- "Pregestation Targets | training.supervise_tensor" --> training_resource__contract__stage_0_pregestation__loss__stage0_classifier_loss
+    training_resource__contract__stage_0_pregestation__input__pregestation_masks -- "Pregestation Masks | training.supervise_tensor" --> training_resource__contract__stage_0_pregestation__loss__stage0_classifier_loss
+    training_resource__contract__stage_0_pregestation__output__classifier_logits -- "Classifier Logits | training.predict_tensor" --> training_resource__contract__stage_0_pregestation__loss__stage0_classifier_loss
+    training_resource__contract__stage_0_pregestation__output__classifier_mask_logits -- "Classifier Mask Logits | training.predict_tensor" --> training_resource__contract__stage_0_pregestation__loss__stage0_classifier_loss
+    training_resource__contract__stage_0_pregestation__loss__stage0_classifier_loss -- "Classifier Optimizer | training.optimize" --> training_resource__contract__model__classifier
+    training_resource__contract__model__classifier -- "Classifier | training.consume_model" --> training_module__stage_1_gestation
+    training_resource__contract__state__label_embedding_bank -- "Label Embedding Bank | training.condition_state" --> training_module__stage_1_gestation
+    training_resource__contract__stage_1_gestation__input__gestation_images -- "Gestation Images | training.consume_tensor" --> training_module__stage_1_gestation
+    training_resource__contract__stage_1_gestation__input__gestation_targets -- "Gestation Targets | training.consume_tensor" --> training_module__stage_1_gestation
+    training_resource__contract__stage_1_gestation__input__gestation_masks -- "Gestation Masks | training.consume_tensor" --> training_module__stage_1_gestation
+    training_module__stage_1_gestation -- "Classifier Logits | training.emit_tensor" --> training_resource__contract__stage_1_gestation__output__classifier_logits
+    training_module__stage_1_gestation -- "Classifier Mask Logits | training.emit_tensor" --> training_resource__contract__stage_1_gestation__output__classifier_mask_logits
+    training_resource__contract__stage_1_gestation__input__gestation_images -- "Gestation Images | training.supervise_tensor" --> training_resource__contract__stage_1_gestation__loss__stage1_classifier_loss
+    training_resource__contract__stage_1_gestation__input__gestation_targets -- "Gestation Targets | training.supervise_tensor" --> training_resource__contract__stage_1_gestation__loss__stage1_classifier_loss
+    training_resource__contract__stage_1_gestation__input__gestation_masks -- "Gestation Masks | training.supervise_tensor" --> training_resource__contract__stage_1_gestation__loss__stage1_classifier_loss
+    training_resource__contract__stage_1_gestation__output__classifier_logits -- "Classifier Logits | training.predict_tensor" --> training_resource__contract__stage_1_gestation__loss__stage1_classifier_loss
+    training_resource__contract__stage_1_gestation__output__classifier_mask_logits -- "Classifier Mask Logits | training.predict_tensor" --> training_resource__contract__stage_1_gestation__loss__stage1_classifier_loss
+    training_resource__contract__stage_1_gestation__loss__stage1_classifier_loss -- "Classifier Optimizer | training.optimize" --> training_resource__contract__model__classifier
+    training_resource__contract__model__classifier -- "Classifier | training.consume_model" --> training_module__stage_2_berkeley
+    training_resource__contract__state__label_embedding_bank -- "Label Embedding Bank | training.condition_state" --> training_module__stage_2_berkeley
+    training_resource__contract__stage_2_berkeley__input__berkeley_images -- "Berkeley Images | training.consume_tensor" --> training_module__stage_2_berkeley
+    training_resource__contract__stage_2_berkeley__input__berkeley_targets -- "Berkeley Targets | training.consume_tensor" --> training_module__stage_2_berkeley
+    training_resource__contract__stage_2_berkeley__input__berkeley_masks -- "Berkeley Masks | training.consume_tensor" --> training_module__stage_2_berkeley
+    training_module__stage_2_berkeley -- "Classifier Logits | training.emit_tensor" --> training_resource__contract__stage_2_berkeley__output__classifier_logits
+    training_module__stage_2_berkeley -- "Classifier Mask Logits | training.emit_tensor" --> training_resource__contract__stage_2_berkeley__output__classifier_mask_logits
+    training_resource__contract__stage_2_berkeley__input__berkeley_images -- "Berkeley Images | training.supervise_tensor" --> training_resource__contract__stage_2_berkeley__loss__stage2_classifier_loss
+    training_resource__contract__stage_2_berkeley__input__berkeley_targets -- "Berkeley Targets | training.supervise_tensor" --> training_resource__contract__stage_2_berkeley__loss__stage2_classifier_loss
+    training_resource__contract__stage_2_berkeley__input__berkeley_masks -- "Berkeley Masks | training.supervise_tensor" --> training_resource__contract__stage_2_berkeley__loss__stage2_classifier_loss
+    training_resource__contract__stage_2_berkeley__output__classifier_logits -- "Classifier Logits | training.predict_tensor" --> training_resource__contract__stage_2_berkeley__loss__stage2_classifier_loss
+    training_resource__contract__stage_2_berkeley__output__classifier_mask_logits -- "Classifier Mask Logits | training.predict_tensor" --> training_resource__contract__stage_2_berkeley__loss__stage2_classifier_loss
+    training_resource__contract__stage_2_berkeley__loss__stage2_classifier_loss -- "Classifier Optimizer | training.optimize" --> training_resource__contract__model__classifier
+    training_resource__contract__model__transformer -- "Transformer | training.consume_model" --> training_module__stage_r_transformer
+    training_resource__contract__model__classifier -- "Classifier | training.condition_model" --> training_module__stage_r_transformer
+    training_resource__contract__state__render_config -- "Render Config | training.condition_state" --> training_module__stage_r_transformer
+    training_resource__contract__stage_r_transformer__input__wave_chunk_batch -- "Wave Chunk Batch | training.consume_tensor" --> training_module__stage_r_transformer
+    training_module__stage_r_transformer -- "Rendered Wave Images | training.emit_tensor" --> training_resource__contract__stage_r_transformer__output__rendered_wave_images
+    training_module__stage_r_transformer -- "Reconstructed Wave Chunks | training.emit_tensor" --> training_resource__contract__stage_r_transformer__output__reconstructed_wave_chunks
+    training_resource__contract__stage_r_transformer__input__wave_chunk_batch -- "Wave Chunk Batch | training.supervise_tensor" --> training_resource__contract__stage_r_transformer__loss__stage_r_transformer_loss
+    training_resource__contract__stage_r_transformer__output__rendered_wave_images -- "Rendered Wave Images | training.predict_tensor" --> training_resource__contract__stage_r_transformer__loss__stage_r_transformer_loss
+    training_resource__contract__stage_r_transformer__output__reconstructed_wave_chunks -- "Reconstructed Wave Chunks | training.predict_tensor" --> training_resource__contract__stage_r_transformer__loss__stage_r_transformer_loss
+    training_resource__contract__stage_r_transformer__loss__stage_r_transformer_loss -- "Transformer Optimizer | training.optimize" --> training_resource__contract__model__transformer
+    training_resource__contract__model__generator -- "Generator | training.consume_model" --> training_module__stage_g_generator
+    training_resource__contract__model__discriminator -- "Discriminator | training.condition_model" --> training_module__stage_g_generator
+    training_resource__contract__model__classifier -- "Classifier | training.condition_model" --> training_module__stage_g_generator
+    training_resource__contract__state__vocab_snapshot_library -- "Vocab Snapshot Library | training.condition_state" --> training_module__stage_g_generator
+    training_resource__contract__stage_g_generator__input__payload_images -- "Payload Images | training.consume_tensor" --> training_module__stage_g_generator
+    training_resource__contract__stage_g_generator__input__payload_conditions -- "Payload Conditions | training.consume_tensor" --> training_module__stage_g_generator
+    training_resource__contract__stage_g_generator__input__payload_masks -- "Payload Masks | training.consume_tensor" --> training_module__stage_g_generator
+    training_module__stage_g_generator -- "Generated Images | training.emit_tensor" --> training_resource__contract__stage_g_generator__output__generated_images
+    training_module__stage_g_generator -- "Discriminator Patch Logits | training.emit_tensor" --> training_resource__contract__stage_g_generator__output__discriminator_patch_logits
+    training_resource__contract__stage_g_generator__input__payload_images -- "Payload Images | training.supervise_tensor" --> training_resource__contract__stage_g_generator__loss__stage_g_generator_loss
+    training_resource__contract__stage_g_generator__input__payload_conditions -- "Payload Conditions | training.supervise_tensor" --> training_resource__contract__stage_g_generator__loss__stage_g_generator_loss
+    training_resource__contract__stage_g_generator__output__generated_images -- "Generated Images | training.predict_tensor" --> training_resource__contract__stage_g_generator__loss__stage_g_generator_loss
+    training_resource__contract__stage_g_generator__loss__stage_g_generator_loss -- "Generator Optimizer | training.optimize" --> training_resource__contract__model__generator
+    training_resource__contract__stage_g_generator__input__payload_images -- "Payload Images | training.supervise_tensor" --> training_resource__contract__stage_g_generator__loss__stage_g_discriminator_loss
+    training_resource__contract__stage_g_generator__output__generated_images -- "Generated Images | training.predict_tensor" --> training_resource__contract__stage_g_generator__loss__stage_g_discriminator_loss
+    training_resource__contract__stage_g_generator__output__discriminator_patch_logits -- "Discriminator Patch Logits | training.predict_tensor" --> training_resource__contract__stage_g_generator__loss__stage_g_discriminator_loss
+    training_resource__contract__stage_g_generator__loss__stage_g_discriminator_loss -- "Discriminator Optimizer | training.optimize" --> training_resource__contract__model__discriminator
+    training_resource__contract__model__wave_classifier -- "Wave Classifier | training.consume_model" --> training_module__stage_w_wave_classifier
+    training_resource__contract__model__transformer -- "Transformer | training.condition_model" --> training_module__stage_w_wave_classifier
+    training_resource__contract__model__classifier -- "Classifier | training.condition_model" --> training_module__stage_w_wave_classifier
+    training_resource__contract__state__render_config -- "Render Config | training.condition_state" --> training_module__stage_w_wave_classifier
+    training_resource__contract__state__label_embedding_bank -- "Label Embedding Bank | training.condition_state" --> training_module__stage_w_wave_classifier
+    training_resource__contract__stage_w_wave_classifier__input__candidate_wave_chunks -- "Candidate Wave Chunks | training.consume_tensor" --> training_module__stage_w_wave_classifier
+    training_resource__contract__stage_w_wave_classifier__input__accepted_wave_images -- "Accepted Wave Images | training.consume_tensor" --> training_module__stage_w_wave_classifier
+    training_resource__contract__stage_w_wave_classifier__input__accepted_wave_targets -- "Accepted Wave Targets | training.consume_tensor" --> training_module__stage_w_wave_classifier
+    training_module__stage_w_wave_classifier -- "Wave Classifier Logits | training.emit_tensor" --> training_resource__contract__stage_w_wave_classifier__output__wave_classifier_logits
+    training_resource__contract__stage_w_wave_classifier__input__accepted_wave_images -- "Accepted Wave Images | training.supervise_tensor" --> training_resource__contract__stage_w_wave_classifier__loss__stage_w_classifier_loss
+    training_resource__contract__stage_w_wave_classifier__input__accepted_wave_targets -- "Accepted Wave Targets | training.supervise_tensor" --> training_resource__contract__stage_w_wave_classifier__loss__stage_w_classifier_loss
+    training_resource__contract__stage_w_wave_classifier__output__wave_classifier_logits -- "Wave Classifier Logits | training.predict_tensor" --> training_resource__contract__stage_w_wave_classifier__loss__stage_w_classifier_loss
+    training_resource__contract__stage_w_wave_classifier__loss__stage_w_classifier_loss -- "Wave Classifier Optimizer | training.optimize" --> training_resource__contract__model__wave_classifier
+    training_resource__contract__model__classifier -- "Classifier | training.consume_model" --> training_module__stage_c_lora
+    training_resource__contract__state__label_embedding_bank -- "Label Embedding Bank | training.condition_state" --> training_module__stage_c_lora
+    training_resource__contract__state__active_churn_terms -- "Active Churn Terms | training.condition_state" --> training_module__stage_c_lora
+    training_resource__contract__stage_c_lora__input__berkeley_images -- "Berkeley Images | training.consume_tensor" --> training_module__stage_c_lora
+    training_resource__contract__stage_c_lora__input__berkeley_targets -- "Berkeley Targets | training.consume_tensor" --> training_module__stage_c_lora
+    training_resource__contract__stage_c_lora__input__berkeley_masks -- "Berkeley Masks | training.consume_tensor" --> training_module__stage_c_lora
+    training_module__stage_c_lora -- "Classifier Logits | training.emit_tensor" --> training_resource__contract__stage_c_lora__output__classifier_logits
+    training_module__stage_c_lora -- "Classifier Lora State | training.emit_tensor" --> training_resource__contract__stage_c_lora__output__classifier_lora_state
+    training_resource__contract__stage_c_lora__input__berkeley_images -- "Berkeley Images | training.supervise_tensor" --> training_resource__contract__stage_c_lora__loss__stagec_lora_loss
+    training_resource__contract__stage_c_lora__input__berkeley_targets -- "Berkeley Targets | training.supervise_tensor" --> training_resource__contract__stage_c_lora__loss__stagec_lora_loss
+    training_resource__contract__stage_c_lora__input__berkeley_masks -- "Berkeley Masks | training.supervise_tensor" --> training_resource__contract__stage_c_lora__loss__stagec_lora_loss
+    training_resource__contract__stage_c_lora__output__classifier_logits -- "Classifier Logits | training.predict_tensor" --> training_resource__contract__stage_c_lora__loss__stagec_lora_loss
+    training_resource__contract__stage_c_lora__loss__stagec_lora_loss -- "Classifier Optimizer | training.optimize" --> training_resource__contract__model__classifier
+    training_resource__contract__model__classifier -- "Classifier | training.consume_model" --> training_module__stage_fake_feedback
+    training_resource__contract__model__generator -- "Generator | training.condition_model" --> training_module__stage_fake_feedback
+    training_resource__contract__model__discriminator -- "Discriminator | training.condition_model" --> training_module__stage_fake_feedback
+    training_resource__contract__state__payload_conditions -- "Payload Conditions | training.condition_state" --> training_module__stage_fake_feedback
+    training_resource__contract__stage_fake_feedback__input__fake_images -- "Fake Images | training.consume_tensor" --> training_module__stage_fake_feedback
+    training_resource__contract__stage_fake_feedback__input__fake_condition_targets -- "Fake Condition Targets | training.consume_tensor" --> training_module__stage_fake_feedback
+    training_resource__contract__stage_fake_feedback__input__discriminator_confidence -- "Discriminator Confidence | training.consume_tensor" --> training_module__stage_fake_feedback
+    training_module__stage_fake_feedback -- "Classifier Fake Logits | training.emit_tensor" --> training_resource__contract__stage_fake_feedback__output__classifier_fake_logits
+    training_resource__contract__stage_fake_feedback__input__fake_images -- "Fake Images | training.supervise_tensor" --> training_resource__contract__stage_fake_feedback__loss__fake_class_loss
+    training_resource__contract__stage_fake_feedback__input__fake_condition_targets -- "Fake Condition Targets | training.supervise_tensor" --> training_resource__contract__stage_fake_feedback__loss__fake_class_loss
+    training_resource__contract__stage_fake_feedback__input__discriminator_confidence -- "Discriminator Confidence | training.supervise_tensor" --> training_resource__contract__stage_fake_feedback__loss__fake_class_loss
+    training_resource__contract__stage_fake_feedback__output__classifier_fake_logits -- "Classifier Fake Logits | training.predict_tensor" --> training_resource__contract__stage_fake_feedback__loss__fake_class_loss
+    training_resource__contract__stage_fake_feedback__loss__fake_class_loss -- "Classifier Optimizer | training.optimize" --> training_resource__contract__model__classifier
+
+    linkStyle 0 stroke:#2563EB,stroke-width:3px,opacity:0.92,stroke-dasharray:0;
+    linkStyle 1 stroke:#7C3AED,stroke-width:3px,opacity:0.90,stroke-dasharray:6 3;
+    linkStyle 2 stroke:#2563EB,stroke-width:3px,opacity:0.92,stroke-dasharray:0;
+    linkStyle 3 stroke:#2563EB,stroke-width:3px,opacity:0.92,stroke-dasharray:0;
+    linkStyle 4 stroke:#2563EB,stroke-width:3px,opacity:0.92,stroke-dasharray:0;
+    linkStyle 5 stroke:#F97316,stroke-width:3px,opacity:0.92,stroke-dasharray:0;
+    linkStyle 6 stroke:#F97316,stroke-width:3px,opacity:0.92,stroke-dasharray:0;
+    linkStyle 7 stroke:#0891B2,stroke-width:3px,opacity:0.92,stroke-dasharray:2 2;
+    linkStyle 8 stroke:#0891B2,stroke-width:3px,opacity:0.92,stroke-dasharray:2 2;
+    linkStyle 9 stroke:#0891B2,stroke-width:3px,opacity:0.92,stroke-dasharray:2 2;
+    linkStyle 10 stroke:#F97316,stroke-width:3px,opacity:0.92,stroke-dasharray:0;
+    linkStyle 11 stroke:#F97316,stroke-width:3px,opacity:0.92,stroke-dasharray:0;
+    linkStyle 12 stroke:#16A34A,stroke-width:4px,opacity:0.96,stroke-dasharray:0;
+    linkStyle 13 stroke:#2563EB,stroke-width:3px,opacity:0.92,stroke-dasharray:0;
+    linkStyle 14 stroke:#7C3AED,stroke-width:3px,opacity:0.90,stroke-dasharray:6 3;
+    linkStyle 15 stroke:#2563EB,stroke-width:3px,opacity:0.92,stroke-dasharray:0;
+    linkStyle 16 stroke:#2563EB,stroke-width:3px,opacity:0.92,stroke-dasharray:0;
+    linkStyle 17 stroke:#2563EB,stroke-width:3px,opacity:0.92,stroke-dasharray:0;
+    linkStyle 18 stroke:#F97316,stroke-width:3px,opacity:0.92,stroke-dasharray:0;
+    linkStyle 19 stroke:#F97316,stroke-width:3px,opacity:0.92,stroke-dasharray:0;
+    linkStyle 20 stroke:#0891B2,stroke-width:3px,opacity:0.92,stroke-dasharray:2 2;
+    linkStyle 21 stroke:#0891B2,stroke-width:3px,opacity:0.92,stroke-dasharray:2 2;
+    linkStyle 22 stroke:#0891B2,stroke-width:3px,opacity:0.92,stroke-dasharray:2 2;
+    linkStyle 23 stroke:#F97316,stroke-width:3px,opacity:0.92,stroke-dasharray:0;
+    linkStyle 24 stroke:#F97316,stroke-width:3px,opacity:0.92,stroke-dasharray:0;
+    linkStyle 25 stroke:#16A34A,stroke-width:4px,opacity:0.96,stroke-dasharray:0;
+    linkStyle 26 stroke:#2563EB,stroke-width:3px,opacity:0.92,stroke-dasharray:0;
+    linkStyle 27 stroke:#7C3AED,stroke-width:3px,opacity:0.90,stroke-dasharray:6 3;
+    linkStyle 28 stroke:#2563EB,stroke-width:3px,opacity:0.92,stroke-dasharray:0;
+    linkStyle 29 stroke:#2563EB,stroke-width:3px,opacity:0.92,stroke-dasharray:0;
+    linkStyle 30 stroke:#2563EB,stroke-width:3px,opacity:0.92,stroke-dasharray:0;
+    linkStyle 31 stroke:#F97316,stroke-width:3px,opacity:0.92,stroke-dasharray:0;
+    linkStyle 32 stroke:#F97316,stroke-width:3px,opacity:0.92,stroke-dasharray:0;
+    linkStyle 33 stroke:#0891B2,stroke-width:3px,opacity:0.92,stroke-dasharray:2 2;
+    linkStyle 34 stroke:#0891B2,stroke-width:3px,opacity:0.92,stroke-dasharray:2 2;
+    linkStyle 35 stroke:#0891B2,stroke-width:3px,opacity:0.92,stroke-dasharray:2 2;
+    linkStyle 36 stroke:#F97316,stroke-width:3px,opacity:0.92,stroke-dasharray:0;
+    linkStyle 37 stroke:#F97316,stroke-width:3px,opacity:0.92,stroke-dasharray:0;
+    linkStyle 38 stroke:#16A34A,stroke-width:4px,opacity:0.96,stroke-dasharray:0;
+    linkStyle 39 stroke:#2563EB,stroke-width:3px,opacity:0.92,stroke-dasharray:0;
+    linkStyle 40 stroke:#7C3AED,stroke-width:3px,opacity:0.90,stroke-dasharray:6 3;
+    linkStyle 41 stroke:#7C3AED,stroke-width:3px,opacity:0.90,stroke-dasharray:6 3;
+    linkStyle 42 stroke:#2563EB,stroke-width:3px,opacity:0.92,stroke-dasharray:0;
+    linkStyle 43 stroke:#F97316,stroke-width:3px,opacity:0.92,stroke-dasharray:0;
+    linkStyle 44 stroke:#F97316,stroke-width:3px,opacity:0.92,stroke-dasharray:0;
+    linkStyle 45 stroke:#0891B2,stroke-width:3px,opacity:0.92,stroke-dasharray:2 2;
+    linkStyle 46 stroke:#F97316,stroke-width:3px,opacity:0.92,stroke-dasharray:0;
+    linkStyle 47 stroke:#F97316,stroke-width:3px,opacity:0.92,stroke-dasharray:0;
+    linkStyle 48 stroke:#16A34A,stroke-width:4px,opacity:0.96,stroke-dasharray:0;
+    linkStyle 49 stroke:#2563EB,stroke-width:3px,opacity:0.92,stroke-dasharray:0;
+    linkStyle 50 stroke:#7C3AED,stroke-width:3px,opacity:0.90,stroke-dasharray:6 3;
+    linkStyle 51 stroke:#7C3AED,stroke-width:3px,opacity:0.90,stroke-dasharray:6 3;
+    linkStyle 52 stroke:#7C3AED,stroke-width:3px,opacity:0.90,stroke-dasharray:6 3;
+    linkStyle 53 stroke:#2563EB,stroke-width:3px,opacity:0.92,stroke-dasharray:0;
+    linkStyle 54 stroke:#2563EB,stroke-width:3px,opacity:0.92,stroke-dasharray:0;
+    linkStyle 55 stroke:#2563EB,stroke-width:3px,opacity:0.92,stroke-dasharray:0;
+    linkStyle 56 stroke:#F97316,stroke-width:3px,opacity:0.92,stroke-dasharray:0;
+    linkStyle 57 stroke:#F97316,stroke-width:3px,opacity:0.92,stroke-dasharray:0;
+    linkStyle 58 stroke:#0891B2,stroke-width:3px,opacity:0.92,stroke-dasharray:2 2;
+    linkStyle 59 stroke:#0891B2,stroke-width:3px,opacity:0.92,stroke-dasharray:2 2;
+    linkStyle 60 stroke:#F97316,stroke-width:3px,opacity:0.92,stroke-dasharray:0;
+    linkStyle 61 stroke:#16A34A,stroke-width:4px,opacity:0.96,stroke-dasharray:0;
+    linkStyle 62 stroke:#0891B2,stroke-width:3px,opacity:0.92,stroke-dasharray:2 2;
+    linkStyle 63 stroke:#F97316,stroke-width:3px,opacity:0.92,stroke-dasharray:0;
+    linkStyle 64 stroke:#F97316,stroke-width:3px,opacity:0.92,stroke-dasharray:0;
+    linkStyle 65 stroke:#16A34A,stroke-width:4px,opacity:0.96,stroke-dasharray:0;
+    linkStyle 66 stroke:#2563EB,stroke-width:3px,opacity:0.92,stroke-dasharray:0;
+    linkStyle 67 stroke:#7C3AED,stroke-width:3px,opacity:0.90,stroke-dasharray:6 3;
+    linkStyle 68 stroke:#7C3AED,stroke-width:3px,opacity:0.90,stroke-dasharray:6 3;
+    linkStyle 69 stroke:#7C3AED,stroke-width:3px,opacity:0.90,stroke-dasharray:6 3;
+    linkStyle 70 stroke:#7C3AED,stroke-width:3px,opacity:0.90,stroke-dasharray:6 3;
+    linkStyle 71 stroke:#2563EB,stroke-width:3px,opacity:0.92,stroke-dasharray:0;
+    linkStyle 72 stroke:#2563EB,stroke-width:3px,opacity:0.92,stroke-dasharray:0;
+    linkStyle 73 stroke:#2563EB,stroke-width:3px,opacity:0.92,stroke-dasharray:0;
+    linkStyle 74 stroke:#F97316,stroke-width:3px,opacity:0.92,stroke-dasharray:0;
+    linkStyle 75 stroke:#0891B2,stroke-width:3px,opacity:0.92,stroke-dasharray:2 2;
+    linkStyle 76 stroke:#0891B2,stroke-width:3px,opacity:0.92,stroke-dasharray:2 2;
+    linkStyle 77 stroke:#F97316,stroke-width:3px,opacity:0.92,stroke-dasharray:0;
+    linkStyle 78 stroke:#16A34A,stroke-width:4px,opacity:0.96,stroke-dasharray:0;
+    linkStyle 79 stroke:#2563EB,stroke-width:3px,opacity:0.92,stroke-dasharray:0;
+    linkStyle 80 stroke:#7C3AED,stroke-width:3px,opacity:0.90,stroke-dasharray:6 3;
+    linkStyle 81 stroke:#7C3AED,stroke-width:3px,opacity:0.90,stroke-dasharray:6 3;
+    linkStyle 82 stroke:#2563EB,stroke-width:3px,opacity:0.92,stroke-dasharray:0;
+    linkStyle 83 stroke:#2563EB,stroke-width:3px,opacity:0.92,stroke-dasharray:0;
+    linkStyle 84 stroke:#2563EB,stroke-width:3px,opacity:0.92,stroke-dasharray:0;
+    linkStyle 85 stroke:#F97316,stroke-width:3px,opacity:0.92,stroke-dasharray:0;
+    linkStyle 86 stroke:#A16207,stroke-width:3px,opacity:0.90,stroke-dasharray:8 3;
+    linkStyle 87 stroke:#0891B2,stroke-width:3px,opacity:0.92,stroke-dasharray:2 2;
+    linkStyle 88 stroke:#0891B2,stroke-width:3px,opacity:0.92,stroke-dasharray:2 2;
+    linkStyle 89 stroke:#0891B2,stroke-width:3px,opacity:0.92,stroke-dasharray:2 2;
+    linkStyle 90 stroke:#F97316,stroke-width:3px,opacity:0.92,stroke-dasharray:0;
+    linkStyle 91 stroke:#16A34A,stroke-width:4px,opacity:0.96,stroke-dasharray:0;
+    linkStyle 92 stroke:#2563EB,stroke-width:3px,opacity:0.92,stroke-dasharray:0;
+    linkStyle 93 stroke:#7C3AED,stroke-width:3px,opacity:0.90,stroke-dasharray:6 3;
+    linkStyle 94 stroke:#7C3AED,stroke-width:3px,opacity:0.90,stroke-dasharray:6 3;
+    linkStyle 95 stroke:#7C3AED,stroke-width:3px,opacity:0.90,stroke-dasharray:6 3;
+    linkStyle 96 stroke:#2563EB,stroke-width:3px,opacity:0.92,stroke-dasharray:0;
+    linkStyle 97 stroke:#2563EB,stroke-width:3px,opacity:0.92,stroke-dasharray:0;
+    linkStyle 98 stroke:#2563EB,stroke-width:3px,opacity:0.92,stroke-dasharray:0;
+    linkStyle 99 stroke:#F97316,stroke-width:3px,opacity:0.92,stroke-dasharray:0;
+    linkStyle 100 stroke:#0891B2,stroke-width:3px,opacity:0.92,stroke-dasharray:2 2;
+    linkStyle 101 stroke:#0891B2,stroke-width:3px,opacity:0.92,stroke-dasharray:2 2;
+    linkStyle 102 stroke:#0891B2,stroke-width:3px,opacity:0.92,stroke-dasharray:2 2;
+    linkStyle 103 stroke:#F97316,stroke-width:3px,opacity:0.92,stroke-dasharray:0;
+    linkStyle 104 stroke:#16A34A,stroke-width:4px,opacity:0.96,stroke-dasharray:0;

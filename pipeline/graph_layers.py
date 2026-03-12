@@ -36,6 +36,11 @@ NODE_STYLE_MAP: Dict[str, Dict[str, str]] = {
     "inference": {"fill": "#F4F1DE", "stroke": "#3D405B", "color": "#1B1F2A"},
     "buffer": {"fill": "#E0FBFC", "stroke": "#006D77", "color": "#00313A"},
     "gate": {"fill": "#FDE2E4", "stroke": "#C0392B", "color": "#4A0F13"},
+    "supervision": {"fill": "#DDEBFF", "stroke": "#2563EB", "color": "#0F172A"},
+    "state": {"fill": "#EFE3FF", "stroke": "#7C3AED", "color": "#2E1065"},
+    "trainers": {"fill": "#FFE8D6", "stroke": "#C05621", "color": "#4A1D05"},
+    "objectives": {"fill": "#FDE2E4", "stroke": "#C0392B", "color": "#4A0F13"},
+    "updates": {"fill": "#E8F5E9", "stroke": "#2E7D32", "color": "#102A12"},
     "other": {"fill": "#F3F4F6", "stroke": "#6B7280", "color": "#111827"},
 }
 
@@ -55,6 +60,15 @@ INFERENCE_FACULTY_ORDER = [
     "inference",
     "buffer",
     "gate",
+    "other",
+]
+
+TRAINING_MECHANICS_FACULTY_ORDER = [
+    "supervision",
+    "state",
+    "trainers",
+    "objectives",
+    "updates",
     "other",
 ]
 
@@ -241,6 +255,8 @@ def build_graph_layers(graph: PipelineGraph) -> Dict[str, Dict[str, Any]]:
         "inference": _build_inference_layer(),
         "provenance": _build_provenance_layer(all_nodes),
         "stack_view": _build_stack_view_layer(execution_nodes, execution_edges),
+        "training_mechanics": _build_training_mechanics_layer(execution_nodes),
+        "training_contracts": _build_training_contracts_layer(execution_nodes),
     }
 
 
@@ -350,6 +366,8 @@ def build_graph_layers_from_plan(plan: TrainingGraphPlan) -> Dict[str, Dict[str,
         },
     )
     layers["stack_view"] = _build_stack_view_layer(execution_nodes, execution_edges)
+    layers["training_mechanics"] = _build_training_mechanics_layer(execution_nodes)
+    layers["training_contracts"] = _build_training_contracts_layer(execution_nodes)
     return layers
 
 
@@ -420,6 +438,568 @@ def _build_stack_view_layer(
         "layer_id": "stack_view",
         "label": "Operations Stack View",
         "description": "Node-interior processes and their ownership edges alongside the execution topology.",
+        "status": "active",
+        "mermaid_direction": "LR",
+        "nodes": layer_nodes,
+        "edges": layer_edges,
+    }
+
+
+def _training_resource_node_id(resource_id: str) -> str:
+    return f"training_resource::{str(resource_id)}"
+
+
+def _training_module_node_id(node_id: str) -> str:
+    return f"training_module::{str(node_id)}"
+
+
+def _training_resource_label(resource_id: str) -> str:
+    text = str(resource_id or "").replace("_", " ").replace("-", " ").strip()
+    return " ".join(part.capitalize() for part in text.split()) or str(resource_id)
+
+
+def _training_resource_visuals(kind: str) -> Dict[str, str]:
+    key = str(kind or "state").strip().lower()
+    if key == "dataset":
+        return {"faculty": "supervision", "object_type": "dataset", "shape": "bus", "archetype": "dataset"}
+    if key == "loss":
+        return {"faculty": "objectives", "object_type": "objective", "shape": "terminal", "archetype": "loss"}
+    if key in {"output", "artifact", "metric"}:
+        return {"faculty": "updates", "object_type": "artifact", "shape": "terminal", "archetype": key}
+    if key == "model":
+        return {"faculty": "state", "object_type": "model", "shape": "process", "archetype": "model"}
+    return {"faculty": "state", "object_type": "state", "shape": "process", "archetype": key or "state"}
+
+
+def _merge_training_resource_def(existing: Dict[str, Any], incoming: Dict[str, Any]) -> Dict[str, Any]:
+    merged = dict(existing or {})
+    for key in ("id", "label", "kind", "detail", "role"):
+        value = str(incoming.get(key, "") or "").strip()
+        if value and not str(merged.get(key, "") or "").strip():
+            merged[key] = value
+    return merged
+
+
+def _build_training_mechanics_layer(
+    nodes: Iterable[GraphNodeRecord],
+) -> Dict[str, Any]:
+    trainer_specs: List[Dict[str, Any]] = []
+    resource_defs: Dict[str, Dict[str, Any]] = {}
+
+    for node in list(nodes):
+        metadata = dict(getattr(node, "metadata", {}) or {})
+        mechanics = dict(metadata.get("training_mechanics", {}) or {})
+        if not mechanics or not bool(mechanics.get("enabled", True)):
+            continue
+
+        flows = [dict(flow) for flow in list(mechanics.get("flows", []) or []) if isinstance(flow, dict)]
+        for item in list(mechanics.get("inputs", []) or []) + list(mechanics.get("losses", []) or []) + list(mechanics.get("outputs", []) or []):
+            if not isinstance(item, dict):
+                continue
+            resource_id = str(item.get("id", "") or "").strip()
+            if not resource_id:
+                continue
+            resource_defs[resource_id] = _merge_training_resource_def(resource_defs.get(resource_id, {}), dict(item))
+        for flow in flows:
+            for endpoint in (str(flow.get("source", "") or "").strip(), str(flow.get("target", "") or "").strip()):
+                if not endpoint or endpoint == "self":
+                    continue
+                resource_defs.setdefault(
+                    endpoint,
+                    {
+                        "id": endpoint,
+                        "label": _training_resource_label(endpoint),
+                        "kind": "state",
+                        "detail": "",
+                        "role": "",
+                    },
+                )
+        trainer_specs.append(
+            {
+                "node_id": str(node.node_id),
+                "label": str(mechanics.get("module_label", "") or node.label or node.node_id),
+                "family": str(mechanics.get("module_family", "trainer") or "trainer"),
+                "summary": str(mechanics.get("summary", "") or "").strip(),
+                "flows": flows,
+            }
+        )
+
+    if not trainer_specs:
+        return {
+            "layer_id": "training_mechanics",
+            "label": "Neural Training Mechanics",
+            "description": "Reserved IR layer for model/data/loss mechanics.",
+            "status": "planned",
+            "mermaid_direction": "LR",
+            "nodes": [],
+            "edges": [],
+        }
+
+    layer_nodes: List[Dict[str, Any]] = []
+    layer_edges: List[Dict[str, Any]] = []
+
+    for resource_id in sorted(resource_defs.keys()):
+        resource = dict(resource_defs.get(resource_id, {}) or {})
+        visuals = _training_resource_visuals(str(resource.get("kind", "state") or "state"))
+        layer_nodes.append(
+            _layer_node(
+                _training_resource_node_id(resource_id),
+                str(resource.get("label", "") or _training_resource_label(resource_id)),
+                object_type=visuals["object_type"],
+                faculty=visuals["faculty"],
+                archetype=visuals["archetype"],
+                shape=visuals["shape"],
+                metadata={
+                    "resource_id": resource_id,
+                    "kind": str(resource.get("kind", "state") or "state"),
+                    "detail": str(resource.get("detail", "") or ""),
+                    "role": str(resource.get("role", "") or ""),
+                },
+            )
+        )
+
+    for trainer in trainer_specs:
+        layer_nodes.append(
+            _layer_node(
+                _training_module_node_id(trainer["node_id"]),
+                trainer["label"],
+                object_type="trainer",
+                faculty="trainers",
+                archetype=str(trainer["family"] or "trainer"),
+                shape="process",
+                metadata={
+                    "node_id": str(trainer["node_id"]),
+                    "summary": str(trainer["summary"]),
+                    "module_family": str(trainer["family"]),
+                },
+            )
+        )
+
+    for trainer in trainer_specs:
+        module_node_id = _training_module_node_id(trainer["node_id"])
+        for flow in trainer["flows"]:
+            source_ref = str(flow.get("source", "") or "").strip()
+            target_ref = str(flow.get("target", "") or "").strip()
+            if not source_ref or not target_ref:
+                continue
+            source_node_id = module_node_id if source_ref == "self" else _training_resource_node_id(source_ref)
+            target_node_id = module_node_id if target_ref == "self" else _training_resource_node_id(target_ref)
+            flow_kind = str(flow.get("kind", "flow") or "flow").strip().lower()
+            label = str(flow.get("label", "") or flow_kind.replace("_", " ")).strip()
+            layer_edges.append(
+                _layer_edge(
+                    source_node_id,
+                    target_node_id,
+                    label=label,
+                    readme_label=label,
+                    reaction_name=f"training.{flow_kind}",
+                    target_function="",
+                    metadata={
+                        "style_role": flow_kind,
+                        "mechanics_node_id": str(trainer["node_id"]),
+                        "label": label,
+                        "readme_label": label,
+                    },
+                )
+            )
+
+    return {
+        "layer_id": "training_mechanics",
+        "label": "Neural Training Mechanics",
+        "description": "IR view of trainer modules, supervision sources, objectives, and optimization/data flows.",
+        "status": "active",
+        "mermaid_direction": "LR",
+        "nodes": layer_nodes,
+        "edges": layer_edges,
+    }
+
+
+def _training_contract_port_resource_id(node_id: str, port_id: str, io: str) -> str:
+    return f"contract::{str(node_id)}::{str(io)}::{str(port_id)}"
+
+
+def _training_contract_loss_resource_id(node_id: str, loss_id: str) -> str:
+    return f"contract::{str(node_id)}::loss::{str(loss_id)}"
+
+
+def _training_contract_model_resource_id(model_attr: str) -> str:
+    return f"contract::model::{str(model_attr)}"
+
+
+def _training_contract_state_resource_id(state_id: str) -> str:
+    return f"contract::state::{str(state_id)}"
+
+
+def _training_contract_port_detail(port: Dict[str, Any]) -> str:
+    parts: List[str] = []
+    dtype = str(port.get("dtype", "") or "").strip()
+    shape = str(port.get("shape", "") or "").strip()
+    semantic = str(port.get("semantic", "") or "").strip()
+    detail = str(port.get("detail", "") or "").strip()
+    if dtype:
+        parts.append(dtype)
+    if shape:
+        parts.append(shape)
+    if semantic:
+        parts.append(semantic)
+    if detail:
+        parts.append(detail)
+    return " | ".join(parts)
+
+
+def _training_contract_loss_detail(loss: Dict[str, Any]) -> str:
+    parts: List[str] = []
+    kind = str(loss.get("kind", "") or "").strip()
+    detail = str(loss.get("detail", "") or "").strip()
+    if kind:
+        parts.append(kind)
+    if detail:
+        parts.append(detail)
+    return " | ".join(parts)
+
+
+def _training_contract_model_for_optimizer(
+    optimizer_attr: str,
+    model_attrs: List[str],
+    primary_model_attr: str,
+) -> str:
+    opt = str(optimizer_attr or "").strip()
+    primary = str(primary_model_attr or "").strip()
+    if opt.endswith("_optimizer"):
+        candidate = opt[: -len("_optimizer")]
+        if candidate in model_attrs:
+            return candidate
+    for model_attr in model_attrs:
+        if model_attr and model_attr in opt:
+            return model_attr
+    return primary or (model_attrs[0] if model_attrs else "")
+
+
+def _build_training_contracts_layer(
+    nodes: Iterable[GraphNodeRecord],
+) -> Dict[str, Any]:
+    trainer_specs: List[Dict[str, Any]] = []
+    resource_defs: Dict[str, Dict[str, Any]] = {}
+    layer_edges: List[Dict[str, Any]] = []
+
+    for node in list(nodes):
+        metadata = dict(getattr(node, "metadata", {}) or {})
+        contract = dict(metadata.get("ir_node_contract", {}) or {})
+        if not contract:
+            continue
+
+        node_id = str(node.node_id)
+        mechanics = dict(metadata.get("training_mechanics", {}) or {})
+        trainer_label = str(
+            mechanics.get("module_label", "")
+            or node.label
+            or metadata.get("description", "")
+            or node_id
+        )
+        framework = str(contract.get("framework", "pytorch") or "pytorch").strip()
+        node_role = str(contract.get("node_role", "trainer") or "trainer").strip()
+        template_id = str(contract.get("template_id", "") or "").strip()
+        notes = str(contract.get("notes", "") or "").strip()
+        primary_model_attr = str(contract.get("primary_model_attr", "") or "").strip()
+        model_attrs = [
+            str(item or "").strip()
+            for item in list(contract.get("model_attrs", []) or [])
+            if str(item or "").strip()
+        ]
+        optimizer_attrs = [
+            str(item or "").strip()
+            for item in list(contract.get("optimizer_attrs", []) or [])
+            if str(item or "").strip()
+        ]
+
+        trainer_specs.append(
+            {
+                "node_id": node_id,
+                "label": trainer_label,
+                "summary": f"{framework} | {node_role}" if framework or node_role else "",
+                "detail": template_id or notes,
+                "notes": notes,
+            }
+        )
+
+        input_map: Dict[str, str] = {}
+        output_map: Dict[str, str] = {}
+        state_map: Dict[str, str] = {}
+
+        for port in [dict(item) for item in list(contract.get("input_ports", []) or []) if isinstance(item, dict)]:
+            port_id = str(port.get("port_id", "") or "").strip()
+            if not port_id:
+                continue
+            resource_id = _training_contract_port_resource_id(node_id, port_id, "input")
+            input_map[port_id] = resource_id
+            resource_defs[resource_id] = _merge_training_resource_def(
+                resource_defs.get(resource_id, {}),
+                {
+                    "id": resource_id,
+                    "label": str(port.get("label", "") or port_id),
+                    "kind": "dataset",
+                    "detail": _training_contract_port_detail(port),
+                    "role": str(port.get("semantic", "") or "").strip(),
+                },
+            )
+
+        for port in [dict(item) for item in list(contract.get("output_ports", []) or []) if isinstance(item, dict)]:
+            port_id = str(port.get("port_id", "") or "").strip()
+            if not port_id:
+                continue
+            resource_id = _training_contract_port_resource_id(node_id, port_id, "output")
+            output_map[port_id] = resource_id
+            kind = "output"
+            semantic = str(port.get("semantic", "") or "").strip().lower()
+            if "state" in semantic or "adapter" in semantic:
+                kind = "artifact"
+            resource_defs[resource_id] = _merge_training_resource_def(
+                resource_defs.get(resource_id, {}),
+                {
+                    "id": resource_id,
+                    "label": str(port.get("label", "") or port_id),
+                    "kind": kind,
+                    "detail": _training_contract_port_detail(port),
+                    "role": str(port.get("semantic", "") or "").strip(),
+                },
+            )
+
+        for state in [dict(item) for item in list(contract.get("state_inputs", []) or []) if isinstance(item, dict)]:
+            state_id = str(state.get("state_id", "") or "").strip()
+            if not state_id:
+                continue
+            resource_id = _training_contract_state_resource_id(state_id)
+            state_map[state_id] = resource_id
+            resource_defs[resource_id] = _merge_training_resource_def(
+                resource_defs.get(resource_id, {}),
+                {
+                    "id": resource_id,
+                    "label": str(state.get("label", "") or state_id),
+                    "kind": "state",
+                    "detail": str(state.get("detail", "") or "").strip(),
+                    "role": str(state.get("role", "") or "").strip(),
+                },
+            )
+
+        for model_attr in model_attrs:
+            resource_id = _training_contract_model_resource_id(model_attr)
+            resource_defs[resource_id] = _merge_training_resource_def(
+                resource_defs.get(resource_id, {}),
+                {
+                    "id": resource_id,
+                    "label": _training_resource_label(model_attr),
+                    "kind": "model",
+                    "detail": "shared trainable or teacher model resource",
+                    "role": "primary_model" if model_attr == primary_model_attr else "auxiliary_model",
+                },
+            )
+
+        module_node_id = _training_module_node_id(node_id)
+
+        for model_attr in model_attrs:
+            resource_id = _training_contract_model_resource_id(model_attr)
+            layer_edges.append(
+                _layer_edge(
+                    _training_resource_node_id(resource_id),
+                    module_node_id,
+                    label=_training_resource_label(model_attr),
+                    readme_label=_training_resource_label(model_attr),
+                    reaction_name="training.consume_model" if model_attr == primary_model_attr else "training.condition_model",
+                    target_function="",
+                    metadata={"style_role": "consume" if model_attr == primary_model_attr else "condition"},
+                )
+            )
+
+        for state_id, resource_id in state_map.items():
+            layer_edges.append(
+                _layer_edge(
+                    _training_resource_node_id(resource_id),
+                    module_node_id,
+                    label=_training_resource_label(state_id),
+                    readme_label=_training_resource_label(state_id),
+                    reaction_name="training.condition_state",
+                    target_function="",
+                    metadata={"style_role": "condition"},
+                )
+            )
+
+        for port_id, resource_id in input_map.items():
+            layer_edges.append(
+                _layer_edge(
+                    _training_resource_node_id(resource_id),
+                    module_node_id,
+                    label=_training_resource_label(port_id),
+                    readme_label=_training_resource_label(port_id),
+                    reaction_name="training.consume_tensor",
+                    target_function="",
+                    metadata={"style_role": "consume"},
+                )
+            )
+
+        for port_id, resource_id in output_map.items():
+            role = str(dict(resource_defs.get(resource_id, {}) or {}).get("role", "") or "").lower()
+            style_role = "emit" if "state" in role or "adapter" in role else "predict"
+            layer_edges.append(
+                _layer_edge(
+                    module_node_id,
+                    _training_resource_node_id(resource_id),
+                    label=_training_resource_label(port_id),
+                    readme_label=_training_resource_label(port_id),
+                    reaction_name="training.emit_tensor",
+                    target_function="",
+                    metadata={"style_role": style_role},
+                )
+            )
+
+        for loss in [dict(item) for item in list(contract.get("losses", []) or []) if isinstance(item, dict)]:
+            loss_id = str(loss.get("loss_id", "") or "").strip()
+            if not loss_id:
+                continue
+            loss_resource_id = _training_contract_loss_resource_id(node_id, loss_id)
+            resource_defs[loss_resource_id] = _merge_training_resource_def(
+                resource_defs.get(loss_resource_id, {}),
+                {
+                    "id": loss_resource_id,
+                    "label": str(loss.get("label", "") or loss_id),
+                    "kind": "loss",
+                    "detail": _training_contract_loss_detail(loss),
+                    "role": "",
+                },
+            )
+
+            source_hits = 0
+            for source_port_id in [str(item or "").strip() for item in list(loss.get("source_ports", []) or []) if str(item or "").strip()]:
+                if source_port_id in output_map:
+                    source_hits += 1
+                    layer_edges.append(
+                        _layer_edge(
+                            _training_resource_node_id(output_map[source_port_id]),
+                            _training_resource_node_id(loss_resource_id),
+                            label=_training_resource_label(source_port_id),
+                            readme_label=_training_resource_label(source_port_id),
+                            reaction_name="training.predict_tensor",
+                            target_function="",
+                            metadata={"style_role": "predict"},
+                        )
+                    )
+                elif source_port_id in input_map:
+                    source_hits += 1
+                    layer_edges.append(
+                        _layer_edge(
+                            _training_resource_node_id(input_map[source_port_id]),
+                            _training_resource_node_id(loss_resource_id),
+                            label=_training_resource_label(source_port_id),
+                            readme_label=_training_resource_label(source_port_id),
+                            reaction_name="training.supervise_tensor",
+                            target_function="",
+                            metadata={"style_role": "supervise"},
+                        )
+                    )
+                elif source_port_id in state_map:
+                    source_hits += 1
+                    layer_edges.append(
+                        _layer_edge(
+                            _training_resource_node_id(state_map[source_port_id]),
+                            _training_resource_node_id(loss_resource_id),
+                            label=_training_resource_label(source_port_id),
+                            readme_label=_training_resource_label(source_port_id),
+                            reaction_name="training.supervise_state",
+                            target_function="",
+                            metadata={"style_role": "supervise"},
+                        )
+                    )
+
+            if source_hits <= 0:
+                layer_edges.append(
+                    _layer_edge(
+                        module_node_id,
+                        _training_resource_node_id(loss_resource_id),
+                        label=_training_resource_label(loss_id),
+                        readme_label=_training_resource_label(loss_id),
+                        reaction_name="training.evaluate_loss",
+                        target_function="",
+                        metadata={"style_role": "predict"},
+                    )
+                )
+
+            loss_optimizer_targets = [
+                str(item or "").strip()
+                for item in list(loss.get("optimizer_targets", []) or [])
+                if str(item or "").strip()
+            ] or list(optimizer_attrs)
+            for optimizer_attr in loss_optimizer_targets:
+                target_model_attr = _training_contract_model_for_optimizer(
+                    optimizer_attr,
+                    model_attrs,
+                    primary_model_attr,
+                )
+                if not target_model_attr:
+                    continue
+                layer_edges.append(
+                    _layer_edge(
+                        _training_resource_node_id(loss_resource_id),
+                        _training_resource_node_id(_training_contract_model_resource_id(target_model_attr)),
+                        label=_training_resource_label(optimizer_attr),
+                        readme_label=_training_resource_label(optimizer_attr),
+                        reaction_name="training.optimize",
+                        target_function="",
+                        metadata={"style_role": "optimize"},
+                    )
+                )
+
+    if not trainer_specs:
+        return {
+            "layer_id": "training_contracts",
+            "label": "IR Training Contracts",
+            "description": "Reserved IR layer for explicit PyTorch training-node contracts.",
+            "status": "planned",
+            "mermaid_direction": "LR",
+            "nodes": [],
+            "edges": [],
+        }
+
+    layer_nodes: List[Dict[str, Any]] = []
+    for resource_id in sorted(resource_defs.keys()):
+        resource = dict(resource_defs.get(resource_id, {}) or {})
+        visuals = _training_resource_visuals(str(resource.get("kind", "state") or "state"))
+        layer_nodes.append(
+            _layer_node(
+                _training_resource_node_id(resource_id),
+                str(resource.get("label", "") or _training_resource_label(resource_id)),
+                object_type=visuals["object_type"],
+                faculty=visuals["faculty"],
+                archetype=visuals["archetype"],
+                shape=visuals["shape"],
+                metadata={
+                    "resource_id": resource_id,
+                    "kind": str(resource.get("kind", "state") or "state"),
+                    "detail": str(resource.get("detail", "") or ""),
+                    "role": str(resource.get("role", "") or ""),
+                },
+            )
+        )
+
+    for trainer in trainer_specs:
+        layer_nodes.append(
+            _layer_node(
+                _training_module_node_id(trainer["node_id"]),
+                trainer["label"],
+                object_type="trainer",
+                faculty="trainers",
+                archetype="ir_training_contract",
+                shape="process",
+                metadata={
+                    "node_id": str(trainer["node_id"]),
+                    "summary": str(trainer["summary"]),
+                    "detail": str(trainer["detail"] or trainer["notes"]),
+                },
+            )
+        )
+
+    return {
+        "layer_id": "training_contracts",
+        "label": "IR Training Contracts",
+        "description": "IR-backed PyTorch module canvas showing per-node tensor ports, state inputs, objectives, and optimization targets.",
         "status": "active",
         "mermaid_direction": "LR",
         "nodes": layer_nodes,
@@ -1448,7 +2028,7 @@ def _render_dense_nodes(
             continue
         lines.append(f"    subgraph group_{_sanitize_mermaid_token(faculty)}[{_escape_mermaid(_faculty_label(faculty))}]")
         for node in lane_nodes:
-            label = _dense_node_label(node)
+            label = _dense_node_label(layer_id, node)
             if emit_identity_comments:
                 lines.append(f"        %% node_id:{str(node.get('node_id', 'node'))}")
             lines.append(f"        {alias_map[str(node['node_id'])]}{_mermaid_node_shape(label, shape=str(node.get('shape', 'process')))}")
@@ -1526,11 +2106,18 @@ def _render_layer_legend(layer: Dict[str, Any]) -> str:
         return "Node colors group buses, inference objects, buffers, and acceptance gates. Edge colors separate ingress, interpretation, synthesis, retry-loop, repack, and egress paths."
     if layer_id == "execution_overlay":
         return "The colored edges retain topology and data/reaction structure. The black numbered edges show scheduler order, while diamond nodes expose the explicit guard checks that gate later stages."
+    if layer_id in {"training_mechanics", "training_contracts"}:
+        return "Blue nodes are supervision sources, purple nodes are shared model/state banks, orange nodes are trainer modules, red nodes are objectives, and green nodes are emitted updates or artifacts. Edge colors distinguish consumed inputs, conditioning signals, forward predictions, supervision links, optimizer steps, and emitted artifacts."
     return "Node colors group bootstrap, build, vocab, data, train, gate, and housekeeping faculties. Edge colors separate startup, per-round, data-provision, gated progression, and end-of-round reactions."
 
 
 def _faculty_order(layer_id: str, faculties: Iterable[str]) -> List[str]:
-    known = INFERENCE_FACULTY_ORDER if layer_id == "inference" else EXECUTION_FACULTY_ORDER
+    if layer_id == "inference":
+        known = INFERENCE_FACULTY_ORDER
+    elif layer_id in {"training_mechanics", "training_contracts"}:
+        known = TRAINING_MECHANICS_FACULTY_ORDER
+    else:
+        known = EXECUTION_FACULTY_ORDER
     out = [faculty for faculty in known if faculty in faculties]
     for faculty in faculties:
         if faculty not in out:
@@ -1568,7 +2155,7 @@ def _execution_node_label(node_id: str, node: Any) -> str:
     return class_name.strip() or node_id.replace("_", " ").title()
 
 
-def _dense_node_label(node: Dict[str, Any]) -> str:
+def _dense_node_label(layer_id: str, node: Dict[str, Any]) -> str:
     base = str(node.get("label", node.get("node_id", "node"))).strip()
     object_type = str(node.get("object_type", "object") or "object").strip()
     faculty = str(node.get("faculty", "other") or "other").strip()
@@ -1590,6 +2177,15 @@ def _dense_node_label(node: Dict[str, Any]) -> str:
         sn_labels = [s for s in sn_labels if s]
         if sn_labels:
             label += "<br/><small>" + " \u00b7 ".join(sn_labels) + "</small>"
+    if layer_id in {"training_mechanics", "training_contracts"}:
+        extra = []
+        metadata = dict(node.get("metadata", {}) or {})
+        for key in ("summary", "detail"):
+            value = str(metadata.get(key, "") or "").strip()
+            if value and value not in extra:
+                extra.append(value)
+        if extra:
+            label += "<br/><small>" + " \u00b7 ".join(extra[:2]) + "</small>"
     return label
 
 
@@ -1604,6 +2200,21 @@ def _edge_style(layer_id: str, edge: Dict[str, Any]) -> Dict[str, str]:
         return {"stroke": "#8B5CF6", "width": "2px", "opacity": "0.85", "dasharray": "4 2"}
     if str(metadata.get("style_role", "") or "") == "cycle":
         return {"stroke": "#9333EA", "width": "3px", "opacity": "0.90", "dasharray": "10 4"}
+    if layer_id in {"training_mechanics", "training_contracts"}:
+        role = str(metadata.get("style_role", "") or "").strip().lower()
+        if role == "consume":
+            return {"stroke": "#2563EB", "width": "3px", "opacity": "0.92", "dasharray": "0"}
+        if role == "condition":
+            return {"stroke": "#7C3AED", "width": "3px", "opacity": "0.90", "dasharray": "6 3"}
+        if role == "predict":
+            return {"stroke": "#F97316", "width": "3px", "opacity": "0.92", "dasharray": "0"}
+        if role == "supervise":
+            return {"stroke": "#0891B2", "width": "3px", "opacity": "0.92", "dasharray": "2 2"}
+        if role == "optimize":
+            return {"stroke": "#16A34A", "width": "4px", "opacity": "0.96", "dasharray": "0"}
+        if role == "emit":
+            return {"stroke": "#A16207", "width": "3px", "opacity": "0.90", "dasharray": "8 3"}
+        return {"stroke": "#6B7280", "width": "2px", "opacity": "0.75", "dasharray": "0"}
 
     label = str(edge.get("label", "") or "").strip().lower()
     readme_label = str(edge.get("readme_label", "") or "").strip().lower()
@@ -1804,7 +2415,7 @@ def _mmdc_export_artifact(
 
 def main(argv: Optional[Iterable[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="Generate layered Mermaid flowcharts from the graph definitions.")
-    parser.add_argument("--layer", choices=["execution", "execution_overlay", "inference", "provenance", "stack_view"], default="", help="Print a single layer Mermaid flowchart.")
+    parser.add_argument("--layer", choices=["execution", "execution_overlay", "inference", "provenance", "stack_view", "training_mechanics", "training_contracts"], default="", help="Print a single layer Mermaid flowchart.")
     parser.add_argument("--view", choices=["dense", "minimal", "reaction"], default="dense", help="Rendering mode for --layer output.")
     parser.add_argument("--write-readme", action="store_true", help="Update README.md generated Mermaid sections in place.")
     parser.add_argument("--readme-path", default="README.md", help="README path to update when --write-readme is set.")

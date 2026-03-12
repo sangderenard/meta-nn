@@ -51,7 +51,13 @@ import torch
 
 from pipeline.context import PipelineContext
 from pipeline.graph import PipelineNode
-from pipeline.nodes.base import GatedNode, make_grad_scaler
+from pipeline.nodes.base import (
+    IRLossTermSpec,
+    IRStateSpec,
+    IRTrainingNode,
+    IRTensorPortSpec,
+    make_grad_scaler,
+)
 import hashlib
 import json
 import numpy as np
@@ -224,7 +230,7 @@ class BuildGANNode(PipelineNode):
 # Stage G — GAN training node
 # ---------------------------------------------------------------------------
 
-class GeneratorTrainNode(GatedNode):
+class GeneratorTrainNode(IRTrainingNode):
     """Stage G: Train conditional GAN pair.
 
     Requires all base gates (pre-gestation, gestation, Berkeley).
@@ -242,9 +248,141 @@ class GeneratorTrainNode(GatedNode):
     description = "Stage G: Conditional GAN training (generator + discriminator)"
     required_gates = ["gate_pregestation", "gate_gestation", "gate_berkeley"]
     gpu_models = ["generator", "discriminator", "classifier"]
+    model_attr = "generator"
+    extra_model_attrs = ["discriminator", "classifier"]
+    optimizer_attrs = ["generator_optimizer", "discriminator_optimizer"]
 
     def __init__(self, cfg: GeneratorConfig) -> None:
         self.cfg = cfg
+
+    def ir_input_ports(self) -> List[IRTensorPortSpec]:
+        return [
+            IRTensorPortSpec(
+                "payload_images",
+                "Payload images",
+                io="input",
+                dtype="float32",
+                shape="B x 3 x H x W",
+                semantic="real_image_batch",
+                detail="real semantic payload images used for adversarial and reconstruction supervision",
+            ),
+            IRTensorPortSpec(
+                "payload_conditions",
+                "Payload conditions",
+                io="input",
+                dtype="float32",
+                shape="B x C",
+                semantic="condition_vectors",
+                detail="multihot semantic conditioning vectors",
+            ),
+            IRTensorPortSpec(
+                "payload_masks",
+                "Payload masks",
+                io="input",
+                dtype="float32",
+                shape="B x 1 x H x W",
+                semantic="spatial_mask_batch",
+                detail="optional spatial targets aligned with the payload bank",
+            ),
+        ]
+
+    def ir_output_ports(self) -> List[IRTensorPortSpec]:
+        return [
+            IRTensorPortSpec(
+                "generated_images",
+                "Generated images",
+                io="output",
+                dtype="float32",
+                shape="B x 3 x H x W",
+                semantic="generated_image_batch",
+                detail="conditioned samples emitted by the GAN generator",
+            ),
+            IRTensorPortSpec(
+                "discriminator_patch_logits",
+                "Discriminator patch logits",
+                io="output",
+                dtype="float32",
+                shape="B x 1 x h x w",
+                semantic="patch_discriminator_logits",
+                detail="critic scores over real and generated image patches",
+            ),
+        ]
+
+    def ir_loss_terms(self) -> List[IRLossTermSpec]:
+        return [
+            IRLossTermSpec(
+                "stage_g_generator_loss",
+                "Stage G generator objective",
+                kind="adversarial+classifier_guidance+wave_reconstruction",
+                optimizer_targets=["generator_optimizer"],
+                source_ports=["payload_images", "payload_conditions", "generated_images"],
+                detail="Generator objective combining adversarial pressure, classifier guidance, and wave reconstruction fidelity",
+            ),
+            IRLossTermSpec(
+                "stage_g_discriminator_loss",
+                "Stage G discriminator objective",
+                kind="real_fake+r1_penalty",
+                optimizer_targets=["discriminator_optimizer"],
+                source_ports=["payload_images", "generated_images", "discriminator_patch_logits"],
+                detail="Discriminator objective over real/fake patches with R1 stabilization",
+            ),
+        ]
+
+    def ir_state_inputs(self) -> List[IRStateSpec]:
+        return [
+            IRStateSpec(
+                "vocab_snapshot_library",
+                "Vocab snapshot library",
+                role="checkpoint_bank",
+                detail="keyed G+D snapshot bank for restoring vocab-specific GAN states",
+            ),
+        ]
+
+    def ir_contract_notes(self) -> str:
+        return (
+            "PyTorch Stage-G trainer with a dual-model contract. The current helper "
+            "creates its own inner optimizers per call, but the IR still declares "
+            "generator/discriminator ownership, tensor surfaces, and optimization targets."
+        )
+
+    def declare_training_mechanics(self) -> Dict[str, Any]:
+        return {
+            "module_family": "gan",
+            "module_label": "Stage G Generator",
+            "summary": "Generator and discriminator co-train against payload supervision, classifier guidance, and adversarial pressure.",
+            "inputs": [
+                {"id": "semantic_payload_bank", "label": "Semantic payload bank", "kind": "dataset", "detail": "real target images for adversarial refresh"},
+                {"id": "semantic_condition_bank", "label": "Condition bank", "kind": "state", "detail": "multihot conditioning vectors"},
+                {"id": "semantic_payload_masks", "label": "Payload masks", "kind": "dataset", "detail": "optional spatial supervision masks"},
+                {"id": "gan_generator_model", "label": "GAN generator", "kind": "model", "detail": "conditioned image synthesizer"},
+                {"id": "gan_discriminator_model", "label": "GAN discriminator", "kind": "model", "detail": "real-vs-fake critic with stability penalty"},
+                {"id": "classifier_model", "label": "Classifier teacher", "kind": "model", "detail": "semantic guidance signal for generated samples"},
+            ],
+            "losses": [
+                {"id": "loss_stage_g_generator", "label": "adv + classifier guidance + wave recon", "kind": "loss", "detail": "generator composite objective"},
+                {"id": "loss_stage_g_discriminator", "label": "real/fake discrimination + R1", "kind": "loss", "detail": "discriminator objective"},
+            ],
+            "outputs": [
+                {"id": "gan_generator_model", "label": "GAN generator", "kind": "model", "detail": "updated generator weights"},
+                {"id": "gan_discriminator_model", "label": "GAN discriminator", "kind": "model", "detail": "updated discriminator weights"},
+            ],
+            "flows": [
+                {"source": "semantic_payload_bank", "target": "self", "label": "real image targets", "kind": "consume"},
+                {"source": "semantic_condition_bank", "target": "self", "label": "conditioning vectors", "kind": "condition"},
+                {"source": "semantic_payload_masks", "target": "self", "label": "spatial targets", "kind": "consume"},
+                {"source": "gan_generator_model", "target": "self", "label": "generator weights", "kind": "consume"},
+                {"source": "gan_discriminator_model", "target": "self", "label": "critic weights", "kind": "consume"},
+                {"source": "classifier_model", "target": "self", "label": "semantic teacher", "kind": "condition"},
+                {"source": "self", "target": "loss_stage_g_generator", "label": "fake samples", "kind": "predict"},
+                {"source": "semantic_payload_bank", "target": "loss_stage_g_generator", "label": "real targets", "kind": "supervise"},
+                {"source": "semantic_condition_bank", "target": "loss_stage_g_generator", "label": "conditioning targets", "kind": "supervise"},
+                {"source": "classifier_model", "target": "loss_stage_g_generator", "label": "feature guidance", "kind": "supervise"},
+                {"source": "self", "target": "loss_stage_g_discriminator", "label": "real vs fake logits", "kind": "predict"},
+                {"source": "semantic_payload_bank", "target": "loss_stage_g_discriminator", "label": "real samples", "kind": "supervise"},
+                {"source": "loss_stage_g_generator", "target": "gan_generator_model", "label": "optimizer step", "kind": "optimize"},
+                {"source": "loss_stage_g_discriminator", "target": "gan_discriminator_model", "label": "optimizer step", "kind": "optimize"},
+            ],
+        }
 
     def should_run(self, ctx: PipelineContext) -> bool:
         if not super().should_run(ctx):

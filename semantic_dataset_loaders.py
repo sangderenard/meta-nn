@@ -127,10 +127,26 @@ def convert_sbd_mat_to_npz(root) -> None:
     Idempotent: skips any .mat file that already has a matching .npz.
     """
     from pathlib import Path as _Path
-    cls_dir = _Path(str(root)) / "cls"
-    if not cls_dir.exists():
+    root_path = _Path(str(root))
+    cls_dirs = []
+    for cls_dir in (
+        root_path / "cls",
+        root_path / "dataset" / "cls",
+        root_path / "benchmark_RELEASE" / "dataset" / "cls",
+    ):
+        if cls_dir.exists() and cls_dir not in cls_dirs:
+            cls_dirs.append(cls_dir)
+    if not cls_dirs:
         return
-    needs = [f for f in sorted(cls_dir.glob("*.mat")) if not (cls_dir / f"{f.stem}.npz").exists()]
+    needs = []
+    for cls_dir in cls_dirs:
+        needs.extend(
+            [
+                f
+                for f in sorted(cls_dir.glob("*.mat"))
+                if not (cls_dir / f"{f.stem}.npz").exists()
+            ]
+        )
     if not needs:
         return
     try:
@@ -151,7 +167,7 @@ def convert_sbd_mat_to_npz(root) -> None:
                     except Exception:
                         pass
                 if seg is not None:
-                    _np.savez_compressed(str(cls_dir / f"{mat_path.stem}.npz"), segmentation=seg)
+                    _np.savez_compressed(str(mat_path.with_suffix(".npz")), segmentation=seg)
             except Exception:
                 errors += 1
         print(f"[mat2npz] done. errors={errors}", flush=True)
@@ -160,33 +176,69 @@ def convert_sbd_mat_to_npz(root) -> None:
 
 
 def _read_sbd_split_file(root, split_name: str):
-    """Read Berkeley SBD split file and return (image_paths, mask_stems).
+    """Read Berkeley SBD split file and return (image_paths, mask_paths).
 
     Does not import scipy or torchvision — just reads the .txt index file.
     Prefers train_noval.txt for the train split (excludes val overlap).
-    Returns: (list of Path, list of str stem names)
+    Supports the flattened repo layout (root/{train,val}.txt + root/img + root/cls),
+    the legacy root/dataset layout, and benchmark_RELEASE/dataset.
+    Returns: (list[Path], list[str])
     """
     from pathlib import Path as _Path
+
     root = _Path(str(root))
-    dataset_dir = root / "dataset"
-    candidates = []
-    if split_name == "train":
-        candidates.append(dataset_dir / "train_noval.txt")
-    candidates.append(dataset_dir / f"{split_name}.txt")
-    split_file = next((c for c in candidates if c.exists()), None)
-    if split_file is None:
-        return [], []
-    img_dir = root / "img"
-    cls_dir = root / "cls"
-    lines = [ln.strip() for ln in split_file.read_text(encoding="utf-8").splitlines() if ln.strip()]
-    image_paths = []
-    mask_stems = []
-    for name in lines:
-        img_p = img_dir / f"{name}.jpg"
-        if img_p.exists():
+    layout_candidates = [
+        (root / "dataset", root),
+        (root, root),
+        (root / "benchmark_RELEASE" / "dataset", root / "benchmark_RELEASE" / "dataset"),
+    ]
+    seen_layout_keys = set()
+
+    for split_dir, asset_root in layout_candidates:
+        layout_key = (str(split_dir), str(asset_root))
+        if layout_key in seen_layout_keys:
+            continue
+        seen_layout_keys.add(layout_key)
+
+        split_candidates = []
+        if split_name == "train":
+            split_candidates.append(split_dir / "train_noval.txt")
+        split_candidates.append(split_dir / f"{split_name}.txt")
+        split_file = next((c for c in split_candidates if c.exists()), None)
+        if split_file is None:
+            continue
+
+        img_dir = asset_root / "img"
+        cls_dir = asset_root / "cls"
+        if not img_dir.exists() and (split_dir / "img").exists():
+            img_dir = split_dir / "img"
+        if not cls_dir.exists() and (split_dir / "cls").exists():
+            cls_dir = split_dir / "cls"
+        if not img_dir.exists():
+            continue
+
+        lines = [
+            ln.strip()
+            for ln in split_file.read_text(encoding="utf-8").splitlines()
+            if ln.strip()
+        ]
+        image_paths = []
+        mask_paths = []
+        for name in lines:
+            stem = str(name).strip()
+            img_p = img_dir / f"{stem}.jpg"
+            if not img_p.exists():
+                continue
+            mask_p = cls_dir / f"{stem}.mat"
+            if not mask_p.exists():
+                mask_npz = cls_dir / f"{stem}.npz"
+                mask_p = mask_npz if mask_npz.exists() else mask_p
             image_paths.append(img_p)
-            mask_stems.append(str(name))
-    return image_paths, mask_stems
+            mask_paths.append(str(mask_p) if mask_p.exists() else "")
+        if image_paths:
+            return image_paths, mask_paths
+
+    return [], []
 
 
 @dataclass
@@ -800,9 +852,9 @@ def semantic_mask_stack_collate(batch: Sequence[Any]) -> Any:
         xs.append(sample[0])
         ys.append(sample[1])
         ms.append(sample[2])
-        stack_t = sample[3] if torch.is_tensor(sample[3]) else torch.as_tensor(sample[3], dtype=torch.float32)
+        stack_t = sample[3] if torch.is_tensor(sample[3]) else torch.as_tensor(sample[3])
         idx_t = sample[4] if torch.is_tensor(sample[4]) else torch.as_tensor(sample[4], dtype=torch.long)
-        mask_stacks.append(stack_t.to(dtype=torch.float32))
+        mask_stacks.append(stack_t)
         mask_indices.append(idx_t.to(dtype=torch.long))
     return {
         "x": torch.stack(xs, dim=0),
@@ -2958,7 +3010,7 @@ def collect_semantic_disk_rows(
     convert_sbd_mat_to_npz(root)
     split_specs = [("train", "berkeley_sbd_train"), ("val", "berkeley_sbd_val")]
     for split_name, source_key in split_specs:
-        _split_images, _mask_stems = _read_sbd_split_file(root, split_name)
+        _split_images, _mask_paths = _read_sbd_split_file(root, split_name)
         label_path = root / "cache" / f"sbd_{split_name}_multilabel.npz"
         if not label_path.exists():
             raise RuntimeError(
@@ -2997,7 +3049,7 @@ def collect_semantic_disk_rows(
                 (
                     ip,
                     np.asarray(yv, dtype=np.float32).reshape(-1).copy(),
-                    str(root / "cls" / f"{_mask_stems[int(i)]}.mat") if int(i) < int(len(_mask_stems)) else "",
+                    str(_mask_paths[int(i)]) if int(i) < int(len(_mask_paths)) else "",
                     str(source_key),
                     str(split_name),
                 )
@@ -3115,13 +3167,13 @@ def collect_semantic_disk_rows(
         "row_build_threads": int(startup_row_threads),
         "row_build_seconds": float(max(0.0, time.perf_counter() - t0)),
         "inprocess_cache_hit": False,
+        "mask_cache_enabled": False,
+        "mask_cache_hits": 0,
+        "mask_cache_writes": 0,
+        "mask_cache_failures": 0,
+        "mask_cache_seconds": 0.0,
+        "mask_cache_threads": 0,
     }
-    cache_info = _materialize_semantic_row_mask_cache(
-        rows=rows,
-        class_names=class_names,
-        cache_root=_resolve_semantic_mask_cache_root(root),
-    )
-    info.update(cache_info)
     with _SEMANTIC_DISK_ROWS_CACHE_LOCK:
         _SEMANTIC_DISK_ROWS_CACHE[cache_key] = (_clone_semantic_disk_rows(rows), dict(info))
     return rows, info

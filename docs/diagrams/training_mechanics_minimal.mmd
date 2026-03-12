@@ -1,0 +1,108 @@
+%%{init: {'theme':'base','themeVariables':{'background':'#f5f6f7','mainBkg':'#f5f6f7'},'flowchart':{'curve':'basis','htmlLabels':true}}}%%
+flowchart LR
+    training_resource__accepted_wave_dataset[["Accepted wave dataset"]]
+    training_resource__active_churn_terms["Active churn terms"]
+    training_resource__berkeley_refresh_loader[["Berkeley refresh deck"]]
+    training_resource__classifier_lora_slots["LoRA slot snapshots"]
+    training_resource__classifier_model["Classifier weights"]
+    training_resource__gan_discriminator_model["GAN discriminator"]
+    training_resource__gan_generator_model["GAN generator"]
+    training_resource__gestation_loader[["Gestation deck"]]
+    training_resource__label_embedding_bank["Label embedding bank"]
+    training_resource__loss_fake_class(["Fake sentinel BCE"])
+    training_resource__loss_stage0_classifier(["BCE + cosine + mask BCE"])
+    training_resource__loss_stage1_classifier(["BCE + cosine + mask BCE"])
+    training_resource__loss_stage2_classifier(["BCE + cosine + mask BCE"])
+    training_resource__loss_stage_g_discriminator(["real/fake discrimination + R1"])
+    training_resource__loss_stage_g_generator(["adv + classifier guidance + wave recon"])
+    training_resource__loss_stage_r_transformer(["feature + rank + entropy + bitplane + wave L1"])
+    training_resource__loss_stage_w_classifier(["wave BCE supervision"])
+    training_resource__loss_stagec_lora(["BCE + cosine + mask BCE"])
+    training_resource__pregestation_loader[["Pregestation deck"]]
+    training_resource__render_config["Render config"]
+    training_resource__semantic_condition_bank["Condition bank"]
+    training_resource__semantic_payload_bank[["Semantic payload bank"]]
+    training_resource__semantic_payload_masks[["Payload masks"]]
+    training_resource__transformer_model["WavePatchTransformer"]
+    training_resource__wave_classifier_model["Wave classifier"]
+    training_resource__wave_stream_batch[["Wave stream batch"]]
+    training_module__stage_0_pregestation["Stage 0 Pregestation"]
+    training_module__stage_1_gestation["Stage 1 Gestation"]
+    training_module__stage_2_berkeley["Stage 2 Berkeley Refresh"]
+    training_module__stage_r_transformer["Stage R Transformer"]
+    training_module__stage_g_generator["Stage G Generator"]
+    training_module__stage_w_wave_classifier["Stage W Wave Classifier"]
+    training_module__stage_c_lora["Stage C LoRA Round"]
+    training_module__stage_fake_feedback["Fake-Class Feedback"]
+
+    training_resource__pregestation_loader --> training_module__stage_0_pregestation
+    training_resource__classifier_model --> training_module__stage_0_pregestation
+    training_resource__label_embedding_bank --> training_module__stage_0_pregestation
+    training_module__stage_0_pregestation --> training_resource__loss_stage0_classifier
+    training_resource__pregestation_loader --> training_resource__loss_stage0_classifier
+    training_resource__label_embedding_bank --> training_resource__loss_stage0_classifier
+    training_resource__loss_stage0_classifier --> training_resource__classifier_model
+    training_resource__gestation_loader --> training_module__stage_1_gestation
+    training_resource__classifier_model --> training_module__stage_1_gestation
+    training_resource__label_embedding_bank --> training_module__stage_1_gestation
+    training_module__stage_1_gestation --> training_resource__loss_stage1_classifier
+    training_resource__gestation_loader --> training_resource__loss_stage1_classifier
+    training_resource__label_embedding_bank --> training_resource__loss_stage1_classifier
+    training_resource__loss_stage1_classifier --> training_resource__classifier_model
+    training_resource__berkeley_refresh_loader --> training_module__stage_2_berkeley
+    training_resource__classifier_model --> training_module__stage_2_berkeley
+    training_resource__label_embedding_bank --> training_module__stage_2_berkeley
+    training_module__stage_2_berkeley --> training_resource__loss_stage2_classifier
+    training_resource__berkeley_refresh_loader --> training_resource__loss_stage2_classifier
+    training_resource__label_embedding_bank --> training_resource__loss_stage2_classifier
+    training_resource__loss_stage2_classifier --> training_resource__classifier_model
+    training_resource__wave_stream_batch --> training_module__stage_r_transformer
+    training_resource__transformer_model --> training_module__stage_r_transformer
+    training_resource__classifier_model --> training_module__stage_r_transformer
+    training_resource__render_config --> training_module__stage_r_transformer
+    training_module__stage_r_transformer --> training_resource__loss_stage_r_transformer
+    training_resource__wave_stream_batch --> training_resource__loss_stage_r_transformer
+    training_resource__classifier_model --> training_resource__loss_stage_r_transformer
+    training_resource__render_config --> training_resource__loss_stage_r_transformer
+    training_resource__loss_stage_r_transformer --> training_resource__transformer_model
+    training_resource__semantic_payload_bank --> training_module__stage_g_generator
+    training_resource__semantic_condition_bank --> training_module__stage_g_generator
+    training_resource__semantic_payload_masks --> training_module__stage_g_generator
+    training_resource__gan_generator_model --> training_module__stage_g_generator
+    training_resource__gan_discriminator_model --> training_module__stage_g_generator
+    training_resource__classifier_model --> training_module__stage_g_generator
+    training_module__stage_g_generator --> training_resource__loss_stage_g_generator
+    training_resource__semantic_payload_bank --> training_resource__loss_stage_g_generator
+    training_resource__semantic_condition_bank --> training_resource__loss_stage_g_generator
+    training_resource__classifier_model --> training_resource__loss_stage_g_generator
+    training_module__stage_g_generator --> training_resource__loss_stage_g_discriminator
+    training_resource__semantic_payload_bank --> training_resource__loss_stage_g_discriminator
+    training_resource__loss_stage_g_generator --> training_resource__gan_generator_model
+    training_resource__loss_stage_g_discriminator --> training_resource__gan_discriminator_model
+    training_resource__wave_stream_batch --> training_module__stage_w_wave_classifier
+    training_resource__transformer_model --> training_module__stage_w_wave_classifier
+    training_resource__classifier_model --> training_module__stage_w_wave_classifier
+    training_resource__render_config --> training_module__stage_w_wave_classifier
+    training_module__stage_w_wave_classifier --> training_resource__accepted_wave_dataset
+    training_resource__accepted_wave_dataset --> training_module__stage_w_wave_classifier
+    training_resource__wave_classifier_model --> training_module__stage_w_wave_classifier
+    training_module__stage_w_wave_classifier --> training_resource__loss_stage_w_classifier
+    training_resource__accepted_wave_dataset --> training_resource__loss_stage_w_classifier
+    training_resource__loss_stage_w_classifier --> training_resource__wave_classifier_model
+    training_resource__berkeley_refresh_loader --> training_module__stage_c_lora
+    training_resource__classifier_model --> training_module__stage_c_lora
+    training_resource__label_embedding_bank --> training_module__stage_c_lora
+    training_resource__active_churn_terms --> training_module__stage_c_lora
+    training_module__stage_c_lora --> training_resource__loss_stagec_lora
+    training_resource__berkeley_refresh_loader --> training_resource__loss_stagec_lora
+    training_resource__label_embedding_bank --> training_resource__loss_stagec_lora
+    training_resource__loss_stagec_lora --> training_resource__classifier_model
+    training_module__stage_c_lora --> training_resource__classifier_lora_slots
+    training_resource__gan_generator_model --> training_module__stage_fake_feedback
+    training_resource__gan_discriminator_model --> training_module__stage_fake_feedback
+    training_resource__semantic_condition_bank --> training_module__stage_fake_feedback
+    training_resource__classifier_model --> training_module__stage_fake_feedback
+    training_module__stage_fake_feedback --> training_resource__loss_fake_class
+    training_resource__gan_discriminator_model --> training_resource__loss_fake_class
+    training_resource__semantic_condition_bank --> training_resource__loss_fake_class
+    training_resource__loss_fake_class --> training_resource__classifier_model

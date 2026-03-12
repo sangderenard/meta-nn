@@ -53,7 +53,13 @@ import torch.nn as nn
 
 from pipeline.context import PipelineContext
 from pipeline.graph import PipelineNode
-from pipeline.nodes.base import GatedNode, make_grad_scaler
+from pipeline.nodes.base import (
+    IRLossTermSpec,
+    IRStateSpec,
+    IRTrainingNode,
+    IRTensorPortSpec,
+    make_grad_scaler,
+)
 from pipeline.nodes.label_embedding_node import _normalize_l2_rows_np
 from pipeline.nodes.vocab_node import _semantic_expand_inferred_tags, _semantic_noise_terms_from_spectrum_sample
 from pipeline.wave_io import _decode_record_to_mono, _save_mono_wav
@@ -178,7 +184,7 @@ class BuildWaveClassifierNode(PipelineNode):
 # Stage W — wave classifier training node
 # ---------------------------------------------------------------------------
 
-class WaveClassifierTrainNode(GatedNode):
+class WaveClassifierTrainNode(IRTrainingNode):
     """Stage W: Build dataset from transformer outputs and train wave classifier.
 
     Requires Gate 0 + Gate 1 + Gate R (transformer).
@@ -195,9 +201,128 @@ class WaveClassifierTrainNode(GatedNode):
     description = "Stage W: Wave classifier training on transformer outputs"
     required_gates = ["gate_pregestation", "gate_gestation", "gate_transformer"]
     gpu_models = ["wave_classifier", "transformer", "classifier"]
+    model_attr = "wave_classifier"
+    extra_model_attrs = ["transformer", "classifier"]
+    optimizer_attrs = ["wave_classifier_optimizer"]
 
     def __init__(self, cfg: WaveClassifierConfig) -> None:
         self.cfg = cfg
+
+    def ir_input_ports(self) -> List[IRTensorPortSpec]:
+        return [
+            IRTensorPortSpec(
+                "candidate_wave_chunks",
+                "Candidate wave chunks",
+                io="input",
+                dtype="float32",
+                shape="B x chunk_samples",
+                semantic="wave_chunk_batch",
+                detail="candidate chunks sampled from decoded WAV streams before acceptance filtering",
+            ),
+            IRTensorPortSpec(
+                "accepted_wave_images",
+                "Accepted wave images",
+                io="input",
+                dtype="float32",
+                shape="B x 3 x H x W",
+                semantic="accepted_wave_render_batch",
+                detail="transformer-approved renders recycled into the wave-classifier dataset",
+            ),
+            IRTensorPortSpec(
+                "accepted_wave_targets",
+                "Accepted wave targets",
+                io="input",
+                dtype="float32",
+                shape="B x C",
+                semantic="wave_label_targets",
+                detail="folder-, spectral-, or hash-derived labels for accepted chunks",
+            ),
+        ]
+
+    def ir_output_ports(self) -> List[IRTensorPortSpec]:
+        return [
+            IRTensorPortSpec(
+                "wave_classifier_logits",
+                "Wave-classifier logits",
+                io="output",
+                dtype="float32",
+                shape="B x C",
+                semantic="class_logits",
+                detail="wave classifier predictions over accepted render images",
+            ),
+        ]
+
+    def ir_loss_terms(self) -> List[IRLossTermSpec]:
+        return [
+            IRLossTermSpec(
+                "stage_w_classifier_loss",
+                "Stage W classifier objective",
+                kind="multilabel_bce",
+                optimizer_targets=["wave_classifier_optimizer"],
+                source_ports=[
+                    "accepted_wave_images",
+                    "accepted_wave_targets",
+                    "wave_classifier_logits",
+                ],
+                detail="Standard wave-classifier BCE supervision over the accepted-chunk dataset",
+            ),
+        ]
+
+    def ir_state_inputs(self) -> List[IRStateSpec]:
+        return [
+            IRStateSpec(
+                "render_config",
+                "Render config",
+                role="render_geometry",
+                detail="render parameters reused while building the accepted wave-image dataset",
+            ),
+            IRStateSpec(
+                "label_embedding_bank",
+                "Label embedding bank",
+                role="zero_shot_reference",
+                detail="semantic embedding bank used for optional zero-shot evaluation on accepted renders",
+            ),
+        ]
+
+    def ir_contract_notes(self) -> str:
+        return (
+            "PyTorch Stage-W trainer. The node first materializes an accepted-chunk "
+            "dataset from transformer outputs, then trains a dedicated classifier and "
+            "feeds its metrics back into the upstream wave gate."
+        )
+
+    def declare_training_mechanics(self) -> Dict[str, Any]:
+        return {
+            "module_family": "wave_classifier",
+            "module_label": "Stage W Wave Classifier",
+            "summary": "Accepted transformer renders are recycled into a dedicated wave classifier and fed back as wave-level quality signals.",
+            "inputs": [
+                {"id": "wave_stream_batch", "label": "Wave stream batch", "kind": "dataset", "detail": "candidate chunks extracted from WAV streams"},
+                {"id": "transformer_model", "label": "WavePatchTransformer", "kind": "model", "detail": "produces accepted render candidates"},
+                {"id": "classifier_model", "label": "Classifier teacher", "kind": "model", "detail": "screens transformer outputs before wave training"},
+                {"id": "render_config", "label": "Render config", "kind": "state", "detail": "render parameters for accepted chunk images"},
+                {"id": "wave_classifier_model", "label": "Wave classifier", "kind": "model", "detail": "dedicated classifier for accepted wave renders"},
+            ],
+            "losses": [
+                {"id": "loss_stage_w_classifier", "label": "wave BCE supervision", "kind": "loss", "detail": "wave-classifier training objective"},
+            ],
+            "outputs": [
+                {"id": "accepted_wave_dataset", "label": "Accepted wave dataset", "kind": "dataset", "detail": "train/val deck built from transformer outputs"},
+                {"id": "wave_classifier_model", "label": "Wave classifier", "kind": "model", "detail": "updated wave-classifier weights"},
+            ],
+            "flows": [
+                {"source": "wave_stream_batch", "target": "self", "label": "candidate wave chunks", "kind": "consume"},
+                {"source": "transformer_model", "target": "self", "label": "accepted render source", "kind": "condition"},
+                {"source": "classifier_model", "target": "self", "label": "semantic acceptance teacher", "kind": "condition"},
+                {"source": "render_config", "target": "self", "label": "render parameters", "kind": "condition"},
+                {"source": "self", "target": "accepted_wave_dataset", "label": "accepted chunk dataset build", "kind": "emit"},
+                {"source": "accepted_wave_dataset", "target": "self", "label": "train/val loaders", "kind": "consume"},
+                {"source": "wave_classifier_model", "target": "self", "label": "trainable weights", "kind": "consume"},
+                {"source": "self", "target": "loss_stage_w_classifier", "label": "wave logits", "kind": "predict"},
+                {"source": "accepted_wave_dataset", "target": "loss_stage_w_classifier", "label": "wave labels", "kind": "supervise"},
+                {"source": "loss_stage_w_classifier", "target": "wave_classifier_model", "label": "optimizer step", "kind": "optimize"},
+            ],
+        }
 
     def should_run(self, ctx: PipelineContext) -> bool:
         if not super().should_run(ctx):

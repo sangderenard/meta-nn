@@ -1,0 +1,171 @@
+%%{init: {'theme':'base','themeVariables':{'background':'#f5f6f7','mainBkg':'#f5f6f7'},'flowchart':{'curve':'basis','htmlLabels':true}}}%%
+flowchart LR
+    training_resource__contract__model__classifier["Classifier"]
+    training_resource__contract__model__discriminator["Discriminator"]
+    training_resource__contract__model__generator["Generator"]
+    training_resource__contract__model__transformer["Transformer"]
+    training_resource__contract__model__wave_classifier["Wave Classifier"]
+    training_resource__contract__stage_0_pregestation__input__pregestation_images[["Pregestation images"]]
+    training_resource__contract__stage_0_pregestation__input__pregestation_masks[["Pregestation masks"]]
+    training_resource__contract__stage_0_pregestation__input__pregestation_targets[["Pregestation targets"]]
+    training_resource__contract__stage_0_pregestation__loss__stage0_classifier_loss(["Stage 0 classifier objective"])
+    training_resource__contract__stage_0_pregestation__output__classifier_logits(["Classifier logits"])
+    training_resource__contract__stage_0_pregestation__output__classifier_mask_logits(["Mask logits"])
+    training_resource__contract__stage_1_gestation__input__gestation_images[["Gestation images"]]
+    training_resource__contract__stage_1_gestation__input__gestation_masks[["Gestation masks"]]
+    training_resource__contract__stage_1_gestation__input__gestation_targets[["Gestation targets"]]
+    training_resource__contract__stage_1_gestation__loss__stage1_classifier_loss(["Stage 1 classifier objective"])
+    training_resource__contract__stage_1_gestation__output__classifier_logits(["Classifier logits"])
+    training_resource__contract__stage_1_gestation__output__classifier_mask_logits(["Mask logits"])
+    training_resource__contract__stage_2_berkeley__input__berkeley_images[["Berkeley images"]]
+    training_resource__contract__stage_2_berkeley__input__berkeley_masks[["Berkeley masks"]]
+    training_resource__contract__stage_2_berkeley__input__berkeley_targets[["Berkeley targets"]]
+    training_resource__contract__stage_2_berkeley__loss__stage2_classifier_loss(["Stage 2 classifier objective"])
+    training_resource__contract__stage_2_berkeley__output__classifier_logits(["Classifier logits"])
+    training_resource__contract__stage_2_berkeley__output__classifier_mask_logits(["Mask logits"])
+    training_resource__contract__stage_c_lora__input__berkeley_images[["Berkeley images"]]
+    training_resource__contract__stage_c_lora__input__berkeley_masks[["Berkeley masks"]]
+    training_resource__contract__stage_c_lora__input__berkeley_targets[["Berkeley targets"]]
+    training_resource__contract__stage_c_lora__loss__stagec_lora_loss(["Stage C LoRA objective"])
+    training_resource__contract__stage_c_lora__output__classifier_logits(["Classifier logits"])
+    training_resource__contract__stage_c_lora__output__classifier_lora_state(["LoRA slot state"])
+    training_resource__contract__stage_fake_feedback__input__discriminator_confidence[["Discriminator confidence"]]
+    training_resource__contract__stage_fake_feedback__input__fake_condition_targets[["Condition targets"]]
+    training_resource__contract__stage_fake_feedback__input__fake_images[["Generated images"]]
+    training_resource__contract__stage_fake_feedback__loss__fake_class_loss(["Fake-class objective"])
+    training_resource__contract__stage_fake_feedback__output__classifier_fake_logits(["Fake-class logits"])
+    training_resource__contract__stage_g_generator__input__payload_conditions[["Payload conditions"]]
+    training_resource__contract__stage_g_generator__input__payload_images[["Payload images"]]
+    training_resource__contract__stage_g_generator__input__payload_masks[["Payload masks"]]
+    training_resource__contract__stage_g_generator__loss__stage_g_discriminator_loss(["Stage G discriminator objective"])
+    training_resource__contract__stage_g_generator__loss__stage_g_generator_loss(["Stage G generator objective"])
+    training_resource__contract__stage_g_generator__output__discriminator_patch_logits(["Discriminator patch logits"])
+    training_resource__contract__stage_g_generator__output__generated_images(["Generated images"])
+    training_resource__contract__stage_r_transformer__input__wave_chunk_batch[["Wave chunk batch"]]
+    training_resource__contract__stage_r_transformer__loss__stage_r_transformer_loss(["Stage R transformer objective"])
+    training_resource__contract__stage_r_transformer__output__reconstructed_wave_chunks(["Reconstructed wave chunks"])
+    training_resource__contract__stage_r_transformer__output__rendered_wave_images(["Rendered wave images"])
+    training_resource__contract__stage_w_wave_classifier__input__accepted_wave_images[["Accepted wave images"]]
+    training_resource__contract__stage_w_wave_classifier__input__accepted_wave_targets[["Accepted wave targets"]]
+    training_resource__contract__stage_w_wave_classifier__input__candidate_wave_chunks[["Candidate wave chunks"]]
+    training_resource__contract__stage_w_wave_classifier__loss__stage_w_classifier_loss(["Stage W classifier objective"])
+    training_resource__contract__stage_w_wave_classifier__output__wave_classifier_logits(["Wave-classifier logits"])
+    training_resource__contract__state__active_churn_terms["Active churn terms"]
+    training_resource__contract__state__label_embedding_bank["Label embedding bank"]
+    training_resource__contract__state__payload_conditions["Semantic condition bank"]
+    training_resource__contract__state__render_config["Render config"]
+    training_resource__contract__state__vocab_snapshot_library["Vocab snapshot library"]
+    training_module__stage_0_pregestation["Stage 0 Pregestation"]
+    training_module__stage_1_gestation["Stage 1 Gestation"]
+    training_module__stage_2_berkeley["Stage 2 Berkeley Refresh"]
+    training_module__stage_r_transformer["Stage R Transformer"]
+    training_module__stage_g_generator["Stage G Generator"]
+    training_module__stage_w_wave_classifier["Stage W Wave Classifier"]
+    training_module__stage_c_lora["Stage C LoRA Round"]
+    training_module__stage_fake_feedback["Fake-Class Feedback"]
+
+    training_resource__contract__model__classifier --> training_module__stage_0_pregestation
+    training_resource__contract__state__label_embedding_bank --> training_module__stage_0_pregestation
+    training_resource__contract__stage_0_pregestation__input__pregestation_images --> training_module__stage_0_pregestation
+    training_resource__contract__stage_0_pregestation__input__pregestation_targets --> training_module__stage_0_pregestation
+    training_resource__contract__stage_0_pregestation__input__pregestation_masks --> training_module__stage_0_pregestation
+    training_module__stage_0_pregestation --> training_resource__contract__stage_0_pregestation__output__classifier_logits
+    training_module__stage_0_pregestation --> training_resource__contract__stage_0_pregestation__output__classifier_mask_logits
+    training_resource__contract__stage_0_pregestation__input__pregestation_images --> training_resource__contract__stage_0_pregestation__loss__stage0_classifier_loss
+    training_resource__contract__stage_0_pregestation__input__pregestation_targets --> training_resource__contract__stage_0_pregestation__loss__stage0_classifier_loss
+    training_resource__contract__stage_0_pregestation__input__pregestation_masks --> training_resource__contract__stage_0_pregestation__loss__stage0_classifier_loss
+    training_resource__contract__stage_0_pregestation__output__classifier_logits --> training_resource__contract__stage_0_pregestation__loss__stage0_classifier_loss
+    training_resource__contract__stage_0_pregestation__output__classifier_mask_logits --> training_resource__contract__stage_0_pregestation__loss__stage0_classifier_loss
+    training_resource__contract__stage_0_pregestation__loss__stage0_classifier_loss --> training_resource__contract__model__classifier
+    training_resource__contract__model__classifier --> training_module__stage_1_gestation
+    training_resource__contract__state__label_embedding_bank --> training_module__stage_1_gestation
+    training_resource__contract__stage_1_gestation__input__gestation_images --> training_module__stage_1_gestation
+    training_resource__contract__stage_1_gestation__input__gestation_targets --> training_module__stage_1_gestation
+    training_resource__contract__stage_1_gestation__input__gestation_masks --> training_module__stage_1_gestation
+    training_module__stage_1_gestation --> training_resource__contract__stage_1_gestation__output__classifier_logits
+    training_module__stage_1_gestation --> training_resource__contract__stage_1_gestation__output__classifier_mask_logits
+    training_resource__contract__stage_1_gestation__input__gestation_images --> training_resource__contract__stage_1_gestation__loss__stage1_classifier_loss
+    training_resource__contract__stage_1_gestation__input__gestation_targets --> training_resource__contract__stage_1_gestation__loss__stage1_classifier_loss
+    training_resource__contract__stage_1_gestation__input__gestation_masks --> training_resource__contract__stage_1_gestation__loss__stage1_classifier_loss
+    training_resource__contract__stage_1_gestation__output__classifier_logits --> training_resource__contract__stage_1_gestation__loss__stage1_classifier_loss
+    training_resource__contract__stage_1_gestation__output__classifier_mask_logits --> training_resource__contract__stage_1_gestation__loss__stage1_classifier_loss
+    training_resource__contract__stage_1_gestation__loss__stage1_classifier_loss --> training_resource__contract__model__classifier
+    training_resource__contract__model__classifier --> training_module__stage_2_berkeley
+    training_resource__contract__state__label_embedding_bank --> training_module__stage_2_berkeley
+    training_resource__contract__stage_2_berkeley__input__berkeley_images --> training_module__stage_2_berkeley
+    training_resource__contract__stage_2_berkeley__input__berkeley_targets --> training_module__stage_2_berkeley
+    training_resource__contract__stage_2_berkeley__input__berkeley_masks --> training_module__stage_2_berkeley
+    training_module__stage_2_berkeley --> training_resource__contract__stage_2_berkeley__output__classifier_logits
+    training_module__stage_2_berkeley --> training_resource__contract__stage_2_berkeley__output__classifier_mask_logits
+    training_resource__contract__stage_2_berkeley__input__berkeley_images --> training_resource__contract__stage_2_berkeley__loss__stage2_classifier_loss
+    training_resource__contract__stage_2_berkeley__input__berkeley_targets --> training_resource__contract__stage_2_berkeley__loss__stage2_classifier_loss
+    training_resource__contract__stage_2_berkeley__input__berkeley_masks --> training_resource__contract__stage_2_berkeley__loss__stage2_classifier_loss
+    training_resource__contract__stage_2_berkeley__output__classifier_logits --> training_resource__contract__stage_2_berkeley__loss__stage2_classifier_loss
+    training_resource__contract__stage_2_berkeley__output__classifier_mask_logits --> training_resource__contract__stage_2_berkeley__loss__stage2_classifier_loss
+    training_resource__contract__stage_2_berkeley__loss__stage2_classifier_loss --> training_resource__contract__model__classifier
+    training_resource__contract__model__transformer --> training_module__stage_r_transformer
+    training_resource__contract__model__classifier --> training_module__stage_r_transformer
+    training_resource__contract__state__render_config --> training_module__stage_r_transformer
+    training_resource__contract__stage_r_transformer__input__wave_chunk_batch --> training_module__stage_r_transformer
+    training_module__stage_r_transformer --> training_resource__contract__stage_r_transformer__output__rendered_wave_images
+    training_module__stage_r_transformer --> training_resource__contract__stage_r_transformer__output__reconstructed_wave_chunks
+    training_resource__contract__stage_r_transformer__input__wave_chunk_batch --> training_resource__contract__stage_r_transformer__loss__stage_r_transformer_loss
+    training_resource__contract__stage_r_transformer__output__rendered_wave_images --> training_resource__contract__stage_r_transformer__loss__stage_r_transformer_loss
+    training_resource__contract__stage_r_transformer__output__reconstructed_wave_chunks --> training_resource__contract__stage_r_transformer__loss__stage_r_transformer_loss
+    training_resource__contract__stage_r_transformer__loss__stage_r_transformer_loss --> training_resource__contract__model__transformer
+    training_resource__contract__model__generator --> training_module__stage_g_generator
+    training_resource__contract__model__discriminator --> training_module__stage_g_generator
+    training_resource__contract__model__classifier --> training_module__stage_g_generator
+    training_resource__contract__state__vocab_snapshot_library --> training_module__stage_g_generator
+    training_resource__contract__stage_g_generator__input__payload_images --> training_module__stage_g_generator
+    training_resource__contract__stage_g_generator__input__payload_conditions --> training_module__stage_g_generator
+    training_resource__contract__stage_g_generator__input__payload_masks --> training_module__stage_g_generator
+    training_module__stage_g_generator --> training_resource__contract__stage_g_generator__output__generated_images
+    training_module__stage_g_generator --> training_resource__contract__stage_g_generator__output__discriminator_patch_logits
+    training_resource__contract__stage_g_generator__input__payload_images --> training_resource__contract__stage_g_generator__loss__stage_g_generator_loss
+    training_resource__contract__stage_g_generator__input__payload_conditions --> training_resource__contract__stage_g_generator__loss__stage_g_generator_loss
+    training_resource__contract__stage_g_generator__output__generated_images --> training_resource__contract__stage_g_generator__loss__stage_g_generator_loss
+    training_resource__contract__stage_g_generator__loss__stage_g_generator_loss --> training_resource__contract__model__generator
+    training_resource__contract__stage_g_generator__input__payload_images --> training_resource__contract__stage_g_generator__loss__stage_g_discriminator_loss
+    training_resource__contract__stage_g_generator__output__generated_images --> training_resource__contract__stage_g_generator__loss__stage_g_discriminator_loss
+    training_resource__contract__stage_g_generator__output__discriminator_patch_logits --> training_resource__contract__stage_g_generator__loss__stage_g_discriminator_loss
+    training_resource__contract__stage_g_generator__loss__stage_g_discriminator_loss --> training_resource__contract__model__discriminator
+    training_resource__contract__model__wave_classifier --> training_module__stage_w_wave_classifier
+    training_resource__contract__model__transformer --> training_module__stage_w_wave_classifier
+    training_resource__contract__model__classifier --> training_module__stage_w_wave_classifier
+    training_resource__contract__state__render_config --> training_module__stage_w_wave_classifier
+    training_resource__contract__state__label_embedding_bank --> training_module__stage_w_wave_classifier
+    training_resource__contract__stage_w_wave_classifier__input__candidate_wave_chunks --> training_module__stage_w_wave_classifier
+    training_resource__contract__stage_w_wave_classifier__input__accepted_wave_images --> training_module__stage_w_wave_classifier
+    training_resource__contract__stage_w_wave_classifier__input__accepted_wave_targets --> training_module__stage_w_wave_classifier
+    training_module__stage_w_wave_classifier --> training_resource__contract__stage_w_wave_classifier__output__wave_classifier_logits
+    training_resource__contract__stage_w_wave_classifier__input__accepted_wave_images --> training_resource__contract__stage_w_wave_classifier__loss__stage_w_classifier_loss
+    training_resource__contract__stage_w_wave_classifier__input__accepted_wave_targets --> training_resource__contract__stage_w_wave_classifier__loss__stage_w_classifier_loss
+    training_resource__contract__stage_w_wave_classifier__output__wave_classifier_logits --> training_resource__contract__stage_w_wave_classifier__loss__stage_w_classifier_loss
+    training_resource__contract__stage_w_wave_classifier__loss__stage_w_classifier_loss --> training_resource__contract__model__wave_classifier
+    training_resource__contract__model__classifier --> training_module__stage_c_lora
+    training_resource__contract__state__label_embedding_bank --> training_module__stage_c_lora
+    training_resource__contract__state__active_churn_terms --> training_module__stage_c_lora
+    training_resource__contract__stage_c_lora__input__berkeley_images --> training_module__stage_c_lora
+    training_resource__contract__stage_c_lora__input__berkeley_targets --> training_module__stage_c_lora
+    training_resource__contract__stage_c_lora__input__berkeley_masks --> training_module__stage_c_lora
+    training_module__stage_c_lora --> training_resource__contract__stage_c_lora__output__classifier_logits
+    training_module__stage_c_lora --> training_resource__contract__stage_c_lora__output__classifier_lora_state
+    training_resource__contract__stage_c_lora__input__berkeley_images --> training_resource__contract__stage_c_lora__loss__stagec_lora_loss
+    training_resource__contract__stage_c_lora__input__berkeley_targets --> training_resource__contract__stage_c_lora__loss__stagec_lora_loss
+    training_resource__contract__stage_c_lora__input__berkeley_masks --> training_resource__contract__stage_c_lora__loss__stagec_lora_loss
+    training_resource__contract__stage_c_lora__output__classifier_logits --> training_resource__contract__stage_c_lora__loss__stagec_lora_loss
+    training_resource__contract__stage_c_lora__loss__stagec_lora_loss --> training_resource__contract__model__classifier
+    training_resource__contract__model__classifier --> training_module__stage_fake_feedback
+    training_resource__contract__model__generator --> training_module__stage_fake_feedback
+    training_resource__contract__model__discriminator --> training_module__stage_fake_feedback
+    training_resource__contract__state__payload_conditions --> training_module__stage_fake_feedback
+    training_resource__contract__stage_fake_feedback__input__fake_images --> training_module__stage_fake_feedback
+    training_resource__contract__stage_fake_feedback__input__fake_condition_targets --> training_module__stage_fake_feedback
+    training_resource__contract__stage_fake_feedback__input__discriminator_confidence --> training_module__stage_fake_feedback
+    training_module__stage_fake_feedback --> training_resource__contract__stage_fake_feedback__output__classifier_fake_logits
+    training_resource__contract__stage_fake_feedback__input__fake_images --> training_resource__contract__stage_fake_feedback__loss__fake_class_loss
+    training_resource__contract__stage_fake_feedback__input__fake_condition_targets --> training_resource__contract__stage_fake_feedback__loss__fake_class_loss
+    training_resource__contract__stage_fake_feedback__input__discriminator_confidence --> training_resource__contract__stage_fake_feedback__loss__fake_class_loss
+    training_resource__contract__stage_fake_feedback__output__classifier_fake_logits --> training_resource__contract__stage_fake_feedback__loss__fake_class_loss
+    training_resource__contract__stage_fake_feedback__loss__fake_class_loss --> training_resource__contract__model__classifier

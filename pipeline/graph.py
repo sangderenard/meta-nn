@@ -158,6 +158,16 @@ class PipelineNode(ABC):
         """
         return []
 
+    def declare_training_mechanics(self) -> Dict[str, Any]:
+        """Declare NN-training mechanics for IR-first visualization.
+
+        Training nodes can override this to describe their conceptual inputs,
+        outputs, losses, and optimization/data-flow edges without exposing
+        Python control flow. The plan exporter persists this into node metadata
+        so alternate graph views can render the system as a neural-design canvas.
+        """
+        return {}
+
     @property
     def gpu_models(self) -> List[str]:
         """Context attribute names of ``nn.Module`` objects this node accesses.

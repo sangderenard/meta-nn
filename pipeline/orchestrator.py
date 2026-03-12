@@ -264,6 +264,31 @@ def _prepare_runtime(args, output_dir: Path, device: torch.device) -> dict:
     }
 
 
+def _initialize_loss_logger(ctx: PipelineContext) -> None:
+    out_dir = getattr(ctx, "output_dir", None)
+    if out_dir is None:
+        return
+    try:
+        from wav_ml_viewer import _LossFileLogger
+    except Exception as exc:
+        _log(f"[loss-logger] WARNING: could not import loss logger: {exc}")
+        return
+
+    loss_log_path = Path(out_dir) / "loss_log.bin"
+    loss_log_prev_path = Path(out_dir) / "loss_log_prev.bin"
+    try:
+        if loss_log_path.exists():
+            loss_log_path.replace(loss_log_prev_path)
+            _log("[loss-logger] rotated loss_log.bin -> loss_log_prev.bin for new session")
+    except Exception as exc:
+        _log(f"[loss-logger] WARNING: could not rotate loss log: {exc}")
+
+    try:
+        ctx.loss_logger = _LossFileLogger(path=loss_log_path)
+    except Exception as exc:
+        _log(f"[loss-logger] WARNING: could not open loss log: {exc}")
+
+
 def _restore_context_from_resume(ctx: PipelineContext) -> None:
     from wav_ml_core import RenderConfig
 
@@ -1495,6 +1520,7 @@ def run(args, output_dir: Path, initial_plan=None) -> None:
     ctx.orchestration_cycles = cycles
     ctx.orchestration_rounds = rounds_per_cycle
     ctx.viewer_proxy = _make_viewer_proxy(args, cycles)
+    _initialize_loss_logger(ctx)
     if ctx.viewer_proxy is not None:
         set_cycle_roster = getattr(ctx.viewer_proxy, "set_cycle_roster", None)
         if callable(set_cycle_roster):
@@ -1706,6 +1732,11 @@ def run(args, output_dir: Path, initial_plan=None) -> None:
     )
     _write_summary(ctx, summary_path)
     _write_summary(ctx, legacy_summary_path)
+    if ctx.loss_logger is not None:
+        try:
+            ctx.loss_logger.close()
+        except Exception:
+            pass
     _log(f"[orchestrator] run complete. summary -> {summary_path}")
 
 
@@ -1923,17 +1954,31 @@ def _build_configs_from_args(args) -> dict:
         build_batch_size=int(_g("berkeley_refresh_loader_batch_size", "berkeley_build_batch", default=32)),
         build_num_workers=int(_g("berkeley_refresh_workers", default=0)),
         max_images=int(_g("berkeley_payload_max_samples", default=0)),
+        force_cache_rebuild=bool(_g("berkeley_payload_cache_rebuild", default=False)),
         seed=int(_g("seed", default=42)),
-        auto_install_scipy=bool(_g("auto_install_scipy", default=False)),
+        auto_install_scipy=bool(_g("berkeley_auto_install_scipy", "auto_install_scipy", default=False)),
     )
 
     berkeley_data = BerkeleyDataConfig(
+        berkeley_data_root=str(_g("berkeley_data_root", default="") or ""),
+        image_size=int(_g("berkeley_image_size", "image_size", default=128)),
         batch_size=int(_g("berkeley_refresh_batch_size", "berkeley_batch_size", default=16)),
         num_workers=int(_g("berkeley_refresh_workers", "num_workers", default=0)),
         prefetch_factor=int(_g("loader_prefetch_factor", default=0)),
         prebuild_batches=int(_g("berkeley_refresh_cache_batches", default=0)),
+        seed=int(_g("seed", default=42)),
+        wheel_max_bytes=int(max(0, int(_g("berkeley_wheel_max_mb", default=0)))) * 1024 * 1024,
+        wheel_sanity_cap_bytes=int(max(1, int(_g("berkeley_wheel_sanity_cap_mb", default=8192)))) * 1024 * 1024,
+        wheel_allow_large_override=bool(_g("berkeley_wheel_allow_large_override", default=False)),
+        wheel_expiry_uses=int(_g("berkeley_wheel_expiry_uses", default=1)),
+        wheel_lookahead_batches=int(_g("berkeley_wheel_lookahead_batches", default=0)),
+        wheel_use_rare_term_deck=bool(_g("berkeley_wheel_use_rare_term_deck", default=True)),
+        refresh_deformations_per_clean=int(_g("berkeley_refresh_deformations_per_clean", default=2)),
+        refresh_include_clean=bool(_g("berkeley_refresh_include_clean", default=True)),
         rebuild_every_n_rounds=int(_g("berkeley_refresh_round_every", "berkeley_refresh_every", default=4)),
         gate_val_batch_size=int(_g("gate_berkeley_batch_size", default=32)),
+        gate_val_num_workers=int(_g("berkeley_refresh_workers", "num_workers", default=0)),
+        gate_val_max_val=int(_g("gate_berkeley_max_val", default=0)),
     )
 
     berkeley_gate = BerkeleyGateConfig(

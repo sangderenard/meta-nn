@@ -46,6 +46,10 @@ from pipeline.context import PipelineContext
 from pipeline.graph import PipelineNode
 from pipeline.nodes.base import (
     GatedNode,
+    IRLossTermSpec,
+    IRStateSpec,
+    IRTrainingNode,
+    IRTensorPortSpec,
     autocast_context,
     freeze,
     make_grad_scaler,
@@ -66,6 +70,7 @@ from pipeline.nodes.data_nodes import (
     _unpack_masked_semantic_batch,
 )
 from pipeline.nodes.vocab_node import _label_knockout_tensor_batch
+from pipeline.preview import make_classifier_step_preview_callback
 from pipeline.utils import (
     _classifier_supervision_loss,
     _cuda_mem_diag,
@@ -255,7 +260,7 @@ class BuildClassifierNode(PipelineNode):
 # Stage 0 — Pre-gestation training node
 # ---------------------------------------------------------------------------
 
-class PregestationTrainNode(PipelineNode):
+class PregestationTrainNode(IRTrainingNode):
     """Stage 0: Train classifier on synthetic geometric direction+colour logic images.
 
     This is the very first stage; the classifier learns basic colour/direction/shape
@@ -267,9 +272,61 @@ class PregestationTrainNode(PipelineNode):
     node_id = "stage_0_pregestation"
     description = "Stage 0: pre-gestation classifier training (geometric logic)"
     gpu_models = ["classifier"]
+    model_attr = "classifier"
+    optimizer_attrs = ["classifier_optimizer"]
 
     def __init__(self, cfg: ClassifierConfig) -> None:
         self.cfg = cfg
+
+    def ir_input_ports(self) -> List[IRTensorPortSpec]:
+        return [
+            IRTensorPortSpec("pregestation_images", "Pregestation images", io="input", dtype="float32", shape="B x 3 x H x W", semantic="image_batch", detail="synthetic logic render batch"),
+            IRTensorPortSpec("pregestation_targets", "Pregestation targets", io="input", dtype="float32", shape="B x C", semantic="multilabel_targets", detail="multi-hot classifier targets"),
+            IRTensorPortSpec("pregestation_masks", "Pregestation masks", io="input", dtype="float32", shape="B x 1 x H x W", semantic="segmentation_mask", detail="mask supervision targets"),
+        ]
+
+    def ir_output_ports(self) -> List[IRTensorPortSpec]:
+        return [
+            IRTensorPortSpec("classifier_logits", "Classifier logits", io="output", dtype="float32", shape="B x C", semantic="class_logits", detail="stage-0 semantic predictions"),
+            IRTensorPortSpec("classifier_mask_logits", "Mask logits", io="output", dtype="float32", shape="B x 1 x H x W", semantic="mask_logits", detail="stage-0 mask decoder predictions"),
+        ]
+
+    def ir_loss_terms(self) -> List[IRLossTermSpec]:
+        return [
+            IRLossTermSpec("stage0_classifier_loss", "Stage 0 classifier objective", kind="bce+cosine+mask_bce", optimizer_targets=["classifier_optimizer"], source_ports=["pregestation_images", "pregestation_targets", "pregestation_masks", "classifier_logits", "classifier_mask_logits"], detail="BCE supervision plus semantic cosine loss plus mask BCE"),
+        ]
+
+    def ir_state_inputs(self) -> List[IRStateSpec]:
+        return [
+            IRStateSpec("label_embedding_bank", "Label embedding bank", role="semantic_teacher", detail="semantic cosine targets"),
+        ]
+
+    def declare_training_mechanics(self) -> Dict[str, Any]:
+        return {
+            "module_family": "classifier",
+            "module_label": "Stage 0 Pregestation",
+            "summary": "Synthetic geometry supervision warms the shared classifier before real-image stages.",
+            "inputs": [
+                {"id": "pregestation_loader", "label": "Pregestation deck", "kind": "dataset", "detail": "logic RGB images, multihot labels, masks"},
+                {"id": "classifier_model", "label": "Classifier weights", "kind": "model", "detail": "TinyConv backbone plus semantic head"},
+                {"id": "label_embedding_bank", "label": "Label embedding bank", "kind": "state", "detail": "semantic cosine target vectors"},
+            ],
+            "losses": [
+                {"id": "loss_stage0_classifier", "label": "BCE + cosine + mask BCE", "kind": "loss", "detail": "Stage-0 classifier supervision objective"},
+            ],
+            "outputs": [
+                {"id": "classifier_model", "label": "Classifier weights", "kind": "model", "detail": "updated shared classifier state"},
+            ],
+            "flows": [
+                {"source": "pregestation_loader", "target": "self", "label": "logic images + labels + masks", "kind": "consume"},
+                {"source": "classifier_model", "target": "self", "label": "trainable weights", "kind": "consume"},
+                {"source": "label_embedding_bank", "target": "self", "label": "semantic targets", "kind": "condition"},
+                {"source": "self", "target": "loss_stage0_classifier", "label": "logits + mask logits", "kind": "predict"},
+                {"source": "pregestation_loader", "target": "loss_stage0_classifier", "label": "targets + masks", "kind": "supervise"},
+                {"source": "label_embedding_bank", "target": "loss_stage0_classifier", "label": "cosine anchors", "kind": "supervise"},
+                {"source": "loss_stage0_classifier", "target": "classifier_model", "label": "AdamW update", "kind": "optimize"},
+            ],
+        }
 
     def should_run(self, ctx: PipelineContext) -> bool:
         # Always attempt until gate passes; harmless to run again after passing.
@@ -277,6 +334,7 @@ class PregestationTrainNode(PipelineNode):
 
     def execute(self, ctx: PipelineContext) -> None:
         from pipeline.nodes.base import make_training_progress_callback
+        preview_callback = make_classifier_step_preview_callback(ctx, self.node_id)
         result = _run_classifier_refresh_epochs(
             classifier=ctx.classifier,
             optimizer=ctx.classifier_optimizer,
@@ -292,7 +350,13 @@ class PregestationTrainNode(PipelineNode):
             channels_last=self.cfg.channels_last,
             stage_label="stage0_pregestation",
             log_every=self.cfg.log_every,
-            progress_callback=make_training_progress_callback(ctx, self.node_id, "stage0_pregestation"),
+            step_preview_callback=preview_callback,
+            progress_callback=make_training_progress_callback(
+                ctx,
+                self.node_id,
+                "stage0_pregestation",
+                publish_loss=(preview_callback is None),
+            ),
             stop_requested=ctx.stop_requested,
             args=ctx.args,
         )
@@ -306,7 +370,7 @@ class PregestationTrainNode(PipelineNode):
 # Stage 1 — Gestation training node
 # ---------------------------------------------------------------------------
 
-class GestationTrainNode(GatedNode):
+class GestationTrainNode(IRTrainingNode):
     """Stage 1: Train classifier on bootstrap primitive symbols.
 
     Requires Gate 0 to have passed.  Teaches the classifier to recognise
@@ -321,12 +385,65 @@ class GestationTrainNode(GatedNode):
     description = "Stage 1: gestation classifier training (bootstrap primitives)"
     required_gates = ["gate_pregestation"]
     gpu_models = ["classifier"]
+    model_attr = "classifier"
+    optimizer_attrs = ["classifier_optimizer"]
 
     def __init__(self, cfg: ClassifierConfig) -> None:
         self.cfg = cfg
 
+    def ir_input_ports(self) -> List[IRTensorPortSpec]:
+        return [
+            IRTensorPortSpec("gestation_images", "Gestation images", io="input", dtype="float32", shape="B x 3 x H x W", semantic="image_batch", detail="bootstrap symbol render batch"),
+            IRTensorPortSpec("gestation_targets", "Gestation targets", io="input", dtype="float32", shape="B x C", semantic="multilabel_targets", detail="multi-hot classifier targets"),
+            IRTensorPortSpec("gestation_masks", "Gestation masks", io="input", dtype="float32", shape="B x 1 x H x W", semantic="segmentation_mask", detail="mask supervision targets"),
+        ]
+
+    def ir_output_ports(self) -> List[IRTensorPortSpec]:
+        return [
+            IRTensorPortSpec("classifier_logits", "Classifier logits", io="output", dtype="float32", shape="B x C", semantic="class_logits", detail="stage-1 semantic predictions"),
+            IRTensorPortSpec("classifier_mask_logits", "Mask logits", io="output", dtype="float32", shape="B x 1 x H x W", semantic="mask_logits", detail="stage-1 mask decoder predictions"),
+        ]
+
+    def ir_loss_terms(self) -> List[IRLossTermSpec]:
+        return [
+            IRLossTermSpec("stage1_classifier_loss", "Stage 1 classifier objective", kind="bce+cosine+mask_bce", optimizer_targets=["classifier_optimizer"], source_ports=["gestation_images", "gestation_targets", "gestation_masks", "classifier_logits", "classifier_mask_logits"], detail="BCE supervision plus semantic cosine loss plus mask BCE"),
+        ]
+
+    def ir_state_inputs(self) -> List[IRStateSpec]:
+        return [
+            IRStateSpec("label_embedding_bank", "Label embedding bank", role="semantic_teacher", detail="semantic cosine targets"),
+        ]
+
+    def declare_training_mechanics(self) -> Dict[str, Any]:
+        return {
+            "module_family": "classifier",
+            "module_label": "Stage 1 Gestation",
+            "summary": "Bootstrap symbol supervision extends the classifier from synthetic logic to primitive semantic images.",
+            "inputs": [
+                {"id": "gestation_loader", "label": "Gestation deck", "kind": "dataset", "detail": "bootstrap symbols, labels, masks"},
+                {"id": "classifier_model", "label": "Classifier weights", "kind": "model", "detail": "shared TinyConv classifier"},
+                {"id": "label_embedding_bank", "label": "Label embedding bank", "kind": "state", "detail": "semantic cosine target vectors"},
+            ],
+            "losses": [
+                {"id": "loss_stage1_classifier", "label": "BCE + cosine + mask BCE", "kind": "loss", "detail": "Gestation classifier supervision objective"},
+            ],
+            "outputs": [
+                {"id": "classifier_model", "label": "Classifier weights", "kind": "model", "detail": "updated shared classifier state"},
+            ],
+            "flows": [
+                {"source": "gestation_loader", "target": "self", "label": "symbol images + labels + masks", "kind": "consume"},
+                {"source": "classifier_model", "target": "self", "label": "trainable weights", "kind": "consume"},
+                {"source": "label_embedding_bank", "target": "self", "label": "semantic targets", "kind": "condition"},
+                {"source": "self", "target": "loss_stage1_classifier", "label": "logits + mask logits", "kind": "predict"},
+                {"source": "gestation_loader", "target": "loss_stage1_classifier", "label": "targets + masks", "kind": "supervise"},
+                {"source": "label_embedding_bank", "target": "loss_stage1_classifier", "label": "cosine anchors", "kind": "supervise"},
+                {"source": "loss_stage1_classifier", "target": "classifier_model", "label": "AdamW update", "kind": "optimize"},
+            ],
+        }
+
     def execute(self, ctx: PipelineContext) -> None:
         from pipeline.nodes.base import make_training_progress_callback
+        preview_callback = make_classifier_step_preview_callback(ctx, self.node_id)
         result = _run_classifier_refresh_epochs(
             classifier=ctx.classifier,
             optimizer=ctx.classifier_optimizer,
@@ -342,7 +459,13 @@ class GestationTrainNode(GatedNode):
             channels_last=self.cfg.channels_last,
             stage_label="stage1_gestation",
             log_every=self.cfg.log_every,
-            progress_callback=make_training_progress_callback(ctx, self.node_id, "stage1_gestation"),
+            step_preview_callback=preview_callback,
+            progress_callback=make_training_progress_callback(
+                ctx,
+                self.node_id,
+                "stage1_gestation",
+                publish_loss=(preview_callback is None),
+            ),
             stop_requested=ctx.stop_requested,
             args=ctx.args,
         )
@@ -356,7 +479,7 @@ class GestationTrainNode(GatedNode):
 # Stage 2 — Berkeley SBD refresh training node
 # ---------------------------------------------------------------------------
 
-class BerkeleyRefreshTrainNode(GatedNode):
+class BerkeleyRefreshTrainNode(IRTrainingNode):
     """Stage 2: Full classifier refresh on Berkeley SBD + external payload images.
 
     Requires Gates 0+1.  Runs every N rounds (controlled by orchestrator edge
@@ -370,12 +493,65 @@ class BerkeleyRefreshTrainNode(GatedNode):
     description = "Stage 2: Berkeley SBD refresh (full multi-label classification)"
     required_gates = ["gate_pregestation", "gate_gestation"]
     gpu_models = ["classifier"]
+    model_attr = "classifier"
+    optimizer_attrs = ["classifier_optimizer"]
 
     def __init__(self, cfg: ClassifierConfig) -> None:
         self.cfg = cfg
 
+    def ir_input_ports(self) -> List[IRTensorPortSpec]:
+        return [
+            IRTensorPortSpec("berkeley_images", "Berkeley images", io="input", dtype="float32", shape="B x 3 x H x W", semantic="image_batch", detail="real-image semantic supervision batch"),
+            IRTensorPortSpec("berkeley_targets", "Berkeley targets", io="input", dtype="float32", shape="B x C", semantic="multilabel_targets", detail="multi-hot semantic targets"),
+            IRTensorPortSpec("berkeley_masks", "Berkeley masks", io="input", dtype="float32", shape="B x 1 x H x W", semantic="segmentation_mask", detail="mask supervision targets"),
+        ]
+
+    def ir_output_ports(self) -> List[IRTensorPortSpec]:
+        return [
+            IRTensorPortSpec("classifier_logits", "Classifier logits", io="output", dtype="float32", shape="B x C", semantic="class_logits", detail="stage-2 semantic predictions"),
+            IRTensorPortSpec("classifier_mask_logits", "Mask logits", io="output", dtype="float32", shape="B x 1 x H x W", semantic="mask_logits", detail="stage-2 mask decoder predictions"),
+        ]
+
+    def ir_loss_terms(self) -> List[IRLossTermSpec]:
+        return [
+            IRLossTermSpec("stage2_classifier_loss", "Stage 2 classifier objective", kind="bce+cosine+mask_bce", optimizer_targets=["classifier_optimizer"], source_ports=["berkeley_images", "berkeley_targets", "berkeley_masks", "classifier_logits", "classifier_mask_logits"], detail="Real-image BCE supervision plus semantic cosine loss plus mask BCE"),
+        ]
+
+    def ir_state_inputs(self) -> List[IRStateSpec]:
+        return [
+            IRStateSpec("label_embedding_bank", "Label embedding bank", role="semantic_teacher", detail="semantic cosine targets"),
+        ]
+
+    def declare_training_mechanics(self) -> Dict[str, Any]:
+        return {
+            "module_family": "classifier",
+            "module_label": "Stage 2 Berkeley Refresh",
+            "summary": "Full real-image semantic refresh trains the classifier on Berkeley and payload supervision.",
+            "inputs": [
+                {"id": "berkeley_refresh_loader", "label": "Berkeley refresh deck", "kind": "dataset", "detail": "real images, multihot labels, masks"},
+                {"id": "classifier_model", "label": "Classifier weights", "kind": "model", "detail": "shared TinyConv classifier"},
+                {"id": "label_embedding_bank", "label": "Label embedding bank", "kind": "state", "detail": "semantic cosine target vectors"},
+            ],
+            "losses": [
+                {"id": "loss_stage2_classifier", "label": "BCE + cosine + mask BCE", "kind": "loss", "detail": "Real-image classifier supervision objective"},
+            ],
+            "outputs": [
+                {"id": "classifier_model", "label": "Classifier weights", "kind": "model", "detail": "updated shared classifier state"},
+            ],
+            "flows": [
+                {"source": "berkeley_refresh_loader", "target": "self", "label": "real images + labels + masks", "kind": "consume"},
+                {"source": "classifier_model", "target": "self", "label": "trainable weights", "kind": "consume"},
+                {"source": "label_embedding_bank", "target": "self", "label": "semantic targets", "kind": "condition"},
+                {"source": "self", "target": "loss_stage2_classifier", "label": "logits + mask logits", "kind": "predict"},
+                {"source": "berkeley_refresh_loader", "target": "loss_stage2_classifier", "label": "targets + masks", "kind": "supervise"},
+                {"source": "label_embedding_bank", "target": "loss_stage2_classifier", "label": "cosine anchors", "kind": "supervise"},
+                {"source": "loss_stage2_classifier", "target": "classifier_model", "label": "AdamW update", "kind": "optimize"},
+            ],
+        }
+
     def execute(self, ctx: PipelineContext) -> None:
         from pipeline.nodes.base import make_training_progress_callback
+        preview_callback = make_classifier_step_preview_callback(ctx, self.node_id)
         result = _run_classifier_refresh_epochs(
             classifier=ctx.classifier,
             optimizer=ctx.classifier_optimizer,
@@ -391,7 +567,13 @@ class BerkeleyRefreshTrainNode(GatedNode):
             channels_last=self.cfg.channels_last,
             stage_label="stage2_berkeley",
             log_every=self.cfg.log_every,
-            progress_callback=make_training_progress_callback(ctx, self.node_id, "stage2_berkeley"),
+            step_preview_callback=preview_callback,
+            progress_callback=make_training_progress_callback(
+                ctx,
+                self.node_id,
+                "stage2_berkeley",
+                publish_loss=(preview_callback is None),
+            ),
             stop_requested=ctx.stop_requested,
             args=ctx.args,
         )
@@ -405,7 +587,7 @@ class BerkeleyRefreshTrainNode(GatedNode):
 # Stage C — LoRA slot training node
 # ---------------------------------------------------------------------------
 
-class LoRARoundNode(GatedNode):
+class LoRARoundNode(IRTrainingNode):
     """Stage C: Per-term LoRA adapter slot training.
 
     Requires all base gates.  For each active churn-term group a dedicated
@@ -420,9 +602,66 @@ class LoRARoundNode(GatedNode):
     description = "Stage C: LoRA slot switching and per-term Berkeley training"
     required_gates = ["gate_pregestation", "gate_gestation", "gate_berkeley"]
     gpu_models = ["classifier"]
+    model_attr = "classifier"
+    optimizer_attrs = ["classifier_optimizer"]
 
     def __init__(self, cfg: ClassifierConfig) -> None:
         self.cfg = cfg
+
+    def ir_input_ports(self) -> List[IRTensorPortSpec]:
+        return [
+            IRTensorPortSpec("berkeley_images", "Berkeley images", io="input", dtype="float32", shape="B x 3 x H x W", semantic="image_batch", detail="real-image specialization batch"),
+            IRTensorPortSpec("berkeley_targets", "Berkeley targets", io="input", dtype="float32", shape="B x C", semantic="multilabel_targets", detail="slot-specific semantic targets"),
+            IRTensorPortSpec("berkeley_masks", "Berkeley masks", io="input", dtype="float32", shape="B x 1 x H x W", semantic="segmentation_mask", detail="mask supervision targets"),
+        ]
+
+    def ir_output_ports(self) -> List[IRTensorPortSpec]:
+        return [
+            IRTensorPortSpec("classifier_logits", "Classifier logits", io="output", dtype="float32", shape="B x C", semantic="class_logits", detail="LoRA-specialized semantic predictions"),
+            IRTensorPortSpec("classifier_lora_state", "LoRA slot state", io="output", dtype="float32", shape="slot tensors", semantic="adapter_state", detail="snapshotted slot parameters"),
+        ]
+
+    def ir_loss_terms(self) -> List[IRLossTermSpec]:
+        return [
+            IRLossTermSpec("stagec_lora_loss", "Stage C LoRA objective", kind="bce+cosine+mask_bce", optimizer_targets=["classifier_optimizer"], source_ports=["berkeley_images", "berkeley_targets", "berkeley_masks", "classifier_logits"], detail="Per-slot classifier supervision on Berkeley rows"),
+        ]
+
+    def ir_state_inputs(self) -> List[IRStateSpec]:
+        return [
+            IRStateSpec("label_embedding_bank", "Label embedding bank", role="semantic_teacher", detail="semantic cosine targets"),
+            IRStateSpec("active_churn_terms", "Active churn terms", role="slot_router", detail="maps vocab groups onto LoRA slots"),
+        ]
+
+    def declare_training_mechanics(self) -> Dict[str, Any]:
+        return {
+            "module_family": "classifier",
+            "module_label": "Stage C LoRA Round",
+            "summary": "Per-term LoRA slots specialize the classifier on Berkeley rows without discarding the shared backbone.",
+            "inputs": [
+                {"id": "berkeley_refresh_loader", "label": "Berkeley refresh deck", "kind": "dataset", "detail": "real-image semantic supervision"},
+                {"id": "classifier_model", "label": "Classifier + active LoRA", "kind": "model", "detail": "shared classifier with slot adapters"},
+                {"id": "label_embedding_bank", "label": "Label embedding bank", "kind": "state", "detail": "semantic cosine target vectors"},
+                {"id": "active_churn_terms", "label": "Active churn terms", "kind": "state", "detail": "term groups mapped onto LoRA slots"},
+            ],
+            "losses": [
+                {"id": "loss_stagec_lora", "label": "BCE + cosine + mask BCE", "kind": "loss", "detail": "LoRA slot supervision objective"},
+            ],
+            "outputs": [
+                {"id": "classifier_model", "label": "Classifier + active LoRA", "kind": "model", "detail": "adapter-updated classifier state"},
+                {"id": "classifier_lora_slots", "label": "LoRA slot snapshots", "kind": "state", "detail": "snapshotted per-term adapter states"},
+            ],
+            "flows": [
+                {"source": "berkeley_refresh_loader", "target": "self", "label": "real-image supervision", "kind": "consume"},
+                {"source": "classifier_model", "target": "self", "label": "shared weights + active slot", "kind": "consume"},
+                {"source": "label_embedding_bank", "target": "self", "label": "semantic targets", "kind": "condition"},
+                {"source": "active_churn_terms", "target": "self", "label": "slot assignment", "kind": "condition"},
+                {"source": "self", "target": "loss_stagec_lora", "label": "slot logits + mask logits", "kind": "predict"},
+                {"source": "berkeley_refresh_loader", "target": "loss_stagec_lora", "label": "targets + masks", "kind": "supervise"},
+                {"source": "label_embedding_bank", "target": "loss_stagec_lora", "label": "cosine anchors", "kind": "supervise"},
+                {"source": "loss_stagec_lora", "target": "classifier_model", "label": "LoRA weight update", "kind": "optimize"},
+                {"source": "self", "target": "classifier_lora_slots", "label": "snapshot trained slots", "kind": "emit"},
+            ],
+        }
 
     def execute(self, ctx: PipelineContext) -> None:
         if not self.cfg.lora_enabled:
@@ -481,7 +720,7 @@ class LoRARoundNode(GatedNode):
 # Fake-class feedback node
 # ---------------------------------------------------------------------------
 
-class FakeClassFeedbackNode(GatedNode):
+class FakeClassFeedbackNode(IRTrainingNode):
     """Fake-class refresh: train the classifier to detect GAN outputs.
 
     Requires the generator to exist and all base gates to have passed.
@@ -496,9 +735,63 @@ class FakeClassFeedbackNode(GatedNode):
     description = "Fake-class feedback: train classifier to detect GAN outputs"
     required_gates = ["gate_pregestation", "gate_gestation"]
     gpu_models = ["classifier", "generator", "discriminator"]
+    model_attr = "classifier"
+    extra_model_attrs = ["generator", "discriminator"]
+    optimizer_attrs = ["classifier_optimizer"]
 
     def __init__(self, cfg: ClassifierConfig) -> None:
         self.cfg = cfg
+
+    def ir_input_ports(self) -> List[IRTensorPortSpec]:
+        return [
+            IRTensorPortSpec("fake_images", "Generated images", io="input", dtype="float32", shape="B x 3 x H x W", semantic="generated_image_batch", detail="conditioned GAN samples"),
+            IRTensorPortSpec("fake_condition_targets", "Condition targets", io="input", dtype="float32", shape="B x C", semantic="condition_vectors", detail="conditioning vectors reused as supervision context"),
+            IRTensorPortSpec("discriminator_confidence", "Discriminator confidence", io="input", dtype="float32", shape="B x 1", semantic="curriculum_weight", detail="hardness weighting from discriminator"),
+        ]
+
+    def ir_output_ports(self) -> List[IRTensorPortSpec]:
+        return [
+            IRTensorPortSpec("classifier_fake_logits", "Fake-class logits", io="output", dtype="float32", shape="B x C", semantic="class_logits", detail="classifier response to GAN samples"),
+        ]
+
+    def ir_loss_terms(self) -> List[IRLossTermSpec]:
+        return [
+            IRLossTermSpec("fake_class_loss", "Fake-class objective", kind="sentinel_bce", optimizer_targets=["classifier_optimizer"], source_ports=["fake_images", "fake_condition_targets", "discriminator_confidence", "classifier_fake_logits"], detail="BCE objective for GAN-image sentinel detection"),
+        ]
+
+    def ir_state_inputs(self) -> List[IRStateSpec]:
+        return [
+            IRStateSpec("payload_conditions", "Semantic condition bank", role="conditioning_bank", detail="semantic condition vectors used to sample fake images"),
+        ]
+
+    def declare_training_mechanics(self) -> Dict[str, Any]:
+        return {
+            "module_family": "classifier",
+            "module_label": "Fake-Class Feedback",
+            "summary": "GAN samples become a sentinel supervision signal so the classifier learns to reject generated artefacts.",
+            "inputs": [
+                {"id": "classifier_model", "label": "Classifier weights", "kind": "model", "detail": "shared TinyConv classifier"},
+                {"id": "gan_generator_model", "label": "GAN generator", "kind": "model", "detail": "produces conditioned fake images"},
+                {"id": "gan_discriminator_model", "label": "GAN discriminator", "kind": "model", "detail": "weights fake-sample hardness by confidence"},
+                {"id": "semantic_condition_bank", "label": "Semantic condition bank", "kind": "state", "detail": "class-conditioned prompts for fake sampling"},
+            ],
+            "losses": [
+                {"id": "loss_fake_class", "label": "Fake sentinel BCE", "kind": "loss", "detail": "classifier fake-image detection objective"},
+            ],
+            "outputs": [
+                {"id": "classifier_model", "label": "Classifier weights", "kind": "model", "detail": "updated fake-detector-aware classifier state"},
+            ],
+            "flows": [
+                {"source": "gan_generator_model", "target": "self", "label": "conditioned fake samples", "kind": "consume"},
+                {"source": "gan_discriminator_model", "target": "self", "label": "confidence curriculum", "kind": "condition"},
+                {"source": "semantic_condition_bank", "target": "self", "label": "conditioning vectors", "kind": "condition"},
+                {"source": "classifier_model", "target": "self", "label": "trainable weights", "kind": "consume"},
+                {"source": "self", "target": "loss_fake_class", "label": "fake logits", "kind": "predict"},
+                {"source": "gan_discriminator_model", "target": "loss_fake_class", "label": "hardness weights", "kind": "supervise"},
+                {"source": "semantic_condition_bank", "target": "loss_fake_class", "label": "sentinel targets", "kind": "supervise"},
+                {"source": "loss_fake_class", "target": "classifier_model", "label": "AdamW update", "kind": "optimize"},
+            ],
+        }
 
     def should_run(self, ctx: PipelineContext) -> bool:
         if not super().should_run(ctx):

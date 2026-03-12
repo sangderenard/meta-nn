@@ -14,6 +14,7 @@ import json
 import os
 import time
 from contextlib import contextmanager, nullcontext
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
@@ -22,6 +23,103 @@ import torch.nn as nn
 
 from pipeline.graph import PipelineNode
 from pipeline.context import PipelineContext, GateState
+
+
+_IR_TRAINING_TEMPLATE_PATH = (
+    Path(__file__).resolve().parents[2] / "templates" / "ir_pytorch_training_node_template.py.tmpl"
+)
+
+
+@dataclass
+class IRTensorPortSpec:
+    port_id: str
+    label: str
+    io: str = "input"   # input | output
+    dtype: str = "float32"
+    shape: str = ""
+    semantic: str = ""
+    detail: str = ""
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "port_id": str(self.port_id),
+            "label": str(self.label),
+            "io": str(self.io),
+            "dtype": str(self.dtype),
+            "shape": str(self.shape),
+            "semantic": str(self.semantic),
+            "detail": str(self.detail),
+        }
+
+
+@dataclass
+class IRLossTermSpec:
+    loss_id: str
+    label: str
+    kind: str = "composite"
+    optimizer_targets: List[str] = field(default_factory=list)
+    source_ports: List[str] = field(default_factory=list)
+    detail: str = ""
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "loss_id": str(self.loss_id),
+            "label": str(self.label),
+            "kind": str(self.kind),
+            "optimizer_targets": [str(x) for x in self.optimizer_targets],
+            "source_ports": [str(x) for x in self.source_ports],
+            "detail": str(self.detail),
+        }
+
+
+@dataclass
+class IRStateSpec:
+    state_id: str
+    label: str
+    role: str = "state"
+    detail: str = ""
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "state_id": str(self.state_id),
+            "label": str(self.label),
+            "role": str(self.role),
+            "detail": str(self.detail),
+        }
+
+
+@dataclass
+class IRTrainingNodeContract:
+    framework: str = "pytorch"
+    template_id: str = "ir_pytorch_training_node_v1"
+    template_path: str = ""
+    node_role: str = "trainer"
+    primary_model_attr: str = ""
+    model_attrs: List[str] = field(default_factory=list)
+    optimizer_attrs: List[str] = field(default_factory=list)
+    required_gates: List[str] = field(default_factory=list)
+    input_ports: List[IRTensorPortSpec] = field(default_factory=list)
+    output_ports: List[IRTensorPortSpec] = field(default_factory=list)
+    losses: List[IRLossTermSpec] = field(default_factory=list)
+    state_inputs: List[IRStateSpec] = field(default_factory=list)
+    notes: str = ""
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "framework": str(self.framework),
+            "template_id": str(self.template_id),
+            "template_path": str(self.template_path),
+            "node_role": str(self.node_role),
+            "primary_model_attr": str(self.primary_model_attr),
+            "model_attrs": [str(x) for x in self.model_attrs],
+            "optimizer_attrs": [str(x) for x in self.optimizer_attrs],
+            "required_gates": [str(x) for x in self.required_gates],
+            "input_ports": [x.to_dict() for x in self.input_ports],
+            "output_ports": [x.to_dict() for x in self.output_ports],
+            "losses": [x.to_dict() for x in self.losses],
+            "state_inputs": [x.to_dict() for x in self.state_inputs],
+            "notes": str(self.notes),
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -241,6 +339,8 @@ def make_training_progress_callback(
     ctx: "PipelineContext",
     node_id: str,
     stage_label: str,
+    *,
+    publish_loss: bool = True,
 ) -> Optional[Callable]:
     """Return a callback that fires every *log_every* steps and sends a live
     progress event to ``ctx.viewer_proxy`` (the GUI), if one is connected.
@@ -251,10 +351,9 @@ def make_training_progress_callback(
     viewer is present — a ``None`` return means no-op.
     """
     viewer = getattr(ctx, "viewer_proxy", None)
-    if viewer is None:
-        return None
-    send_fn = getattr(viewer, "send_execution_event", None)
-    if not callable(send_fn):
+    send_fn = getattr(viewer, "send_execution_event", None) if viewer is not None else None
+    publish_progress = getattr(ctx, "publish_node_progress", None)
+    if not callable(send_fn) and not callable(publish_progress):
         return None
 
     from pipeline.plan_protocol import ExecutionEventPayload
@@ -270,18 +369,24 @@ def make_training_progress_callback(
             + (f"  {sps:.0f} samp/s" if sps > 0 else "")
         )
         try:
-            send_fn(ExecutionEventPayload(
-                event_id=str(_uuid.uuid4()),
-                node_id=str(node_id),
-                kind="training_progress",
-                phase="running",
-                status="running",
-                ts=time.time(),
-                message=msg,
-                metrics={"step": step, "total_steps": total, "loss": loss},
-            ))
+            if callable(send_fn):
+                send_fn(ExecutionEventPayload(
+                    event_id=str(_uuid.uuid4()),
+                    node_id=str(node_id),
+                    kind="training_progress",
+                    phase="running",
+                    status="running",
+                    ts=time.time(),
+                    message=msg,
+                    metrics={"step": step, "total_steps": total, "loss": loss},
+                ))
         except Exception:
             pass
+        if bool(publish_loss) and callable(publish_progress):
+            try:
+                publish_progress(str(node_id), float(loss))
+            except Exception:
+                pass
 
     return _callback
 
@@ -460,6 +565,106 @@ class TrainableModelNode(GatedNode):
     def feature_unfreeze(model: nn.Module):
         from pipeline.utils import _set_feature_freeze
         _set_feature_freeze(model, freeze=False)
+
+
+class IRTrainingNode(TrainableModelNode):
+    """PyTorch-oriented training node base with an explicit IR contract.
+
+    This base does not replace bespoke math; it packages the common structure
+    needed for IR-driven tooling and future codegen:
+      * framework + template identity
+      * model / optimizer ownership
+      * typed tensor ports
+      * declared loss terms and state dependencies
+      * generic training sub-process phases
+    """
+
+    ir_template_id: str = "ir_pytorch_training_node_v1"
+    ir_template_path: str = str(_IR_TRAINING_TEMPLATE_PATH)
+    ir_node_role: str = "trainer"
+    extra_model_attrs: Sequence[str] = ()
+    optimizer_attrs: Sequence[str] = ()
+
+    def ir_input_ports(self) -> List[IRTensorPortSpec]:
+        return []
+
+    def ir_output_ports(self) -> List[IRTensorPortSpec]:
+        return []
+
+    def ir_loss_terms(self) -> List[IRLossTermSpec]:
+        return []
+
+    def ir_state_inputs(self) -> List[IRStateSpec]:
+        return []
+
+    def ir_contract_notes(self) -> str:
+        return str(getattr(self, "description", "") or "")
+
+    def declare_ir_node_contract(self) -> Dict[str, Any]:
+        model_attrs: List[str] = []
+        primary = str(getattr(self, "model_attr", "") or "").strip()
+        if primary:
+            model_attrs.append(primary)
+        for attr in list(getattr(self, "extra_model_attrs", ()) or ()):
+            name = str(attr or "").strip()
+            if name and name not in model_attrs:
+                model_attrs.append(name)
+
+        contract = IRTrainingNodeContract(
+            framework="pytorch",
+            template_id=str(getattr(self, "ir_template_id", "ir_pytorch_training_node_v1") or "ir_pytorch_training_node_v1"),
+            template_path=str(getattr(self, "ir_template_path", "") or str(_IR_TRAINING_TEMPLATE_PATH)),
+            node_role=str(getattr(self, "ir_node_role", "trainer") or "trainer"),
+            primary_model_attr=primary,
+            model_attrs=model_attrs,
+            optimizer_attrs=[str(x) for x in list(getattr(self, "optimizer_attrs", ()) or ()) if str(x or "").strip()],
+            required_gates=[str(x) for x in list(getattr(self, "required_gates", ()) or ()) if str(x or "").strip()],
+            input_ports=list(self.ir_input_ports() or []),
+            output_ports=list(self.ir_output_ports() or []),
+            losses=list(self.ir_loss_terms() or []),
+            state_inputs=list(self.ir_state_inputs() or []),
+            notes=str(self.ir_contract_notes() or ""),
+        )
+        return contract.to_dict()
+
+    def declare_subnodes(self) -> List[Dict[str, Any]]:
+        return [
+            {
+                "subnode_id": f"{self.node_id}::batch_prepare",
+                "kind": "data_prep",
+                "label": "Prepare tensors",
+                "order": 0,
+                "metadata": {"template_id": str(getattr(self, "ir_template_id", ""))},
+            },
+            {
+                "subnode_id": f"{self.node_id}::forward_pass",
+                "kind": "training_core",
+                "label": "Forward pass",
+                "order": 1,
+                "metadata": {"framework": "pytorch"},
+            },
+            {
+                "subnode_id": f"{self.node_id}::objective_eval",
+                "kind": "training_core",
+                "label": "Evaluate losses",
+                "order": 2,
+                "metadata": {"framework": "pytorch"},
+            },
+            {
+                "subnode_id": f"{self.node_id}::optimizer_step",
+                "kind": "sync",
+                "label": "Backward + optimizer step",
+                "order": 3,
+                "metadata": {"framework": "pytorch"},
+            },
+            {
+                "subnode_id": f"{self.node_id}::state_emit",
+                "kind": "io",
+                "label": "Emit updated state",
+                "order": 4,
+                "metadata": {"framework": "pytorch"},
+            },
+        ]
 
 
 # ---------------------------------------------------------------------------

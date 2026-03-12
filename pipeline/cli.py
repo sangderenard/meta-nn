@@ -655,6 +655,78 @@ def parse_args():
     p.add_argument("--berkeley-refresh-vram-fraction", type=float, default=0.90, help="Target fraction of free VRAM to fill for auto refresh batch.")
     p.add_argument("--berkeley-refresh-activation-mult", type=float, default=10.0, help="Activation overhead multiplier used for auto refresh batch sizing.")
     p.add_argument("--berkeley-refresh-max-batch-cap", type=int, default=0, help="Hard cap for auto refresh batch size (0 = no cap).")
+    p.add_argument(
+        "--berkeley-wheel-max-mb",
+        type=int,
+        default=0,
+        help=(
+            "Explicit max size of the Berkeley semantic wheel cache in MB. "
+            "0 means project the full wheel and apply the sanity cap guard."
+        ),
+    )
+    p.add_argument(
+        "--berkeley-wheel-sanity-cap-mb",
+        type=int,
+        default=8192,
+        help="Hard sanity guard for projected Berkeley wheel size in MB when no explicit override is enabled.",
+    )
+    p.add_argument(
+        "--berkeley-wheel-allow-large-override",
+        dest="berkeley_wheel_allow_large_override",
+        action="store_true",
+        help="Allow Berkeley semantic wheels to exceed the sanity cap.",
+    )
+    p.add_argument(
+        "--no-berkeley-wheel-allow-large-override",
+        dest="berkeley_wheel_allow_large_override",
+        action="store_false",
+    )
+    p.add_argument(
+        "--berkeley-wheel-expiry-uses",
+        type=int,
+        default=1,
+        help="Reuse a Berkeley semantic wheel this many loader builds before expiring and rebuilding it in place.",
+    )
+    p.add_argument(
+        "--berkeley-wheel-lookahead-batches",
+        type=int,
+        default=0,
+        help="How many compressed Berkeley wheel chunks to keep ahead in memory; 0 derives from loader prefetch.",
+    )
+    p.add_argument(
+        "--berkeley-wheel-use-rare-term-deck",
+        dest="berkeley_wheel_use_rare_term_deck",
+        action="store_true",
+        help="Use rare-term-weighted deck sampling for Berkeley wheel selection.",
+    )
+    p.add_argument(
+        "--no-berkeley-wheel-use-rare-term-deck",
+        dest="berkeley_wheel_use_rare_term_deck",
+        action="store_false",
+    )
+    p.add_argument(
+        "--berkeley-refresh-deformations-per-clean",
+        type=int,
+        default=2,
+        help="Number of cached deformed variants to materialize for each Berkeley clean training row.",
+    )
+    p.add_argument(
+        "--berkeley-refresh-include-clean",
+        dest="berkeley_refresh_include_clean",
+        action="store_true",
+        help="Include the clean Berkeley row alongside cached deformed variants.",
+    )
+    p.add_argument(
+        "--no-berkeley-refresh-include-clean",
+        dest="berkeley_refresh_include_clean",
+        action="store_false",
+    )
+    p.add_argument(
+        "--gate-berkeley-max-val",
+        type=int,
+        default=0,
+        help="Cap Berkeley gate validation rows; 0 uses the full validation deck.",
+    )
     p.add_argument("--stage-c-lora-enabled", dest="stage_c_lora_enabled", action="store_true", help="Enable Stage C LoRA-only classifier refresh on churn rows.")
     p.add_argument("--no-stage-c-lora-enabled", dest="stage_c_lora_enabled", action="store_false")
     p.add_argument("--stage-c-lora-rank", type=int, default=8, help="LoRA rank used for Stage C classifier overlays.")
@@ -1478,6 +1550,9 @@ def parse_args():
         classifier_init_required=False,
         label_embeddings_enabled=True,
         berkeley_payload_cache_rebuild=False,
+        berkeley_wheel_allow_large_override=False,
+        berkeley_wheel_use_rare_term_deck=True,
+        berkeley_refresh_include_clean=True,
         semantic_vocab_churn_enabled=False,
         semantic_vocab_regurgitated_churn_enabled=True,
         semantic_vocab_deferred_churn_prob=0.35,

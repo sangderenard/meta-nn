@@ -38,26 +38,53 @@ flowchart LR
     data_node__heuristic_eye["Heuristic Eye"]
     data_node__mask_flatten["Mask Flatten"]
     stage_0_pregestation["Stage 0 Pregestation"]
-    stage_0_pregestation__should_run["Gate check"]
-    stage_0_pregestation__execute["Stage 0: pre-gestation classifier training (geometric logic)"]
+    stage_0_pregestation__batch_prepare["Prepare tensors"]
+    stage_0_pregestation__forward_pass["Forward pass"]
+    stage_0_pregestation__objective_eval["Evaluate losses"]
+    stage_0_pregestation__optimizer_step["Backward + optimizer step"]
+    stage_0_pregestation__state_emit["Emit updated state"]
     stage_1_gestation["Stage 1 Gestation"]
-    stage_1_gestation__execute["Stage 1: gestation classifier training (bootstrap primitives)"]
+    stage_1_gestation__batch_prepare["Prepare tensors"]
+    stage_1_gestation__forward_pass["Forward pass"]
+    stage_1_gestation__objective_eval["Evaluate losses"]
+    stage_1_gestation__optimizer_step["Backward + optimizer step"]
+    stage_1_gestation__state_emit["Emit updated state"]
     stage_2_berkeley["Stage 2 Berkeley"]
-    stage_2_berkeley__execute["Stage 2: Berkeley SBD refresh (full multi-label classification)"]
+    stage_2_berkeley__batch_prepare["Prepare tensors"]
+    stage_2_berkeley__forward_pass["Forward pass"]
+    stage_2_berkeley__objective_eval["Evaluate losses"]
+    stage_2_berkeley__optimizer_step["Backward + optimizer step"]
+    stage_2_berkeley__state_emit["Emit updated state"]
     stage_r_transformer["Stage R Transformer"]
-    stage_r_transformer__should_run["Gate check"]
-    stage_r_transformer__execute["Stage R: WavePatchTransformer feature-score training"]
+    stage_r_transformer__batch_prepare["Prepare tensors"]
+    stage_r_transformer__forward_pass["Forward pass"]
+    stage_r_transformer__objective_eval["Evaluate losses"]
+    stage_r_transformer__optimizer_step["Backward + optimizer step"]
+    stage_r_transformer__state_emit["Emit updated state"]
     stage_g_generator["Stage G Generator"]
-    stage_g_generator__should_run["Gate check"]
-    stage_g_generator__execute["Stage G: Conditional GAN training (generator + discriminator)"]
+    stage_g_generator__batch_prepare["Prepare tensors"]
+    stage_g_generator__forward_pass["Forward pass"]
+    stage_g_generator__objective_eval["Evaluate losses"]
+    stage_g_generator__optimizer_step["Backward + optimizer step"]
+    stage_g_generator__state_emit["Emit updated state"]
     stage_w_wave_classifier["Stage W Wave Classifier"]
-    stage_w_wave_classifier__should_run["Gate check"]
-    stage_w_wave_classifier__execute["Stage W: Wave classifier training on transformer outputs"]
+    stage_w_wave_classifier__batch_prepare["Prepare tensors"]
+    stage_w_wave_classifier__forward_pass["Forward pass"]
+    stage_w_wave_classifier__objective_eval["Evaluate losses"]
+    stage_w_wave_classifier__optimizer_step["Backward + optimizer step"]
+    stage_w_wave_classifier__state_emit["Emit updated state"]
     stage_c_lora["Stage C Lora"]
-    stage_c_lora__execute["Stage C: LoRA slot switching and per-term Berkeley training"]
+    stage_c_lora__batch_prepare["Prepare tensors"]
+    stage_c_lora__forward_pass["Forward pass"]
+    stage_c_lora__objective_eval["Evaluate losses"]
+    stage_c_lora__optimizer_step["Backward + optimizer step"]
+    stage_c_lora__state_emit["Emit updated state"]
     stage_fake_feedback["Stage Fake Feedback"]
-    stage_fake_feedback__should_run["Gate check"]
-    stage_fake_feedback__execute["Fake-class feedback: train classifier to detect GAN outputs"]
+    stage_fake_feedback__batch_prepare["Prepare tensors"]
+    stage_fake_feedback__forward_pass["Forward pass"]
+    stage_fake_feedback__objective_eval["Evaluate losses"]
+    stage_fake_feedback__optimizer_step["Backward + optimizer step"]
+    stage_fake_feedback__state_emit["Emit updated state"]
     gate_0_pregestation_eval["Gate 0 Pregestation Eval"]
     gate_0_pregestation_eval__should_run["Gate check"]
     gate_0_pregestation_eval__execute["Gate 0 Eval: pre-gestation validation loss"]
@@ -108,19 +135,46 @@ flowchart LR
     data_node --> data_node__distortion_masks
     data_node --> data_node__heuristic_eye
     data_node --> data_node__mask_flatten
-    stage_0_pregestation --> stage_0_pregestation__should_run
-    stage_0_pregestation --> stage_0_pregestation__execute
-    stage_1_gestation --> stage_1_gestation__execute
-    stage_2_berkeley --> stage_2_berkeley__execute
-    stage_r_transformer --> stage_r_transformer__should_run
-    stage_r_transformer --> stage_r_transformer__execute
-    stage_g_generator --> stage_g_generator__should_run
-    stage_g_generator --> stage_g_generator__execute
-    stage_w_wave_classifier --> stage_w_wave_classifier__should_run
-    stage_w_wave_classifier --> stage_w_wave_classifier__execute
-    stage_c_lora --> stage_c_lora__execute
-    stage_fake_feedback --> stage_fake_feedback__should_run
-    stage_fake_feedback --> stage_fake_feedback__execute
+    stage_0_pregestation --> stage_0_pregestation__batch_prepare
+    stage_0_pregestation --> stage_0_pregestation__forward_pass
+    stage_0_pregestation --> stage_0_pregestation__objective_eval
+    stage_0_pregestation --> stage_0_pregestation__optimizer_step
+    stage_0_pregestation --> stage_0_pregestation__state_emit
+    stage_1_gestation --> stage_1_gestation__batch_prepare
+    stage_1_gestation --> stage_1_gestation__forward_pass
+    stage_1_gestation --> stage_1_gestation__objective_eval
+    stage_1_gestation --> stage_1_gestation__optimizer_step
+    stage_1_gestation --> stage_1_gestation__state_emit
+    stage_2_berkeley --> stage_2_berkeley__batch_prepare
+    stage_2_berkeley --> stage_2_berkeley__forward_pass
+    stage_2_berkeley --> stage_2_berkeley__objective_eval
+    stage_2_berkeley --> stage_2_berkeley__optimizer_step
+    stage_2_berkeley --> stage_2_berkeley__state_emit
+    stage_r_transformer --> stage_r_transformer__batch_prepare
+    stage_r_transformer --> stage_r_transformer__forward_pass
+    stage_r_transformer --> stage_r_transformer__objective_eval
+    stage_r_transformer --> stage_r_transformer__optimizer_step
+    stage_r_transformer --> stage_r_transformer__state_emit
+    stage_g_generator --> stage_g_generator__batch_prepare
+    stage_g_generator --> stage_g_generator__forward_pass
+    stage_g_generator --> stage_g_generator__objective_eval
+    stage_g_generator --> stage_g_generator__optimizer_step
+    stage_g_generator --> stage_g_generator__state_emit
+    stage_w_wave_classifier --> stage_w_wave_classifier__batch_prepare
+    stage_w_wave_classifier --> stage_w_wave_classifier__forward_pass
+    stage_w_wave_classifier --> stage_w_wave_classifier__objective_eval
+    stage_w_wave_classifier --> stage_w_wave_classifier__optimizer_step
+    stage_w_wave_classifier --> stage_w_wave_classifier__state_emit
+    stage_c_lora --> stage_c_lora__batch_prepare
+    stage_c_lora --> stage_c_lora__forward_pass
+    stage_c_lora --> stage_c_lora__objective_eval
+    stage_c_lora --> stage_c_lora__optimizer_step
+    stage_c_lora --> stage_c_lora__state_emit
+    stage_fake_feedback --> stage_fake_feedback__batch_prepare
+    stage_fake_feedback --> stage_fake_feedback__forward_pass
+    stage_fake_feedback --> stage_fake_feedback__objective_eval
+    stage_fake_feedback --> stage_fake_feedback__optimizer_step
+    stage_fake_feedback --> stage_fake_feedback__state_emit
     gate_0_pregestation_eval --> gate_0_pregestation_eval__should_run
     gate_0_pregestation_eval --> gate_0_pregestation_eval__execute
     gate_1_gestation_eval --> gate_1_gestation_eval__should_run
