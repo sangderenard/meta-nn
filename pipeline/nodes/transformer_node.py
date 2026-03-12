@@ -63,7 +63,7 @@ class TransformerConfig:
     ff_mult: int = 4
     dropout: float = 0.1
     patch_size: int = 16          # pixels per patch (image side)
-    image_size: int = 64          # rendered image side length in pixels
+    image_size: int = 128         # rendered image side length in pixels
     chunk_samples: int = 0        # 0 = auto-derive from image_size + sample_rate
 
     # Deskew prefilter (learns to straighten slanted waveform renderings)

@@ -208,6 +208,7 @@ class GraphNodeRecord:
     subnodes: list[SubnodeRecord] = field(default_factory=list)
     owned_action_ids: list[str] = field(default_factory=list)
     gpu_models: list[str] = field(default_factory=list)
+    run_condition_expr: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -224,6 +225,7 @@ class GraphNodeRecord:
             "enabled": bool(self.enabled),
             "execution_policy": str(self.execution_policy),
             "execution_policy_config": _jsonable(self.execution_policy_config),
+            "run_condition_expr": str(self.run_condition_expr),
             "metadata": _jsonable(self.metadata),
             "subnodes": [sn.to_dict() for sn in self.subnodes],
             "owned_action_ids": [str(aid) for aid in self.owned_action_ids],
@@ -254,6 +256,7 @@ class GraphNodeRecord:
             ],
             owned_action_ids=[str(aid) for aid in data.get("owned_action_ids", [])],
             gpu_models=[str(m) for m in data.get("gpu_models", [])],
+            run_condition_expr=str(data.get("run_condition_expr", "")),
         )
 
 
@@ -272,6 +275,7 @@ class GraphEdgeRecord:
     metadata: Dict[str, Any] = field(default_factory=dict)
     action_id: str = ""
     cycle_control: Dict[str, Any] = field(default_factory=dict)
+    condition_expr: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -280,6 +284,7 @@ class GraphEdgeRecord:
             "source_node_id": str(self.source_node_id),
             "target_node_id": str(self.target_node_id),
             "condition_id": str(self.condition_id),
+            "condition_expr": str(self.condition_expr),
             "layer": str(self.layer),
             "target_function": str(self.target_function),
             "reaction_name": str(self.reaction_name),
@@ -306,6 +311,7 @@ class GraphEdgeRecord:
             metadata=dict(data.get("metadata", {})),
             action_id=str(data.get("action_id", "")),
             cycle_control=dict(data.get("cycle_control", {})),
+            condition_expr=str(data.get("condition_expr", "")),
         )
 
 
@@ -1078,6 +1084,23 @@ def _infer_subnodes_and_actions(
     return subnodes, actions
 
 
+def _synthesize_edge_condition_expr(condition_id: str) -> str:
+    """Return a portable condition expression for a given condition_id."""
+    if not str(condition_id or "").strip():
+        return ""
+    from pipeline.condition_expr import expr_for_condition_id
+    return expr_for_condition_id(str(condition_id).strip())
+
+
+def _synthesize_node_run_expr(node: Any) -> str:
+    """Return a run_condition_expr for a live PipelineNode."""
+    try:
+        from pipeline.condition_expr import expr_for_node_should_run
+        return expr_for_node_should_run(node)
+    except Exception:
+        return ""
+
+
 def plan_from_pipeline_graph(
     graph: "PipelineGraph",
     *,
@@ -1159,6 +1182,7 @@ def plan_from_pipeline_graph(
                 execution_policy_config=_jsonable(_exec_policy_cfg),
                 metadata=_jsonable(record_meta),
                 gpu_models=[str(m) for m in gpu_models_raw],
+                run_condition_expr=_synthesize_node_run_expr(node),
             )
         )
 
@@ -1208,6 +1232,7 @@ def plan_from_pipeline_graph(
                 reaction_defaults=serialized_defaults,
                 enabled=True,
                 metadata=_jsonable(record_meta),
+                condition_expr=_synthesize_edge_condition_expr(condition_id),
             )
         )
 

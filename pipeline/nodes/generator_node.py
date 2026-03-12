@@ -70,7 +70,7 @@ class GeneratorConfig:
     g_depth: int = 4
     g_base_ch: int = 64
     g_max_ch: int = 512
-    image_size: int = 64            # output image side length in pixels
+    image_size: int = 128           # output image side length in pixels
 
     # ---- discriminator architecture -------------------------------------
     d_depth: int = 4

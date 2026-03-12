@@ -1394,7 +1394,7 @@ def _image_any_to_rgb_chw01(img: Any, image_size: int) -> np.ndarray:
 
 def _semantic_tonal_tags_from_image(
     image: Any,
-    image_size: int = 64,
+    image_size: int = 128,
     low_threshold: float = 0.15,
     high_threshold: float = 0.85,
     coverage_threshold: float = 0.25,
@@ -1442,7 +1442,7 @@ def _semantic_tonal_tags_from_image(
 def _semantic_terms_with_tonal_tags(
     terms: Sequence[str],
     image: Any,
-    image_size: int = 64,
+    image_size: int = 128,
 ) -> List[str]:
     base = _normalize_vocab_terms([str(x) for x in list(terms)])
     tones = _semantic_tonal_tags_from_image(image=image, image_size=int(image_size))
@@ -2572,6 +2572,7 @@ def _build_pregestation_logic_rows(
     out_images: List[np.ndarray] = []
     out_masks: List[np.ndarray] = []
     out_mask_stacks: List[np.ndarray] = []
+    out_elem_term_lists: List[List[List[str]]] = []
     out_terms: List[List[str]] = []
 
     def _build_samples(dir_labels: List[str], cx0: float, cy0: float, n: int) -> None:
@@ -2633,9 +2634,11 @@ def _build_pregestation_logic_rows(
                     cross_terms = ["gray", "shape", "signal"]
                     cross_mask = _cross_alpha.astype(np.float32, copy=False)
                     elem_masks = [bg_mask, disk_mask, cross_mask]
+                    elem_term_lists = [bg_terms, circle_terms, cross_terms]
                     merged = _normalize_vocab_terms(bg_terms + circle_terms + cross_terms)
                 else:
                     elem_masks = [bg_mask, disk_mask]
+                    elem_term_lists = [bg_terms, circle_terms]
                     merged = _normalize_vocab_terms(bg_terms + circle_terms)
 
                 # Composite mask: additive-sum all per-element masks, normalized
@@ -2646,6 +2649,7 @@ def _build_pregestation_logic_rows(
                 out_images.append(img)
                 out_masks.append(composite_mask)
                 out_mask_stacks.append(elem_stack)
+                out_elem_term_lists.append(elem_term_lists)
                 out_terms.append(merged)
 
     # Cardinal combos (always generated).
@@ -2673,7 +2677,7 @@ def _build_pregestation_logic_rows(
         "circle_displacement_temperature": float(d_temp),
         "reason": f"formal_logic_{mode}",
     }
-    return out_images, out_masks, out_mask_stacks, out_terms, info
+    return out_images, out_masks, out_mask_stacks, out_elem_term_lists, out_terms, info
 
 
 # Recognized color term names whose score maps can be extracted by

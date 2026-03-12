@@ -461,6 +461,50 @@ def depth_map_from_mask_stack(stack: Any, label_indices: Optional[Sequence[int]]
     return _normalize_attention_map(weighted, gamma=1.0, blur_kernel=0)
 
 
+def elem_stacks_to_label_stacks(
+    elem_stack: np.ndarray,
+    elem_term_lists: Sequence[Sequence[str]],
+    label_vec: np.ndarray,
+    term_to_idx: Dict[str, int],
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Convert per-element spatial masks into per-label mask stacks.
+
+    Each element mask is replicated for every positive label index that
+    appears in that element's term list.  The result is a ``[K, H, W]``
+    stack paired with a ``[K]`` int64 index array suitable for direct
+    lookup by ``_expand_semantic_mask_supervision_batch``.
+    """
+    y = np.asarray(label_vec, dtype=np.float32).reshape(-1)
+    positive_set = set(np.where(y >= 0.5)[0].tolist())
+    stack = np.asarray(elem_stack, dtype=np.float32)
+    if int(stack.ndim) == 2:
+        stack = stack[None, ...]
+    out_masks: List[np.ndarray] = []
+    out_idx: List[int] = []
+    seen: set = set()
+    for ei in range(min(int(stack.shape[0]), int(len(elem_term_lists)))):
+        for term in elem_term_lists[int(ei)]:
+            tk = re.sub(r"\s+", " ", str(term)).strip().lower()
+            ci = int(term_to_idx.get(tk, -1))
+            if ci < 0 or ci not in positive_set or ci in seen:
+                continue
+            seen.add(ci)
+            out_masks.append(stack[int(ei)])
+            out_idx.append(ci)
+    # Any positive label not covered by an element gets the composite.
+    if len(out_masks) > 0:
+        composite = _composite_mask_stack(np.stack(out_masks, axis=0))
+    else:
+        composite = _composite_mask_stack(stack)
+    for ci in sorted(positive_set - seen):
+        out_masks.append(composite)
+        out_idx.append(ci)
+    if len(out_masks) == 0:
+        h, w = int(stack.shape[-2]), int(stack.shape[-1])
+        return np.zeros((0, h, w), dtype=np.float32), np.zeros((0,), dtype=np.int64)
+    return np.stack(out_masks, axis=0).astype(np.float32, copy=False), np.asarray(out_idx, dtype=np.int64)
+
+
 def build_label_mask_stack(
     mixed_mask: Any,
     label_vec: Any,
@@ -1773,29 +1817,13 @@ class BootstrapDynamicDataset(Dataset):
                     if 0 <= int(ti) < int(tgt.size):
                         tgt[int(ti)] = 1.0
             if bool(self.return_mask_stack):
-                exact_term_masks = dict(aug_term_masks) if isinstance(aug_term_masks, dict) else {}
-                base_signal_terms = ["signal", "object"]
-                for base_term in base_signal_terms:
-                    if _norm_txt(base_term) not in exact_term_masks and float(np.max(mask_base)) > 1e-8:
-                        exact_term_masks[_norm_txt(base_term)] = np.asarray(mask_base, dtype=np.float32)
-                if "mixed noise and signal" in aug_term_set and float(np.max(mask_base)) > 1e-8:
-                    exact_term_masks["mixed noise and signal"] = np.maximum(
-                        np.asarray(exact_term_masks.get("noise", touched), dtype=np.float32),
-                        np.asarray(mask_base, dtype=np.float32),
-                    ).astype(np.float32, copy=False)
-                mask_stack_np, mask_idx_np = build_term_mask_stack_from_image(
-                    image=img,
+                # The composite mask already includes the base signal and
+                # augmentation deformations blended together.  Tile it per
+                # active label instead of re-inferring per-term masks.
+                mask_stack_np, mask_idx_np = build_label_mask_stack(
+                    mixed_mask=np.asarray(mask, dtype=np.float32),
                     label_vec=tgt,
-                    idx_to_term=self.idx_to_term,
-                    term_mask_overrides=exact_term_masks,
                 )
-                if int(mask_stack_np.shape[0]) > 0 and int(mask_idx_np.size) > 0:
-                    mixed_from_stack = _composite_mask_stack(mask_stack_np)
-                    mask = _blend_attention_maps(
-                        [np.asarray(mask, dtype=np.float32), np.asarray(mixed_from_stack, dtype=np.float32)],
-                        weights=[0.55, 1.10],
-                        gamma=0.92,
-                    ).astype(np.float32, copy=False)
         return (
             np.asarray(img, dtype=np.float32),
             np.asarray(tgt, dtype=np.float32),
@@ -1816,13 +1844,7 @@ class BootstrapDynamicDataset(Dataset):
             mask = np.zeros((int(img.shape[1]), int(img.shape[2])), dtype=np.float32)
         if bool(self.return_mask_stack):
             if self._cache_mask_offsets_mm is None or self._cache_mask_indices_mm is None or self._cache_mask_stacks_mm is None:
-                mask_stack_np, mask_idx_np = build_term_mask_stack_from_image(
-                    image=img,
-                    label_vec=tgt,
-                    idx_to_term=self.idx_to_term,
-                )
-                if int(mask_stack_np.shape[0]) <= 0 or int(mask_idx_np.size) <= 0:
-                    mask_stack_np, mask_idx_np = build_label_mask_stack(mixed_mask=mask, label_vec=tgt)
+                mask_stack_np, mask_idx_np = build_label_mask_stack(mixed_mask=mask, label_vec=tgt)
             else:
                 start = int(self._cache_mask_offsets_mm[int(index)])
                 stop = int(self._cache_mask_offsets_mm[int(index) + 1])
@@ -1851,20 +1873,21 @@ class BootstrapDynamicDataset(Dataset):
         cached_stack = self.base_mask_stacks[int(idx)]
         cached_stack_idx = self.base_mask_stack_indices[int(idx)]
         if cached_mask is None:
-            tgt = np.asarray(self.targets[int(idx)], dtype=np.float32).reshape(-1)
-            active_terms = [
-                str(self.idx_to_term[int(j)])
-                for j in np.where(tgt >= 0.5)[0].astype(np.int64).tolist()
-                if int(j) in self.idx_to_term
-            ]
-            cached_mask = infer_semantic_support_mask(self.images[int(idx)], terms=active_terms)
+            # Derive composite mask from the element stack if the builder
+            # provided one; fall back to a uniform mask otherwise.  The
+            # expensive infer_semantic_support_mask heuristic is NOT
+            # appropriate for synthetic rows whose geometry is already known.
+            if cached_stack is not None and int(np.asarray(cached_stack).ndim) == 3 and int(np.asarray(cached_stack).shape[0]) > 0:
+                cached_mask = _composite_mask_stack(np.asarray(cached_stack, dtype=np.float32))
+            else:
+                img_ref = np.asarray(self.images[int(idx)], dtype=np.float32)
+                cached_mask = np.ones((int(img_ref.shape[1]), int(img_ref.shape[2])), dtype=np.float32)
             self.base_masks[int(idx)] = np.asarray(cached_mask, dtype=np.float32)
         if bool(self.return_mask_stack) and (cached_stack is None or cached_stack_idx is None):
             tgt = np.asarray(self.targets[int(idx)], dtype=np.float32).reshape(-1)
-            cached_stack, cached_stack_idx = build_term_mask_stack_from_image(
-                image=self.images[int(idx)],
+            cached_stack, cached_stack_idx = build_label_mask_stack(
+                mixed_mask=np.asarray(cached_mask, dtype=np.float32),
                 label_vec=tgt,
-                idx_to_term=self.idx_to_term,
             )
             self.base_mask_stacks[int(idx)] = np.asarray(cached_stack, dtype=np.float32)
             self.base_mask_stack_indices[int(idx)] = np.asarray(cached_stack_idx, dtype=np.int64)
@@ -1895,12 +1918,6 @@ class BootstrapDynamicDataset(Dataset):
         if bool(self.return_masks):
             mask_t = torch.from_numpy(np.asarray(mask, dtype=np.float32)[None, ...])
             if bool(self.return_mask_stack):
-                if int(mask_stack_np.shape[0]) <= 0 or int(mask_idx_np.size) <= 0:
-                    mask_stack_np, mask_idx_np = build_term_mask_stack_from_image(
-                        image=img,
-                        label_vec=tgt,
-                            idx_to_term=self.idx_to_term,
-                    )
                 if int(mask_stack_np.shape[0]) <= 0 or int(mask_idx_np.size) <= 0:
                     mask_stack_np, mask_idx_np = build_label_mask_stack(mixed_mask=mask, label_vec=tgt)
                 return (

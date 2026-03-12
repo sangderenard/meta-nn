@@ -24,6 +24,9 @@ Checks:
  17. execution_program traversal can revisit cyclic paths before halting
  18. execution_policy fields survive plan export and JSON round-trip
  19. execution_policy badges appear in dense Mermaid rendering
+ 20. condition expression DSL parses and evaluates correctly
+ 21. condition_expr and run_condition_expr survive plan JSON round-trip
+ 22. condition_expr appears in Mermaid and roundtrips through editable edit
 """
 from __future__ import annotations
 
@@ -1092,6 +1095,167 @@ def test_execution_policy_mermaid_badges(graph):
     _ok("execution_policy badges render correctly in dense Mermaid")
 
 
+# ── test: condition expression evaluator ──────────────────────────────────────
+
+def test_condition_expr_evaluator():
+    """Verify the condition expression DSL parses and evaluates correctly."""
+    print("\n--- test_condition_expr_evaluator ---")
+    from pipeline.condition_expr import (
+        evaluate_condition_expr,
+        validate_condition_expr,
+        expr_for_condition_id,
+    )
+
+    # Simple boolean literals.
+    ctx = types.SimpleNamespace()
+    _assert(evaluate_condition_expr("TRUE", ctx) is True, "TRUE evaluates to True")
+    _assert(evaluate_condition_expr("FALSE", ctx) is False, "FALSE evaluates to False")
+    _assert(evaluate_condition_expr("NOT FALSE", ctx) is True, "NOT FALSE evaluates to True")
+
+    # IS_NONE / IS_NOT_NONE.
+    ctx = types.SimpleNamespace(foo=None, bar=42)
+    _assert(evaluate_condition_expr("foo IS_NONE", ctx) is True, "foo IS_NONE with None value")
+    _assert(evaluate_condition_expr("bar IS_NOT_NONE", ctx) is True, "bar IS_NOT_NONE with value")
+    _assert(evaluate_condition_expr("bar IS_NONE", ctx) is False, "bar IS_NONE when not None")
+
+    # CONTAINS.
+    ctx = types.SimpleNamespace(orchestration_mode="gcw")
+    _assert(evaluate_condition_expr('orchestration_mode CONTAINS "g"', ctx) is True, 'CONTAINS "g" in "gcw"')
+    _assert(evaluate_condition_expr('orchestration_mode CONTAINS "x"', ctx) is False, 'CONTAINS "x" not in "gcw"')
+
+    # MOD.
+    ctx = types.SimpleNamespace(round_id=6)
+    _assert(evaluate_condition_expr("round_id MOD 3 == 0", ctx) is True, "6 MOD 3 == 0")
+    _assert(evaluate_condition_expr("round_id MOD 4 == 0", ctx) is False, "6 MOD 4 != 0")
+
+    # AND / OR.
+    ctx = types.SimpleNamespace(a=True, b=False)
+    _assert(evaluate_condition_expr("a AND b", ctx) is False, "True AND False = False")
+    _assert(evaluate_condition_expr("a OR b", ctx) is True, "True OR False = True")
+
+    # Dotted accessors.
+    ctx = types.SimpleNamespace(gate_pregestation=types.SimpleNamespace(passed=True))
+    _assert(evaluate_condition_expr("gate_pregestation.passed", ctx) is True, "dotted accessor truthy")
+
+    # GATE_OVERRIDE.
+    ctx = types.SimpleNamespace(gate_override_enabled=lambda: True)
+    _assert(evaluate_condition_expr("GATE_OVERRIDE", ctx) is True, "GATE_OVERRIDE when override enabled")
+    ctx = types.SimpleNamespace(gate_override_enabled=lambda: False)
+    _assert(evaluate_condition_expr("GATE_OVERRIDE", ctx) is False, "GATE_OVERRIDE when override disabled")
+
+    # Validation.
+    _assert(validate_condition_expr("a AND b") is None, "valid expression passes validation")
+    _assert(validate_condition_expr("a AND AND b") is not None, "invalid expression fails validation")
+
+    # Legacy mapping.
+    for cid in [
+        "orchestration.mode_has_generator",
+        "gates.pregestation_passed",
+        "gates.early_passed",
+        "gates.all_base_passed",
+        "gates.wave_stage_ready",
+    ]:
+        expr = expr_for_condition_id(cid)
+        _assert(bool(expr), f"expr_for_condition_id({cid!r}) returns non-empty string")
+        _assert(validate_condition_expr(expr) is None, f"expr for {cid!r} is syntactically valid")
+
+    _ok("condition expression evaluator parses and evaluates correctly")
+
+
+# ── test: condition_expr roundtrip in plan JSON ───────────────────────────────
+
+def test_condition_expr_plan_roundtrip(graph):
+    """Verify condition_expr and run_condition_expr survive plan JSON round-trip."""
+    print("\n--- test_condition_expr_plan_roundtrip ---")
+    plan = plan_from_pipeline_graph(
+        graph,
+        name="CondExpr RT Test Plan",
+        revision=1,
+        worker_hints={"output_dir": "/tmp/smoke_cexpr", "capabilities": ["plan_apply"]},
+        graph_layers=build_graph_layers(graph),
+        execution_program=build_execution_program(graph),
+    )
+
+    # Check that condition_expr is populated on edges with a condition_id.
+    edges_with_cid = [e for e in plan.edges if str(e.condition_id or "").strip()]
+    _assert(len(edges_with_cid) > 0, "plan has edges with condition_id")
+    for edge in edges_with_cid:
+        _assert(bool(edge.condition_expr), f"edge {edge.edge_id} has condition_expr for condition_id={edge.condition_id!r}")
+
+    # Check that nodes have run_condition_expr populated.
+    nodes_with_rcexpr = [n for n in plan.nodes if str(getattr(n, "run_condition_expr", "") or "").strip()]
+    _assert(len(nodes_with_rcexpr) > 0, "some plan nodes have run_condition_expr")
+
+    # JSON round-trip.
+    with tempfile.TemporaryDirectory() as td:
+        path = Path(td) / "cexpr_plan.json"
+        plan.save_json(path)
+        reloaded = TrainingGraphPlan.load_json(path)
+
+    # Edge condition_expr survives.
+    reloaded_edge_map = {e.edge_id: e for e in reloaded.edges}
+    for edge in edges_with_cid:
+        re = reloaded_edge_map.get(edge.edge_id)
+        _assert(re is not None, f"edge {edge.edge_id} present after reload")
+        _assert(re.condition_expr == edge.condition_expr, f"edge {edge.edge_id} condition_expr survives round-trip")
+
+    # Node run_condition_expr survives.
+    reloaded_node_map = {n.node_id: n for n in reloaded.nodes}
+    for node in nodes_with_rcexpr:
+        rn = reloaded_node_map.get(node.node_id)
+        _assert(rn is not None, f"node {node.node_id} present after reload")
+        _assert(rn.run_condition_expr == node.run_condition_expr, f"node {node.node_id} run_condition_expr survives round-trip")
+
+    _ok("condition_expr and run_condition_expr survive plan JSON round-trip")
+
+
+# ── test: condition_expr appears in Mermaid and roundtrips through edit ────────
+
+def test_condition_expr_mermaid_roundtrip(graph):
+    """Verify condition_expr appears in dense Mermaid and survives editable round-trip."""
+    print("\n--- test_condition_expr_mermaid_roundtrip ---")
+    plan = plan_from_pipeline_graph(
+        graph,
+        name="CondExpr Mermaid Test",
+        revision=1,
+        worker_hints={"output_dir": "/tmp/smoke_mermaid_cexpr", "capabilities": ["plan_apply"]},
+        graph_layers=build_graph_layers(graph),
+        execution_program=build_execution_program(graph),
+    )
+
+    # Render dense with identity comments (editable mode).
+    mermaid = render_plan_mermaid_flowchart(plan, layer_id="execution", view="dense", editable=True)
+
+    # Dense rendering should contain condition_expr annotations for gated edges.
+    _assert("GATE_OVERRIDE" in mermaid, "dense Mermaid contains GATE_OVERRIDE expression")
+
+    # Minimal rendering should NOT contain expressions.
+    mermaid_min = render_plan_mermaid_flowchart(plan, layer_id="execution", view="minimal")
+    _assert("GATE_OVERRIDE" not in mermaid_min, "minimal Mermaid does NOT contain GATE_OVERRIDE")
+
+    # Round-trip through editable Mermaid.
+    plan2 = apply_mermaid_execution_edit(plan, mermaid)
+    edges_with_cexpr = [e for e in plan2.edges if bool(getattr(e, "condition_expr", ""))]
+    _assert(len(edges_with_cexpr) > 0, "condition_expr survives Mermaid edit round-trip")
+
+    # Modify a condition_expr in the Mermaid text by replacing an expression.
+    original_edge = next((e for e in plan.edges if str(e.condition_expr or "").strip()), None)
+    _assert(original_edge is not None, "found edge with condition_expr for edit test")
+    old_expr = original_edge.condition_expr
+    new_expr = "TRUE"
+    modified_mermaid = mermaid.replace(old_expr, new_expr, 1)
+    if modified_mermaid != mermaid:
+        plan3 = apply_mermaid_execution_edit(plan, modified_mermaid)
+        edited_edge = next((e for e in plan3.edges if e.edge_id == original_edge.edge_id), None)
+        _assert(edited_edge is not None, "edited edge found after edit")
+        _assert(edited_edge.condition_expr == new_expr, f"condition_expr updated from Mermaid edit: {edited_edge.condition_expr!r}")
+        _ok("condition_expr was edited via Mermaid and persisted")
+    else:
+        _ok("(skipped edit mutation — expression not found verbatim in Mermaid)")
+
+    _ok("condition_expr appears in Mermaid and roundtrips through editable edit")
+
+
 def main():
     print("=== Smoke test: plan round-trip ===")
     graph, node_count, edge_count = test_build_pipeline_graph()
@@ -1117,6 +1281,9 @@ def main():
     test_cycle_gate_drives_interpreter(graph)
     test_execution_policy_roundtrip(graph)
     test_execution_policy_mermaid_badges(graph)
+    test_condition_expr_evaluator()
+    test_condition_expr_plan_roundtrip(graph)
+    test_condition_expr_mermaid_roundtrip(graph)
     print("\n=== All checks passed ===")
 
 

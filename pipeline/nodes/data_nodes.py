@@ -50,6 +50,7 @@ from pipeline.nodes.vocab_node import _normalize_vocab_terms, _semantic_term_ind
 from semantic_dataset_loaders import (
     DiskSemanticRowsDataset,
     collect_semantic_disk_rows,
+    elem_stacks_to_label_stacks,
     maybe_wrap_loader_with_threaded_prefetch,
     semantic_mask_stack_collate,
 )
@@ -248,7 +249,7 @@ class PregestationDataConfig:
     samples_per_combo: int = 64
 
     # Image resolution (must match classifier input)
-    image_size: int = 64
+    image_size: int = 128
 
     # Batch and loader settings
     batch_size: int = 32
@@ -282,7 +283,7 @@ class PregestationDataConfig:
 class GestationDataConfig:
     """Idiosyncrasies of the bootstrap primitive symbol dataset."""
 
-    image_size: int = 64
+    image_size: int = 128
     batch_size: int = 32
     num_workers: int = 0
     samples_per_term: int = 32
@@ -301,7 +302,7 @@ class BerkeleyPayloadConfig:
     payload_bank_dir: str = ""       # empty → {berkeley_root}/cache/payload_bank_rgb...
 
     # Image resolution for payload rendering
-    image_size: int = 64
+    image_size: int = 128
 
     # Batch size for building the bank
     build_batch_size: int = 32
@@ -330,7 +331,7 @@ class BerkeleyDataConfig:
     """Idiosyncrasies of the Berkeley SBD Stage 2 refresh loader."""
 
     berkeley_data_root: str = ""     # empty → from ctx
-    image_size: int = 64
+    image_size: int = 128
     batch_size: int = 16
     num_workers: int = 0
     prefetch_factor: int = 2
@@ -518,11 +519,12 @@ class DataNode(PipelineNode):
         all_images: list = []
         all_masks: list = []
         all_mask_stacks: list = []
+        all_elem_term_lists: list = []
         all_targets: list = []
         all_term_rows: list = []
         target_dim = max(1, int(len(ctx.class_names)))
         for mode in (self.preg_cfg.mode_sequence or ["direction_color", "symbol", "noise_texture"]):
-            imgs, masks, mask_stacks, term_rows, _info = _build_pregestation_logic_rows(
+            imgs, masks, mask_stacks, elem_term_lists, term_rows, _info = _build_pregestation_logic_rows(
                 image_size=self.preg_cfg.image_size,
                 seed=self.preg_cfg.seed,
                 samples_per_combo=self.preg_cfg.samples_per_combo,
@@ -534,6 +536,7 @@ class DataNode(PipelineNode):
             all_images.extend(imgs)
             all_masks.extend(masks)
             all_mask_stacks.extend(mask_stacks)
+            all_elem_term_lists.extend(elem_term_lists)
             all_term_rows.extend(term_rows)
             for term_row in term_rows:
                 y = np.zeros((target_dim,), dtype=np.float32)
@@ -551,6 +554,26 @@ class DataNode(PipelineNode):
             _log("[data-node] WARNING: no pregestation images built")
             return
 
+        # ---- Precompute per-label mask stacks from per-element stacks ----
+        # This converts spatial element masks (bg, disk, cross) into
+        # label-indexed stacks so __getitem__ and the training loop never
+        # need to recompute anything.
+        all_label_stacks: list = []
+        all_label_indices: list = []
+        for i in range(len(all_images)):
+            if i < len(all_mask_stacks) and i < len(all_elem_term_lists):
+                ls, li = elem_stacks_to_label_stacks(
+                    elem_stack=all_mask_stacks[i],
+                    elem_term_lists=all_elem_term_lists[i],
+                    label_vec=all_targets[i],
+                    term_to_idx=ctx.semantic_term_to_idx,
+                )
+                all_label_stacks.append(ls)
+                all_label_indices.append(li)
+            else:
+                all_label_stacks.append(None)
+                all_label_indices.append(None)
+
         dataset = BootstrapDynamicDataset(
             images=all_images, targets=all_targets, total_rows=int(len(all_images)),
             seed=int(self.preg_cfg.seed), augment=False, expected_target_dim=target_dim,
@@ -558,9 +581,14 @@ class DataNode(PipelineNode):
             return_masks=True, return_mask_stack=True, dataset_name="pregestation",
             base_masks=(all_masks if len(all_masks) == len(all_images) else None),
         )
-        if len(all_mask_stacks) == len(all_images):
-            for i, ms in enumerate(all_mask_stacks):
-                dataset.base_mask_stacks[i] = np.asarray(ms, dtype=np.float32)
+        if len(all_label_stacks) == len(all_images):
+            for i in range(len(all_images)):
+                if all_label_stacks[i] is not None:
+                    dataset.base_mask_stacks[i] = np.asarray(all_label_stacks[i], dtype=np.float32)
+                elif i < len(all_mask_stacks):
+                    dataset.base_mask_stacks[i] = np.asarray(all_mask_stacks[i], dtype=np.float32)
+                if all_label_indices[i] is not None:
+                    dataset.base_mask_stack_indices[i] = np.asarray(all_label_indices[i], dtype=np.int64)
 
         train_idx, val_idx = _orphan_free_split(
             targets=all_targets, seed=self.preg_cfg.seed,

@@ -295,6 +295,7 @@ def build_execution_layer_from_records(
                     **metadata,
                     "edge_id": str(edge.edge_id),
                     "condition_id": str(edge.condition_id or ""),
+                    "condition_expr": str(getattr(edge, "condition_expr", "") or ""),
                     "layer": str(edge.layer or "execution"),
                 },
             )
@@ -976,6 +977,11 @@ def _build_execution_layer(graph: PipelineGraph) -> Dict[str, Any]:
     for edge in graph.edges:
         reaction = getattr(edge, "reaction", None)
         label = str(getattr(edge, "label", "") or "")
+        _cid = str(getattr(edge, "condition_id", "") or "")
+        _cexpr = str(getattr(edge, "condition_expr", "") or "")
+        if _cid and not _cexpr:
+            from pipeline.condition_expr import expr_for_condition_id
+            _cexpr = expr_for_condition_id(_cid)
         edges.append(
             _layer_edge(
                 str(edge.source_id),
@@ -985,7 +991,8 @@ def _build_execution_layer(graph: PipelineGraph) -> Dict[str, Any]:
                 reaction_name=str(getattr(reaction, "reaction_name", "") or ""),
                 target_function=str(getattr(reaction, "target_function", "") or ""),
                 metadata={
-                    "condition_id": str(getattr(edge, "condition_id", "") or ""),
+                    "condition_id": _cid,
+                    "condition_expr": _cexpr,
                     "layer": str(getattr(edge, "layer", "execution") or "execution"),
                 },
             )
@@ -1241,7 +1248,14 @@ def parse_mermaid_flowchart(body: str) -> Dict[str, Any]:
         if edge_match is not None:
             source_alias = str(edge_match.group("source"))
             target_alias = str(edge_match.group("target"))
-            label = _base_edge_label(str(edge_match.groupdict().get("label", "") or ""))
+            raw_label = str(edge_match.groupdict().get("label", "") or "")
+            label = _base_edge_label(raw_label)
+            parsed_cexpr = _extract_edge_condition_expr(raw_label)
+            edge_meta: Dict[str, Any] = {}
+            if pending_edge_id:
+                edge_meta["edge_id"] = pending_edge_id
+            if parsed_cexpr:
+                edge_meta["condition_expr"] = parsed_cexpr
             edges.append(
                 {
                     "edge_id": pending_edge_id,
@@ -1249,7 +1263,7 @@ def parse_mermaid_flowchart(body: str) -> Dict[str, Any]:
                     "target_node_id": alias_to_node_id.get(target_alias, target_alias),
                     "label": label,
                     "readme_label": label,
-                    "metadata": {"edge_id": pending_edge_id} if pending_edge_id else {},
+                    "metadata": edge_meta,
                 }
             )
             pending_edge_id = ""
@@ -1354,6 +1368,10 @@ def apply_mermaid_execution_edit(plan: TrainingGraphPlan, mermaid_text: str) -> 
         edge_label = _base_edge_label(str(parsed_edge.get("label", metadata.get("label", base.kind)) or metadata.get("label", base.kind) or base.kind))
         metadata["label"] = edge_label
         metadata["readme_label"] = edge_label
+        # Pick up condition_expr edits from the Mermaid label, falling back to base.
+        parsed_meta = dict(parsed_edge.get("metadata", {}) or {})
+        edited_cexpr = str(parsed_meta.get("condition_expr", "") or "").strip()
+        cexpr = edited_cexpr or str(getattr(base, "condition_expr", "") or "")
         updated_edges.append(
             GraphEdgeRecord(
                 edge_id=base.edge_id,
@@ -1361,6 +1379,7 @@ def apply_mermaid_execution_edit(plan: TrainingGraphPlan, mermaid_text: str) -> 
                 source_node_id=source_id,
                 target_node_id=target_id,
                 condition_id=base.condition_id,
+                condition_expr=cexpr,
                 layer=base.layer,
                 target_function=base.target_function,
                 reaction_name=base.reaction_name,
@@ -1461,6 +1480,12 @@ def _edge_label(edge: Dict[str, Any], *, view: str) -> str:
         if base and reaction_name:
             return f"{base} | {reaction_name}"
         return reaction_name or base
+    # Dense view — append portable condition expression when present.
+    cexpr = str(dict(edge.get("metadata", {}) or {}).get("condition_expr", "") or "").strip()
+    if cexpr and base:
+        return f"{base} [{cexpr}]"
+    if cexpr:
+        return f"[{cexpr}]"
     return base
 
 
@@ -1633,7 +1658,21 @@ def _base_node_label(label: str) -> str:
 
 
 def _base_edge_label(label: str) -> str:
-    return str(label or "").split(" | ", 1)[0].strip()
+    raw = str(label or "").split(" | ", 1)[0].strip()
+    # Strip trailing condition_expr annotation: "label [expr]" → "label"
+    match = re.match(r'^(.*?)\s*\[([^\]]+)\]\s*$', raw)
+    if match:
+        return match.group(1).strip()
+    return raw
+
+
+def _extract_edge_condition_expr(label: str) -> str:
+    """Extract the condition_expr from a Mermaid edge label like 'label [expr]'."""
+    raw = str(label or "").split(" | ", 1)[0].strip()
+    match = re.match(r'^(?:.*?)\s*\[([^\]]+)\]\s*$', raw)
+    if match:
+        return match.group(1).strip()
+    return ""
 
 
 def _root_node_ids_from_records(

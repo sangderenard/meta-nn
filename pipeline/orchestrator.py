@@ -326,31 +326,37 @@ def _worker_id_for_output(output_dir: Path) -> str:
 
 
 def _build_condition_blobs() -> dict:
+    from pipeline.condition_expr import expr_for_condition_id
     return {
         _CONDITION_ID_GENERATOR_MODE: {
             "label": "Generator mode enabled",
             "description": "True when orchestration_mode includes the generator stage.",
             "callable": "_generator_exists",
+            "condition_expr": expr_for_condition_id(_CONDITION_ID_GENERATOR_MODE),
         },
         _CONDITION_ID_PREGESTATION_GATE: {
             "label": "Pregestation gate passed",
             "description": "True when Stage 0 has cleared, or the GUI gate override is active.",
             "callable": "_gate_pregestation_passed",
+            "condition_expr": expr_for_condition_id(_CONDITION_ID_PREGESTATION_GATE),
         },
         _CONDITION_ID_EARLY_GATES: {
             "label": "Early gates passed",
             "description": "True when pregestation and gestation have both cleared, or the GUI gate override is active.",
             "callable": "_early_gates_passed",
+            "condition_expr": expr_for_condition_id(_CONDITION_ID_EARLY_GATES),
         },
         _CONDITION_ID_ALL_GATES: {
             "label": "All base gates passed",
             "description": "True when pregestation, gestation, and Berkeley have cleared, or the GUI gate override is active.",
             "callable": "_all_gates_passed",
+            "condition_expr": expr_for_condition_id(_CONDITION_ID_ALL_GATES),
         },
         _CONDITION_ID_WAVE_STAGE_READY: {
             "label": "Wave stage ready",
             "description": "True when the transformer exists and the upstream gates allow the wave classifier stage.",
             "callable": "_wave_stage_ready",
+            "condition_expr": expr_for_condition_id(_CONDITION_ID_WAVE_STAGE_READY),
         },
     }
 
@@ -580,7 +586,7 @@ def _make_viewer_proxy(args, cycles: int):
     try:
         from wav_ml_viewer import ViewerIPCProxy
 
-        image_size = int(_arg_value(args, "image_size", default=64))
+        image_size = int(_arg_value(args, "image_size", default=128))
         proxy = ViewerIPCProxy(
             port_file=port_file,
             enabled=True,
@@ -745,7 +751,7 @@ def _execution_plan_edges(plan) -> list[Any]:
     return edges if edges else [edge for edge in list(getattr(plan, "edges", []) or []) if bool(getattr(edge, "enabled", True))]
 
 
-def _condition_for_plan_edge(condition_id: str, *, condition_blobs: dict | None = None):
+def _condition_for_plan_edge(condition_id: str, *, condition_blobs: dict | None = None, condition_expr: str = ""):
     registry = {
         _CONDITION_ID_GENERATOR_MODE: _generator_exists,
         _CONDITION_ID_PREGESTATION_GATE: _gate_pregestation_passed,
@@ -754,11 +760,29 @@ def _condition_for_plan_edge(condition_id: str, *, condition_blobs: dict | None 
         _CONDITION_ID_WAVE_STAGE_READY: _wave_stage_ready,
     }
     resolved_id = str(condition_id or "").strip()
+    resolved_expr = str(condition_expr or "").strip()
+
+    # Prefer condition_expr when available — it's the portable, IR-first path.
+    if resolved_expr:
+        from pipeline.condition_expr import evaluate_condition_expr
+        def _expr_condition(ctx, _e=resolved_expr):
+            return evaluate_condition_expr(_e, ctx)
+        return _expr_condition
+
     if not resolved_id:
         return None
     if resolved_id in registry:
         return registry[resolved_id]
     blob = dict((condition_blobs or {}).get(resolved_id, {}) or {})
+
+    # Check if the blob carries a condition_expr.
+    blob_expr = str(blob.get("condition_expr", "") or "").strip()
+    if blob_expr:
+        from pipeline.condition_expr import evaluate_condition_expr
+        def _blob_expr_condition(ctx, _e=blob_expr):
+            return evaluate_condition_expr(_e, ctx)
+        return _blob_expr_condition
+
     predicate_name = str(blob.get("callable_ref", "") or "").rsplit(".", 1)[-1].strip()
     if predicate_name:
         def _plan_condition(ctx, _name=predicate_name):
@@ -1336,10 +1360,37 @@ def _runtime_execution_program(plan) -> dict:
 
 
 def _program_condition_resolver(condition_id: str, ctx: PipelineContext) -> bool:
+    """Fallback resolver when no plan is available."""
     condition = _condition_for_plan_edge(condition_id)
     if condition is None:
         return True
     return bool(condition(ctx))
+
+
+def _make_condition_resolver(plan):
+    """Build a plan-aware condition resolver that prefers condition_expr from the IR."""
+    expr_map: dict[str, str] = {}
+    blobs: dict = {}
+    if plan is not None:
+        for edge in getattr(plan, "edges", []) or []:
+            cid = (getattr(edge, "condition_id", None)
+                   or (edge.get("condition_id") if isinstance(edge, dict) else "")
+                   or "")
+            expr = (getattr(edge, "condition_expr", None)
+                    or (edge.get("condition_expr") if isinstance(edge, dict) else "")
+                    or "")
+            if cid and expr and cid not in expr_map:
+                expr_map[cid] = expr
+        blobs = dict(getattr(plan, "condition_blobs", {}) or {})
+
+    def _resolver(condition_id: str, ctx: PipelineContext) -> bool:
+        expr = expr_map.get(condition_id, "")
+        condition = _condition_for_plan_edge(condition_id, condition_blobs=blobs, condition_expr=expr)
+        if condition is None:
+            return True
+        return bool(condition(ctx))
+
+    return _resolver
 
 
 def _runtime_node_sequence(graph: PipelineGraph, plan) -> list[str]:
@@ -1350,12 +1401,14 @@ def _runtime_node_sequence(graph: PipelineGraph, plan) -> list[str]:
 
 
 def _execute_runtime_pass(graph: PipelineGraph, ctx: PipelineContext, *, sequence: Optional[list[str]] = None) -> dict[str, str]:
-    execution_program = _runtime_execution_program(getattr(ctx, "graph_plan", None))
+    plan = getattr(ctx, "graph_plan", None)
+    execution_program = _runtime_execution_program(plan)
     if execution_program:
+        resolver = _make_condition_resolver(plan)
         return graph.execute_program(
             ctx,
             execution_program,
-            condition_resolver=_program_condition_resolver,
+            condition_resolver=resolver,
         )
     return graph.execute_sequence(ctx, sequence=sequence)
 
