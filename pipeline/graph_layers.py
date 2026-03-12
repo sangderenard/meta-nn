@@ -906,7 +906,7 @@ def _artifact_download_links(layer_id: str, view: str, *, asset_link_prefix: str
     if not prefix:
         return ""
     base = f"{prefix}/{layer_id}_{view}"
-    return f"Downloads: [SVG]({base}.svg) | [MMD]({base}.mmd)"
+    return f"Downloads: [PNG]({base}.png) | [SVG]({base}.svg) | [MMD]({base}.mmd)"
 
 
 def render_readme_layer_section(layer: Dict[str, Any], *, asset_link_prefix: str = "") -> str:
