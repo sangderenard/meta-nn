@@ -14,8 +14,11 @@ from pipeline.nodes.data_nodes import (
     _unpack_masked_semantic_batch,
 )
 from pipeline.semantic_wheel_cache import (
+    SemanticWheelCandidate,
     SemanticWheelConfig,
     SemanticWheelDataset,
+    build_semantic_cache_entry,
+    ensure_semantic_candidate_cache,
     ensure_semantic_wheel_cache,
 )
 from semantic_dataset_loaders import SemanticDiskRow, semantic_mask_stack_collate
@@ -156,7 +159,78 @@ def test_sanity_cap_guard() -> None:
         raise AssertionError("expected sanity cap guard to raise")
 
 
+def test_generic_candidate_deck_rotation() -> None:
+    print("\n--- test_generic_candidate_deck_rotation ---")
+    with tempfile.TemporaryDirectory(dir=".") as td:
+        root = Path(td)
+        label_dim = 5
+        images: list[np.ndarray] = []
+        targets: list[np.ndarray] = []
+        candidates: list[SemanticWheelCandidate] = []
+        for i in range(5):
+            img = np.zeros((3, 12, 12), dtype=np.float32)
+            img[0, :, :] = float(i + 1) / 8.0
+            img[1, 2:10, 2:10] = 1.0
+            y = np.zeros((label_dim,), dtype=np.float32)
+            y[i] = 1.0
+            images.append(img)
+            targets.append(y)
+            candidates.append(
+                SemanticWheelCandidate(
+                    cache_key=f"candidate-{i}",
+                    terms=[f"term-{i}"],
+                    source="synthetic",
+                )
+            )
+
+        def _entry_group(base_idx: int, _base_pos: int) -> list[dict]:
+            return [
+                build_semantic_cache_entry(
+                    image=images[int(base_idx)],
+                    label_vec=targets[int(base_idx)],
+                    image_size=16,
+                )
+            ]
+
+        cfg = SemanticWheelConfig(
+            purpose="generic_deck",
+            cache_root=str(root / "cache"),
+            image_size=16,
+            batch_size=2,
+            lookahead_batches=1,
+            seed=11,
+            deformations_per_clean=0,
+            include_clean=True,
+            max_base_rows=2,
+            sanity_cap_bytes=64 * 1024 * 1024,
+            allow_large_override=False,
+            expiry_uses=1,
+            use_rare_term_deck=False,
+        )
+        first = ensure_semantic_candidate_cache(
+            candidates=candidates,
+            candidate_indices=list(range(5)),
+            build_entry_group=_entry_group,
+            label_dim=label_dim,
+            config=cfg,
+        )
+        second = ensure_semantic_candidate_cache(
+            candidates=candidates,
+            candidate_indices=list(range(5)),
+            build_entry_group=_entry_group,
+            label_dim=label_dim,
+            config=cfg,
+        )
+        first_rows = [int(x) for x in list(first.get("base_candidate_indices") or [])]
+        second_rows = [int(x) for x in list(second.get("base_candidate_indices") or [])]
+        assert int(len(first_rows)) == 2
+        assert int(len(second_rows)) == 2
+        assert set(first_rows).isdisjoint(set(second_rows))
+        _ok("generic candidate cache rotates bounded deck slices across rebuilds")
+
+
 if __name__ == "__main__":
     test_roundtrip()
     test_sanity_cap_guard()
+    test_generic_candidate_deck_rotation()
     print("\nALL TESTS PASSED")

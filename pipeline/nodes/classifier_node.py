@@ -137,13 +137,13 @@ class ClassifierConfig:
     stage0_epochs: int = 3
     stage0_samples_per_combo: int = 64
     stage0_batch_size: int = 32
-    stage0_loss_target: float = 0.35
+    stage0_loss_target: float = 0.80
     stage0_required_consecutive: int = 2
 
     # ---- Stage 1 — gestation (bootstrap primitives) ----------------------
     stage1_epochs: int = 5
     stage1_batch_size: int = 32
-    stage1_loss_target: float = 0.30
+    stage1_loss_target: float = 0.80
     stage1_required_consecutive: int = 2
 
     # ---- Stage 2 — Berkeley SBD refresh ----------------------------------
@@ -897,13 +897,38 @@ def _sync_gate_classifier_replica(
     gate_device: torch.device,
     channels_last: bool = False,
 ) -> Tuple[nn.Module, Dict[str, Any]]:
+    def _sync_label_bank_state(source_base: nn.Module, gate_model: nn.Module) -> None:
+        source_bank = getattr(source_base, "label_embed_bank", None)
+        source_enabled_buf = getattr(source_base, "label_embed_enabled", None)
+        source_enabled = bool(
+            isinstance(source_enabled_buf, torch.Tensor)
+            and int(source_enabled_buf.numel()) > 0
+            and bool(int(source_enabled_buf.reshape(-1)[0].item()))
+        )
+        source_bank_valid = bool(
+            source_enabled
+            and isinstance(source_bank, torch.Tensor)
+            and int(source_bank.ndim) == 2
+            and int(source_bank.shape[0]) > 0
+            and int(source_bank.shape[1]) > 0
+        )
+        if bool(source_bank_valid) and hasattr(gate_model, "set_label_embedding_bank"):
+            gate_model.set_label_embedding_bank(
+                source_bank.detach().to(device=gate_device, dtype=torch.float32),
+                temperature=float(getattr(source_base, "embed_temperature", 10.0)),
+            )
+            return
+        if hasattr(gate_model, "disable_label_embedding_bank"):
+            gate_model.disable_label_embedding_bank()
+
     source_base = _unwrap_module_for_replica(source_classifier)
     created = False
     if gate_classifier is None:
         gate_classifier = copy.deepcopy(source_base)
         created = True
     gate_classifier = gate_classifier.to(device=gate_device, dtype=torch.float32)
-    gate_classifier.load_state_dict(source_base.state_dict(), strict=True)
+    _sync_label_bank_state(source_base, gate_classifier)
+    gate_classifier.load_state_dict(source_base.state_dict(), strict=not bool(created))
     gate_classifier.eval()
     for p in gate_classifier.parameters():
         p.requires_grad_(False)
@@ -911,6 +936,7 @@ def _sync_gate_classifier_replica(
         gate_classifier = gate_classifier.to(memory_format=torch.channels_last)
     return gate_classifier, {
         "created": bool(created),
+        "strict_load": bool(not bool(created)),
         "device": str(gate_device),
         "source_device": str(next(source_base.parameters()).device),
     }

@@ -423,9 +423,9 @@ def _default_class_names() -> List[str]:
         "low band", "mid band", "high band", "broadband", "narrowband",
         "burst", "echo", "object", "layout", "mask", "composite",
         "red", "green", "blue", "yellow", "cyan", "magenta",
-        "brown", "black", "white", "gray", "grey",
+        "brown", "black", "white", "gray", "edge",
         "white noise", "pink noise", "brown noise", "red noise",
-        "blue noise", "violet noise", "gray noise",
+        "blue noise", "violet noise", "grey noise",
         "gaussian white noise", "uniform white noise",
     ]
     return [str(x).strip() for x in class_names if str(x).strip()]
@@ -869,7 +869,7 @@ def _semantic_target_entries_from_vector(
 def _format_target_line_from_condition(
     cond_vec: Any,
     class_names: Sequence[str],
-    max_items: int = 4,
+    max_items: int = 0,
     threshold: float = 0.5,
 ) -> str:
     if isinstance(cond_vec, torch.Tensor):

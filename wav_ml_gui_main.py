@@ -212,6 +212,8 @@ def main():
                         help="IPC listen port (0 = auto-assign)")
     parser.add_argument("--port-file", default=None,
                         help="Write the actual IPC port number to this file")
+    parser.add_argument("--launch-script", default=None,
+                        help="Path to the training launcher script (.bat) for the START button")
     args = parser.parse_args()
 
     image_hw = (int(args.image_size), int(args.image_size))
@@ -240,6 +242,15 @@ def main():
     # Start IPC server for training processes to connect
     server = ViewerIPCServer(viewer, port=int(args.port), port_file=str(port_file))
     server.start()
+
+    # Give the viewer a back-reference to the server (for connection state)
+    # and launch info (for the START button).
+    viewer.set_ipc_server(server)
+    viewer.set_launch_info(
+        launch_script=args.launch_script,
+        output_dir=str(out_dir),
+        port_file_path=str(port_file),
+    )
 
     print("[gui] viewer ready, waiting for training process...", flush=True)
 

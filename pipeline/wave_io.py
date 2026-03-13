@@ -176,7 +176,7 @@ def _latent_noise_profile_keys() -> List[str]:
         "red_noise",
         "blue_noise",
         "violet_noise",
-        "gray_noise",
+        "grey_noise",
     ]
 
 
@@ -204,7 +204,7 @@ def _latent_noise_profile_spec(profile_key: str) -> Tuple[float, str]:
         "red_noise": (1.8, "gaussian"),
         "blue_noise": (-1.0, "gaussian"),
         "violet_noise": (-2.0, "gaussian"),
-        "gray_noise": (0.5, "gaussian"),
+        "grey_noise": (0.5, "gaussian"),
     }
     return tuple(lut.get(key, (0.0, "gaussian")))
 

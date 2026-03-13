@@ -54,7 +54,7 @@ def _chw_to_u8_hwc(image_chw: np.ndarray) -> np.ndarray:
     )
 
 
-def _format_target_line(target_vec: Any, class_names: Sequence[str], threshold: float = 0.5, max_items: int = 6) -> str:
+def _format_target_line(target_vec: Any, class_names: Sequence[str], threshold: float = 0.5, max_items: int = 0) -> str:
     if target_vec is None:
         return "target:none"
     arr = _to_np_float(target_vec).reshape(-1)
@@ -65,20 +65,20 @@ def _format_target_line(target_vec: Any, class_names: Sequence[str], threshold: 
                 hits.append(str(class_names[idx]))
             else:
                 hits.append(f"class_{idx}")
-        if len(hits) >= int(max_items):
-            break
+            if int(max_items) > 0 and len(hits) >= int(max_items):
+                break
     if not hits:
         return "target:none"
     return "target:" + ", ".join(hits)
 
 
-def _format_top_lines(probs: Any, class_names: Sequence[str], topk: int = 5) -> List[str]:
+def _format_top_lines(probs: Any, class_names: Sequence[str], topk: int = 0) -> List[str]:
     if probs is None:
         return []
     arr = _to_np_float(probs).reshape(-1)
     if arr.size <= 0:
         return []
-    order = np.argsort(-arr)[: max(1, int(topk))]
+    order = np.argsort(-arr) if int(topk) <= 0 else np.argsort(-arr)[: max(1, int(topk))]
     lines: List[str] = []
     for idx in order:
         label = str(class_names[int(idx)]) if 0 <= int(idx) < len(class_names) else f"class_{int(idx)}"

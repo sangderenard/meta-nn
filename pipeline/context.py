@@ -377,6 +377,22 @@ class PipelineContext:
         except Exception:
             return False
 
+    def shutdown_save(self) -> bool:
+        """Return True when the GUI requested stop-with-save (default True)."""
+        proxy = self.viewer_proxy
+        if proxy is None:
+            return True
+        fn = getattr(proxy, "shutdown_save", None)
+        if not callable(fn):
+            return True
+        try:
+            val = fn()
+            if val is None:
+                return True
+            return bool(val)
+        except Exception:
+            return True
+
     def publish_loss(self, stage_id: int, loss: float, aux: float = 0.0) -> None:
         stage = int(stage_id)
         value = float(loss)

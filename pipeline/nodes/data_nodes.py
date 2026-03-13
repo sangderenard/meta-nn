@@ -20,9 +20,11 @@ Data ownership
 """
 from __future__ import annotations
 
+import gzip
 import hashlib
 import json
 import math
+import pickle
 import re
 import time
 from dataclasses import dataclass, field
@@ -31,6 +33,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
+from tqdm import tqdm
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
@@ -39,28 +42,38 @@ from pipeline.context import PipelineContext
 from pipeline.graph import PipelineNode
 from pipeline.nodes.base import GatedNode, OneTimeNode
 from pipeline.semantic_wheel_cache import (
+    SemanticWheelCandidate,
     SemanticWheelConfig,
     SemanticWheelDataset,
     SemanticWheelPayloadBank,
     SemanticWheelPayloadView,
     StatefulSequentialDeckSampler,
+    _build_deformed_entry,
+    build_semantic_cache_entry,
+    ensure_semantic_candidate_cache,
     ensure_semantic_wheel_cache,
 )
 from pipeline.utils import (
-    _dataloader_perf_kwargs,
     _default_class_names,
-    _effective_dataloader_num_workers,
     _split_payload_cache_indices,
 )
 # Backward-compat alias — internal code now uses _default_class_names
 _default_berkeley_class_names = _default_class_names
 from pipeline.nodes.vocab_node import _normalize_vocab_terms, _semantic_term_index_map
 from semantic_dataset_loaders import (
+    BootstrapDynamicDataset,
     DiskSemanticRowsDataset,
+    _composite_mask_stack,
+    build_label_mask_stack,
+    build_loader_from_manifest,
+    build_term_mask_stack_from_image,
+    build_term_mask_stacks_from_images,
+    combine_label_mask_stacks,
     collect_semantic_disk_rows,
     elem_stacks_to_label_stacks,
-    maybe_wrap_loader_with_threaded_prefetch,
-    semantic_mask_stack_collate,
+    infer_semantic_support_mask,
+    infer_semantic_support_masks,
+    StageDatasetManifest,
 )
 
 
@@ -161,7 +174,7 @@ class WavePoolNode(PipelineNode):
         return not self._done
 
     def execute(self, ctx: PipelineContext) -> None:
-        from wav_ml_core import discover_wavs, read_wav_record
+        from wav_ml_core import discover_wavs, read_wav_record, decode_pcm, _resolve_decode_mode
 
         # Resolve WAV directory from node config or ctx.args
         wav_dir = str(self.cfg.wav_dir).strip() or str(getattr(ctx.args, "wav_dir", "")).strip()
@@ -201,20 +214,26 @@ class WavePoolNode(PipelineNode):
         else:
             _log(f"[wave-pool] discovered {len(records)} real WAV files")
 
-        # Decode to mono float32 streams directly via read_wav_record.
-        # _prepare_streams from the monolith requires a RenderConfig that is not
-        # available yet at this stage (config search runs after WavePoolNode).
+        # Decode to WaveRecord objects and mono float32 streams.
         chunk_samples = int(self.cfg.chunk_samples)
+        wav_record_list: list = []
         raw_streams: list = []
         paths: list = []
         for rec in records:
             try:
                 wav = read_wav_record(rec)
-                if wav is not None and getattr(wav, "float_data", None) is not None and len(wav.float_data) > 0:
-                    raw_streams.append(wav.float_data)
+                if wav is None or wav.nframes == 0:
+                    continue
+                nch = wav.nch if wav.nch in (1, 2) else 2
+                mode = _resolve_decode_mode(wav.sampwidth, "auto")
+                samples_f32, _, _, _ = decode_pcm(wav.frames, user_nch=nch, mode=mode)
+                if samples_f32 is not None and samples_f32.size > 0:
+                    wav_record_list.append(wav)
+                    raw_streams.append(samples_f32)
                     paths.append(str(rec))
             except Exception as exc:
                 _log(f"[wave-pool] WARNING: could not decode {rec}: {exc}")
+        records = wav_record_list
         streams = raw_streams
 
         # Filter out streams shorter than chunk_samples
@@ -225,6 +244,7 @@ class WavePoolNode(PipelineNode):
             ]
             streams = [streams[i] for i in keep]
             paths = [paths[i] for i in keep]
+            records = [records[i] for i in keep]
         # Also drop streams shorter than min_stream_seconds
         min_samples = 0
         if self.cfg.min_stream_seconds > 0:
@@ -237,6 +257,7 @@ class WavePoolNode(PipelineNode):
             ]
             streams = [streams[i] for i in keep]
             paths = [paths[i] for i in keep]
+            records = [records[i] for i in keep]
 
         ctx.wav_records = list(records)
         ctx.float_streams = list(streams)
@@ -282,6 +303,13 @@ class PregestationDataConfig:
     # RNG seed for reproducible generation
     seed: int = 42
 
+    # How many rounds to keep pregestation data before rebuilding.
+    # Vocab churns every round, but rebuilding pregestation for each small
+    # vocab change is wasteful — the disk cache absorbs re-use when the same
+    # vocab recurs, but the wheel still needs rebuilding when it changes.
+    # 20 rounds is a reasonable balance between freshness and build cost.
+    rebuild_every_n_rounds: int = 20
+
 
 # ---------------------------------------------------------------------------
 # Gestation data node  (Stage 1)
@@ -296,6 +324,9 @@ class GestationDataConfig:
     num_workers: int = 0
     samples_per_term: int = 32
     cache_mb: int = 128
+
+    # How many rounds to keep gestation data before rebuilding.
+    rebuild_every_n_rounds: int = 20
 
 
 # ---------------------------------------------------------------------------
@@ -409,7 +440,10 @@ class DataNode(PipelineNode):
         self.payload_cfg = payload_cfg
         self.bdata_cfg = bdata_cfg
         self._preg_vocab_hash: int = -1
+        self._preg_last_build_round: int = -1
+        self._preg_rebuild_epoch: int = 0
         self._gest_vocab_hash: int = -1
+        self._gest_last_build_round: int = -1
         self._bdata_last_build_round: int = -1
         self._payload_built: bool = False
 
@@ -423,7 +457,10 @@ class DataNode(PipelineNode):
             name="pregestation",
             tier="ram",
             ctx_attrs=["pregestation_loader", "pregestation_dataset", "pregestation_eval_loader", "pregestation_eval_dataset", "pregestation_logic_rows"],
-            expiry_fn=lambda ctx: hash(tuple(ctx.class_names)) != self._preg_vocab_hash,
+            expiry_fn=lambda ctx: (
+                self._preg_last_build_round < 0
+                or (ctx.total_rounds_completed - self._preg_last_build_round) >= self.preg_cfg.rebuild_every_n_rounds
+            ),
             size_fn=lambda: self._estimate_possession_bytes("pregestation"),
             pass_cap=self.preg_cfg.cache_mb * 1024 * 1024,
         )
@@ -431,7 +468,10 @@ class DataNode(PipelineNode):
             name="gestation",
             tier="ram",
             ctx_attrs=["gestation_loader", "gestation_dataset", "gestation_eval_loader", "gestation_eval_dataset"],
-            expiry_fn=lambda ctx: hash(tuple(ctx.class_names)) != self._gest_vocab_hash,
+            expiry_fn=lambda ctx: (
+                self._gest_last_build_round < 0
+                or (ctx.total_rounds_completed - self._gest_last_build_round) >= self.gest_cfg.rebuild_every_n_rounds
+            ),
             size_fn=lambda: self._estimate_possession_bytes("gestation"),
             pass_cap=self.gest_cfg.cache_mb * 1024 * 1024,
         )
@@ -569,13 +609,40 @@ class DataNode(PipelineNode):
             gc.collect()
 
     # ------------------------------------------------------------------
+    # Temperature scheduling — sinusoidal with low-frequency carrier
+    # ------------------------------------------------------------------
+
+    def _pregestation_temperature_scale(self) -> float:
+        """Return a temperature multiplier for the current rebuild epoch.
+
+        The multiplier follows a low-frequency carrier envelope (half-cosine
+        that rises from 1.0 to a peak then falls back) modulated by a faster
+        sinusoidal oscillation so the temperature *undulates* while rising.
+        After ``carrier_period`` rebuild epochs the envelope resets to 1.0.
+        """
+        carrier_period = 8   # full rise-and-fall cycle in rebuild epochs
+        peak_scale = 2.5     # max temperature multiplier at the carrier peak
+        fast_freq = 3.0      # higher-frequency modulation cycles per carrier
+        mod_depth = 0.25     # modulation amplitude as fraction of carrier
+
+        epoch = self._preg_rebuild_epoch
+        t = (float(epoch) % float(carrier_period)) / float(max(1, carrier_period))
+        # Low-frequency carrier: 0 → 1 → 0 (half-cosine envelope)
+        carrier = 0.5 * (1.0 - math.cos(2.0 * math.pi * t))
+        # Fast modulation riding on the carrier
+        fast = math.sin(2.0 * math.pi * fast_freq * t)
+        modulated = carrier * (1.0 + mod_depth * fast)
+        return 1.0 + (peak_scale - 1.0) * max(0.0, modulated)
+
+    # ------------------------------------------------------------------
     # Edge-traversal providers  (assigned as on_traverse on outgoing edges)
     # ------------------------------------------------------------------
 
     def provide_pregestation(self, ctx: PipelineContext) -> None:
-        current_hash = hash(tuple(ctx.class_names))
-        if current_hash == self._preg_vocab_hash and ctx.pregestation_loader is not None:
-            return
+        if ctx.pregestation_loader is not None and self._preg_last_build_round >= 0:
+            rounds_since_build = ctx.total_rounds_completed - self._preg_last_build_round
+            if rounds_since_build < self.preg_cfg.rebuild_every_n_rounds:
+                return
 
         # Release stale loaders before rebuild
         ctx.pregestation_loader = None
@@ -583,80 +650,159 @@ class DataNode(PipelineNode):
         ctx.pregestation_dataset = None
         ctx.pregestation_eval_dataset = None
 
-        from pipeline.nodes.vocab_node import _build_pregestation_logic_rows
-        from semantic_dataset_loaders import (
-            BootstrapDynamicDataset,
-            build_loader_from_manifest,
-            StageDatasetManifest,
+        # Advance rebuild epoch and compute temperature scaling
+        self._preg_rebuild_epoch += 1
+        _temp_scale = self._pregestation_temperature_scale()
+        _log(f"[data-node] pregestation rebuild epoch={self._preg_rebuild_epoch} temp_scale={_temp_scale:.3f}")
+
+        from pipeline.nodes.vocab_node import (
+            _build_pregestation_logic_rows,
+            _semantic_terms_with_tonal_tags,
         )
 
-        active_terms_lc = [t.lower() for t in ctx.class_names]
-        all_images: list = []
-        all_masks: list = []
-        all_mask_stacks: list = []
-        all_elem_term_lists: list = []
-        all_targets: list = []
-        all_term_rows: list = []
         target_dim = max(1, int(len(ctx.class_names)))
-        for mode in (self.preg_cfg.mode_sequence or ["direction_color", "symbol", "noise_texture"]):
-            imgs, masks, mask_stacks, elem_term_lists, term_rows, _info = _build_pregestation_logic_rows(
-                image_size=self.preg_cfg.image_size,
-                seed=self.preg_cfg.seed,
-                samples_per_combo=self.preg_cfg.samples_per_combo,
-                active_terms_lc=active_terms_lc,
-                circle_radius_temperature=self.preg_cfg.circle_radius_temperature,
-                circle_displacement_temperature=self.preg_cfg.displacement_temperature,
-                mode=mode,
-            )
-            all_images.extend(imgs)
-            all_masks.extend(masks)
-            all_mask_stacks.extend(mask_stacks)
-            all_elem_term_lists.extend(elem_term_lists)
-            all_term_rows.extend(term_rows)
-            for term_row in term_rows:
-                y = np.zeros((target_dim,), dtype=np.float32)
-                for term in term_row:
-                    idx = ctx.semantic_term_to_idx.get(str(term).strip().lower(), -1)
-                    if int(idx) >= 0:
-                        y[int(idx)] = 1.0
-                all_targets.append(y)
+        active_terms_lc = [t.lower() for t in ctx.class_names]
+        _mode_seq = list(self.preg_cfg.mode_sequence or ["direction_color", "symbol", "noise_texture"])
+
+        # ---- Raw-data disk cache (keyed by vocab + config) ----
+        _raw_cache_dir = _raw_stage_cache_dir(ctx, "pregestation")
+        _raw_cache_key = _raw_stage_cache_key({
+            "class_names": sorted(ctx.class_names),
+            "seed": self.preg_cfg.seed,
+            "samples_per_combo": self.preg_cfg.samples_per_combo,
+            "mode_sequence": sorted(_mode_seq),
+            "image_size": self.preg_cfg.image_size,
+        })
+        _raw_cached = _load_raw_stage_cache(_raw_cache_dir, _raw_cache_key)
+        if _raw_cached is not None:
+            _log(f"[data-node] pregestation raw cache HIT ({_raw_cache_key[:8]}…) — skipping generation")
+            all_images = _raw_cached["all_images"]
+            all_masks = _raw_cached["all_masks"]
+            all_label_stacks = _raw_cached["all_label_stacks"]
+            all_label_indices = _raw_cached["all_label_indices"]
+            all_targets = _raw_cached["all_targets"]
+            all_term_rows = _raw_cached["all_term_rows"]
+        else:
+            _log(f"[data-node] pregestation raw cache MISS ({_raw_cache_key[:8]}…) — generating")
+            all_images: list = []
+            all_masks: list = []
+            all_mask_stacks: list = []
+            all_elem_term_lists: list = []
+            all_targets: list = []
+            all_term_rows: list = []
+            for mode in tqdm(_mode_seq, desc="[pregestation] generating modes", unit="mode", leave=False, dynamic_ncols=True):
+                imgs, masks, mask_stacks, elem_term_lists, term_rows, _info = _build_pregestation_logic_rows(
+                    image_size=self.preg_cfg.image_size,
+                    seed=self.preg_cfg.seed,
+                    samples_per_combo=self.preg_cfg.samples_per_combo,
+                    active_terms_lc=active_terms_lc,
+                    circle_radius_temperature=self.preg_cfg.circle_radius_temperature * _temp_scale,
+                    circle_displacement_temperature=self.preg_cfg.displacement_temperature * _temp_scale,
+                    mode=mode,
+                )
+                all_images.extend(imgs)
+                all_masks.extend(masks)
+                all_mask_stacks.extend(mask_stacks)
+                all_elem_term_lists.extend(elem_term_lists)
+                for row_idx, term_row in enumerate(term_rows):
+                    img_ref = imgs[int(row_idx)] if int(row_idx) < int(len(imgs)) else None
+                    enriched_terms = (
+                        _semantic_terms_with_tonal_tags(
+                            terms=term_row,
+                            image=img_ref,
+                            image_size=int(self.preg_cfg.image_size),
+                        )
+                        if img_ref is not None
+                        else list(term_row)
+                    )
+                    all_term_rows.append(list(enriched_terms))
+                    y = np.zeros((target_dim,), dtype=np.float32)
+                    for term in enriched_terms:
+                        idx = ctx.semantic_term_to_idx.get(str(term).strip().lower(), -1)
+                        if int(idx) >= 0:
+                            y[int(idx)] = 1.0
+                    all_targets.append(y)
+
+            if not all_images:
+                _log("[data-node] WARNING: no pregestation images built")
+                return
+
+            # ---- Precompute per-label mask stacks from element stacks ----
+            all_label_stacks: list = []
+            all_label_indices: list = []
+            for i in tqdm(range(len(all_images)), desc="[pregestation] building mask stacks", unit="img", leave=False, dynamic_ncols=True):
+                img_np = np.asarray(all_images[i], dtype=np.float32)
+                if i < len(all_masks):
+                    base_mask_np = np.asarray(all_masks[i], dtype=np.float32)
+                else:
+                    base_mask_np = np.ones((int(img_np.shape[1]), int(img_np.shape[2])), dtype=np.float32)
+                if i < len(all_mask_stacks) and i < len(all_elem_term_lists):
+                    explicit_stack, explicit_idx = elem_stacks_to_label_stacks(
+                        elem_stack=all_mask_stacks[i],
+                        elem_term_lists=all_elem_term_lists[i],
+                        label_vec=all_targets[i],
+                        term_to_idx=ctx.semantic_term_to_idx,
+                    )
+                else:
+                    explicit_stack = np.zeros((0, int(base_mask_np.shape[0]), int(base_mask_np.shape[1])), dtype=np.float32)
+                    explicit_idx = np.zeros((0,), dtype=np.int64)
+                fallback_stack, fallback_idx = build_label_mask_stack(
+                    mixed_mask=base_mask_np,
+                    label_vec=all_targets[i],
+                    treat_mixed_mask_as_creation=True,
+                )
+                merged_stack, merged_idx = combine_label_mask_stacks(
+                    all_targets[i],
+                    (explicit_stack, explicit_idx),
+                    (fallback_stack, fallback_idx),
+                    height=int(base_mask_np.shape[0]),
+                    width=int(base_mask_np.shape[1]),
+                    fallback_creation_mask=base_mask_np,
+                )
+                if i < len(all_masks):
+                    all_masks[i] = (
+                        _composite_mask_stack(merged_stack)
+                        if int(np.asarray(merged_stack).size) > 0
+                        else base_mask_np
+                    )
+                all_label_stacks.append(np.asarray(merged_stack, dtype=np.float32))
+                all_label_indices.append(np.asarray(merged_idx, dtype=np.int64))
+
+            # ---- Persist to disk cache ----
+            _log(f"[data-node] pregestation saving raw cache ({_raw_cache_key[:8]}…)")
+            with tqdm(total=1, desc="[pregestation] writing cache", unit="file", leave=False, dynamic_ncols=True) as _pbar:
+                _save_raw_stage_cache(_raw_cache_dir, _raw_cache_key, {
+                    "all_images": [np.asarray(im, dtype=np.float32) for im in all_images],
+                    "all_masks": [np.asarray(m, dtype=np.float32) for m in all_masks],
+                    "all_label_stacks": list(all_label_stacks),
+                    "all_label_indices": list(all_label_indices),
+                    "all_targets": list(all_targets),
+                    "all_term_rows": list(all_term_rows),
+                })
+                _pbar.update(1)
 
         if not all_images:
             _log("[data-node] WARNING: no pregestation images built")
             return
 
-        # ---- Precompute per-label mask stacks from per-element stacks ----
-        all_label_stacks: list = []
-        all_label_indices: list = []
-        for i in range(len(all_images)):
-            if i < len(all_mask_stacks) and i < len(all_elem_term_lists):
-                ls, li = elem_stacks_to_label_stacks(
-                    elem_stack=all_mask_stacks[i],
-                    elem_term_lists=all_elem_term_lists[i],
-                    label_vec=all_targets[i],
-                    term_to_idx=ctx.semantic_term_to_idx,
-                )
-                all_label_stacks.append(ls)
-                all_label_indices.append(li)
-            else:
-                all_label_stacks.append(None)
-                all_label_indices.append(None)
-
-        dataset = BootstrapDynamicDataset(
-            images=all_images, targets=all_targets, total_rows=int(len(all_images)),
-            seed=int(self.preg_cfg.seed), augment=False, expected_target_dim=target_dim,
-            semantic_term_to_idx=ctx.semantic_term_to_idx, augment_apply_terms=False,
-            return_masks=True, return_mask_stack=True, dataset_name="pregestation",
-            base_masks=(all_masks if len(all_masks) == len(all_images) else None),
+        dataset, selected_indices, cache_info = _build_semantic_stage_cache_dataset(
+            ctx=ctx,
+            stage_name="pregestation",
+            images=all_images,
+            targets=all_targets,
+            masks=all_masks,
+            mask_stacks=all_label_stacks,
+            mask_indices=all_label_indices,
+            terms_rows=all_term_rows,
+            source_tag="pregestation",
+            image_size=int(self.preg_cfg.image_size),
+            batch_size=max(1, int(self.preg_cfg.batch_size)),
+            seed=int(self.preg_cfg.seed),
+            target_dim=int(target_dim),
+            semantic_term_to_idx=ctx.semantic_term_to_idx,
+            stage_cache_mb=int(self.preg_cfg.cache_mb),
         )
-        if len(all_label_stacks) == len(all_images):
-            for i in range(len(all_images)):
-                if all_label_stacks[i] is not None:
-                    dataset.base_mask_stacks[i] = np.asarray(all_label_stacks[i], dtype=np.float32)
-                elif i < len(all_mask_stacks):
-                    dataset.base_mask_stacks[i] = np.asarray(all_mask_stacks[i], dtype=np.float32)
-                if all_label_indices[i] is not None:
-                    dataset.base_mask_stack_indices[i] = np.asarray(all_label_indices[i], dtype=np.int64)
+        selected_targets = [np.asarray(all_targets[int(i)], dtype=np.float32).reshape(-1) for i in selected_indices]
 
         ctx.pregestation_logic_rows = {
             "images": all_images,
@@ -667,50 +813,48 @@ class DataNode(PipelineNode):
             "label_mask_indices": all_label_indices,
             "targets": all_targets,
             "terms": all_term_rows,
+            "selected_indices": list(selected_indices),
+            "cache_info": dict(cache_info),
         }
 
         train_idx, val_idx = _orphan_free_split(
-            targets=all_targets, seed=self.preg_cfg.seed,
+            targets=selected_targets, seed=self.preg_cfg.seed,
             val_fraction=0.15, min_val=1,
         )
-        train_manifest = StageDatasetManifest(
-            name="pregestation", dataset=dataset,
+        loader, eval_loader = _build_stage_loader_pair(
+            dataset=dataset,
+            name="pregestation",
             batch_size=max(1, int(self.preg_cfg.batch_size)),
-            seed=int(self.preg_cfg.seed),
             num_workers=max(0, int(self.preg_cfg.num_workers)),
-            device_type=str(getattr(ctx.device, "type", "cpu")),
-            ordered_indices=train_idx,
-        )
-        loader, _count = build_loader_from_manifest(manifest=train_manifest)
-        eval_manifest = StageDatasetManifest(
-            name="pregestation_eval", dataset=dataset,
-            batch_size=max(1, int(self.preg_cfg.batch_size)),
             seed=int(self.preg_cfg.seed),
-            num_workers=max(0, int(self.preg_cfg.num_workers)),
             device_type=str(getattr(ctx.device, "type", "cpu")),
-            ordered_indices=val_idx,
+            train_indices=train_idx,
+            eval_indices=val_idx,
+            prefetch_factor=2,
+            shuffle_train=True,
         )
-        eval_loader, _eval_count = build_loader_from_manifest(manifest=eval_manifest)
         ctx.pregestation_dataset = dataset
         ctx.pregestation_loader = loader
         ctx.pregestation_eval_dataset = dataset
         ctx.pregestation_eval_loader = eval_loader
-        self._preg_vocab_hash = current_hash
+        self._preg_vocab_hash = hash(tuple(ctx.class_names))
+        self._preg_last_build_round = ctx.total_rounds_completed
 
         # N-pass tracking + orphan-free validation reserve
         poss = self.possessions["pregestation"]
         poss.pass_ages.append(0)
-        poss.pass_row_counts.append(len(all_images))
+        poss.pass_row_counts.append(len(selected_indices))
         poss.train_indices = train_idx
         poss.val_indices = val_idx
         poss.mark_built()
-        _log(f"[data-node] pregestation: {len(all_images)} images "
+        _log(f"[data-node] pregestation: {len(selected_indices)} images "
              f"(train={len(train_idx)} val={len(val_idx)}) batch_size={self.preg_cfg.batch_size}")
 
     def provide_gestation(self, ctx: PipelineContext) -> None:
-        current_hash = hash(tuple(ctx.class_names))
-        if current_hash == self._gest_vocab_hash and ctx.gestation_loader is not None:
-            return
+        if ctx.gestation_loader is not None and self._gest_last_build_round >= 0:
+            rounds_since_build = ctx.total_rounds_completed - self._gest_last_build_round
+            if rounds_since_build < self.gest_cfg.rebuild_every_n_rounds:
+                return
 
         # Release stale loaders before rebuild
         ctx.gestation_loader = None
@@ -718,11 +862,7 @@ class DataNode(PipelineNode):
         ctx.gestation_dataset = None
         ctx.gestation_eval_dataset = None
 
-        from semantic_dataset_loaders import (
-            BootstrapDynamicDataset,
-            build_loader_from_manifest,
-            StageDatasetManifest,
-        )
+        from pipeline.nodes.vocab_node import _semantic_terms_with_tonal_tags
         symbol_pool = ctx.symbol_pool or {}
         images, targets = _flatten_symbol_pool(
             symbol_pool=symbol_pool, class_names=ctx.class_names,
@@ -733,49 +873,145 @@ class DataNode(PipelineNode):
             _log("[data-node] WARNING: no gestation symbol images")
             return
 
-        dataset = BootstrapDynamicDataset(
-            images=images, targets=targets, total_rows=int(len(images)),
-            seed=int(getattr(ctx.args, "seed", 0) or 0), augment=False,
-            expected_target_dim=max(1, int(len(ctx.class_names))),
-            semantic_term_to_idx=ctx.semantic_term_to_idx, augment_apply_terms=False,
-            return_masks=False, return_mask_stack=False, dataset_name="gestation",
+        idx_to_term = {int(i): str(name) for i, name in enumerate(ctx.class_names)}
+        _n_gest = int(min(len(images), len(targets)))
+
+        # ---- Raw-data disk cache (keyed by vocab + symbol pool composition) ----
+        _pool_sig = sorted((str(k), int(len(v))) for k, v in symbol_pool.items())
+        _gest_seed = int(getattr(ctx.args, "seed", 0) or 0)
+        _raw_cache_dir = _raw_stage_cache_dir(ctx, "gestation")
+        _raw_cache_key = _raw_stage_cache_key({
+            "class_names": sorted(ctx.class_names),
+            "seed": _gest_seed,
+            "samples_per_term": self.gest_cfg.samples_per_term,
+            "image_size": self.gest_cfg.image_size,
+            "pool_sig": _pool_sig,
+        })
+        _raw_cached = _load_raw_stage_cache(_raw_cache_dir, _raw_cache_key)
+        if _raw_cached is not None:
+            _log(f"[data-node] gestation raw cache HIT ({_raw_cache_key[:8]}…) — skipping inference")
+            masks = _raw_cached["masks"]
+            mask_stacks = _raw_cached["mask_stacks"]
+            mask_indices = _raw_cached["mask_indices"]
+            terms_rows = _raw_cached["terms_rows"]
+        else:
+            _log(f"[data-node] gestation raw cache MISS ({_raw_cache_key[:8]}…) — running inference")
+
+            # --- Step 1: terms per image (sequential — lightweight string ops only) ---
+            _gest_image_size = int(self.gest_cfg.image_size)
+            _class_names_snap = list(ctx.class_names)
+            _all_terms = [
+                list(_semantic_terms_with_tonal_tags(
+                    terms=_positive_terms_from_target(np.asarray(targets[i], dtype=np.float32).reshape(-1), _class_names_snap),
+                    image=images[i],
+                    image_size=_gest_image_size,
+                ))
+                for i in tqdm(range(_n_gest), desc="[gestation] building terms", unit="img", leave=False, dynamic_ncols=True)
+            ]
+
+            # --- Step 2: infer support masks — one vectorised call for ALL images ---
+            _images_np = np.stack([np.asarray(images[i], dtype=np.float32) for i in range(_n_gest)], axis=0)
+            _targets_np = np.stack([np.asarray(targets[i], dtype=np.float32).reshape(-1) for i in range(_n_gest)], axis=0)
+            _base_masks = infer_semantic_support_masks(images=_images_np, terms_batch=_all_terms)  # [N, H, W]
+
+            # --- Step 3: heuristic term-mask stacks — one vectorised call for ALL images ---
+            _heuristic_stacks, _heuristic_indices = build_term_mask_stacks_from_images(
+                images=_images_np,
+                label_vecs=_targets_np,
+                idx_to_term=idx_to_term,
+            )
+
+            # --- Step 4: combine/fallback/composite per image ---
+            terms_rows: List[List[str]] = []
+            masks: List[np.ndarray] = []
+            mask_stacks: List[np.ndarray] = []
+            mask_indices: List[np.ndarray] = []
+            for i in tqdm(range(_n_gest), desc="[gestation] combining mask stacks", unit="img", leave=False, dynamic_ncols=True):
+                y = np.asarray(targets[int(i)], dtype=np.float32).reshape(-1)
+                base_mask = np.asarray(_base_masks[i], dtype=np.float32)
+                fallback_stack, fallback_idx = build_label_mask_stack(
+                    mixed_mask=base_mask,
+                    label_vec=y,
+                    treat_mixed_mask_as_creation=True,
+                )
+                merged_stack, merged_idx = combine_label_mask_stacks(
+                    y,
+                    (np.asarray(_heuristic_stacks[i], dtype=np.float32), np.asarray(_heuristic_indices[i], dtype=np.int64)),
+                    (fallback_stack, fallback_idx),
+                    height=int(base_mask.shape[0]),
+                    width=int(base_mask.shape[1]),
+                    fallback_creation_mask=base_mask,
+                )
+                mixed_mask = (
+                    _composite_mask_stack(merged_stack)
+                    if int(np.asarray(merged_stack).size) > 0
+                    else base_mask
+                )
+                terms_rows.append(_all_terms[i])
+                masks.append(np.asarray(mixed_mask, dtype=np.float32))
+                mask_stacks.append(np.asarray(merged_stack, dtype=np.float32))
+                mask_indices.append(np.asarray(merged_idx, dtype=np.int64))
+
+            # ---- Persist to disk cache ----
+            _log(f"[data-node] gestation saving raw cache ({_raw_cache_key[:8]}…)")
+            with tqdm(total=1, desc="[gestation] writing cache", unit="file", leave=False, dynamic_ncols=True) as _pbar:
+                _save_raw_stage_cache(_raw_cache_dir, _raw_cache_key, {
+                    "masks": list(masks),
+                    "mask_stacks": list(mask_stacks),
+                    "mask_indices": list(mask_indices),
+                    "terms_rows": list(terms_rows),
+                })
+                _pbar.update(1)
+
+        dataset, selected_indices, _cache_info = _build_semantic_stage_cache_dataset(
+            ctx=ctx,
+            stage_name="gestation",
+            images=images,
+            targets=targets,
+            masks=masks,
+            mask_stacks=mask_stacks,
+            mask_indices=mask_indices,
+            terms_rows=terms_rows,
+            source_tag="gestation",
+            image_size=int(self.gest_cfg.image_size),
+            batch_size=max(1, int(self.gest_cfg.batch_size)),
+            seed=int(getattr(ctx.args, "seed", 0) or 0),
+            target_dim=max(1, int(len(ctx.class_names))),
+            semantic_term_to_idx=ctx.semantic_term_to_idx,
+            stage_cache_mb=int(self.gest_cfg.cache_mb),
         )
+        selected_targets = [np.asarray(targets[int(i)], dtype=np.float32).reshape(-1) for i in selected_indices]
         train_idx, val_idx = _orphan_free_split(
-            targets=targets, seed=int(getattr(ctx.args, "seed", 0) or 0),
+            targets=selected_targets, seed=int(getattr(ctx.args, "seed", 0) or 0),
             val_fraction=0.15, min_val=1,
         )
-        train_manifest = StageDatasetManifest(
-            name="gestation", dataset=dataset,
+        loader, eval_loader = _build_stage_loader_pair(
+            dataset=dataset,
+            name="gestation",
             batch_size=max(1, int(self.gest_cfg.batch_size)),
-            seed=int(getattr(ctx.args, "seed", 0) or 0),
             num_workers=max(0, int(self.gest_cfg.num_workers)),
-            device_type=str(getattr(ctx.device, "type", "cpu")),
-            ordered_indices=train_idx,
-        )
-        loader, _count = build_loader_from_manifest(manifest=train_manifest)
-        eval_manifest = StageDatasetManifest(
-            name="gestation_eval", dataset=dataset,
-            batch_size=max(1, int(self.gest_cfg.batch_size)),
             seed=int(getattr(ctx.args, "seed", 0) or 0),
-            num_workers=max(0, int(self.gest_cfg.num_workers)),
             device_type=str(getattr(ctx.device, "type", "cpu")),
-            ordered_indices=val_idx,
+            train_indices=train_idx,
+            eval_indices=val_idx,
+            prefetch_factor=2,
+            shuffle_train=True,
         )
-        eval_loader, _eval_count = build_loader_from_manifest(manifest=eval_manifest)
         ctx.gestation_dataset = dataset
         ctx.gestation_loader = loader
         ctx.gestation_eval_dataset = dataset
         ctx.gestation_eval_loader = eval_loader
-        self._gest_vocab_hash = current_hash
+        self._gest_vocab_hash = hash(tuple(ctx.class_names))
+        self._gest_last_build_round = ctx.total_rounds_completed
 
         # N-pass tracking + orphan-free validation reserve
         poss = self.possessions["gestation"]
         poss.pass_ages.append(0)
-        poss.pass_row_counts.append(len(images))
+        poss.pass_row_counts.append(len(selected_indices))
         poss.train_indices = train_idx
         poss.val_indices = val_idx
         poss.mark_built()
-        _log(f"[data-node] gestation: {len(images)} images "
+        _log(f"[data-node] gestation: {len(selected_indices)} images "
              f"(train={len(train_idx)} val={len(val_idx)}) batch_size={self.gest_cfg.batch_size}")
 
     def provide_pregestation_eval(self, ctx: PipelineContext) -> None:
@@ -1349,11 +1585,13 @@ def _flatten_symbol_pool(
     images = []
     targets = []
     n_classes = len(class_names)
+    _skipped_terms: List[str] = []
 
     for term, term_images in symbol_pool.items():
         term_lc = str(term).strip().lower()
         idx = semantic_term_to_idx.get(term_lc, -1)
         if idx < 0:
+            _skipped_terms.append(term_lc)
             continue
         term_imgs = list(term_images)[:samples_per_term]
         for img in term_imgs:
@@ -1362,6 +1600,9 @@ def _flatten_symbol_pool(
             images.append(img)
             targets.append(target)
 
+    if _skipped_terms:
+        _log(f"[data-node] _flatten_symbol_pool: {len(_skipped_terms)} pool terms not in vocab: {sorted(set(_skipped_terms))}")
+    _log(f"[data-node] _flatten_symbol_pool: pool_terms={len(symbol_pool)} matched={len(images)} n_classes={n_classes}")
     return images, targets
 
 
@@ -1378,6 +1619,334 @@ def _mask_tensor_to_float01(mask: torch.Tensor) -> torch.Tensor:
         if bool(torch.isfinite(vmax)) and float(vmax.item()) > 1.0:
             out = out / 255.0
     return torch.clamp(out, 0.0, 1.0)
+
+
+def _stage_cache_component(name: str) -> str:
+    txt = re.sub(r"[^a-z0-9_-]+", "_", str(name).strip().lower())
+    txt = re.sub(r"_+", "_", txt).strip("_")
+    return txt or "stage"
+
+
+def _resolve_semantic_stage_cache_root(ctx: PipelineContext, stage_name: str) -> str:
+    base = str(getattr(ctx, "semantic_stage_cache_dir", "") or "").strip()
+    if not base:
+        out_dir = Path(getattr(ctx, "output_dir", Path(".")))
+        base = str(out_dir / "semantic_stage_cache")
+    return str(Path(base) / _stage_cache_component(stage_name))
+
+
+# ---------------------------------------------------------------------------
+# Raw-data stage cache  (disk persistence keyed by vocab+config hash)
+# Caches the expensive computed arrays (images, masks, label stacks, targets,
+# term rows) so that provide_pregestation / provide_gestation can skip
+# re-generating them when the same vocabulary is seen again in a later round.
+# Max-entry eviction (by oldest mtime) prevents unbounded accumulation.
+# ---------------------------------------------------------------------------
+
+def _raw_stage_cache_dir(ctx: PipelineContext, stage_name: str) -> Path:
+    base = str(getattr(ctx, "semantic_stage_cache_dir", "") or "").strip()
+    if not base:
+        out_dir = Path(getattr(ctx, "output_dir", Path(".")))
+        base = str(out_dir / "semantic_stage_cache")
+    return Path(base) / f"{_stage_cache_component(stage_name)}_raw"
+
+
+def _raw_stage_cache_key(params: Dict[str, Any]) -> str:
+    return hashlib.sha256(
+        json.dumps(params, sort_keys=True, default=str).encode()
+    ).hexdigest()[:32]
+
+
+def _load_raw_stage_cache(cache_dir: Path, key: str) -> Optional[Dict[str, Any]]:
+    path = cache_dir / f"{key}.pkl.gz"
+    if not path.exists():
+        return None
+    try:
+        with gzip.open(str(path), "rb") as fh:
+            data = pickle.load(fh)
+        path.touch()  # update mtime for LRU eviction
+        return data
+    except Exception:
+        try:
+            path.unlink()
+        except Exception:
+            pass
+        return None
+
+
+def _save_raw_stage_cache(
+    cache_dir: Path,
+    key: str,
+    data: Dict[str, Any],
+    max_entries: int = 30,
+) -> None:
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    path = cache_dir / f"{key}.pkl.gz"
+    with gzip.open(str(path), "wb", compresslevel=1) as fh:
+        pickle.dump(data, fh)
+    # Evict oldest entries when over the limit
+    entries = sorted(
+        [p for p in cache_dir.glob("*.pkl.gz") if p.is_file()],
+        key=lambda p: p.stat().st_mtime,
+    )
+    while len(entries) > int(max_entries):
+        try:
+            entries[0].unlink()
+        except Exception:
+            pass
+        entries = entries[1:]
+
+
+def _semantic_stage_cache_args(ctx: PipelineContext, stage_cache_mb: int) -> Dict[str, Any]:
+    args = getattr(ctx, "args", None)
+    return {
+        "enabled": bool(getattr(args, "semantic_stage_cache_enabled", True)),
+        "max_rows": max(0, int(getattr(args, "semantic_stage_cache_max_rows", 0) or 0)),
+        "rebuild": bool(getattr(args, "semantic_stage_cache_rebuild", False)),
+        "slot_lifespan": int(getattr(args, "semantic_stage_cache_slot_lifespan", 0) or 0),
+        "lookahead_batches": max(0, int(getattr(args, "semantic_stage_cache_lookahead_batches", 0) or 0)),
+        "sanity_cap_bytes": max(1, int(getattr(args, "semantic_stage_cache_sanity_cap_mb", 8192) or 8192)) * 1024 * 1024,
+        "allow_large_override": bool(getattr(args, "semantic_stage_cache_allow_large_override", False)),
+        "use_rare_term_deck": bool(getattr(args, "semantic_stage_cache_use_rare_term_deck", True)),
+        "explicit_max_bytes": max(0, int(stage_cache_mb)) * 1024 * 1024,
+    }
+
+
+def _positive_terms_from_target(target: Any, class_names: Sequence[str]) -> List[str]:
+    y = np.asarray(target, dtype=np.float32).reshape(-1)
+    out: List[str] = []
+    for idx in np.where(y >= 0.5)[0].astype(np.int64).tolist():
+        if 0 <= int(idx) < int(len(class_names)):
+            out.append(str(class_names[int(idx)]))
+    return list(_normalize_vocab_terms(out))
+
+
+def _semantic_stage_candidate_key(stage_name: str, image: Any, target: Any, terms: Sequence[str]) -> str:
+    hasher = hashlib.sha256()
+    arr = np.asarray(image, dtype=np.float32)
+    tgt = (np.asarray(target, dtype=np.float32).reshape(-1) >= 0.5).astype(np.uint8, copy=False)
+    hasher.update(str(stage_name).encode("utf-8"))
+    hasher.update(np.asarray(arr.shape, dtype=np.int64).tobytes())
+    if int(arr.ndim) == 3 and int(arr.shape[0]) in (1, 3, 4):
+        img_bytes = np.clip(np.rint(np.clip(np.asarray(arr[:3], dtype=np.float32), 0.0, 1.0) * 255.0), 0.0, 255.0).astype(np.uint8, copy=False)
+    else:
+        img_bytes = np.clip(np.rint(np.clip(np.asarray(arr, dtype=np.float32), 0.0, 1.0) * 255.0), 0.0, 255.0).astype(np.uint8, copy=False)
+    hasher.update(np.asarray(img_bytes.shape, dtype=np.int64).tobytes())
+    hasher.update(img_bytes.tobytes())
+    hasher.update(tgt.tobytes())
+    hasher.update(json.dumps(list(_normalize_vocab_terms(terms)), sort_keys=True, ensure_ascii=True).encode("utf-8"))
+    return str(hasher.hexdigest())
+
+
+def _build_inmemory_semantic_stage_dataset(
+    *,
+    images: Sequence[Any],
+    targets: Sequence[Any],
+    masks: Sequence[Any],
+    mask_stacks: Sequence[Any],
+    mask_indices: Sequence[Any],
+    seed: int,
+    target_dim: int,
+    semantic_term_to_idx: Dict[str, int],
+    dataset_name: str,
+) -> Dataset:
+    dataset = BootstrapDynamicDataset(
+        images=images,
+        targets=targets,
+        total_rows=int(len(images)),
+        seed=int(seed),
+        augment=False,
+        expected_target_dim=int(target_dim),
+        semantic_term_to_idx=semantic_term_to_idx,
+        augment_apply_terms=False,
+        return_masks=True,
+        return_mask_stack=True,
+        dataset_name=str(dataset_name),
+        base_masks=(list(masks) if int(len(masks)) == int(len(images)) else None),
+    )
+    for i in range(int(len(images))):
+        if int(i) < int(len(mask_stacks)) and mask_stacks[int(i)] is not None:
+            dataset.base_mask_stacks[int(i)] = np.asarray(mask_stacks[int(i)], dtype=np.float32)
+        if int(i) < int(len(mask_indices)) and mask_indices[int(i)] is not None:
+            dataset.base_mask_stack_indices[int(i)] = np.asarray(mask_indices[int(i)], dtype=np.int64)
+    return dataset
+
+
+def _build_stage_loader_pair(
+    *,
+    dataset: Dataset,
+    name: str,
+    batch_size: int,
+    num_workers: int,
+    seed: int,
+    device_type: str,
+    train_indices: Sequence[int],
+    eval_indices: Sequence[int],
+    prefetch_factor: int = 2,
+    shuffle_train: bool = True,
+    train_sampler: Optional[Any] = None,
+) -> Tuple[Optional[DataLoader], Optional[DataLoader]]:
+    train_manifest = StageDatasetManifest(
+        name=str(name),
+        dataset=dataset,
+        batch_size=max(1, int(batch_size)),
+        seed=int(seed),
+        num_workers=max(0, int(num_workers)),
+        device_type=str(device_type),
+        ordered_indices=list(train_indices),
+        prefetch_factor=int(prefetch_factor),
+        pin_memory=(str(device_type).strip().lower() == "cuda"),
+        shuffle=bool(shuffle_train),
+        sampler=train_sampler,
+    )
+    loader, _ = build_loader_from_manifest(manifest=train_manifest)
+    eval_manifest = StageDatasetManifest(
+        name=f"{str(name)}_eval",
+        dataset=dataset,
+        batch_size=max(1, int(batch_size)),
+        seed=int(seed),
+        num_workers=max(0, int(num_workers)),
+        device_type=str(device_type),
+        ordered_indices=list(eval_indices),
+        prefetch_factor=int(prefetch_factor),
+        pin_memory=(str(device_type).strip().lower() == "cuda"),
+        shuffle=False,
+    )
+    eval_loader, _ = build_loader_from_manifest(manifest=eval_manifest)
+    return loader, eval_loader
+
+
+def _build_semantic_stage_cache_dataset(
+    *,
+    ctx: PipelineContext,
+    stage_name: str,
+    images: Sequence[Any],
+    targets: Sequence[Any],
+    masks: Sequence[Any],
+    mask_stacks: Sequence[Any],
+    mask_indices: Sequence[Any],
+    terms_rows: Sequence[Sequence[str]],
+    source_tag: str,
+    image_size: int,
+    batch_size: int,
+    seed: int,
+    target_dim: int,
+    semantic_term_to_idx: Dict[str, int],
+    stage_cache_mb: int,
+    deformations_per_clean: int = 2,
+    include_clean: bool = True,
+) -> Tuple[Dataset, List[int], Dict[str, Any]]:
+    cache_args = _semantic_stage_cache_args(ctx=ctx, stage_cache_mb=int(stage_cache_mb))
+    total_rows = min(
+        int(len(images)),
+        int(len(targets)),
+        int(len(masks)),
+        int(len(mask_stacks)),
+        int(len(mask_indices)),
+        int(len(terms_rows)),
+    )
+    if int(total_rows) <= 0:
+        raise RuntimeError(f"{str(stage_name)} requires non-empty semantic stage rows")
+    if not bool(cache_args.get("enabled", True)):
+        ds = _build_inmemory_semantic_stage_dataset(
+            images=list(images)[: int(total_rows)],
+            targets=list(targets)[: int(total_rows)],
+            masks=list(masks)[: int(total_rows)],
+            mask_stacks=list(mask_stacks)[: int(total_rows)],
+            mask_indices=list(mask_indices)[: int(total_rows)],
+            seed=int(seed),
+            target_dim=int(target_dim),
+            semantic_term_to_idx=semantic_term_to_idx,
+            dataset_name=str(stage_name),
+        )
+        return ds, list(range(int(total_rows))), {"cache_enabled": False, "total_rows": int(total_rows)}
+
+    candidates: List[SemanticWheelCandidate] = []
+    for i in tqdm(range(int(total_rows)), desc=f"[{stage_name}] hashing candidates", unit="row", leave=False, dynamic_ncols=True):
+        term_row = list(_normalize_vocab_terms(terms_rows[int(i)]))
+        candidates.append(
+            SemanticWheelCandidate(
+                cache_key=_semantic_stage_candidate_key(
+                    stage_name=str(stage_name),
+                    image=images[int(i)],
+                    target=targets[int(i)],
+                    terms=term_row,
+                ),
+                terms=list(term_row),
+                source=str(source_tag),
+            )
+        )
+
+    def _entry_group(base_idx: int, _base_pos: int) -> List[Dict[str, Any]]:
+        clean = build_semantic_cache_entry(
+            image=images[int(base_idx)],
+            label_vec=targets[int(base_idx)],
+            image_size=int(image_size),
+            mixed_mask=masks[int(base_idx)],
+            mask_stack=mask_stacks[int(base_idx)],
+            mask_indices=mask_indices[int(base_idx)],
+        )
+        out: List[Dict[str, Any]] = []
+        if bool(include_clean):
+            out.append(dict(clean))
+        _term_to_idx = dict(semantic_term_to_idx)
+        for vi in range(max(0, int(deformations_per_clean))):
+            out.append(
+                _build_deformed_entry(
+                    clean_entry=clean,
+                    variant_idx=int(vi),
+                    base_row_position=int(_base_pos),
+                    seed=int(seed),
+                    term_to_idx=_term_to_idx,
+                )
+            )
+        return out
+
+    slot_lifespan = int(cache_args.get("slot_lifespan", 0))
+    explicit_max_bytes = int(cache_args.get("explicit_max_bytes", 0))
+    max_rows = int(cache_args.get("max_rows", 0))
+    if int(slot_lifespan) <= 0 and (
+        int(explicit_max_bytes) > 0
+        or (int(max_rows) > 0 and int(max_rows) < int(total_rows))
+    ):
+        # A bounded wheel must rotate through its deck instead of freezing on the
+        # first slice forever, even when no explicit slot lifespan was requested.
+        slot_lifespan = 1
+
+    wheel_result = ensure_semantic_candidate_cache(
+        candidates=candidates,
+        candidate_indices=list(range(int(total_rows))),
+        build_entry_group=_entry_group,
+        label_dim=int(target_dim),
+        config=SemanticWheelConfig(
+            purpose=str(stage_name),
+            cache_root=_resolve_semantic_stage_cache_root(ctx=ctx, stage_name=str(stage_name)),
+            image_size=int(image_size),
+            batch_size=max(1, int(batch_size)),
+            lookahead_batches=_resolve_semantic_wheel_lookahead_batches(
+                lookahead_batches=int(cache_args.get("lookahead_batches", 0)),
+                prefetch_factor=2,
+            ),
+            seed=int(seed),
+            deformations_per_clean=max(0, int(deformations_per_clean)),
+            include_clean=bool(include_clean),
+            explicit_max_bytes=int(explicit_max_bytes),
+            sanity_cap_bytes=int(cache_args.get("sanity_cap_bytes", 8 * 1024 * 1024 * 1024)),
+            allow_large_override=bool(cache_args.get("allow_large_override", False)),
+            expiry_uses=int(slot_lifespan),
+            max_base_rows=int(max_rows),
+            use_rare_term_deck=bool(cache_args.get("use_rare_term_deck", True)),
+            force_rebuild=bool(cache_args.get("rebuild", False)),
+        ),
+    )
+    wheel_info = dict(wheel_result.get("info") or {})
+    wheel_info["cache_dir"] = str(wheel_result.get("cache_dir", ""))
+    wheel_info["cache_manifest"] = str(wheel_result.get("manifest", ""))
+    wheel_info["cache_hit"] = bool(wheel_result.get("cache_hit", False))
+    _log_semantic_wheel_summary(str(stage_name), wheel_info)
+    ds = SemanticWheelDataset(cache_dir=str(wheel_result.get("cache_dir", "")), return_mask_stack=True)
+    selected_indices = [int(x) for x in list(wheel_result.get("base_candidate_indices") or wheel_result.get("base_row_indices") or [])]
+    return ds, selected_indices, wheel_info
 
 
 def _berkeley_wheel_cache_root(data_root: str) -> str:
@@ -1672,29 +2241,21 @@ def _build_berkeley_refresh_loader(
         cache_dir=str(wheel_result.get("cache_dir", "")),
         return_mask_stack=bool(return_mask_stack),
     )
-    loader_num_workers = _effective_dataloader_num_workers(num_workers=num_workers, device=device)
-    sampler = StatefulSequentialDeckSampler(len(ds))
-    loader = DataLoader(
-        ds,
-        batch_size=max(1, int(batch_size)),
-        shuffle=False,
-        sampler=sampler,
-        num_workers=int(loader_num_workers),
-        pin_memory=(device.type == "cuda"),
-        drop_last=False,
-        collate_fn=(semantic_mask_stack_collate if bool(getattr(ds, "use_semantic_mask_stack_collate", False)) else None),
-        **_dataloader_perf_kwargs(
-            num_workers=int(loader_num_workers),
+    loader, _ = build_loader_from_manifest(
+        manifest=StageDatasetManifest(
+            name="berkeley_refresh_train",
+            dataset=ds,
+            batch_size=max(1, int(batch_size)),
+            seed=int(seed),
+            num_workers=max(0, int(num_workers)),
+            device_type=str(device.type),
+            ordered_indices=list(range(int(len(ds)))),
             persistent_workers=bool(persistent_workers),
             prefetch_factor=int(prefetch_factor),
-        ),
-    )
-    loader = maybe_wrap_loader_with_threaded_prefetch(
-        loader=loader,
-        requested_workers=int(num_workers),
-        effective_workers=int(loader_num_workers),
-        device_type=str(device.type),
-        prefetch_factor=int(prefetch_factor),
+            pin_memory=(device.type == "cuda"),
+            shuffle=False,
+            sampler=StatefulSequentialDeckSampler(len(ds)),
+        )
     )
     setattr(loader, "_refresh_source_stats", source_stats)
     setattr(loader, "_refresh_rows_info", rows_info)
@@ -2514,7 +3075,7 @@ def _build_payload_validation_gate_dataset(
         if 0 <= int(idx) < int(len(rows))
     ]
     label_rows = []
-    for i in range(int(len(ds))):
+    for i in tqdm(range(int(len(ds))), desc="[payload val] reading labels", unit="row", leave=False, dynamic_ncols=True):
         item = ds.read_numpy_entry(int(i))
         label_rows.append(np.asarray(item["label_vec_u8"], dtype=np.float32).reshape(-1))
     label_dim = int(label_rows[0].size) if int(len(label_rows)) > 0 else 0
@@ -2605,46 +3166,26 @@ def _build_gate_loader_from_arrays(
         )
     y_np = np.stack(y_rows, axis=0).astype(np.float32, copy=False)
     y_np = np.clip(y_np[:, : int(y_dim)], 0.0, 1.0).astype(np.float32, copy=False)
-
-    if ordered_indices is None:
-        picks = np.arange(int(n), dtype=np.int64)
-        rng = np.random.default_rng(int(seed))
-        rng.shuffle(picks)
-        if int(max_samples) > 0:
-            picks = picks[: int(min(int(max_samples), int(picks.shape[0])))]
-    else:
-        picks = np.asarray([int(i) for i in ordered_indices if 0 <= int(i) < int(n)], dtype=np.int64)
-        if int(max_samples) > 0 and int(picks.size) > int(max_samples):
-            picks = picks[: int(max_samples)]
-    if int(picks.size) <= 0:
-        return None, 0
-
-    x_t = torch.from_numpy(x_np)
-    y_t = torch.from_numpy(y_np)
-    ds_full: Dataset = torch.utils.data.TensorDataset(x_t, y_t)
-    ds_use: Dataset = torch.utils.data.Subset(ds_full, picks.tolist())
-    loader_num_workers = _effective_dataloader_num_workers(num_workers=num_workers, device=device)
-    loader = DataLoader(
-        ds_use,
-        batch_size=max(1, int(batch_size)),
-        shuffle=False,
-        num_workers=int(loader_num_workers),
-        pin_memory=(device.type == "cuda"),
-        drop_last=False,
-        **_dataloader_perf_kwargs(
-            num_workers=int(loader_num_workers),
+    ds = torch.utils.data.TensorDataset(
+        torch.from_numpy(x_np),
+        torch.from_numpy(y_np),
+    )
+    return build_loader_from_manifest(
+        manifest=StageDatasetManifest(
+            name="gate_array_loader",
+            dataset=ds,
+            batch_size=max(1, int(batch_size)),
+            seed=int(seed),
+            num_workers=max(0, int(num_workers)),
+            device_type=str(device.type),
+            max_samples=max(0, int(max_samples)),
+            ordered_indices=ordered_indices,
             persistent_workers=bool(persistent_workers),
             prefetch_factor=int(prefetch_factor),
-        ),
+            pin_memory=(device.type == "cuda"),
+            shuffle=False,
+        )
     )
-    loader = maybe_wrap_loader_with_threaded_prefetch(
-        loader=loader,
-        requested_workers=int(num_workers),
-        effective_workers=int(loader_num_workers),
-        device_type=str(device.type),
-        prefetch_factor=int(prefetch_factor),
-    )
-    return loader, int(picks.size)
 
 
 def _build_gate_loader_from_dataset(
@@ -2658,48 +3199,22 @@ def _build_gate_loader_from_dataset(
     persistent_workers: bool = False,
     prefetch_factor: int = 2,
 ) -> Tuple[Optional[DataLoader], int]:
-    n = int(len(dataset))
-    if n <= 0:
-        return None, 0
-
-    if ordered_indices is None:
-        picks = np.arange(int(n), dtype=np.int64)
-        rng = np.random.default_rng(int(seed))
-        rng.shuffle(picks)
-        if int(max_samples) > 0:
-            picks = picks[: int(min(int(max_samples), int(picks.shape[0])))]
-    else:
-        picks = np.asarray([int(i) for i in ordered_indices if 0 <= int(i) < int(n)], dtype=np.int64)
-        if int(max_samples) > 0 and int(picks.size) > int(max_samples):
-            picks = picks[: int(max_samples)]
-    if int(picks.size) <= 0:
-        return None, 0
-
-    ds_use: Dataset = dataset if int(picks.size) == int(n) else torch.utils.data.Subset(dataset, picks.tolist())
-    collate_fn = semantic_mask_stack_collate if bool(getattr(dataset, "use_semantic_mask_stack_collate", False)) else None
-    loader_num_workers = _effective_dataloader_num_workers(num_workers=num_workers, device=device)
-    loader = DataLoader(
-        ds_use,
-        batch_size=max(1, int(batch_size)),
-        shuffle=False,
-        num_workers=int(loader_num_workers),
-        pin_memory=(device.type == "cuda"),
-        drop_last=False,
-        collate_fn=collate_fn,
-        **_dataloader_perf_kwargs(
-            num_workers=int(loader_num_workers),
+    return build_loader_from_manifest(
+        manifest=StageDatasetManifest(
+            name="gate_dataset_loader",
+            dataset=dataset,
+            batch_size=max(1, int(batch_size)),
+            seed=int(seed),
+            num_workers=max(0, int(num_workers)),
+            device_type=str(device.type),
+            max_samples=max(0, int(max_samples)),
+            ordered_indices=ordered_indices,
             persistent_workers=bool(persistent_workers),
             prefetch_factor=int(prefetch_factor),
-        ),
+            pin_memory=(device.type == "cuda"),
+            shuffle=False,
+        )
     )
-    loader = maybe_wrap_loader_with_threaded_prefetch(
-        loader=loader,
-        requested_workers=int(num_workers),
-        effective_workers=int(loader_num_workers),
-        device_type=str(device.type),
-        prefetch_factor=int(prefetch_factor),
-    )
-    return loader, int(picks.size)
 
 
 def _unpack_masked_semantic_batch(batch: Any, context: str) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, Any]]:
@@ -3016,7 +3531,7 @@ def _build_berkeley_payload_bank(
     ds = SemanticWheelDataset(cache_dir=str(wheel_result.get("cache_dir", "")), return_mask_stack=False)
     selected_base_rows = [int(x) for x in list(wheel_result.get("base_row_indices") or [])]
     out_targets: List[np.ndarray] = []
-    for i in range(int(len(ds))):
+    for i in tqdm(range(int(len(ds))), desc="[payload bank] reading targets", unit="row", leave=False, dynamic_ncols=True):
         item = ds.read_numpy_entry(int(i))
         out_targets.append(np.asarray(item["label_vec_u8"], dtype=np.float32).reshape(-1))
     out_terms = [

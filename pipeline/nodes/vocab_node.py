@@ -37,6 +37,7 @@ import hashlib
 import json
 import math
 import numpy as np
+from tqdm import tqdm
 import re
 import torch
 import torch.nn.functional as F
@@ -44,7 +45,7 @@ import torch.nn.functional as F
 from pipeline.context import PipelineContext
 from pipeline.graph import PipelineNode
 from pipeline.nodes.base import OneTimeNode
-from semantic_dataset_loaders import _semantic_color_score_maps
+from semantic_dataset_loaders import _semantic_color_score_maps, detect_semantic_color_terms
 
 
 # ---------------------------------------------------------------------------
@@ -184,10 +185,40 @@ class VocabChurnNode(PipelineNode):
     def execute(self, ctx: PipelineContext) -> None:
 
         old_terms = list(ctx.active_extra_terms)
+        pool_terms = _build_full_term_pool(ctx, self.cfg)
+        try:
+            from berkeley_sbd_pretrain import VOC20_CLASSES as _VOC20_CLASSES
+            pool_terms = _merge_vocab_terms(pool_terms, [str(x) for x in list(_VOC20_CLASSES)])
+        except Exception:
+            pool_terms = _merge_vocab_terms(
+                pool_terms,
+                [
+                    "aeroplane",
+                    "bicycle",
+                    "bird",
+                    "boat",
+                    "bottle",
+                    "bus",
+                    "car",
+                    "cat",
+                    "chair",
+                    "cow",
+                    "dining table",
+                    "dog",
+                    "horse",
+                    "motorbike",
+                    "person",
+                    "potted plant",
+                    "sheep",
+                    "sofa",
+                    "train",
+                    "tv monitor",
+                ],
+            )
 
         new_active, churn_info = _rotate_active_extra_terms(
             active_terms=ctx.active_extra_terms,
-            pool_terms=_build_full_term_pool(ctx, self.cfg),
+            pool_terms=pool_terms,
             replace_count=self.cfg.churn_n,
             seed=self.cfg.seed,
             locked_prefix_count=int(len(ctx.core_terms)),
@@ -203,8 +234,10 @@ class VocabChurnNode(PipelineNode):
         changed = [t for t in new_active if t not in old_terms]
         _log(
             f"[vocab-churn] cycle={ctx.vocab_rotation_cycle} "
+            f"{'bulk-fill' if churn_info.get('bulk_fill') else 'rotate'} "
             f"replaced={int(churn_info.get('replaced', len(changed)))} "
-            f"changed={changed[:4]}{'…' if len(changed) > 4 else ''}"
+            f"candidates={int(churn_info.get('candidate_terms', 0))} "
+            f"changed={changed[:8]}{'…' if len(changed) > 8 else ''}"
         )
 
 
@@ -440,7 +473,7 @@ def _build_reference_flashcard_payload_rows(
 
     object_seed_rows: List[Tuple[np.ndarray, np.ndarray]] = []
     n_obj = min(len(payload_images_base), len(payload_conditions_supervised_base))
-    for i in range(int(n_obj)):
+    for i in tqdm(range(int(n_obj)), desc="[flashcard] loading payload images", unit="img", leave=False, dynamic_ncols=True):
         object_seed_rows.append((
             _image_any_to_rgb_chw01(payload_images_base[int(i)], image_size=int(size)),
             np.asarray(payload_conditions_supervised_base[int(i)], dtype=np.float32).reshape(-1),
@@ -526,7 +559,7 @@ def _build_reference_flashcard_payload_rows(
         cards_cond.append(np.asarray(vec, dtype=np.float32).reshape(-1))
         term_counts[key] = int(term_counts.get(key, 0)) + 1
 
-    for term in target_terms:
+    for term in tqdm(target_terms, desc="[flashcard] building term rows", unit="term", leave=False, dynamic_ncols=True):
         term_key = re.sub(r"\s+", " ", str(term)).strip().lower()
         for _ in range(int(per)):
             if term_key == "none":
@@ -713,7 +746,7 @@ _DEFAULT_SEMANTIC_CORE_TERMS: List[str] = [
     "red noise",
     "blue noise",
     "violet noise",
-    "gray noise",
+    "grey noise",
     "gaussian white noise",
     "uniform white noise",
 ]
@@ -840,7 +873,7 @@ def _default_bootstrap_primitive_terms() -> List[str]:
     # no dataset marker terms.
     core_terms = _normalize_vocab_terms(_default_semantic_core_terms())
     color_terms = _normalize_vocab_terms(
-        ["red", "green", "blue", "yellow", "cyan", "magenta", "brown", "gray", "grey"]
+        ["red", "green", "blue", "yellow", "cyan", "magenta", "brown", "gray", "edge"]
     )
     direction_terms = _normalize_vocab_terms(
         ["front", "back", "left", "right", "top", "bottom"]
@@ -883,7 +916,7 @@ def _semantic_kind_keys_for_class_names(class_names: Sequence[str]) -> List[str]
         "red noise": ["red noise"],
         "blue noise": ["blue noise"],
         "violet noise": ["violet noise"],
-        "gray noise": ["gray noise", "grey noise"],
+        "grey noise": ["grey noise", "gray noise"],
         "gaussian white noise": ["gaussian white noise", "white noise"],
         "uniform white noise": ["uniform white noise", "white noise"],
         "signal": ["signal"],
@@ -991,7 +1024,7 @@ def _semantic_noise_family_terms() -> List[str]:
         "red noise",
         "blue noise",
         "violet noise",
-        "gray noise",
+        "grey noise",
         "gaussian white noise",
         "uniform white noise",
     ]
@@ -1009,8 +1042,8 @@ def _semantic_noise_profile_key_from_term(term: str) -> str:
         "red noise": "red_noise",
         "blue noise": "blue_noise",
         "violet noise": "violet_noise",
-        "gray noise": "gray_noise",
-        "grey noise": "gray_noise",
+        "grey noise": "grey_noise",
+        "gray noise": "grey_noise",
     }
     return str(lut.get(key, "")).strip().lower()
 
@@ -1025,7 +1058,7 @@ def _semantic_noise_profile_terms(profile_key: str) -> List[str]:
         "red_noise": ["noise", "red noise"],
         "blue_noise": ["noise", "blue noise"],
         "violet_noise": ["noise", "violet noise"],
-        "gray_noise": ["noise", "gray noise"],
+        "grey_noise": ["noise", "grey noise"],
     }
     if key not in lut:
         return ["noise"]
@@ -1144,7 +1177,7 @@ def _semantic_noise_terms_from_spectrum_sample(sample: Any) -> List[str]:
         "violet noise": -2.0,
         "blue noise": -1.0,
         "white noise": 0.0,
-        "gray noise": 0.5,
+        "grey noise": 0.5,
         "pink noise": 1.0,
         "red noise": 1.8,
         "brown noise": 2.0,
@@ -1203,7 +1236,7 @@ def _semantic_tags_for_symbol_term(term: str) -> List[str]:
         out.extend(["emnist dataset", "signal"])
     elif key.startswith("pictogram "):
         out.extend(["kmnist dataset", "signal"])
-    elif key in ("red", "green", "blue", "yellow", "cyan", "magenta", "brown", "gray", "grey"):
+    elif key in ("red", "green", "blue", "yellow", "cyan", "magenta", "brown", "gray", "edge"):
         out.extend([key, "signal"])
     elif key in ("front", "back", "left", "right", "top", "bottom"):
         out.extend([key, "object", "signal"])
@@ -1425,7 +1458,17 @@ def _semantic_tonal_tags_from_image(
     if high_frac >= cov_t:
         tags.extend(["white", "bright"])
     if (abs(mean_v - 0.5) <= float(gray_mean_tolerance)) and (std_v <= float(gray_std_threshold)):
-        tags.extend(["gray", "grey"])
+        tags.append("gray")
+    # fast edge detection: Sobel gradient magnitude
+    if int(arr.shape[0]) >= 1:
+        _eg = np.clip(np.mean(arr[:3, :, :], axis=0), 0.0, 1.0).astype(np.float32, copy=False)
+        _gx = np.zeros_like(_eg)
+        _gy = np.zeros_like(_eg)
+        _gx[:, 1:-1] = _eg[:, 2:] - _eg[:, :-2]
+        _gy[1:-1, :] = _eg[2:, :] - _eg[:-2, :]
+        _emag = np.sqrt(_gx * _gx + _gy * _gy)
+        if float(np.mean(_emag)) >= 0.06:
+            tags.append("edge")
     # warm/cool color temperature: compare mean R vs mean B channel balance
     if int(arr.shape[0]) >= 3:
         _r_mean = float(np.mean(arr[0]))
@@ -1893,7 +1936,7 @@ def _build_synthetic_semantic_symbol_pool(
             g = _spectral_noise(beta=-1.0, distribution="gaussian")
         elif key == "violet noise":
             g = _spectral_noise(beta=-2.0, distribution="gaussian")
-        elif key in ("gray noise", "grey noise"):
+        elif key in ("grey noise", "gray noise"):
             g = _spectral_noise(beta=0.5, distribution="gaussian")
         elif key == "red":
             return _colored_dot_scene(key, sample_idx=int(sample_idx), target_rgb=(1.0, 0.18, 0.18))
@@ -1909,7 +1952,7 @@ def _build_synthetic_semantic_symbol_pool(
             return _colored_dot_scene(key, sample_idx=int(sample_idx), target_rgb=(1.0, 0.24, 0.92))
         elif key == "brown":
             return _colored_dot_scene(key, sample_idx=int(sample_idx), target_rgb=(0.62, 0.42, 0.20))
-        elif key in ("gray", "grey"):
+        elif key == "gray":
             g = np.full((size, size), 0.50, dtype=np.float32)
         elif key == "pattern":
             g = np.clip(
@@ -2268,7 +2311,7 @@ def _build_internal_bootstrap_symbol_pool(
             "magenta": ((np.floor(xx / 12.0) + np.floor(yy / 12.0)) % 2.0).astype(np.float32, copy=False),
             "brown": np.clip((0.55 * _signal_pattern(phase=phase)) + (0.45 * _box_blur(_signal_pattern(phase=phase + 0.8), k=9)), 0.0, 1.0).astype(np.float32, copy=False),
             "gray": np.full((size, size), 0.5, dtype=np.float32),
-            "grey": np.full((size, size), 0.5, dtype=np.float32),
+            "edge": np.clip(np.abs(np.sin(2.0 * math.pi * 8.0 * x01) * np.cos(2.0 * math.pi * 8.0 * y01)), 0.0, 1.0).astype(np.float32, copy=False),
             "front": np.clip(1.0 - (np.sqrt(((x01 - 0.5) ** 2) + ((y01 - 0.5) ** 2)) * 1.8), 0.0, 1.0).astype(np.float32, copy=False),
             "back": np.clip(np.sqrt(((x01 - 0.5) ** 2) + ((y01 - 0.5) ** 2)) * 1.8, 0.0, 1.0).astype(np.float32, copy=False),
             "left": np.clip(1.0 - x01, 0.0, 1.0).astype(np.float32, copy=False),
@@ -2308,7 +2351,7 @@ def _build_internal_bootstrap_symbol_pool(
             return _spectral_noise_image(sample_idx=int(sample_idx), beta=-1.0, distribution="gaussian")
         if key == "violet noise":
             return _spectral_noise_image(sample_idx=int(sample_idx), beta=-2.0, distribution="gaussian")
-        if key == "gray noise":
+        if key in ("grey noise", "gray noise"):
             return _spectral_noise_image(sample_idx=int(sample_idx), beta=0.5, distribution="gaussian")
         if key == "signal":
             return _signal_pattern(phase=phase)
@@ -2681,11 +2724,11 @@ def _build_pregestation_logic_rows(
 
 
 # Recognized color term names whose score maps can be extracted by
-# _semantic_color_score_maps.  "grey" is an alias for "gray" and both are
-# included so either spelling in the term list triggers mask extraction.
+# _semantic_color_score_maps.  "edge" replaces "grey" (british spelling
+# removed); edge masks are produced by a fast Sobel detector.
 _PREGESTATION_OBSERVED_COLOR_TERMS: Tuple[str, ...] = (
     "red", "orange", "green", "blue", "yellow", "cyan",
-    "magenta", "brown", "black", "white", "gray", "grey",
+    "magenta", "brown", "black", "white", "gray", "edge",
 )
 
 
@@ -2806,7 +2849,7 @@ def _rotate_active_extra_terms(
         "cursor_out": int(cursor_in),
     }
     unlocked = int(len(active) - int(locked))
-    if len(active) <= 0 or len(pool) <= len(active) or k_replace <= 0 or int(unlocked) <= 0:
+    if len(active) <= 0 or k_replace <= 0 or int(unlocked) <= 0:
         return active, info
     _ = int(seed)  # Kept for API compatibility; churn rotation is deterministic.
     active_lc = {str(x).strip().lower() for x in active}
@@ -2814,6 +2857,47 @@ def _rotate_active_extra_terms(
     info["candidate_terms"] = int(len(candidates))
     if len(candidates) <= 0:
         return active, info
+
+    # Count placeholder slots ("semantic slot N") in the unlocked region —
+    # these are empty capacity that real terms should fill.
+    _placeholder_re = re.compile(r"^semantic\s+slot\s+\d+$", re.IGNORECASE)
+    placeholder_indices = [
+        int(i) for i in range(int(locked), int(len(active)))
+        if _placeholder_re.match(str(active[int(i)]).strip())
+    ]
+
+    # ---- bulk-fill path ------------------------------------------------
+    # When every candidate fits in available unlocked slots, activate ALL of
+    # them at once.  Incremental rotation / LoRA grouping is only needed when
+    # candidates outnumber available slots.
+    if int(len(candidates)) <= int(unlocked):
+        ordered = sorted([str(t) for t in candidates], key=lambda s: s.lower())
+        # Prefer filling placeholder slots first, then overwrite real terms
+        # from the tail of the unlocked range only if needed.
+        fill_targets: List[int] = list(placeholder_indices)
+        non_placeholder = [
+            int(i) for i in range(int(locked), int(len(active)))
+            if int(i) not in set(placeholder_indices)
+        ]
+        fill_targets.extend(non_placeholder)
+        changed = 0
+        for pick_i, term in enumerate(ordered):
+            if pick_i >= len(fill_targets):
+                break
+            idx = int(fill_targets[pick_i])
+            if str(active[idx]).strip().lower() == str(term).strip().lower():
+                continue
+            active[idx] = str(term)
+            changed += 1
+        info["changed"] = bool(changed > 0)
+        info["replaced"] = int(changed)
+        info["bulk_fill"] = True
+        info["cursor_out"] = 0
+        return active, info
+
+    # ---- incremental rotation path -------------------------------------
+    # More candidates than slots → rotate a window through the candidate
+    # pool, swapping churn_n (or sweep-derived count) terms per cycle.
     replace_n = min(int(k_replace), int(unlocked))
     if int(sweep_n) > 0:
         auto_n = int(math.ceil(float(len(candidates)) / float(max(1, int(sweep_n)))))

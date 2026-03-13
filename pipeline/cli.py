@@ -558,6 +558,40 @@ def parse_args():
         ),
     )
     p.add_argument(
+        "--semantic-stage-cache-lookahead-batches",
+        type=int,
+        default=0,
+        help="How many compressed semantic stage cache chunks to keep decompressed ahead in memory; 0 derives from loader prefetch.",
+    )
+    p.add_argument(
+        "--semantic-stage-cache-sanity-cap-mb",
+        type=int,
+        default=8192,
+        help="Hard sanity guard for projected semantic stage cache size in MB when no explicit override is enabled.",
+    )
+    p.add_argument(
+        "--semantic-stage-cache-allow-large-override",
+        dest="semantic_stage_cache_allow_large_override",
+        action="store_true",
+        help="Allow semantic stage caches to exceed the sanity cap.",
+    )
+    p.add_argument(
+        "--no-semantic-stage-cache-allow-large-override",
+        dest="semantic_stage_cache_allow_large_override",
+        action="store_false",
+    )
+    p.add_argument(
+        "--semantic-stage-cache-use-rare-term-deck",
+        dest="semantic_stage_cache_use_rare_term_deck",
+        action="store_true",
+        help="Use rare-term-weighted deck sampling when selecting bounded semantic stage cache rows.",
+    )
+    p.add_argument(
+        "--no-semantic-stage-cache-use-rare-term-deck",
+        dest="semantic_stage_cache_use_rare_term_deck",
+        action="store_false",
+    )
+    p.add_argument(
         "--semantic-stage-cache-rebuild",
         dest="semantic_stage_cache_rebuild",
         action="store_true",
@@ -1565,6 +1599,8 @@ def parse_args():
         semantic_vocab_reference_flashcards=False,
         semantic_stage_cache_enabled=True,
         semantic_stage_cache_rebuild=False,
+        semantic_stage_cache_allow_large_override=False,
+        semantic_stage_cache_use_rare_term_deck=True,
         gd_vocab_library_enabled=True,
         gd_vocab_library_autoload=True,
         training_preview_enabled=True,

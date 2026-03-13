@@ -3,10 +3,14 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
 import shutil
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+
+from tqdm import tqdm
 
 import numpy as np
 import torch
@@ -24,8 +28,10 @@ from semantic_dataset_loaders import (
     build_label_mask_stack,
     build_layout_mask,
     build_term_mask_stack_from_image,
+    build_term_mask_stacks_from_images,
     combine_label_mask_stacks,
     infer_semantic_support_mask,
+    infer_semantic_support_masks,
     normalize_vocab_terms,
     term_mask_map_to_label_stack,
 )
@@ -89,6 +95,96 @@ def _positive_label_bits(label_vec: np.ndarray) -> np.ndarray:
     return (np.asarray(label_vec, dtype=np.float32).reshape(-1) >= 0.5).astype(np.uint8, copy=False)
 
 
+def _resolve_candidate_build_workers(work_items: int, max_cap: int = 8) -> int:
+    if int(work_items) <= 1:
+        return 1
+    cpu_count = max(1, int(os.cpu_count() or 1))
+    return max(1, min(int(max_cap), int(cpu_count), int(work_items)))
+
+
+def _fit_image_array_u8(image: Any, image_size: int) -> np.ndarray:
+    arr = np.asarray(image)
+    if int(arr.ndim) == 3 and int(arr.shape[0]) in (1, 3, 4):
+        chw = np.asarray(arr[:3], dtype=np.float32)
+        if int(chw.shape[0]) == 1:
+            chw = np.repeat(chw, 3, axis=0)
+        hwc = np.transpose(chw, (1, 2, 0))
+    elif int(arr.ndim) == 3 and int(arr.shape[2]) in (1, 3, 4):
+        hwc = np.asarray(arr[..., :3], dtype=np.float32)
+        if int(hwc.shape[2]) == 1:
+            hwc = np.repeat(hwc, 3, axis=2)
+    elif int(arr.ndim) == 2:
+        gray = np.asarray(arr, dtype=np.float32)
+        hwc = np.repeat(gray[:, :, None], 3, axis=2)
+    else:
+        raise RuntimeError(f"semantic wheel image row must be CHW/HWC/gray, got {tuple(arr.shape)}")
+    if not np.issubdtype(np.asarray(arr).dtype, np.integer):
+        hwc = np.clip(np.rint(np.clip(hwc, 0.0, 1.0) * 255.0), 0.0, 255.0).astype(np.uint8, copy=False)
+    else:
+        hwc = np.clip(hwc, 0.0, 255.0).astype(np.uint8, copy=False)
+    fitted = _fit_pil_to_square(Image.fromarray(hwc, mode="RGB"), image_size=int(image_size), fill=0)
+    out = np.asarray(fitted, dtype=np.uint8)
+    return np.transpose(out, (2, 0, 1)).astype(np.uint8, copy=False)
+
+
+def build_semantic_cache_entry(
+    *,
+    image: Any,
+    label_vec: Any,
+    image_size: int,
+    mixed_mask: Optional[Any] = None,
+    mask_stack: Optional[Any] = None,
+    mask_indices: Optional[Any] = None,
+) -> Dict[str, Any]:
+    size = max(8, int(image_size))
+    image_u8 = _fit_image_array_u8(image=image, image_size=size)
+    image_f32 = np.clip(np.asarray(image_u8, dtype=np.float32) / 255.0, 0.0, 1.0).astype(np.float32, copy=False)
+    label_arr = np.asarray(label_vec, dtype=np.float32).reshape(-1)
+    if mixed_mask is None:
+        mixed_mask_arr = infer_semantic_support_mask(image=image_f32, terms=[])
+    else:
+        mixed_mask_arr = _fit_mask_array_u8(np.asarray(mixed_mask, dtype=np.float32), image_size=size)
+        mixed_mask_arr = _decode_mask_u8(np.asarray(mixed_mask_arr, dtype=np.uint8))
+    stack_arr = np.asarray(mask_stack) if mask_stack is not None else np.zeros((0, size, size), dtype=np.float32)
+    idx_arr = np.asarray(mask_indices, dtype=np.int64).reshape(-1) if mask_indices is not None else np.zeros((0,), dtype=np.int64)
+    if int(stack_arr.ndim) == 2:
+        stack_arr = stack_arr[None, ...]
+    if int(stack_arr.ndim) == 3 and int(stack_arr.shape[0]) > 0:
+        fitted_parts = [
+            _decode_mask_u8(_fit_mask_array_u8(np.asarray(stack_arr[int(i)], dtype=np.float32), image_size=size))
+            for i in range(int(stack_arr.shape[0]))
+        ]
+        stack_arr = np.stack(fitted_parts, axis=0).astype(np.float32, copy=False)
+    else:
+        stack_arr = np.zeros((0, size, size), dtype=np.float32)
+    pair_count = min(int(stack_arr.shape[0]), int(idx_arr.size))
+    stack_arr = np.asarray(stack_arr[: int(pair_count)], dtype=np.float32)
+    idx_arr = np.asarray(idx_arr[: int(pair_count)], dtype=np.int64)
+    if int(pair_count) <= 0 and int(label_arr.size) > 0:
+        stack_arr, idx_arr = build_label_mask_stack(
+            mixed_mask=np.asarray(mixed_mask_arr, dtype=np.float32),
+            label_vec=label_arr,
+            treat_mixed_mask_as_creation=True,
+        )
+    if int(stack_arr.shape[0]) > 0:
+        mixed_mask_arr = _composite_mask_stack(stack_arr)
+    mixed_mask_arr = _normalize_attention_map(np.asarray(mixed_mask_arr, dtype=np.float32), gamma=0.92, blur_kernel=1)
+    return {
+        "image_u8": np.asarray(image_u8, dtype=np.uint8),
+        "label_vec_u8": _positive_label_bits(label_arr),
+        "mixed_mask_u8": _encode_mask_u8(mixed_mask_arr),
+        "mask_stack_u8": _encode_mask_u8(stack_arr) if int(np.asarray(stack_arr).size) > 0 else np.zeros((0, size, size), dtype=np.uint8),
+        "mask_indices": np.asarray(idx_arr, dtype=np.int32).reshape(-1),
+    }
+
+
+@dataclass
+class SemanticWheelCandidate:
+    cache_key: str
+    terms: List[str]
+    source: str = ""
+
+
 def _row_creation_mask_u8(row: SemanticDiskRow, image_size: int) -> Optional[np.ndarray]:
     size = max(8, int(image_size))
     if row.mask_array is not None:
@@ -138,6 +234,91 @@ def _row_creation_mask_u8(row: SemanticDiskRow, image_size: int) -> Optional[np.
     return None
 
 
+def _sobel_edge_map(gray: np.ndarray) -> np.ndarray:
+    """Fast Sobel gradient magnitude edge map, normalised to [0, 1]."""
+    g = np.asarray(gray, dtype=np.float32)
+    if int(g.ndim) != 2 or int(g.shape[0]) < 3 or int(g.shape[1]) < 3:
+        return np.zeros_like(g)
+    t = torch.from_numpy(g[None, None, ...])
+    kx = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=torch.float32).reshape(1, 1, 3, 3)
+    ky = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], dtype=torch.float32).reshape(1, 1, 3, 3)
+    gx = F.conv2d(t, kx, padding=1)
+    gy = F.conv2d(t, ky, padding=1)
+    mag = torch.sqrt(gx * gx + gy * gy + 1e-12)[0, 0].numpy()
+    vmax = float(np.max(mag))
+    if vmax > 1e-8:
+        mag = mag / vmax
+    return np.clip(mag, 0.0, 1.0).astype(np.float32, copy=False)
+
+
+def _canny_edge_map(
+    gray: np.ndarray,
+    sigma: float = 1.4,
+    low_ratio: float = 0.05,
+    high_ratio: float = 0.15,
+) -> np.ndarray:
+    """Ultra-quality Canny-like edge detection with Gaussian smoothing,
+    non-maximum suppression, and dual-threshold hysteresis.  Pure numpy+torch,
+    no OpenCV dependency."""
+    g = np.asarray(gray, dtype=np.float32)
+    if int(g.ndim) != 2 or int(g.shape[0]) < 5 or int(g.shape[1]) < 5:
+        return np.zeros_like(g)
+    # Step 1: Gaussian blur
+    ks = max(3, int(2 * int(round(3.0 * float(sigma))) + 1))
+    ax = np.arange(-ks // 2 + 1, ks // 2 + 1, dtype=np.float32)
+    xx, yy = np.meshgrid(ax, ax)
+    kernel = np.exp(-(xx ** 2 + yy ** 2) / (2.0 * float(sigma) ** 2)).astype(np.float32)
+    kernel = kernel / float(np.sum(kernel))
+    kt = torch.from_numpy(kernel[None, None, ...])
+    t = torch.from_numpy(g[None, None, ...])
+    smoothed = F.conv2d(t, kt, padding=ks // 2)[0, 0].numpy()
+    # Step 2: Sobel gradients
+    kx = np.array([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=np.float32)
+    ky = np.array([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], dtype=np.float32)
+    st = torch.from_numpy(smoothed[None, None, ...])
+    gx = F.conv2d(st, torch.from_numpy(kx[None, None, ...]), padding=1)[0, 0].numpy()
+    gy = F.conv2d(st, torch.from_numpy(ky[None, None, ...]), padding=1)[0, 0].numpy()
+    mag = np.sqrt(gx ** 2 + gy ** 2 + 1e-12).astype(np.float32)
+    angle = np.arctan2(gy, gx)
+    # Step 3: Non-maximum suppression
+    h, w = mag.shape
+    nms = np.zeros_like(mag)
+    angle_deg = (np.degrees(angle) % 180.0).astype(np.float32)
+    for y in range(1, h - 1):
+        for x in range(1, w - 1):
+            a = float(angle_deg[y, x])
+            if (0.0 <= a < 22.5) or (157.5 <= a <= 180.0):
+                n1, n2 = float(mag[y, x + 1]), float(mag[y, x - 1])
+            elif 22.5 <= a < 67.5:
+                n1, n2 = float(mag[y + 1, x + 1]), float(mag[y - 1, x - 1])
+            elif 67.5 <= a < 112.5:
+                n1, n2 = float(mag[y + 1, x]), float(mag[y - 1, x])
+            else:
+                n1, n2 = float(mag[y + 1, x - 1]), float(mag[y - 1, x + 1])
+            if float(mag[y, x]) >= n1 and float(mag[y, x]) >= n2:
+                nms[y, x] = float(mag[y, x])
+    # Step 4: Dual-threshold hysteresis
+    vmax = float(np.max(nms))
+    if vmax < 1e-8:
+        return np.zeros_like(g)
+    high_thresh = float(high_ratio) * vmax
+    low_thresh = float(low_ratio) * vmax
+    strong = (nms >= high_thresh).astype(np.uint8)
+    weak = ((nms >= low_thresh) & (nms < high_thresh)).astype(np.uint8)
+    # Connect weak edges adjacent to strong edges
+    out = np.asarray(strong, dtype=np.uint8).copy()
+    changed = True
+    while changed:
+        changed = False
+        for y in range(1, h - 1):
+            for x in range(1, w - 1):
+                if int(weak[y, x]) > 0 and int(out[y, x]) == 0:
+                    if int(np.max(out[y - 1:y + 2, x - 1:x + 2])) > 0:
+                        out[y, x] = 1
+                        changed = True
+    return np.clip(out.astype(np.float32), 0.0, 1.0).astype(np.float32, copy=False)
+
+
 def _apply_degrade(
     x: np.ndarray,
     mask: Optional[np.ndarray],
@@ -154,6 +335,10 @@ def _apply_degrade(
         "noise_prob": float(cfg.get("noise_prob", 0.55)),
         "noise_std_min": float(cfg.get("noise_std_min", 0.01)),
         "noise_std_max": float(cfg.get("noise_std_max", 0.08)),
+        "edge_highlight_prob": float(cfg.get("edge_highlight_prob", 0.35)),
+        "edge_highlight_blend_min": float(cfg.get("edge_highlight_blend_min", 0.05)),
+        "edge_highlight_blend_max": float(cfg.get("edge_highlight_blend_max", 0.25)),
+        "edge_highlight_ultra": bool(cfg.get("edge_highlight_ultra", str(os.environ.get("EDGE_HIGHLIGHT_ULTRA", "0")).strip() == "1")),
     }
     rng = np.random.default_rng(int(seed) + (int(idx) * 104729))
     out = np.asarray(x, dtype=np.float32).copy()
@@ -177,7 +362,7 @@ def _apply_degrade(
         for term in normalize_vocab_terms([str(t) for t in list(terms)]):
             tk = _norm_txt(term)
             prev = np.asarray(term_masks.get(tk, np.zeros((int(h), int(w)), dtype=np.float32)), dtype=np.float32)
-            term_masks[tk] = np.maximum(prev, np.asarray(norm, dtype=np.float32)).astype(np.float32, copy=False)
+            term_masks[tk] = _blend_attention_maps([prev, norm], weights=[1.0, 1.0], gamma=0.90)
 
     def _mark_diff(prev_x: np.ndarray, next_x: np.ndarray, scale: float = 1.0) -> None:
         prev_g = np.mean(np.asarray(prev_x, dtype=np.float32), axis=0)
@@ -231,6 +416,24 @@ def _apply_degrade(
             scale=0.90,
             gamma=0.90,
         )
+    if float(rng.random()) < float(cfg_use["edge_highlight_prob"]):
+        prev = np.asarray(out, dtype=np.float32).copy()
+        gray = np.mean(out[:3], axis=0).astype(np.float32, copy=False)
+        if bool(cfg_use["edge_highlight_ultra"]):
+            edge_map = _canny_edge_map(gray)
+        else:
+            edge_map = _sobel_edge_map(gray)
+        blend = float(rng.uniform(
+            float(cfg_use["edge_highlight_blend_min"]),
+            float(cfg_use["edge_highlight_blend_max"]),
+        ))
+        out = out + (float(blend) * edge_map[None, :, :]).astype(np.float32, copy=False)
+        _accumulate_term_mask(
+            ["edge", "signal"],
+            edge_map,
+            scale=0.85,
+            gamma=0.95,
+        )
     out = np.clip(out, 0.0, 1.0).astype(np.float32, copy=False)
     if mask_out is not None:
         touch = _normalize_attention_map(touch, gamma=1.05, blur_kernel=5)
@@ -255,50 +458,93 @@ def _build_clean_entry(
     image_size: int,
     idx_to_term: Dict[int, str],
 ) -> Dict[str, Any]:
+    return _build_clean_entries_batch(
+        rows=[row],
+        image_size=int(image_size),
+        idx_to_term=idx_to_term,
+    )[0]
+
+
+def _build_clean_entries_batch(
+    rows: Sequence[SemanticDiskRow],
+    image_size: int,
+    idx_to_term: Dict[int, str],
+) -> List[Dict[str, Any]]:
+    if len(rows) <= 0:
+        return []
     size = max(8, int(image_size))
-    image_u8 = _load_fit_rgb_u8(row.image_path, image_size=size)
-    image = np.clip(np.asarray(image_u8, dtype=np.float32) / 255.0, 0.0, 1.0).astype(np.float32, copy=False)
-    label_vec = np.asarray(row.label_vec, dtype=np.float32).reshape(-1)
-    creation_mask_u8 = _row_creation_mask_u8(row, image_size=size)
-    creation_mask = _decode_mask_u8(creation_mask_u8) if creation_mask_u8 is not None else None
-    creation_stack = np.zeros((0, size, size), dtype=np.float32)
-    creation_idx = np.zeros((0,), dtype=np.int64)
-    if creation_mask is not None:
-        creation_stack, creation_idx = build_creation_label_mask_stack(
-            label_vec=label_vec,
-            height=size,
-            width=size,
-            creation_mask=np.asarray(creation_mask, dtype=np.float32),
-        )
-    heuristic_stack, heuristic_idx = build_term_mask_stack_from_image(
-        image=image,
-        label_vec=label_vec,
+    image_u8_batch = np.stack(
+        [_load_fit_rgb_u8(row.image_path, image_size=size) for row in rows],
+        axis=0,
+    ).astype(np.uint8, copy=False)
+    image_batch = np.clip(np.asarray(image_u8_batch, dtype=np.float32) / 255.0, 0.0, 1.0).astype(np.float32, copy=False)
+    label_batch = np.stack(
+        [np.asarray(row.label_vec, dtype=np.float32).reshape(-1) for row in rows],
+        axis=0,
+    ).astype(np.float32, copy=False)
+    fallback_masks = infer_semantic_support_masks(
+        images=image_batch,
+        terms_batch=[list(row.terms) for row in rows],
+    )
+    heuristic_stacks, heuristic_indices = build_term_mask_stacks_from_images(
+        images=image_batch,
+        label_vecs=label_batch,
         idx_to_term=idx_to_term,
     )
-    mask_stack, mask_indices = combine_label_mask_stacks(
-        label_vec,
-        (creation_stack, creation_idx),
-        (heuristic_stack, heuristic_idx),
-        height=size,
-        width=size,
-        fallback_creation_mask=creation_mask,
-    )
-    if int(mask_stack.shape[0]) <= 0 or int(mask_indices.size) <= 0:
-        mask_stack, mask_indices = build_creation_label_mask_stack(
-            label_vec=label_vec,
+
+    # Load all creation masks in parallel — each may do disk I/O (.npz/.mat/image)
+    with ThreadPoolExecutor(max_workers=min(8, len(rows))) as _pool:
+        creation_masks_u8: List[Optional[np.ndarray]] = list(
+            _pool.map(lambda r: _row_creation_mask_u8(r, image_size=size), rows)
+        )
+
+    out: List[Dict[str, Any]] = []
+    for row_idx, row in tqdm(enumerate(rows), total=len(rows), desc="[wheel cache] building entries", unit="row", leave=False, dynamic_ncols=True):
+        label_vec = np.asarray(label_batch[int(row_idx)], dtype=np.float32)
+        creation_mask_u8 = creation_masks_u8[int(row_idx)]
+        creation_mask = _decode_mask_u8(creation_mask_u8) if creation_mask_u8 is not None else None
+        creation_stack = np.zeros((0, size, size), dtype=np.float32)
+        creation_idx = np.zeros((0,), dtype=np.int64)
+        if creation_mask is not None:
+            creation_stack, creation_idx = build_creation_label_mask_stack(
+                label_vec=label_vec,
+                height=size,
+                width=size,
+                creation_mask=np.asarray(creation_mask, dtype=np.float32),
+            )
+        heuristic_stack = np.asarray(heuristic_stacks[int(row_idx)], dtype=np.float32)
+        heuristic_idx = np.asarray(heuristic_indices[int(row_idx)], dtype=np.int64)
+        mask_stack, mask_indices = combine_label_mask_stacks(
+            label_vec,
+            (creation_stack, creation_idx),
+            (heuristic_stack, heuristic_idx),
             height=size,
             width=size,
-            creation_mask=np.asarray(creation_mask, dtype=np.float32) if creation_mask is not None else None,
+            fallback_creation_mask=creation_mask,
         )
-    mixed_mask = _composite_mask_stack(mask_stack) if int(mask_stack.shape[0]) > 0 else infer_semantic_support_mask(image=image, terms=row.terms)
-    mixed_mask = _normalize_attention_map(np.asarray(mixed_mask, dtype=np.float32), gamma=0.92, blur_kernel=5)
-    return {
-        "image_u8": np.asarray(image_u8, dtype=np.uint8),
-        "label_vec_u8": _positive_label_bits(label_vec),
-        "mixed_mask_u8": _encode_mask_u8(mixed_mask),
-        "mask_stack_u8": _encode_mask_u8(mask_stack) if int(mask_stack.size) > 0 else np.zeros((0, size, size), dtype=np.uint8),
-        "mask_indices": np.asarray(mask_indices, dtype=np.int32).reshape(-1),
-    }
+        if int(mask_stack.shape[0]) <= 0 or int(mask_indices.size) <= 0:
+            mask_stack, mask_indices = build_creation_label_mask_stack(
+                label_vec=label_vec,
+                height=size,
+                width=size,
+                creation_mask=np.asarray(creation_mask, dtype=np.float32) if creation_mask is not None else None,
+            )
+        mixed_mask = _composite_mask_stack(mask_stack) if int(mask_stack.shape[0]) > 0 else np.asarray(fallback_masks[int(row_idx)], dtype=np.float32)
+        mixed_mask = _normalize_attention_map(np.asarray(mixed_mask, dtype=np.float32), gamma=0.92, blur_kernel=5)
+        # Policy: only deformation steps produce gradient (middle-alpha) masks;
+        # clean entries use binary masks so gradient values trace to deformations.
+        mask_stack = (np.asarray(mask_stack, dtype=np.float32) > 0.5).astype(np.float32, copy=False)
+        mixed_mask = (np.asarray(mixed_mask, dtype=np.float32) > 0.5).astype(np.float32, copy=False)
+        out.append(
+            {
+                "image_u8": np.asarray(image_u8_batch[int(row_idx)], dtype=np.uint8),
+                "label_vec_u8": _positive_label_bits(label_vec),
+                "mixed_mask_u8": _encode_mask_u8(mixed_mask),
+                "mask_stack_u8": _encode_mask_u8(mask_stack) if int(mask_stack.size) > 0 else np.zeros((0, size, size), dtype=np.uint8),
+                "mask_indices": np.asarray(mask_indices, dtype=np.int32).reshape(-1),
+            }
+        )
+    return out
 
 
 def _build_deformed_entry(
@@ -360,10 +606,10 @@ def _build_deformed_entry(
     }
 
 
-def _row_weight_map(rows: Sequence[SemanticDiskRow], candidate_indices: Sequence[int]) -> Dict[int, float]:
+def _candidate_weight_map(candidates: Sequence[SemanticWheelCandidate], candidate_indices: Sequence[int]) -> Dict[int, float]:
     term_freq: Dict[str, int] = {}
     for row_idx in candidate_indices:
-        row = rows[int(row_idx)]
+        row = candidates[int(row_idx)]
         keys = {
             _norm_txt(term)
             for term in normalize_vocab_terms([str(x) for x in list(row.terms)])
@@ -373,7 +619,7 @@ def _row_weight_map(rows: Sequence[SemanticDiskRow], candidate_indices: Sequence
             term_freq[str(key)] = int(term_freq.get(str(key), 0)) + 1
     out: Dict[int, float] = {}
     for row_idx in candidate_indices:
-        row = rows[int(row_idx)]
+        row = candidates[int(row_idx)]
         keys = {
             _norm_txt(term)
             for term in normalize_vocab_terms([str(x) for x in list(row.terms)])
@@ -386,23 +632,21 @@ def _row_weight_map(rows: Sequence[SemanticDiskRow], candidate_indices: Sequence
     return out
 
 
-def _candidate_signature(rows: Sequence[SemanticDiskRow], candidate_indices: Sequence[int]) -> str:
+def _candidate_signature(candidates: Sequence[SemanticWheelCandidate], candidate_indices: Sequence[int]) -> str:
     hasher = hashlib.sha256()
     for row_idx in candidate_indices:
-        row = rows[int(row_idx)]
+        row = candidates[int(row_idx)]
         payload = {
-            "image_path": str(row.image_path),
-            "mask_path": str(row.mask_path or ""),
+            "cache_key": str(row.cache_key),
             "terms": list(normalize_vocab_terms([str(x) for x in list(row.terms)])),
             "source": str(row.source),
         }
         hasher.update(json.dumps(payload, sort_keys=True, ensure_ascii=True).encode("utf-8"))
-        hasher.update(_positive_label_bits(np.asarray(row.label_vec, dtype=np.float32)).tobytes())
     return str(hasher.hexdigest())
 
 
 def _weighted_deck_order(
-    rows: Sequence[SemanticDiskRow],
+    candidates: Sequence[SemanticWheelCandidate],
     candidate_indices: Sequence[int],
     seed: int,
     epoch: int,
@@ -410,7 +654,7 @@ def _weighted_deck_order(
     items = [int(i) for i in candidate_indices]
     if len(items) <= 1:
         return items
-    weights = _row_weight_map(rows=rows, candidate_indices=items)
+    weights = _candidate_weight_map(candidates=candidates, candidate_indices=items)
     rng = np.random.default_rng(max(0, int(seed)) + (int(epoch) * 104729))
     u = np.clip(rng.random(len(items), dtype=np.float64), 1e-9, 1.0)
     keys = []
@@ -692,14 +936,17 @@ class StatefulSequentialDeckSampler(Sampler[int]):
         return int(self.length)
 
 
-def ensure_semantic_wheel_cache(
-    rows: Sequence[SemanticDiskRow],
+def ensure_semantic_candidate_cache(
+    *,
+    candidates: Sequence[SemanticWheelCandidate],
     candidate_indices: Sequence[int],
-    class_names: Sequence[str],
+    build_entry_group: Callable[[int, int], Sequence[Dict[str, Any]]],
+    build_entry_groups_batch: Optional[Callable[[Sequence[Tuple[int, int]]], Sequence[Sequence[Dict[str, Any]]]]] = None,
+    label_dim: int,
     config: SemanticWheelConfig,
 ) -> Dict[str, Any]:
-    if len(rows) <= 0 or len(candidate_indices) <= 0:
-        raise RuntimeError(f"{str(config.purpose)} requires non-empty semantic rows")
+    if len(candidates) <= 0 or len(candidate_indices) <= 0:
+        raise RuntimeError(f"{str(config.purpose)} requires non-empty semantic candidates")
     cache_root = Path(str(config.cache_root).strip())
     cache_root.mkdir(parents=True, exist_ok=True)
     purpose_key = _sanitize_component(config.purpose)
@@ -710,13 +957,13 @@ def ensure_semantic_wheel_cache(
         "lookahead_batches": int(config.lookahead_batches),
         "deformations_per_clean": int(config.deformations_per_clean),
         "include_clean": bool(config.include_clean),
-        "label_dim": int(len(class_names)),
+        "label_dim": int(label_dim),
     }
     signature = _wheel_signature(build_config)
     wheel_dir = cache_root / f"{purpose_key}_{str(signature)[:24]}"
     manifest_path = wheel_dir / "manifest.json"
     deck_state_path = wheel_dir / "deck_state.json"
-    candidate_sig = _candidate_signature(rows=rows, candidate_indices=candidate_indices)
+    candidate_sig = _candidate_signature(candidates=candidates, candidate_indices=candidate_indices)
     manifest = _load_json(manifest_path, default={})
     manifest_ok = bool(
         not bool(config.force_rebuild)
@@ -724,12 +971,13 @@ def ensure_semantic_wheel_cache(
         manifest
         and str(manifest.get("signature", "")) == str(signature)
         and str(manifest.get("candidate_signature", "")) == str(candidate_sig)
-        and int(manifest.get("label_dim", 0)) == int(len(class_names))
+        and int(manifest.get("label_dim", 0)) == int(label_dim)
         and int(manifest.get("image_size", 0)) == int(config.image_size)
     )
     uses = int(manifest.get("use_count", 0)) if manifest_ok else 0
-    expiry_uses = max(1, int(config.expiry_uses))
-    if bool(manifest_ok) and int(uses) < int(expiry_uses):
+    expiry_uses = int(config.expiry_uses)
+    can_reuse = bool(expiry_uses <= 0 or int(uses) < int(expiry_uses))
+    if bool(manifest_ok) and bool(can_reuse):
         manifest["cache_hit"] = True
         manifest["use_count"] = int(uses) + 1
         manifest["lookahead_batches"] = int(config.lookahead_batches)
@@ -740,6 +988,10 @@ def ensure_semantic_wheel_cache(
             "cache_hit": True,
             "dataset": SemanticWheelDataset(cache_dir=str(wheel_dir), return_mask_stack=True),
             "base_row_indices": [int(x) for x in list(manifest.get("base_row_indices", []))],
+            "base_candidate_indices": [
+                int(x)
+                for x in list(manifest.get("base_candidate_indices", manifest.get("base_row_indices", [])))
+            ],
             "info": dict(manifest),
         }
 
@@ -752,7 +1004,7 @@ def ensure_semantic_wheel_cache(
     candidate_list = [int(x) for x in list(candidate_indices)]
     if len(order) != int(len(candidate_list)) or sorted(order) != sorted(candidate_list):
         if bool(config.use_rare_term_deck):
-            order = _weighted_deck_order(rows=rows, candidate_indices=candidate_list, seed=int(config.seed), epoch=int(epoch))
+            order = _weighted_deck_order(candidates=candidates, candidate_indices=candidate_list, seed=int(config.seed), epoch=int(epoch))
         else:
             rng = np.random.default_rng(max(0, int(config.seed)) + (int(epoch) * 104729))
             order = [int(x) for x in rng.permutation(np.asarray(candidate_list, dtype=np.int64)).tolist()]
@@ -763,29 +1015,35 @@ def ensure_semantic_wheel_cache(
     if len(ordered_candidates) <= 0:
         raise RuntimeError(f"{str(config.purpose)} deck selection is empty")
 
-    term_to_idx = {_norm_txt(str(name)): int(i) for i, name in enumerate(class_names) if str(name).strip()}
-    idx_to_term = {int(i): str(name) for i, name in enumerate(class_names) if str(name).strip()}
     entries_per_clean = int(config.deformations_per_clean) + (1 if bool(config.include_clean) else 0)
     if int(entries_per_clean) <= 0:
         raise RuntimeError("semantic wheel requires at least one entry per clean row")
 
-    def _entry_group(base_row_idx: int, base_row_pos: int) -> List[Dict[str, Any]]:
-        row = rows[int(base_row_idx)]
-        clean = _build_clean_entry(row=row, image_size=int(config.image_size), idx_to_term=idx_to_term)
-        out: List[Dict[str, Any]] = []
-        if bool(config.include_clean):
-            out.append(dict(clean))
-        for variant_idx in range(int(config.deformations_per_clean)):
-            out.append(
-                _build_deformed_entry(
-                    clean_entry=clean,
-                    variant_idx=int(variant_idx),
-                    base_row_position=int(base_row_pos),
-                    seed=int(config.seed),
-                    term_to_idx=term_to_idx,
-                    degrade_config=config.degrade_config,
-                )
+    def _build_group(spec: Tuple[int, int]) -> Tuple[int, int, List[Dict[str, Any]]]:
+        base_row_idx, base_pos = spec
+        group = [dict(x) for x in list(build_entry_group(int(base_row_idx), int(base_pos)))]
+        return int(base_pos), int(base_row_idx), group
+
+    def _group_specs(base_row_indices: Sequence[int]) -> List[Tuple[int, int]]:
+        return [(int(base_row_idx), int(base_pos)) for base_pos, base_row_idx in enumerate(base_row_indices)]
+
+    def _group_spec_batches(base_row_indices: Sequence[int]) -> List[List[Tuple[int, int]]]:
+        specs = _group_specs(base_row_indices)
+        chunk_size = max(1, int(config.batch_size))
+        return [specs[i: i + int(chunk_size)] for i in range(0, int(len(specs)), int(chunk_size))]
+
+    def _build_group_batch(spec_batch: Sequence[Tuple[int, int]]) -> List[Tuple[int, int, List[Dict[str, Any]]]]:
+        if build_entry_groups_batch is None:
+            return [_build_group(spec) for spec in spec_batch]
+        groups = list(build_entry_groups_batch(spec_batch))
+        if int(len(groups)) != int(len(spec_batch)):
+            raise RuntimeError(
+                f"{str(config.purpose)} batch entry builder returned {int(len(groups))} groups for {int(len(spec_batch))} specs"
             )
+        out: List[Tuple[int, int, List[Dict[str, Any]]]] = []
+        for spec, group in zip(spec_batch, groups):
+            base_row_idx, base_pos = spec
+            out.append((int(base_pos), int(base_row_idx), [dict(x) for x in list(group)]))
         return out
 
     def _projection_only(limit_bytes: int) -> Dict[str, Any]:
@@ -796,58 +1054,70 @@ def ensure_semantic_wheel_cache(
         total_associations = 0
         total_raw_bytes = 0
         chunk_infos: List[Dict[str, Any]] = []
-        for base_pos, base_row_idx in enumerate(ordered_candidates):
-            pending_before = list(current_entries)
-            group = _entry_group(base_row_idx=int(base_row_idx), base_row_pos=int(base_pos))
-            current_entries.extend(group)
-            temp_infos: List[Dict[str, Any]] = []
-            working = list(current_entries)
-            while int(len(working)) >= int(config.batch_size):
-                _payload_unused, chunk_info = _chunk_payload(
-                    working[: int(config.batch_size)],
-                    label_dim=int(len(class_names)),
-                    image_size=int(config.image_size),
-                )
-                temp_infos.append(dict(chunk_info))
-                working = working[int(config.batch_size):]
-            partial_bytes = 0
-            partial_info: Optional[Dict[str, Any]] = None
-            if len(working) > 0:
-                _payload_unused, partial_info = _chunk_payload(
-                    working,
-                    label_dim=int(len(class_names)),
-                    image_size=int(config.image_size),
-                )
-                partial_bytes = int(partial_info.get("raw_bytes", 0))
-            tentative_total = int(total_raw_bytes)
-            tentative_unique_labels = int(total_unique_labels)
-            tentative_unique_masks = int(total_unique_masks)
-            tentative_associations = int(total_associations)
-            for chunk_info in temp_infos:
-                tentative_total += int(chunk_info.get("raw_bytes", 0))
-                tentative_unique_labels += int(chunk_info.get("unique_labels", 0))
-                tentative_unique_masks += int(chunk_info.get("unique_masks", 0))
-                tentative_associations += int(chunk_info.get("associations", 0))
-            if isinstance(partial_info, dict):
-                tentative_total += int(partial_bytes)
-                tentative_unique_labels += int(partial_info.get("unique_labels", 0))
-                tentative_unique_masks += int(partial_info.get("unique_masks", 0))
-                tentative_associations += int(partial_info.get("associations", 0))
-            if int(limit_bytes) > 0 and int(tentative_total) > int(limit_bytes):
-                current_entries = list(pending_before)
-                break
-            selected_base_rows.append(int(base_row_idx))
-            current_entries = list(working)
-            for chunk_info in temp_infos:
-                chunk_infos.append(dict(chunk_info))
-                total_raw_bytes += int(chunk_info.get("raw_bytes", 0))
-                total_unique_labels += int(chunk_info.get("unique_labels", 0))
-                total_unique_masks += int(chunk_info.get("unique_masks", 0))
-                total_associations += int(chunk_info.get("associations", 0))
+        spec_batches = _group_spec_batches(ordered_candidates)
+        workers = _resolve_candidate_build_workers(len(spec_batches))
+
+        def _collect_projection(group_batch_iter: Any) -> None:
+            nonlocal current_entries, total_raw_bytes, total_unique_labels, total_unique_masks, total_associations
+            for group_batch in group_batch_iter:
+                for _base_pos, base_row_idx, group in group_batch:
+                    pending_before = list(current_entries)
+                    current_entries.extend(group)
+                    temp_infos: List[Dict[str, Any]] = []
+                    working = list(current_entries)
+                    while int(len(working)) >= int(config.batch_size):
+                        _payload_unused, chunk_info = _chunk_payload(
+                            working[: int(config.batch_size)],
+                            label_dim=int(label_dim),
+                            image_size=int(config.image_size),
+                        )
+                        temp_infos.append(dict(chunk_info))
+                        working = working[int(config.batch_size):]
+                    partial_bytes = 0
+                    partial_info: Optional[Dict[str, Any]] = None
+                    if len(working) > 0:
+                        _payload_unused, partial_info = _chunk_payload(
+                            working,
+                            label_dim=int(label_dim),
+                            image_size=int(config.image_size),
+                        )
+                        partial_bytes = int(partial_info.get("raw_bytes", 0))
+                    tentative_total = int(total_raw_bytes)
+                    tentative_unique_labels = int(total_unique_labels)
+                    tentative_unique_masks = int(total_unique_masks)
+                    tentative_associations = int(total_associations)
+                    for chunk_info in temp_infos:
+                        tentative_total += int(chunk_info.get("raw_bytes", 0))
+                        tentative_unique_labels += int(chunk_info.get("unique_labels", 0))
+                        tentative_unique_masks += int(chunk_info.get("unique_masks", 0))
+                        tentative_associations += int(chunk_info.get("associations", 0))
+                    if isinstance(partial_info, dict):
+                        tentative_total += int(partial_bytes)
+                        tentative_unique_labels += int(partial_info.get("unique_labels", 0))
+                        tentative_unique_masks += int(partial_info.get("unique_masks", 0))
+                        tentative_associations += int(partial_info.get("associations", 0))
+                    if int(limit_bytes) > 0 and int(tentative_total) > int(limit_bytes):
+                        current_entries = list(pending_before)
+                        return
+                    selected_base_rows.append(int(base_row_idx))
+                    current_entries = list(working)
+                    for chunk_info in temp_infos:
+                        chunk_infos.append(dict(chunk_info))
+                        total_raw_bytes += int(chunk_info.get("raw_bytes", 0))
+                        total_unique_labels += int(chunk_info.get("unique_labels", 0))
+                        total_unique_masks += int(chunk_info.get("unique_masks", 0))
+                        total_associations += int(chunk_info.get("associations", 0))
+
+        _proj_desc = f"[{config.purpose}] projecting"
+        if int(workers) <= 1:
+            _collect_projection(tqdm(map(_build_group_batch, spec_batches), total=len(spec_batches), desc=_proj_desc, unit="batch", leave=False, dynamic_ncols=True))
+        else:
+            with ThreadPoolExecutor(max_workers=int(workers), thread_name_prefix="semantic-wheel-build") as pool:
+                _collect_projection(tqdm(pool.map(_build_group_batch, spec_batches), total=len(spec_batches), desc=_proj_desc, unit="batch", leave=False, dynamic_ncols=True))
         if len(current_entries) > 0:
             _payload_unused, partial_info = _chunk_payload(
                 current_entries,
-                label_dim=int(len(class_names)),
+                label_dim=int(label_dim),
                 image_size=int(config.image_size),
             )
             chunk_infos.append(dict(partial_info))
@@ -910,7 +1180,7 @@ def ensure_semantic_wheel_cache(
             return
         payload, chunk_info = _chunk_payload(
             entries_to_flush,
-            label_dim=int(len(class_names)),
+            label_dim=int(label_dim),
             image_size=int(config.image_size),
         )
         on_disk = _write_chunk(temp_dir / f"chunk_{int(chunk_idx):04d}.npz", payload)
@@ -921,12 +1191,24 @@ def ensure_semantic_wheel_cache(
         total_associations += int(chunk_info.get("associations", 0))
         chunk_idx += 1
 
-    for base_pos, base_row_idx in enumerate(selected_base_rows):
-        group = _entry_group(base_row_idx=int(base_row_idx), base_row_pos=int(base_pos))
-        current_entries.extend(group)
-        while int(len(current_entries)) >= int(config.batch_size):
-            _flush_chunk(current_entries[: int(config.batch_size)])
-            current_entries = current_entries[int(config.batch_size):]
+    selected_spec_batches = _group_spec_batches(selected_base_rows)
+    build_workers = _resolve_candidate_build_workers(len(selected_spec_batches))
+
+    def _collect_chunks(group_batch_iter: Any) -> None:
+        nonlocal current_entries
+        for group_batch in group_batch_iter:
+            for _base_pos, _base_row_idx, group in group_batch:
+                current_entries.extend(group)
+                while int(len(current_entries)) >= int(config.batch_size):
+                    _flush_chunk(current_entries[: int(config.batch_size)])
+                    current_entries = current_entries[int(config.batch_size):]
+
+    _build_desc = f"[{config.purpose}] writing chunks"
+    if int(build_workers) <= 1:
+        _collect_chunks(tqdm(map(_build_group_batch, selected_spec_batches), total=len(selected_spec_batches), desc=_build_desc, unit="batch", leave=False, dynamic_ncols=True))
+    else:
+        with ThreadPoolExecutor(max_workers=int(build_workers), thread_name_prefix="semantic-wheel-build") as pool:
+            _collect_chunks(tqdm(pool.map(_build_group_batch, selected_spec_batches), total=len(selected_spec_batches), desc=_build_desc, unit="batch", leave=False, dynamic_ncols=True))
     if len(current_entries) > 0:
         _flush_chunk(current_entries)
 
@@ -936,7 +1218,7 @@ def ensure_semantic_wheel_cache(
         "purpose": str(config.purpose),
         "candidate_signature": str(candidate_sig),
         "image_size": int(config.image_size),
-        "label_dim": int(len(class_names)),
+        "label_dim": int(label_dim),
         "batch_size": int(config.batch_size),
         "lookahead_batches": int(config.lookahead_batches),
         "deformations_per_clean": int(config.deformations_per_clean),
@@ -957,6 +1239,8 @@ def ensure_semantic_wheel_cache(
         "total_rows": int(sum(chunk_rows)),
         "base_row_count": int(len(selected_base_rows)),
         "base_row_indices": [int(x) for x in selected_base_rows],
+        "base_candidate_indices": [int(x) for x in selected_base_rows],
+        "entry_group_workers": int(build_workers),
         "total_unique_labels": int(total_unique_labels),
         "total_unique_masks": int(total_unique_masks),
         "total_associations": int(total_associations),
@@ -976,7 +1260,7 @@ def ensure_semantic_wheel_cache(
         new_epoch = int(epoch) + 1
         new_cursor = int(new_cursor % int(len(order)))
         if bool(config.use_rare_term_deck):
-            new_order = _weighted_deck_order(rows=rows, candidate_indices=candidate_list, seed=int(config.seed), epoch=int(new_epoch))
+            new_order = _weighted_deck_order(candidates=candidates, candidate_indices=candidate_list, seed=int(config.seed), epoch=int(new_epoch))
         else:
             rng = np.random.default_rng(max(0, int(config.seed)) + (int(new_epoch) * 104729))
             new_order = [int(x) for x in rng.permutation(np.asarray(candidate_list, dtype=np.int64)).tolist()]
@@ -994,5 +1278,88 @@ def ensure_semantic_wheel_cache(
         "cache_hit": False,
         "dataset": SemanticWheelDataset(cache_dir=str(wheel_dir), return_mask_stack=True),
         "base_row_indices": [int(x) for x in selected_base_rows],
+        "base_candidate_indices": [int(x) for x in selected_base_rows],
         "info": dict(final_manifest),
     }
+
+
+def ensure_semantic_wheel_cache(
+    rows: Sequence[SemanticDiskRow],
+    candidate_indices: Sequence[int],
+    class_names: Sequence[str],
+    config: SemanticWheelConfig,
+) -> Dict[str, Any]:
+    if len(rows) <= 0 or len(candidate_indices) <= 0:
+        raise RuntimeError(f"{str(config.purpose)} requires non-empty semantic rows")
+    term_to_idx = {_norm_txt(str(name)): int(i) for i, name in enumerate(class_names) if str(name).strip()}
+    idx_to_term = {int(i): str(name) for i, name in enumerate(class_names) if str(name).strip()}
+    candidates: List[SemanticWheelCandidate] = []
+    for row in tqdm(rows, total=len(rows), desc=f"[{config.purpose}] hashing rows", unit="row", leave=False, dynamic_ncols=True):
+        payload = {
+            "image_path": str(row.image_path),
+            "mask_path": str(row.mask_path or ""),
+            "terms": list(normalize_vocab_terms([str(x) for x in list(row.terms)])),
+            "source": str(row.source),
+            "labels": _positive_label_bits(np.asarray(row.label_vec, dtype=np.float32)).tolist(),
+        }
+        candidates.append(
+            SemanticWheelCandidate(
+                cache_key=json.dumps(payload, sort_keys=True, ensure_ascii=True),
+                terms=list(normalize_vocab_terms([str(x) for x in list(row.terms)])),
+                source=str(row.source),
+            )
+        )
+
+    def _entry_group(base_row_idx: int, base_row_pos: int) -> List[Dict[str, Any]]:
+        row = rows[int(base_row_idx)]
+        clean = _build_clean_entry(row=row, image_size=int(config.image_size), idx_to_term=idx_to_term)
+        out: List[Dict[str, Any]] = []
+        if bool(config.include_clean):
+            out.append(dict(clean))
+        for variant_idx in range(int(config.deformations_per_clean)):
+            out.append(
+                _build_deformed_entry(
+                    clean_entry=clean,
+                    variant_idx=int(variant_idx),
+                    base_row_position=int(base_row_pos),
+                    seed=int(config.seed),
+                    term_to_idx=term_to_idx,
+                    degrade_config=config.degrade_config,
+                )
+            )
+        return out
+
+    def _entry_groups_batch(spec_batch: Sequence[Tuple[int, int]]) -> List[List[Dict[str, Any]]]:
+        batch_rows = [rows[int(base_row_idx)] for base_row_idx, _base_row_pos in spec_batch]
+        clean_entries = _build_clean_entries_batch(
+            rows=batch_rows,
+            image_size=int(config.image_size),
+            idx_to_term=idx_to_term,
+        )
+        out_groups: List[List[Dict[str, Any]]] = []
+        for clean, (base_row_idx, base_row_pos) in zip(clean_entries, spec_batch):
+            out: List[Dict[str, Any]] = []
+            if bool(config.include_clean):
+                out.append(dict(clean))
+            for variant_idx in range(int(config.deformations_per_clean)):
+                out.append(
+                    _build_deformed_entry(
+                        clean_entry=clean,
+                        variant_idx=int(variant_idx),
+                        base_row_position=int(base_row_pos),
+                        seed=int(config.seed),
+                        term_to_idx=term_to_idx,
+                        degrade_config=config.degrade_config,
+                    )
+                )
+            out_groups.append(out)
+        return out_groups
+
+    return ensure_semantic_candidate_cache(
+        candidates=candidates,
+        candidate_indices=candidate_indices,
+        build_entry_group=_entry_group,
+        build_entry_groups_batch=_entry_groups_batch,
+        label_dim=int(len(class_names)),
+        config=config,
+    )

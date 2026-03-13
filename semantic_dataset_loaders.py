@@ -14,11 +14,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+from tqdm import tqdm
+
 import numpy as np
 import torch
 import torch.nn.functional as F
 from PIL import Image
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, Sampler
 from torch.utils.data._utils.collate import default_collate
 from torchvision.transforms import InterpolationMode
 from torchvision.transforms import functional as TF
@@ -27,6 +29,20 @@ from torchvision.transforms import functional as TF
 _IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".bmp", ".webp", ".tif", ".tiff"}
 _SEMANTIC_DISK_ROWS_CACHE_LOCK = threading.Lock()
 _SEMANTIC_DISK_ROWS_CACHE: Dict[str, Tuple[List["SemanticDiskRow"], Dict[str, Any]]] = {}
+_SEMANTIC_COLOR_TERMS: Tuple[str, ...] = (
+    "red",
+    "orange",
+    "green",
+    "blue",
+    "yellow",
+    "cyan",
+    "magenta",
+    "brown",
+    "black",
+    "white",
+    "gray",
+    "edge",
+)
 
 
 def _directory_size_bytes(path: Path) -> int:
@@ -101,6 +117,7 @@ def _loop_slot_dir(cache_root: Path, slot_idx: int) -> Path:
     return Path(cache_root) / f"loop_slot_{int(slot_idx):04d}"
 
 
+@lru_cache(maxsize=8192)
 def _norm_txt(x: str) -> str:
     return re.sub(r"\s+", " ", str(x)).strip().lower()
 
@@ -295,19 +312,29 @@ def _resolve_semantic_startup_threads(work_items: int, max_cap: int = 16) -> int
     return max(1, min(int(max_cap), int(cpu_count), int(work_items)))
 
 
-def _ordered_thread_map(items: Sequence[Any], worker_fn: Any, max_workers: int) -> List[Any]:
+def _ordered_thread_map(
+    items: Sequence[Any],
+    worker_fn: Any,
+    max_workers: int,
+    desc: str = "processing",
+) -> List[Any]:
     count = int(len(items))
     if count <= 0:
         return []
     workers = max(1, min(int(max_workers), int(count)))
     if workers <= 1:
-        return [worker_fn(item) for item in items]
+        return [
+            worker_fn(item)
+            for item in tqdm(items, desc=desc, unit="row", leave=False, dynamic_ncols=True)
+        ]
     results: List[Any] = [None] * count
     with ThreadPoolExecutor(max_workers=int(workers), thread_name_prefix="semantic-row-build") as pool:
         future_to_index = {pool.submit(worker_fn, item): int(i) for i, item in enumerate(items)}
-        for future in as_completed(future_to_index):
-            idx = int(future_to_index[future])
-            results[idx] = future.result()
+        with tqdm(total=count, desc=desc, unit="row", leave=False, dynamic_ncols=True) as pbar:
+            for future in as_completed(future_to_index):
+                idx = int(future_to_index[future])
+                results[idx] = future.result()
+                pbar.update(1)
     return results
 
 
@@ -533,6 +560,41 @@ def _normalize_stack_row(mask: Any, *, height: int, width: int) -> np.ndarray:
     )
 
 
+def _normalize_mask_array_batch(stack: np.ndarray, height: int, width: int) -> np.ndarray:
+    """Batch version of _normalize_mask_array for [N, H, W] float32 arrays.
+
+    Fast path when all masks are already the correct spatial size — pure numpy,
+    no Python loop.  Falls back to per-element PIL resize only when dimensions
+    differ (uncommon during training where a fixed image_size is used).
+    """
+    arr = np.asarray(stack, dtype=np.float32)
+    if arr.ndim == 2:
+        arr = arr[None]
+    n = int(arr.shape[0])
+    if n == 0:
+        return np.zeros((0, max(0, int(height)), max(0, int(width))), dtype=np.float32)
+    cur_h, cur_w = int(arr.shape[-2]), int(arr.shape[-1])
+    if cur_h != int(height) or cur_w != int(width):
+        # Per-element PIL resize — only when truly needed
+        resized = np.empty((n, int(height), int(width)), dtype=np.float32)
+        for i in range(n):
+            resized[i] = _normalize_mask_array(arr[i], height=int(height), width=int(width))
+        return resized
+    # Fast path: correct size, just clamp range
+    out = arr / 255.0 if float(np.max(arr)) > 1.0 else arr
+    return np.clip(out, 0.0, 1.0).astype(np.float32, copy=False)
+
+
+def _normalize_stack_row_batch(stack: np.ndarray, *, height: int, width: int) -> np.ndarray:
+    """Batch version of _normalize_stack_row for [N, H, W] arrays.
+
+    Returns [N, H, W] — each slice is resize-normalised then attention-normalised.
+    Replaces per-element _normalize_stack_row calls inside tight loops.
+    """
+    clamped = _normalize_mask_array_batch(stack, height=int(height), width=int(width))
+    return _normalize_attention_map_batch(clamped, gamma=1.0, blur_kernel=0)
+
+
 def build_creation_label_mask_stack(
     label_vec: Any,
     *,
@@ -550,9 +612,7 @@ def build_creation_label_mask_stack(
             width = int(base.shape[-1]) if int(base.ndim) >= 2 else int(width)
         base_mask = _normalize_stack_row(base, height=int(height), width=int(width))
     else:
-        if int(height) <= 0 or int(width) <= 0:
-            return np.zeros((0, 0, 0), dtype=np.float32), np.zeros((0,), dtype=np.int64)
-        base_mask = np.ones((int(height), int(width)), dtype=np.float32)
+        return np.zeros((0, int(max(0, height)), int(max(0, width))), dtype=np.float32), np.zeros((0,), dtype=np.int64)
     if int(positive_idx.size) <= 0:
         return np.zeros((0, int(base_mask.shape[0]), int(base_mask.shape[1])), dtype=np.float32), np.zeros((0,), dtype=np.int64)
     stack = np.repeat(base_mask[None, :, :], int(positive_idx.size), axis=0).astype(np.float32, copy=False)
@@ -582,7 +642,7 @@ def term_mask_map_to_label_stack(
             if str(term).strip()
         }
     positive_set = set(_positive_label_indices(label_vec).tolist())
-    rows: List[np.ndarray] = []
+    raw_masks: List[np.ndarray] = []
     indices: List[int] = []
     for raw_term, raw_mask in term_mask_map.items():
         ci = int(lut.get(_norm_txt(str(raw_term)), -1))
@@ -594,14 +654,18 @@ def term_mask_map_to_label_stack(
         if int(height) <= 0 or int(width) <= 0:
             height = int(arr.shape[0])
             width = int(arr.shape[1])
-        norm = _normalize_stack_row(arr, height=int(height), width=int(width))
-        if float(np.max(norm)) <= 1e-8:
-            continue
-        rows.append(norm)
+        raw_masks.append(arr)
         indices.append(int(ci))
-    if len(rows) <= 0:
+    if len(raw_masks) <= 0:
         return np.zeros((0, int(max(0, height)), int(max(0, width))), dtype=np.float32), np.zeros((0,), dtype=np.int64)
-    return np.stack(rows, axis=0).astype(np.float32, copy=False), np.asarray(indices, dtype=np.int64)
+    # Batch-normalise all collected masks at once
+    stacked = np.stack(raw_masks, axis=0)  # [K, H, W]
+    normed = _normalize_stack_row_batch(stacked, height=int(height), width=int(width))  # [K, H, W]
+    vmax_per = np.max(normed.reshape(len(raw_masks), -1), axis=1)
+    keep = np.where(vmax_per > 1e-8)[0]
+    if len(keep) == 0:
+        return np.zeros((0, int(max(0, height)), int(max(0, width))), dtype=np.float32), np.zeros((0,), dtype=np.int64)
+    return normed[keep].astype(np.float32, copy=False), np.array([indices[int(i)] for i in keep], dtype=np.int64)
 
 
 def combine_label_mask_stacks(
@@ -638,27 +702,25 @@ def combine_label_mask_stacks(
             height = int(stack_arr.shape[-2])
             width = int(stack_arr.shape[-1])
         pair_count = min(int(stack_arr.shape[0]), int(idx_arr.size))
-        for si in range(int(pair_count)):
-            cls_idx = int(idx_arr[si])
-            if cls_idx < 0:
-                continue
-            norm = _normalize_stack_row(stack_arr[int(si)], height=int(height), width=int(width))
-            if float(np.max(norm)) <= 1e-8:
-                continue
-            rows.append(norm)
-            indices.append(int(cls_idx))
-            covered.add(int(cls_idx))
+        # Batch-normalise all slices in this part at once, then filter
+        batch_norm = _normalize_stack_row_batch(
+            stack_arr[:int(pair_count)], height=int(height), width=int(width)
+        )  # [pair_count, H, W]
+        vmax_per = np.max(batch_norm.reshape(int(pair_count), -1), axis=1)  # [pair_count]
+        valid_mask = (np.asarray(idx_arr[:int(pair_count)], dtype=np.int64) >= 0) & (vmax_per > 1e-8)
+        for si in np.where(valid_mask)[0]:
+            cls_idx = int(idx_arr[int(si)])
+            rows.append(batch_norm[int(si)])
+            indices.append(cls_idx)
+            covered.add(cls_idx)
 
     missing = [int(ci) for ci in positive_idx.tolist() if int(ci) not in covered]
-    if missing and int(height) > 0 and int(width) > 0:
-        if fallback_creation_mask is not None:
-            base_mask = _normalize_stack_row(
-                fallback_creation_mask,
-                height=int(height),
-                width=int(width),
-            )
-        else:
-            base_mask = np.ones((int(height), int(width)), dtype=np.float32)
+    if missing and fallback_creation_mask is not None and int(height) > 0 and int(width) > 0:
+        base_mask = _normalize_stack_row(
+            fallback_creation_mask,
+            height=int(height),
+            width=int(width),
+        )
         for cls_idx in missing:
             rows.append(np.asarray(base_mask, dtype=np.float32))
             indices.append(int(cls_idx))
@@ -737,19 +799,20 @@ def elem_stacks_to_label_stacks(
     h = int(stack.shape[-2]) if int(stack.ndim) >= 2 else 0
     w = int(stack.shape[-1]) if int(stack.ndim) >= 2 else 0
     covered: set[int] = set()
-    for ei in range(min(int(stack.shape[0]), int(len(elem_term_lists)))):
-        mask_e = _normalize_stack_row(stack[int(ei)], height=int(h), width=int(w))
-        for term in elem_term_lists[int(ei)]:
-            tk = re.sub(r"\s+", " ", str(term)).strip().lower()
-            ci = int(term_to_idx.get(tk, -1))
-            if ci < 0 or ci not in positive_set:
-                continue
-            out_masks.append(mask_e)
-            out_idx.append(ci)
-            covered.add(int(ci))
-    for ci in sorted(positive_set - covered):
-        out_masks.append(np.ones((int(h), int(w)), dtype=np.float32))
-        out_idx.append(ci)
+    n_elems = min(int(stack.shape[0]), int(len(elem_term_lists)))
+    if n_elems > 0:
+        # Batch-normalise all element masks at once instead of per-element
+        batch_norm = _normalize_stack_row_batch(stack[:n_elems], height=int(h), width=int(w))
+        for ei in range(n_elems):
+            mask_e = batch_norm[ei]
+            for term in elem_term_lists[int(ei)]:
+                tk = _norm_txt(str(term))  # cached
+                ci = int(term_to_idx.get(tk, -1))
+                if ci < 0 or ci not in positive_set:
+                    continue
+                out_masks.append(mask_e)
+                out_idx.append(ci)
+                covered.add(int(ci))
     if len(out_masks) == 0:
         h, w = int(stack.shape[-2]), int(stack.shape[-1])
         return np.zeros((0, h, w), dtype=np.float32), np.zeros((0,), dtype=np.int64)
@@ -785,9 +848,11 @@ def build_label_mask_stack(
         )
         if int(out_stack.shape[0]) > 0 and int(out_idx.size) > 0:
             return out_stack, out_idx
-    if int(positive_idx.size) <= 0:
+    if int(positive_idx.size) <= 0 or int(h) <= 0 or int(w) <= 0:
         return np.zeros((0, int(mixed.shape[0]), int(mixed.shape[1])), dtype=np.float32), np.zeros((0,), dtype=np.int64)
-    base_mask = mixed if bool(treat_mixed_mask_as_creation) else np.ones((int(mixed.shape[0]), int(mixed.shape[1])), dtype=np.float32)
+    if (not bool(treat_mixed_mask_as_creation)) or float(np.max(mixed)) <= 1e-8:
+        return np.zeros((0, int(mixed.shape[0]), int(mixed.shape[1])), dtype=np.float32), np.zeros((0,), dtype=np.int64)
+    base_mask = mixed
     stack = np.repeat(base_mask[None, :, :], int(positive_idx.size), axis=0).astype(np.float32, copy=False)
     return stack, np.asarray(positive_idx, dtype=np.int64)
 
@@ -798,41 +863,150 @@ def build_term_mask_stack_from_image(
     idx_to_term: Optional[Dict[int, str]] = None,
     term_mask_overrides: Optional[Dict[str, Any]] = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    y = np.asarray(label_vec, dtype=np.float32).reshape(-1)
-    positive_idx = np.where(y >= 0.5)[0].astype(np.int64)
-    if int(positive_idx.size) <= 0:
-        chw = _image_to_chw01(image)
-        return np.zeros((0, int(chw.shape[1]), int(chw.shape[2])), dtype=np.float32), np.zeros((0,), dtype=np.int64)
+    stacks, indices = build_term_mask_stacks_from_images(
+        images=np.asarray(image, dtype=np.float32)[None, ...],
+        label_vecs=np.asarray(label_vec, dtype=np.float32).reshape(1, -1),
+        idx_to_term=idx_to_term,
+        term_mask_overrides_batch=[term_mask_overrides] if isinstance(term_mask_overrides, dict) else None,
+    )
+    return stacks[0], indices[0]
+
+
+def augment_label_vec_with_detected_color_terms(
+    *,
+    image: Any,
+    label_vec: Any,
+    term_to_idx: Optional[Dict[str, int]] = None,
+    valid_mask: Optional[Any] = None,
+) -> np.ndarray:
+    y = np.asarray(label_vec, dtype=np.float32).reshape(-1).copy()
+    if int(y.size) <= 0 or not isinstance(term_to_idx, dict) or not term_to_idx:
+        return y
+    detected_terms = detect_semantic_color_terms(image=image, mask=valid_mask)
+    for term in normalize_vocab_terms([str(x) for x in list(detected_terms)]):
+        ti = int(term_to_idx.get(_norm_txt(term), -1))
+        if 0 <= int(ti) < int(y.size):
+            y[int(ti)] = 1.0
+    return y
+
+
+def _single_label_whole_image_mask(label_vec: Any, *, height: int, width: int) -> Optional[np.ndarray]:
+    positive_idx = _positive_label_indices(label_vec)
+    if int(positive_idx.size) != 1 or int(height) <= 0 or int(width) <= 0:
+        return None
+    return np.ones((int(height), int(width)), dtype=np.float32)
+
+
+def assemble_semantic_mask_layers(
+    *,
+    image: Any,
+    label_vec: Any,
+    idx_to_term: Optional[Dict[int, str]] = None,
+    term_to_idx: Optional[Dict[str, int]] = None,
+    original_mixed_mask: Optional[Any] = None,
+    original_parts: Optional[Sequence[Tuple[Any, Any]]] = None,
+    deformation_term_masks: Optional[Dict[str, Any]] = None,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     chw = _image_to_chw01(image)
-    color_maps = _semantic_color_score_maps(chw)
-    override_lut = {
-        _norm_txt(str(k)): np.asarray(v, dtype=np.float32)
-        for k, v in (term_mask_overrides.items() if isinstance(term_mask_overrides, dict) else [])
-        if str(k).strip() and v is not None
-    }
-    per_label_masks: List[np.ndarray] = []
-    out_idx: List[int] = []
-    fallback = infer_semantic_support_mask(image=chw, terms=[])
-    for cls_idx in positive_idx.tolist():
-        term = ""
-        if isinstance(idx_to_term, dict):
-            term = re.sub(r"\s+", " ", str(idx_to_term.get(int(cls_idx), ""))).strip()
-        term_key = _norm_txt(term)
-        mask = None
-        if term_key in override_lut:
-            mask = _normalize_attention_map(np.asarray(override_lut[term_key], dtype=np.float32), gamma=0.85, blur_kernel=1)
-        elif term_key in color_maps:
-            color_score = np.asarray(color_maps.get(term_key), dtype=np.float32)
-            thr = max(0.20, float(np.percentile(color_score.reshape(-1), 82)) * 0.75) if int(color_score.size) > 0 else 1.0
-            color_exact = (color_score >= float(thr)).astype(np.float32, copy=False) * np.asarray(color_score, dtype=np.float32)
-            mask = _normalize_attention_map(color_exact, gamma=0.78, blur_kernel=1)
-        if mask is None:
-            mask = infer_semantic_support_mask(image=chw, terms=([term] if term else []))
-        if float(np.max(mask)) <= 1e-8:
-            mask = np.asarray(fallback, dtype=np.float32)
-        per_label_masks.append(np.asarray(mask, dtype=np.float32))
-        out_idx.append(int(cls_idx))
-    return np.stack(per_label_masks, axis=0).astype(np.float32, copy=False), np.asarray(out_idx, dtype=np.int64)
+    h = int(chw.shape[1])
+    w = int(chw.shape[2])
+    y = np.asarray(label_vec, dtype=np.float32).reshape(-1).copy()
+
+    parts: List[Tuple[Any, Any]] = []
+    # Policy: only deformation steps produce gradient masks; binarize originals.
+    for raw_stack, raw_idx in (list(original_parts) if original_parts is not None else []):
+        if raw_stack is not None:
+            _s = np.asarray(raw_stack, dtype=np.float32)
+            if _s.ndim >= 2 and _s.size > 0:
+                raw_stack = (_s > 0.5).astype(np.float32, copy=False)
+        parts.append((raw_stack, raw_idx))
+
+    has_original_parts = any(
+        raw_stack is not None and raw_idx is not None and int(np.asarray(raw_idx).size) > 0
+        for raw_stack, raw_idx in parts
+    )
+    if original_mixed_mask is None or float(np.max(np.asarray(original_mixed_mask, dtype=np.float32))) <= 1e-8:
+        if not bool(has_original_parts):
+            original_mixed_mask = _single_label_whole_image_mask(y, height=int(h), width=int(w))
+
+    if original_mixed_mask is not None:
+        original_stack, original_idx = build_label_mask_stack(
+            mixed_mask=np.asarray(original_mixed_mask, dtype=np.float32),
+            label_vec=y,
+            treat_mixed_mask_as_creation=True,
+        )
+        if int(original_stack.shape[0]) > 0 and int(original_idx.size) > 0:
+            original_stack = (original_stack > 0.5).astype(np.float32, copy=False)
+            parts.append((original_stack, original_idx))
+
+    if isinstance(deformation_term_masks, dict) and deformation_term_masks and isinstance(term_to_idx, dict):
+        for term in normalize_vocab_terms([str(x) for x in list(deformation_term_masks.keys())]):
+            ti = int(term_to_idx.get(_norm_txt(term), -1))
+            if 0 <= int(ti) < int(y.size):
+                y[int(ti)] = 1.0
+        deformation_stack, deformation_idx = term_mask_map_to_label_stack(
+            deformation_term_masks,
+            y,
+            term_to_idx=term_to_idx,
+            height=int(h),
+            width=int(w),
+        )
+        if int(deformation_stack.shape[0]) > 0 and int(deformation_idx.size) > 0:
+            parts.append((deformation_stack, deformation_idx))
+
+    pre_detect_stack, pre_detect_idx = combine_label_mask_stacks(
+        y,
+        *parts,
+        height=int(h),
+        width=int(w),
+        fallback_creation_mask=None,
+    ) if len(parts) > 0 else (
+        np.zeros((0, int(h), int(w)), dtype=np.float32),
+        np.zeros((0,), dtype=np.int64),
+    )
+    detect_mask = (
+        _composite_mask_stack(pre_detect_stack)
+        if int(pre_detect_stack.shape[0]) > 0
+        else (
+            _normalize_stack_row(original_mixed_mask, height=int(h), width=int(w))
+            if original_mixed_mask is not None
+            else None
+        )
+    )
+    y = augment_label_vec_with_detected_color_terms(
+        image=chw,
+        label_vec=y,
+        term_to_idx=term_to_idx,
+        valid_mask=detect_mask,
+    )
+    detected_stack, detected_idx = build_term_mask_stack_from_image(
+        image=chw,
+        label_vec=y,
+        idx_to_term=idx_to_term,
+    ) if isinstance(idx_to_term, dict) and idx_to_term else (
+        np.zeros((0, int(h), int(w)), dtype=np.float32),
+        np.zeros((0,), dtype=np.int64),
+    )
+    if int(detected_stack.shape[0]) > 0 and int(detected_idx.size) > 0:
+        detected_stack = (detected_stack > 0.5).astype(np.float32, copy=False)
+        parts.append((detected_stack, detected_idx))
+
+    final_stack, final_idx = combine_label_mask_stacks(
+        y,
+        *parts,
+        height=int(h),
+        width=int(w),
+        fallback_creation_mask=None,
+    ) if len(parts) > 0 else (
+        np.zeros((0, int(h), int(w)), dtype=np.float32),
+        np.zeros((0,), dtype=np.int64),
+    )
+    mixed_mask = (
+        _composite_mask_stack(final_stack)
+        if int(final_stack.shape[0]) > 0
+        else np.zeros((int(h), int(w)), dtype=np.float32)
+    )
+    return y, np.asarray(mixed_mask, dtype=np.float32), np.asarray(final_stack, dtype=np.float32), np.asarray(final_idx, dtype=np.int64)
 
 
 def semantic_mask_stack_collate(batch: Sequence[Any]) -> Any:
@@ -890,46 +1064,167 @@ def _image_to_chw01(image: Any) -> np.ndarray:
     return np.clip(chw, 0.0, 1.0).astype(np.float32, copy=False)
 
 
+def _image_batch_to_bchw01(images: Any) -> np.ndarray:
+    arr = np.asarray(images, dtype=np.float32)
+    if int(arr.ndim) == 2:
+        return _image_to_chw01(arr)[None, ...]
+    if int(arr.ndim) == 3:
+        if int(arr.shape[0]) in (1, 3, 4) or int(arr.shape[2]) in (1, 3, 4):
+            return _image_to_chw01(arr)[None, ...]
+        bgray = np.repeat(arr[:, None, :, :], 3, axis=1).astype(np.float32, copy=False)
+        vmax = np.max(bgray, axis=(1, 2, 3), keepdims=True) if int(bgray.size) > 0 else np.zeros((int(arr.shape[0]), 1, 1, 1), dtype=np.float32)
+        vmin = np.min(bgray, axis=(1, 2, 3), keepdims=True) if int(bgray.size) > 0 else np.zeros((int(arr.shape[0]), 1, 1, 1), dtype=np.float32)
+        if float(np.max(vmax)) > 1.0:
+            bgray = bgray / 255.0
+        elif float(np.min(vmin)) < 0.0 and float(np.max(vmax)) <= 1.0:
+            bgray = (bgray + 1.0) * 0.5
+        return np.clip(bgray, 0.0, 1.0).astype(np.float32, copy=False)
+    if int(arr.ndim) == 4 and int(arr.shape[1]) in (1, 3, 4):
+        bchw = np.asarray(arr[:, :3, :, :], dtype=np.float32)
+        if int(bchw.shape[1]) == 1:
+            bchw = np.repeat(bchw, 3, axis=1)
+    elif int(arr.ndim) == 4 and int(arr.shape[3]) in (1, 3, 4):
+        bhwc = np.asarray(arr[:, :, :, :3], dtype=np.float32)
+        if int(bhwc.shape[3]) == 1:
+            bhwc = np.repeat(bhwc, 3, axis=3)
+        bchw = np.transpose(bhwc, (0, 3, 1, 2)).astype(np.float32, copy=False)
+    else:
+        raise RuntimeError(f"Unsupported image batch shape for semantic mask inference: {tuple(arr.shape)}")
+    vmax = np.max(bchw, axis=(1, 2, 3), keepdims=True) if int(bchw.size) > 0 else np.zeros((int(bchw.shape[0]), 1, 1, 1), dtype=np.float32)
+    vmin = np.min(bchw, axis=(1, 2, 3), keepdims=True) if int(bchw.size) > 0 else np.zeros((int(bchw.shape[0]), 1, 1, 1), dtype=np.float32)
+    if float(np.max(vmax)) > 1.0:
+        bchw = bchw / 255.0
+    elif float(np.min(vmin)) < 0.0 and float(np.max(vmax)) <= 1.0:
+        bchw = (bchw + 1.0) * 0.5
+    return np.clip(bchw, 0.0, 1.0).astype(np.float32, copy=False)
+
+
+def _avg_pool2d_batch(batch_hw: np.ndarray, kernel_size: int) -> np.ndarray:
+    kk = max(1, int(kernel_size))
+    if kk <= 1:
+        return np.asarray(batch_hw, dtype=np.float32)
+    pooled = F.avg_pool2d(
+        torch.from_numpy(np.asarray(batch_hw, dtype=np.float32)[:, None, :, :]),
+        kernel_size=int(kk),
+        stride=1,
+        padding=int(kk // 2),
+    )
+    return np.asarray(pooled[:, 0].cpu().numpy(), dtype=np.float32)
+
+
+def _normalize_attention_map_batch(mask: Any, gamma: float = 1.0, blur_kernel: int = 0) -> np.ndarray:
+    arr = np.asarray(mask, dtype=np.float32)
+    squeeze = False
+    if int(arr.ndim) == 2:
+        arr = arr[None, ...]
+        squeeze = True
+    if int(arr.ndim) != 3 or int(arr.size) <= 0:
+        out = np.zeros_like(np.asarray(arr, dtype=np.float32), dtype=np.float32)
+        return out[0] if bool(squeeze) and int(out.ndim) == 3 and int(out.shape[0]) > 0 else out
+    arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32, copy=False)
+    arr = np.maximum(arr, 0.0).astype(np.float32, copy=False)
+    vmax = np.max(arr, axis=(1, 2), keepdims=True) if int(arr.size) > 0 else np.zeros((int(arr.shape[0]), 1, 1), dtype=np.float32)
+    valid = vmax > 1e-8
+    arr = np.where(valid, arr / np.where(valid, vmax, 1.0), 0.0).astype(np.float32, copy=False)
+    vmean = np.mean(arr, axis=(1, 2), keepdims=True) if int(arr.size) > 0 else np.zeros((int(arr.shape[0]), 1, 1), dtype=np.float32)
+    arr = np.where(vmean > 1e-8, np.clip(arr / np.maximum(vmean * 2.0, 1.0), 0.0, 1.0), arr).astype(np.float32, copy=False)
+    gm = max(0.35, float(gamma))
+    if abs(gm - 1.0) > 1e-6:
+        arr = np.power(np.clip(arr, 0.0, 1.0), gm).astype(np.float32, copy=False)
+    kk = int(blur_kernel)
+    if kk >= 3:
+        kk = int(kk) | 1
+        arr = _avg_pool2d_batch(arr, kernel_size=int(kk))
+        vmax = np.max(arr, axis=(1, 2), keepdims=True) if int(arr.size) > 0 else np.zeros((int(arr.shape[0]), 1, 1), dtype=np.float32)
+        valid = vmax > 1e-8
+        arr = np.where(valid, arr / np.where(valid, vmax, 1.0), 0.0).astype(np.float32, copy=False)
+    arr = np.clip(arr, 0.0, 1.0).astype(np.float32, copy=False)
+    return np.asarray(arr[0], dtype=np.float32) if bool(squeeze) else arr
+
+
+def _blend_attention_maps_batch(maps: Sequence[Any], weights: Optional[Sequence[float]] = None, gamma: float = 1.0) -> np.ndarray:
+    valid: List[np.ndarray] = []
+    valid_weights: List[float] = []
+    ref_shape: Optional[Tuple[int, int, int]] = None
+    for i, m in enumerate(maps):
+        arr = np.asarray(m, dtype=np.float32)
+        if int(arr.ndim) == 2:
+            arr = arr[None, ...]
+        if int(arr.ndim) != 3 or int(arr.size) <= 0:
+            continue
+        if ref_shape is None:
+            ref_shape = (int(arr.shape[0]), int(arr.shape[1]), int(arr.shape[2]))
+        w = 1.0 if weights is None or i >= int(len(weights)) else float(weights[i])
+        if w <= 0.0:
+            continue
+        norm = _normalize_attention_map_batch(arr, gamma=1.0, blur_kernel=0)
+        if float(np.max(norm)) <= 1e-8:
+            continue
+        valid.append(np.asarray(norm, dtype=np.float32))
+        valid_weights.append(float(w))
+    if len(valid) <= 0:
+        if ref_shape is None:
+            return np.zeros((0, 0, 0), dtype=np.float32)
+        return np.zeros(ref_shape, dtype=np.float32)
+    weights_np = np.asarray(valid_weights, dtype=np.float32).reshape(-1, 1, 1, 1)
+    stack = np.stack(valid, axis=0).astype(np.float32, copy=False)
+    acc = np.sum(weights_np * stack, axis=0).astype(np.float32, copy=False)
+    wsum = float(np.sum(np.asarray(valid_weights, dtype=np.float32)))
+    if wsum > 1e-8:
+        acc = acc / float(wsum)
+    return _normalize_attention_map_batch(acc, gamma=float(gamma), blur_kernel=5)
+
+
 def _semantic_color_score_maps(chw: np.ndarray) -> Dict[str, np.ndarray]:
-    arr = np.clip(np.asarray(chw, dtype=np.float32), 0.0, 1.0)
-    if int(arr.ndim) != 3 or int(arr.shape[0]) < 3:
+    maps = _semantic_color_score_maps_batch(np.asarray(chw, dtype=np.float32)[None, ...])
+    return {str(k): np.asarray(v[0], dtype=np.float32) for k, v in maps.items()}
+
+
+def _semantic_color_score_maps_batch(chw_batch: Any) -> Dict[str, np.ndarray]:
+    arr = np.clip(_image_batch_to_bchw01(chw_batch), 0.0, 1.0).astype(np.float32, copy=False)
+    if int(arr.ndim) != 4 or int(arr.shape[1]) < 3:
         return {}
-    r = np.asarray(arr[0], dtype=np.float32)
-    g = np.asarray(arr[1], dtype=np.float32)
-    b = np.asarray(arr[2], dtype=np.float32)
+    r = np.asarray(arr[:, 0], dtype=np.float32)
+    g = np.asarray(arr[:, 1], dtype=np.float32)
+    b = np.asarray(arr[:, 2], dtype=np.float32)
     vmax = np.maximum.reduce([r, g, b]).astype(np.float32, copy=False)
     vmin = np.minimum.reduce([r, g, b]).astype(np.float32, copy=False)
     sat = np.clip(vmax - vmin, 0.0, 1.0).astype(np.float32, copy=False)
 
-    def _norm01(x: np.ndarray) -> np.ndarray:
+    def _norm01_batch(x: np.ndarray) -> np.ndarray:
         xx = np.asarray(x, dtype=np.float32)
-        hi = float(np.max(xx)) if int(xx.size) > 0 else 0.0
-        if hi <= 1e-8:
-            return np.zeros_like(xx, dtype=np.float32)
-        return np.clip(xx / float(hi), 0.0, 1.0).astype(np.float32, copy=False)
+        hi = np.max(xx, axis=(1, 2), keepdims=True) if int(xx.size) > 0 else np.zeros((int(xx.shape[0]), 1, 1), dtype=np.float32)
+        valid = hi > 1e-8
+        return np.where(valid, np.clip(xx / np.where(valid, hi, 1.0), 0.0, 1.0), 0.0).astype(np.float32, copy=False)
 
-    red = _norm01(np.clip(r - np.maximum(g, b), 0.0, 1.0) * np.clip(sat - 0.05, 0.0, 1.0))
-    green = _norm01(np.clip(g - np.maximum(r, b), 0.0, 1.0) * np.clip(sat - 0.05, 0.0, 1.0))
-    blue = _norm01(np.clip(b - np.maximum(r, g), 0.0, 1.0) * np.clip(sat - 0.05, 0.0, 1.0))
-    yellow = _norm01(np.clip(np.minimum(r, g) - b, 0.0, 1.0) * np.clip(sat - 0.05, 0.0, 1.0))
-    cyan = _norm01(np.clip(np.minimum(g, b) - r, 0.0, 1.0) * np.clip(sat - 0.05, 0.0, 1.0))
-    magenta = _norm01(np.clip(np.minimum(r, b) - g, 0.0, 1.0) * np.clip(sat - 0.05, 0.0, 1.0))
-    brown = _norm01(
+    red = _norm01_batch(np.clip(r - np.maximum(g, b), 0.0, 1.0) * np.clip(sat - 0.05, 0.0, 1.0))
+    green = _norm01_batch(np.clip(g - np.maximum(r, b), 0.0, 1.0) * np.clip(sat - 0.05, 0.0, 1.0))
+    blue = _norm01_batch(np.clip(b - np.maximum(r, g), 0.0, 1.0) * np.clip(sat - 0.05, 0.0, 1.0))
+    yellow = _norm01_batch(np.clip(np.minimum(r, g) - b, 0.0, 1.0) * np.clip(sat - 0.05, 0.0, 1.0))
+    cyan = _norm01_batch(np.clip(np.minimum(g, b) - r, 0.0, 1.0) * np.clip(sat - 0.05, 0.0, 1.0))
+    magenta = _norm01_batch(np.clip(np.minimum(r, b) - g, 0.0, 1.0) * np.clip(sat - 0.05, 0.0, 1.0))
+    brown = _norm01_batch(
         np.clip(r - g, 0.0, 1.0)
         * np.clip(g - b, 0.0, 1.0)
         * np.clip(vmax, 0.15, 0.75)
         * np.clip(0.85 - vmax, 0.0, 1.0)
     )
-    # orange: r dominant over b, r > g by margin, g > b (distinguishes from pure red)
-    orange = _norm01(
+    orange = _norm01_batch(
         np.clip(r - b - 0.05, 0.0, 1.0)
         * np.clip(r - g - 0.08, 0.0, 1.0)
         * np.clip(g - b - 0.02, 0.0, 1.0)
         * np.clip(sat - 0.10, 0.0, 1.0)
     )
-    black = _norm01(np.clip(0.22 - vmax, 0.0, 1.0))
-    white = _norm01(np.clip(vmin - 0.78, 0.0, 1.0) * np.clip(0.20 - sat, 0.0, 1.0))
-    gray = _norm01(np.clip(0.18 - sat, 0.0, 1.0) * np.clip(1.0 - np.abs(vmax - 0.5) * 2.2, 0.0, 1.0))
+    black = _norm01_batch(np.clip(0.22 - vmax, 0.0, 1.0))
+    white = _norm01_batch(np.clip(vmin - 0.78, 0.0, 1.0) * np.clip(0.20 - sat, 0.0, 1.0))
+    gray = _norm01_batch(np.clip(0.18 - sat, 0.0, 1.0) * np.clip(1.0 - np.abs(vmax - 0.5) * 2.2, 0.0, 1.0))
+    # Fast Sobel-like edge detector across batch
+    luma = np.mean(arr[:, :3], axis=1)  # (B, H, W)
+    gx = np.zeros_like(luma)
+    gy = np.zeros_like(luma)
+    gx[:, :, 1:-1] = luma[:, :, 2:] - luma[:, :, :-2]
+    gy[:, 1:-1, :] = luma[:, 2:, :] - luma[:, :-2, :]
+    edge = _norm01_batch(np.sqrt(gx * gx + gy * gy).astype(np.float32, copy=False))
     return {
         "red": red,
         "orange": orange,
@@ -942,7 +1237,7 @@ def _semantic_color_score_maps(chw: np.ndarray) -> Dict[str, np.ndarray]:
         "black": black,
         "white": white,
         "gray": gray,
-        "grey": gray,
+        "edge": edge,
     }
 
 
@@ -974,7 +1269,7 @@ def detect_semantic_color_terms(
         valid_count = int(np.sum(valid_mask))
 
     out: List[str] = []
-    for term in ["red", "orange", "green", "blue", "yellow", "cyan", "magenta", "brown", "black", "white", "gray", "grey"]:
+    for term in ["red", "orange", "green", "blue", "yellow", "cyan", "magenta", "brown", "black", "white", "gray", "edge"]:
         score = np.asarray(maps.get(term), dtype=np.float32)
         if int(score.size) <= 0:
             continue
@@ -985,169 +1280,184 @@ def detect_semantic_color_terms(
     return normalize_vocab_terms(out)
 
 
+def _normalize_semantic_terms_batch(
+    terms_batch: Optional[Sequence[Optional[Sequence[str]]]],
+    batch_size: int,
+) -> List[Sequence[str]]:
+    if terms_batch is None:
+        return [[] for _ in range(int(max(0, batch_size)))]
+    term_rows = list(terms_batch)
+    if int(len(term_rows)) < int(batch_size):
+        term_rows.extend([[] for _ in range(int(batch_size) - int(len(term_rows)))])
+    elif int(len(term_rows)) > int(batch_size):
+        term_rows = term_rows[: int(batch_size)]
+    return term_rows
+
+
+def _semantic_color_mask_from_score(color_score: Any) -> np.ndarray:
+    score = np.asarray(color_score, dtype=np.float32)
+    if int(score.ndim) != 2 or int(score.size) <= 0:
+        return np.zeros((0, 0), dtype=np.float32)
+    thr = max(0.20, float(np.percentile(score.reshape(-1), 82)) * 0.75)
+    exact = (score >= float(thr)).astype(np.float32, copy=False) * score
+    return _normalize_attention_map(exact, gamma=0.78, blur_kernel=1)
+
+
+def _semantic_color_mask_from_score_batch(scores: Any) -> np.ndarray:
+    """Batch version of _semantic_color_mask_from_score for [N, H, W] arrays.
+
+    Computes the 82nd-percentile threshold per image simultaneously using
+    np.percentile over the spatial axes, then thresholds and normalises all
+    images in one pass — no Python loop over N.
+    """
+    arr = np.asarray(scores, dtype=np.float32)
+    squeeze = False
+    if arr.ndim == 2:
+        arr = arr[None]
+        squeeze = True
+    n = int(arr.shape[0])
+    if n == 0 or int(arr.size) == 0:
+        return arr[0] if squeeze else arr
+    flat = arr.reshape(n, -1)  # [N, H*W]
+    # percentile per image — [N]
+    thr = np.percentile(flat, 82, axis=1).astype(np.float32) * 0.75
+    thr = np.maximum(0.20, thr)  # [N]
+    # broadcast threshold over [N, H, W]
+    exact = (arr >= thr[:, None, None]) * arr  # [N, H, W]
+    out = _normalize_attention_map_batch(exact, gamma=0.78, blur_kernel=1)
+    return np.asarray(out[0], dtype=np.float32) if squeeze else out
+
+
+def infer_semantic_support_masks(images: Any, terms_batch: Optional[Sequence[Optional[Sequence[str]]]] = None) -> np.ndarray:
+    bchw = _image_batch_to_bchw01(images)
+    bsz = int(bchw.shape[0]) if int(bchw.ndim) == 4 else 0
+    h = int(bchw.shape[2]) if int(bchw.ndim) == 4 else 0
+    w = int(bchw.shape[3]) if int(bchw.ndim) == 4 else 0
+    if int(bsz) <= 0 or int(h) <= 0 or int(w) <= 0:
+        return np.zeros((int(max(0, bsz)), int(max(0, h)), int(max(0, w))), dtype=np.float32)
+    term_rows = _normalize_semantic_terms_batch(terms_batch, batch_size=int(bsz))
+    color_maps = _semantic_color_score_maps_batch(bchw)
+    # Accumulate max color score per image across relevant terms — no per-image loop.
+    # For each color term present in color_maps, find which images request it, then
+    # max-accumulate that term's [N, H, W] score map into those image slots at once.
+    score_acc = np.zeros((int(bsz), int(h), int(w)), dtype=np.float32)
+    _color_term_set = set(_SEMANTIC_COLOR_TERMS)
+    for term_key, term_scores in color_maps.items():
+        if term_key not in _color_term_set:
+            continue
+        # which images mention this color term — build boolean mask [N]
+        wants = np.array(
+            [term_key in {_norm_txt(t) for t in (row or []) if str(t).strip()} for row in term_rows],
+            dtype=bool,
+        )
+        if not np.any(wants):
+            continue
+        # max-accumulate across the entire [N, H, W] slice in one numpy op
+        score_acc[wants] = np.maximum(score_acc[wants], np.asarray(term_scores, dtype=np.float32)[wants])
+    # Apply batch threshold+normalise only to images that have any signal
+    has_signal = np.max(score_acc.reshape(int(bsz), -1), axis=1) > 1e-8  # [N]
+    out = np.zeros((int(bsz), int(h), int(w)), dtype=np.float32)
+    if np.any(has_signal):
+        out[has_signal] = _semantic_color_mask_from_score_batch(score_acc[has_signal])
+    return out.astype(np.float32, copy=False)
+
+
 def infer_semantic_support_mask(image: Any, terms: Optional[Sequence[str]] = None) -> np.ndarray:
-    # ============================================================
-    # WARNING: THIS FUNCTION IS NOT READY FOR PREGESTATION TRAINING
-    # ============================================================
-    # The non_color_penalty branch actively suppresses pixels that
-    # match colors OTHER than the target — which will corrupt depth-mode
-    # rows by penalizing the gray cross occluder (a labeled element).
-    # The border-median BG estimation, seed-growing, and object_like /
-    # global_like branching all introduce heuristics that can produce
-    # false spatial information when the ground-truth geometry is already
-    # known exactly from the builder masks.
-    # This function is appropriate for the Berkeley/real-image payload path
-    # where no ground-truth geometry exists.  Before using it for any
-    # synthetic training path, audit the non_color_penalty suppression,
-    # the object_like coverage fallback, and the cross-color penalty
-    # weighting to ensure they will not degrade clean builder-generated rows.
-    # ============================================================
-    chw = _image_to_chw01(image)
-    h = int(chw.shape[1])
-    w = int(chw.shape[2])
-    gray = np.clip(np.mean(np.asarray(chw[:3], dtype=np.float32), axis=0), 0.0, 1.0).astype(np.float32, copy=False)
-    if int(gray.size) <= 0:
-        return np.zeros((int(h), int(w)), dtype=np.float32)
-
-    norm_terms = {_norm_txt(t) for t in (terms or []) if str(t).strip()}
-    object_like = bool(
-        ("object" in norm_terms)
-        or any(str(t).startswith("digit ") for t in norm_terms)
-        or any(str(t).startswith("letter ") for t in norm_terms)
-        or any(str(t).startswith("pictogram ") for t in norm_terms)
+    return np.asarray(
+        infer_semantic_support_masks(images=np.asarray(image, dtype=np.float32)[None, ...], terms_batch=[terms or []])[0],
+        dtype=np.float32,
     )
-    color_terms = {
-        str(t)
-        for t in norm_terms
-        if str(t)
-        in {"red", "green", "blue", "yellow", "cyan", "magenta", "brown", "black", "white", "gray", "grey"}
-    }
-    localized_like = bool(
-        bool(object_like)
-        or len(color_terms) > 0
-        or any(
-            t in {
-                "edge",
-                "shape",
-                "texture",
-                "layout",
-                "mask",
-                "composite",
-                "front",
-                "back",
-                "left",
-                "right",
-                "top",
-                "bottom",
+
+
+def build_term_mask_stacks_from_images(
+    images: Any,
+    label_vecs: Any,
+    idx_to_term: Optional[Dict[int, str]] = None,
+    term_mask_overrides_batch: Optional[Sequence[Optional[Dict[str, Any]]]] = None,
+) -> Tuple[List[np.ndarray], List[np.ndarray]]:
+    bchw = _image_batch_to_bchw01(images)
+    bsz = int(bchw.shape[0]) if int(bchw.ndim) == 4 else 0
+    h = int(bchw.shape[2]) if int(bchw.ndim) == 4 else 0
+    w = int(bchw.shape[3]) if int(bchw.ndim) == 4 else 0
+    y = np.asarray(label_vecs, dtype=np.float32)
+    if int(y.ndim) == 1:
+        y = y.reshape(1, -1)
+    if int(bsz) <= 0 or int(y.shape[0]) != int(bsz):
+        return [np.zeros((0, int(h), int(w)), dtype=np.float32) for _ in range(int(max(0, bsz)))], [np.zeros((0,), dtype=np.int64) for _ in range(int(max(0, bsz)))]
+
+    color_maps = _semantic_color_score_maps_batch(bchw)
+    override_rows = list(term_mask_overrides_batch) if term_mask_overrides_batch is not None else [None for _ in range(int(bsz))]
+    if int(len(override_rows)) < int(bsz):
+        override_rows.extend([None for _ in range(int(bsz) - int(len(override_rows)))])
+
+    masks_per_image: List[List[np.ndarray]] = [[] for _ in range(int(bsz))]
+    idx_per_image: List[List[int]] = [[] for _ in range(int(bsz))]
+
+    # Pre-build cls→term_key map once (avoids re-sub inside every loop iteration)
+    cls_to_term_key: Dict[int, str] = {}
+    if isinstance(idx_to_term, dict):
+        for ci, tname in idx_to_term.items():
+            cls_to_term_key[int(ci)] = _norm_txt(str(tname))
+
+    # active[n, c] = True when image n has class c positive — computed for the whole batch at once
+    active = y >= 0.5  # [N, C]
+    n_classes = int(y.shape[1]) if int(y.ndim) >= 2 else 0
+
+    # ---- Color-map path: loop over terms (~12), not over images (N can be large) ----
+    for term_key, term_scores in color_maps.items():
+        # Which class indices map to this color term?
+        cls_for_term = [ci for ci, tk in cls_to_term_key.items() if tk == term_key and int(ci) < int(n_classes)]
+        if not cls_for_term:
+            continue
+        term_scores_arr = np.asarray(term_scores, dtype=np.float32)  # [N, H, W]
+        for cls_idx in cls_for_term:
+            # Which images have this class active? — vectorised boolean index
+            active_imgs = np.where(active[:, int(cls_idx)])[0]  # [K]
+            if len(active_imgs) == 0:
+                continue
+            # Compute masks for ALL active images in one batch call, no Python loop
+            batch_masks = _semantic_color_mask_from_score_batch(term_scores_arr[active_imgs])  # [K, H, W]
+            vmax = np.max(batch_masks.reshape(len(active_imgs), -1), axis=1)  # [K]
+            for li in np.where(vmax > 1e-8)[0]:
+                gi = int(active_imgs[li])
+                masks_per_image[gi].append(batch_masks[int(li)])
+                idx_per_image[gi].append(int(cls_idx))
+
+    # ---- Override path: rare per-image user-supplied masks, stays per-image ----
+    has_overrides = any(isinstance(r, dict) and r for r in override_rows)
+    if has_overrides:
+        for row_idx in range(int(bsz)):
+            if not isinstance(override_rows[int(row_idx)], dict) or not override_rows[int(row_idx)]:
+                continue
+            override_lut = {
+                _norm_txt(str(k)): np.asarray(v, dtype=np.float32)
+                for k, v in override_rows[int(row_idx)].items()
+                if str(k).strip() and v is not None
             }
-            for t in norm_terms
-        )
-    )
-    global_like = bool(
-        (not bool(localized_like))
-        and any(
-            t in {
-                "signal",
-                "noise",
-                "mixed noise and signal",
-                "blur damage",
-                "noise damage",
-                "dropout damage",
-                "quantization damage",
-                "stride skew damage",
-                "white",
-                "black",
-                "gray",
-                "grey",
-                "none",
-            }
-            for t in norm_terms
-        )
-    )
+            positive_idx = np.where(active[int(row_idx)])[0]
+            for cls_idx in positive_idx.tolist():
+                term_key = cls_to_term_key.get(int(cls_idx), "")
+                if term_key not in override_lut:
+                    continue
+                # skip if already contributed by color_map path above
+                if any(int(ei) == int(cls_idx) for ei in idx_per_image[int(row_idx)]):
+                    continue
+                mask = _normalize_attention_map(override_lut[term_key], gamma=0.85, blur_kernel=1)
+                if float(np.max(mask)) <= 1e-8:
+                    continue
+                masks_per_image[int(row_idx)].append(np.asarray(mask, dtype=np.float32))
+                idx_per_image[int(row_idx)].append(int(cls_idx))
 
-    border_parts = [gray[0:1, :], gray[-1:, :], gray[:, 0:1], gray[:, -1:]]
-    border = np.concatenate([np.asarray(p, dtype=np.float32).reshape(-1) for p in border_parts], axis=0)
-    bg = float(np.median(border)) if int(border.size) > 0 else float(np.median(gray))
-
-    blur = F.avg_pool2d(torch.from_numpy(gray[None, None, ...]), kernel_size=5, stride=1, padding=2)[0, 0].cpu().numpy()
-    diff_bg = np.abs(gray - float(bg)).astype(np.float32, copy=False)
-    diff_local = np.abs(gray - np.asarray(blur, dtype=np.float32)).astype(np.float32, copy=False)
-    gy, gx = np.gradient(gray.astype(np.float32, copy=False))
-    grad = np.sqrt((gx * gx) + (gy * gy)).astype(np.float32, copy=False)
-
-    def _norm_map(v: np.ndarray) -> np.ndarray:
-        vmax = float(np.max(v)) if int(v.size) > 0 else 0.0
-        if vmax <= 1e-8:
-            return np.zeros_like(v, dtype=np.float32)
-        return np.clip(np.asarray(v, dtype=np.float32) / float(vmax), 0.0, 1.0).astype(np.float32, copy=False)
-
-    score = np.maximum.reduce([
-        _norm_map(diff_bg),
-        0.85 * _norm_map(diff_local),
-        0.65 * _norm_map(grad),
-    ]).astype(np.float32, copy=False)
-    if len(color_terms) > 0:
-        color_maps = _semantic_color_score_maps(chw)
-        color_parts = [np.asarray(color_maps.get(str(term)), dtype=np.float32) for term in sorted(color_terms) if str(term) in color_maps]
-        color_parts = [x for x in color_parts if int(x.size) > 0]
-        if len(color_parts) > 0:
-            color_score = np.maximum.reduce(color_parts).astype(np.float32, copy=False)
-            color_score = _normalize_attention_map(color_score, gamma=0.82, blur_kernel=3)
-            non_color_penalty = np.ones_like(color_score, dtype=np.float32)
-            other_color_parts = [
-                np.asarray(color_maps.get(str(term)), dtype=np.float32)
-                for term in sorted(color_maps.keys())
-                if str(term) not in color_terms
-            ]
-            other_color_parts = [x for x in other_color_parts if int(x.size) > 0]
-            if len(other_color_parts) > 0:
-                other_score = _normalize_attention_map(np.maximum.reduce(other_color_parts), gamma=1.0, blur_kernel=3)
-                non_color_penalty = np.clip(1.0 - (0.55 * other_score), 0.15, 1.0).astype(np.float32, copy=False)
-            score = _blend_attention_maps(
-                [score * non_color_penalty, color_score * non_color_penalty],
-                weights=[0.28, 1.45],
-                gamma=0.82,
-            ).astype(np.float32, copy=False)
-    score_t = F.avg_pool2d(torch.from_numpy(score[None, None, ...]), kernel_size=5, stride=1, padding=2)
-    score = _normalize_attention_map(score_t[0, 0].cpu().numpy(), gamma=0.92, blur_kernel=5)
-
-    thr = max(0.16, float(np.percentile(score.reshape(-1), 72)) * 0.70)
-    seed = (score >= float(thr)).astype(np.float32, copy=False)
-    seed_t = F.avg_pool2d(torch.from_numpy(seed[None, None, ...]), kernel_size=5, stride=1, padding=2)
-    seed = np.asarray(seed_t[0, 0].cpu().numpy(), dtype=np.float32)
-    seed = _normalize_attention_map(seed, gamma=0.85, blur_kernel=3)
-
-    coverage = float(np.mean(seed >= 0.40)) if int(seed.size) > 0 else 0.0
-    if bool(object_like) and (coverage <= 0.01 or coverage >= 0.97):
-        hi = float(np.percentile(gray.reshape(-1), 75))
-        lo = float(np.percentile(gray.reshape(-1), 25))
-        if abs(float(hi) - float(bg)) >= abs(float(lo) - float(bg)):
-            refine = (gray >= float((hi + bg) * 0.5)).astype(np.float32, copy=False)
-        else:
-            refine = (gray <= float((lo + bg) * 0.5)).astype(np.float32, copy=False)
-        refine_t = F.avg_pool2d(torch.from_numpy(refine[None, None, ...]), kernel_size=5, stride=1, padding=2)
-        seed = _normalize_attention_map(refine_t[0, 0].cpu().numpy(), gamma=0.82, blur_kernel=5)
-        coverage = float(np.mean(seed >= 0.40)) if int(seed.size) > 0 else 0.0
-
-    if coverage <= 0.01:
-        score_thr = max(0.10, float(np.percentile(score.reshape(-1), 55)) * 0.50)
-        fallback = _normalize_attention_map(score * (score >= float(score_thr)).astype(np.float32, copy=False), gamma=0.95, blur_kernel=5)
-        if float(np.max(fallback)) <= 1e-8:
-            fallback = _normalize_attention_map(score, gamma=1.0, blur_kernel=7)
-        seed = fallback
-
-    if bool(object_like):
-        mask = _blend_attention_maps([score, seed], weights=[0.65, 1.15], gamma=0.88)
-    elif bool(global_like):
-        local_grad = _normalize_attention_map((0.55 * diff_local) + (0.85 * grad), gamma=1.05, blur_kernel=5)
-        mask = _blend_attention_maps([score, local_grad], weights=[0.70, 1.20], gamma=1.08)
-    else:
-        mask = _blend_attention_maps([score, seed], weights=[0.90, 0.75], gamma=0.98)
-
-    if bool(object_like) and float(np.mean(mask >= 0.45)) <= 0.02:
-        mask = _blend_attention_maps([mask, seed], weights=[0.65, 1.35], gamma=0.85)
-
-    return _normalize_attention_map(mask, gamma=(0.82 if bool(object_like) else 1.05), blur_kernel=5)
+    out_stack: List[np.ndarray] = []
+    out_idx: List[np.ndarray] = []
+    for row_idx in range(int(bsz)):
+        if len(masks_per_image[int(row_idx)]) <= 0:
+            out_stack.append(np.zeros((0, int(h), int(w)), dtype=np.float32))
+            out_idx.append(np.zeros((0,), dtype=np.int64))
+            continue
+        out_stack.append(np.stack(masks_per_image[int(row_idx)], axis=0).astype(np.float32, copy=False))
+        out_idx.append(np.asarray(idx_per_image[int(row_idx)], dtype=np.int64))
+    return out_stack, out_idx
 
 
 @dataclass
@@ -1163,6 +1473,8 @@ class StageDatasetManifest:
     persistent_workers: bool = False
     prefetch_factor: int = 2
     pin_memory: bool = False
+    shuffle: bool = False
+    sampler: Optional[Sampler] = None
 
 
 def effective_dataloader_num_workers(num_workers: int, device_type: str = "") -> int:
@@ -1201,20 +1513,32 @@ def build_loader_from_manifest(manifest: StageDatasetManifest) -> Tuple[Optional
             picks = picks[: int(manifest.max_samples)]
     if int(picks.size) <= 0:
         return None, 0
+    if manifest.sampler is not None and int(picks.size) != int(n):
+        raise RuntimeError(
+            "StageDatasetManifest sampler requires a full-dataset view; "
+            "subset selection via ordered_indices/max_samples is not compatible."
+        )
     ds_use: Dataset = manifest.dataset if int(picks.size) == int(n) else torch.utils.data.Subset(manifest.dataset, picks.tolist())
     collate_fn = semantic_mask_stack_collate if bool(getattr(manifest.dataset, "use_semantic_mask_stack_collate", False)) else None
     loader_num_workers = effective_dataloader_num_workers(
         num_workers=manifest.num_workers,
         device_type=manifest.device_type,
     )
+    loader_generator = None
+    use_shuffle = bool(manifest.shuffle) and manifest.sampler is None
+    if bool(use_shuffle):
+        loader_generator = torch.Generator()
+        loader_generator.manual_seed(max(0, int(manifest.seed)))
     loader = DataLoader(
         ds_use,
         batch_size=max(1, int(manifest.batch_size)),
-        shuffle=False,
+        shuffle=bool(use_shuffle),
+        sampler=manifest.sampler,
         num_workers=int(loader_num_workers),
         pin_memory=bool(manifest.pin_memory),
         drop_last=False,
         collate_fn=collate_fn,
+        generator=loader_generator,
         **dataloader_perf_kwargs(
             num_workers=int(loader_num_workers),
             persistent_workers=bool(manifest.persistent_workers),
@@ -1277,7 +1601,7 @@ def augment_bootstrap_chw01(
         for term in normalize_vocab_terms([str(t) for t in list(terms)]):
             tk = _norm_txt(term)
             prev_mask = np.asarray(term_masks.get(tk, np.zeros((int(h), int(w)), dtype=np.float32)), dtype=np.float32)
-            term_masks[tk] = np.maximum(prev_mask, np.asarray(norm, dtype=np.float32)).astype(np.float32, copy=False)
+            term_masks[tk] = _blend_attention_maps([prev_mask, norm], weights=[1.0, 1.0], gamma=0.90)
 
     def _mark_diff(prev_x: np.ndarray, next_x: np.ndarray, scale: float = 1.0):
         prev_g = np.mean(np.asarray(prev_x, dtype=np.float32), axis=0)
@@ -1619,6 +1943,10 @@ class BootstrapDynamicDataset(Dataset):
             dataset_name=str(self.dataset_name),
         )
         self.cached_rows = 0
+        # In-memory eager cache: populated at construction for non-augmented datasets
+        # so that __getitem__ is a pure list lookup with zero recomputation per epoch.
+        self._eager_row_cache: List[Optional[tuple]] = [None] * int(self.total_rows)
+        self._eager_row_cache_ready = False
         self._cache_manifest_path = ""
         self._cache_images_path = ""
         self._cache_targets_path = ""
@@ -1649,6 +1977,18 @@ class BootstrapDynamicDataset(Dataset):
             "slot_lifespan": int(self.persistent_cache_slot_lifespan),
         }
         self._initialize_persistent_cache()
+        # For non-augmented datasets with no disk cache: pre-materialise every row
+        # once now so each subsequent __getitem__ is a zero-cost list lookup.
+        if not bool(self.augment) and int(self.cached_rows) < int(self.total_rows):
+            for _ei in tqdm(
+                range(int(self.total_rows)),
+                desc=f"[{self.dataset_name}] materializing",
+                unit="row",
+                leave=False,
+                dynamic_ncols=True,
+            ):
+                self._eager_row_cache[_ei] = self._materialize_numpy_row(_ei)
+            self._eager_row_cache_ready = True
 
     def __getstate__(self):
         state = dict(self.__dict__)
@@ -1658,6 +1998,10 @@ class BootstrapDynamicDataset(Dataset):
         state["_cache_mask_stacks_mm"] = None
         state["_cache_mask_indices_mm"] = None
         state["_cache_mask_offsets_mm"] = None
+        # Don't ship the eager cache across process boundaries — workers re-derive
+        # on demand via _materialize_numpy_row (num_workers=0 on Windows/CUDA anyway).
+        state["_eager_row_cache"] = [None] * int(len(state.get("_eager_row_cache", [])))
+        state["_eager_row_cache_ready"] = False
         return state
 
     def __setstate__(self, state):
@@ -1668,6 +2012,7 @@ class BootstrapDynamicDataset(Dataset):
         self._cache_mask_stacks_mm = None
         self._cache_mask_indices_mm = None
         self._cache_mask_offsets_mm = None
+        self._eager_row_cache_ready = False
 
     def _desired_cached_rows(self) -> int:
         if not self.persistent_cache_dir:
@@ -1812,7 +2157,13 @@ class BootstrapDynamicDataset(Dataset):
         mask_stack_rows: List[np.ndarray] = []
         mask_index_rows: List[np.ndarray] = []
         mask_offsets: List[int] = [0]
-        for idx in range(int(desired_rows)):
+        for idx in tqdm(
+            range(int(desired_rows)),
+            desc=f"[{self.dataset_name}] building cache",
+            unit="row",
+            leave=False,
+            dynamic_ncols=True,
+        ):
             img_np, tgt_np, mask_np, mask_stack_np, mask_idx_np = self._materialize_numpy_row(int(idx))
             images_rows.append(_cache_encode_image_u8(img_np))
             target_rows.append(_cache_encode_target_f16(tgt_np))
@@ -2000,6 +2351,8 @@ class BootstrapDynamicDataset(Dataset):
             idx = int(self.total_rows) + idx
         if idx < 0 or idx >= int(self.total_rows):
             raise IndexError(idx)
+        if bool(self._eager_row_cache_ready) and self._eager_row_cache[idx] is not None:
+            return self._eager_row_cache[idx]  # type: ignore[return-value]
         cycle = int(idx // max(1, int(self.base_rows)))
         off = int(idx % max(1, int(self.base_rows)))
         base_idx = int((off + (cycle * 17) + int(self.seed % max(1, int(self.base_rows)))) % int(self.base_rows))
@@ -2058,23 +2411,16 @@ class BootstrapDynamicDataset(Dataset):
                     ti = int(self.semantic_term_to_idx.get(tk, -1))
                     if 0 <= int(ti) < int(tgt.size):
                         tgt[int(ti)] = 1.0
-            if bool(self.return_mask_stack):
-                aug_stack_np, aug_idx_np = term_mask_map_to_label_stack(
-                    aug_term_masks,
-                    tgt,
-                    term_to_idx=self.semantic_term_to_idx,
-                    height=int(img.shape[1]),
-                    width=int(img.shape[2]),
-                )
-                mask_stack_np, mask_idx_np = combine_label_mask_stacks(
-                    tgt,
-                    (mask_stack_np, mask_idx_np),
-                    (aug_stack_np, aug_idx_np),
-                    height=int(img.shape[1]),
-                    width=int(img.shape[2]),
-                )
-                if int(mask_stack_np.shape[0]) > 0:
-                    mask = _composite_mask_stack(mask_stack_np)
+        if bool(self.return_masks):
+            tgt, mask, mask_stack_np, mask_idx_np = assemble_semantic_mask_layers(
+                image=img,
+                label_vec=tgt,
+                idx_to_term=self.idx_to_term,
+                term_to_idx=self.semantic_term_to_idx,
+                original_mixed_mask=np.asarray(mask, dtype=np.float32),
+                original_parts=[(mask_stack_np, mask_idx_np)],
+                deformation_term_masks=aug_term_masks if bool(self.augment) and int(self.total_rows) > int(self.base_rows) else None,
+            )
         return (
             np.asarray(img, dtype=np.float32),
             np.asarray(tgt, dtype=np.float32),
@@ -2098,7 +2444,7 @@ class BootstrapDynamicDataset(Dataset):
                 mask_stack_np, mask_idx_np = build_label_mask_stack(
                     mixed_mask=np.asarray(mask, dtype=np.float32),
                     label_vec=tgt,
-                    treat_mixed_mask_as_creation=False,
+                    treat_mixed_mask_as_creation=bool(float(np.max(np.asarray(mask, dtype=np.float32))) > 1e-8),
                 )
             else:
                 start = int(self._cache_mask_offsets_mm[int(index)])
@@ -2113,7 +2459,7 @@ class BootstrapDynamicDataset(Dataset):
                     mask_stack_np, mask_idx_np = build_label_mask_stack(
                         mixed_mask=np.asarray(mask, dtype=np.float32),
                         label_vec=tgt,
-                        treat_mixed_mask_as_creation=False,
+                        treat_mixed_mask_as_creation=bool(float(np.max(np.asarray(mask, dtype=np.float32))) > 1e-8),
                     )
         else:
             mask_stack_np = np.zeros((0, int(mask.shape[0]), int(mask.shape[1])), dtype=np.float32)
@@ -2133,21 +2479,26 @@ class BootstrapDynamicDataset(Dataset):
         cached_stack_idx = self.base_mask_stack_indices[int(idx)]
         if cached_mask is None:
             # Derive composite mask from the element stack if the builder
-            # provided one; fall back to a uniform mask otherwise.  The
-            # expensive infer_semantic_support_mask heuristic is NOT
-            # appropriate for synthetic rows whose geometry is already known.
+            # provided one. For a single-label sample with no explicit mask,
+            # treat the whole image as the source mask.
             if cached_stack is not None and int(np.asarray(cached_stack).ndim) == 3 and int(np.asarray(cached_stack).shape[0]) > 0:
                 cached_mask = _composite_mask_stack(np.asarray(cached_stack, dtype=np.float32))
             else:
                 img_ref = np.asarray(self.images[int(idx)], dtype=np.float32)
-                cached_mask = np.ones((int(img_ref.shape[1]), int(img_ref.shape[2])), dtype=np.float32)
+                cached_mask = _single_label_whole_image_mask(
+                    self.targets[int(idx)],
+                    height=int(img_ref.shape[1]),
+                    width=int(img_ref.shape[2]),
+                )
+                if cached_mask is None:
+                    cached_mask = np.zeros((int(img_ref.shape[1]), int(img_ref.shape[2])), dtype=np.float32)
             self.base_masks[int(idx)] = np.asarray(cached_mask, dtype=np.float32)
         if bool(self.return_mask_stack) and (cached_stack is None or cached_stack_idx is None):
             tgt = np.asarray(self.targets[int(idx)], dtype=np.float32).reshape(-1)
             cached_stack, cached_stack_idx = build_label_mask_stack(
                 mixed_mask=np.asarray(cached_mask, dtype=np.float32),
                 label_vec=tgt,
-                treat_mixed_mask_as_creation=False,
+                treat_mixed_mask_as_creation=bool(float(np.max(np.asarray(cached_mask, dtype=np.float32))) > 1e-8),
             )
             self.base_mask_stacks[int(idx)] = np.asarray(cached_stack, dtype=np.float32)
             self.base_mask_stack_indices[int(idx)] = np.asarray(cached_stack_idx, dtype=np.int64)
@@ -2182,7 +2533,7 @@ class BootstrapDynamicDataset(Dataset):
                     mask_stack_np, mask_idx_np = build_label_mask_stack(
                         mixed_mask=np.asarray(mask, dtype=np.float32),
                         label_vec=tgt,
-                        treat_mixed_mask_as_creation=False,
+                        treat_mixed_mask_as_creation=bool(float(np.max(np.asarray(mask, dtype=np.float32))) > 1e-8),
                     )
                 return (
                     x_t,
@@ -2248,6 +2599,10 @@ class DiskSemanticRowsDataset(Dataset):
             "noise_prob": float(cfg.get("noise_prob", 0.55)),
             "noise_std_min": float(cfg.get("noise_std_min", 0.01)),
             "noise_std_max": float(cfg.get("noise_std_max", 0.08)),
+            "edge_highlight_prob": float(cfg.get("edge_highlight_prob", 0.35)),
+            "edge_highlight_blend_min": float(cfg.get("edge_highlight_blend_min", 0.05)),
+            "edge_highlight_blend_max": float(cfg.get("edge_highlight_blend_max", 0.25)),
+            "edge_highlight_ultra": bool(cfg.get("edge_highlight_ultra", str(os.environ.get("EDGE_HIGHLIGHT_ULTRA", "0")).strip() == "1")),
         }
 
     def __len__(self) -> int:
@@ -2335,11 +2690,6 @@ class DiskSemanticRowsDataset(Dataset):
         return None
 
     def _load_mask01(self, row: SemanticDiskRow, h: int, w: int, image_rgb01: Optional[np.ndarray] = None) -> np.ndarray:
-        inferred_mask = infer_semantic_support_mask(
-            image=(image_rgb01 if image_rgb01 is not None else np.zeros((3, int(h), int(w)), dtype=np.float32)),
-            terms=row.terms,
-        )
-
         creation_mask = self._load_creation_mask01(row, h=int(h), w=int(w))
         if creation_mask is not None:
             return np.asarray(creation_mask, dtype=np.float32)
@@ -2353,7 +2703,10 @@ class DiskSemanticRowsDataset(Dataset):
                 gamma=0.95,
                 blur_kernel=1,
             )
-        return _normalize_attention_map(inferred_mask, gamma=0.92, blur_kernel=5)
+        single_mask = _single_label_whole_image_mask(row.label_vec, height=int(h), width=int(w))
+        if single_mask is not None:
+            return np.asarray(single_mask, dtype=np.float32)
+        return np.zeros((int(h), int(w)), dtype=np.float32)
 
     def _apply_degrade(self, x: np.ndarray, mask: Optional[np.ndarray], idx: int) -> Tuple[np.ndarray, Optional[np.ndarray], Dict[str, np.ndarray]]:
         if not bool(self.degrade):
@@ -2380,7 +2733,7 @@ class DiskSemanticRowsDataset(Dataset):
             for term in normalize_vocab_terms([str(t) for t in list(terms)]):
                 tk = _norm_txt(term)
                 prev = np.asarray(term_masks.get(tk, np.zeros((int(h), int(w)), dtype=np.float32)), dtype=np.float32)
-                term_masks[tk] = np.maximum(prev, np.asarray(norm, dtype=np.float32)).astype(np.float32, copy=False)
+                term_masks[tk] = _blend_attention_maps([prev, norm], weights=[1.0, 1.0], gamma=0.90)
 
         def _mark_diff(prev_x: np.ndarray, next_x: np.ndarray, scale: float = 1.0):
             prev_g = np.mean(np.asarray(prev_x, dtype=np.float32), axis=0)
@@ -2434,6 +2787,26 @@ class DiskSemanticRowsDataset(Dataset):
                 scale=0.90,
                 gamma=0.90,
             )
+        if float(rng.random()) < float(self.degrade_config["edge_highlight_prob"]):
+            prev = np.asarray(out, dtype=np.float32).copy()
+            gray = np.mean(out[:3], axis=0).astype(np.float32, copy=False)
+            if bool(self.degrade_config["edge_highlight_ultra"]):
+                from pipeline.semantic_wheel_cache import _canny_edge_map
+                edge_map = _canny_edge_map(gray)
+            else:
+                from pipeline.semantic_wheel_cache import _sobel_edge_map
+                edge_map = _sobel_edge_map(gray)
+            blend = float(rng.uniform(
+                float(self.degrade_config["edge_highlight_blend_min"]),
+                float(self.degrade_config["edge_highlight_blend_max"]),
+            ))
+            out = out + (float(blend) * edge_map[None, :, :]).astype(np.float32, copy=False)
+            _accumulate_term_mask(
+                ["edge", "signal"],
+                edge_map,
+                scale=0.85,
+                gamma=0.95,
+            )
         out = np.clip(out, 0.0, 1.0).astype(np.float32, copy=False)
         if mask_out is not None:
             touch = _normalize_attention_map(touch, gamma=1.05, blur_kernel=5)
@@ -2455,71 +2828,31 @@ class DiskSemanticRowsDataset(Dataset):
     def __getitem__(self, index: int):
         row = self.rows[int(index)]
         x = self._load_rgb01(row.image_path)
-        mask_np = None
-        if bool(self.return_masks):
-            mask_np = self._load_mask01(row, h=int(x.shape[1]), w=int(x.shape[2]), image_rgb01=x)
-        x, mask_np, degrade_term_masks = self._apply_degrade(x=x, mask=mask_np, idx=int(index))
         y = np.asarray(row.label_vec, dtype=np.float32).reshape(-1)
         if bool(self.return_masks):
-            mask_stack_np = np.zeros((0, int(x.shape[1]), int(x.shape[2])), dtype=np.float32)
-            mask_idx_np = np.zeros((0,), dtype=np.int64)
-            if bool(self.return_mask_stack):
-                cached_bundle = _load_row_mask_cache_bundle(getattr(row, "mask_cache_file", ""))
-                cached_stack_array = row.mask_stack_array
-                cached_stack_indices = row.mask_stack_indices
-                if isinstance(cached_bundle, dict):
-                    if cached_stack_array is None:
-                        cached_stack_array = cached_bundle.get("mask_stack")
-                    if cached_stack_indices is None:
-                        cached_stack_indices = cached_bundle.get("mask_indices")
-                creation_mask = self._load_creation_mask01(row, h=int(x.shape[1]), w=int(x.shape[2]))
-                base_stack_np, base_idx_np = build_label_mask_stack(
-                    mixed_mask=np.asarray(
-                        creation_mask
-                        if creation_mask is not None
-                        else np.ones((int(x.shape[1]), int(x.shape[2])), dtype=np.float32),
-                        dtype=np.float32,
-                    ),
-                    label_vec=y,
-                    mask_stack_array=cached_stack_array,
-                    mask_stack_indices=cached_stack_indices,
-                    treat_mixed_mask_as_creation=bool(creation_mask is not None),
-                )
-                if (int(base_stack_np.shape[0]) <= 0 or int(base_idx_np.size) <= 0) and int(len(self.idx_to_term)) > 0:
-                    base_stack_np, base_idx_np = build_term_mask_stack_from_image(
-                        image=x,
-                        label_vec=y,
-                        idx_to_term=self.idx_to_term,
-                    )
-                distortion_stack_np, distortion_idx_np = term_mask_map_to_label_stack(
-                    degrade_term_masks,
-                    y,
-                    term_to_idx=self.term_to_idx,
-                    height=int(x.shape[1]),
-                    width=int(x.shape[2]),
-                )
-                mask_stack_np, mask_idx_np = combine_label_mask_stacks(
-                    y,
-                    (base_stack_np, base_idx_np),
-                    (distortion_stack_np, distortion_idx_np),
-                    height=int(x.shape[1]),
-                    width=int(x.shape[2]),
-                    fallback_creation_mask=creation_mask,
-                )
-                if int(mask_stack_np.shape[0]) > 0:
-                    mask_np = _composite_mask_stack(mask_stack_np)
+            base_mask_np = self._load_mask01(row, h=int(x.shape[1]), w=int(x.shape[2]), image_rgb01=x)
+            cached_bundle = _load_row_mask_cache_bundle(getattr(row, "mask_cache_file", ""))
+            cached_stack_array = row.mask_stack_array
+            cached_stack_indices = row.mask_stack_indices
+            if isinstance(cached_bundle, dict):
+                if cached_stack_array is None:
+                    cached_stack_array = cached_bundle.get("mask_stack")
+                if cached_stack_indices is None:
+                    cached_stack_indices = cached_bundle.get("mask_indices")
+            x, base_mask_np, degrade_term_masks = self._apply_degrade(x=x, mask=base_mask_np, idx=int(index))
+            y, mask_np, mask_stack_np, mask_idx_np = assemble_semantic_mask_layers(
+                image=x,
+                label_vec=y,
+                idx_to_term=self.idx_to_term,
+                term_to_idx=self.term_to_idx,
+                original_mixed_mask=np.asarray(base_mask_np, dtype=np.float32),
+                original_parts=[(cached_stack_array, cached_stack_indices)],
+                deformation_term_masks=degrade_term_masks,
+            )
             x_t = torch.from_numpy(np.asarray(x, dtype=np.float32))
             y_t = torch.from_numpy(np.asarray(y, dtype=np.float32))
             mask_t = torch.from_numpy(np.asarray(mask_np, dtype=np.float32)[None, ...])
             if bool(self.return_mask_stack):
-                if int(mask_stack_np.shape[0]) <= 0 or int(mask_idx_np.size) <= 0:
-                    mask_stack_np, mask_idx_np = build_label_mask_stack(
-                        mixed_mask=np.asarray(mask_np, dtype=np.float32),
-                        label_vec=y,
-                        mask_stack_array=cached_stack_array,
-                        mask_stack_indices=cached_stack_indices,
-                        treat_mixed_mask_as_creation=False,
-                    )
                 return (
                     x_t,
                     y_t,
@@ -2749,37 +3082,20 @@ def _build_and_store_row_mask_cache(
     if explicit_mask is None and isinstance(layout, dict):
         explicit_mask = _normalize_attention_map(build_layout_mask(layout, height=int(h), width=int(w)), gamma=0.95, blur_kernel=3)
 
-    creation_stack = np.zeros((0, int(h), int(w)), dtype=np.float32)
-    creation_idx = np.zeros((0,), dtype=np.int64)
-    if explicit_mask is not None:
-        creation_stack, creation_idx = build_creation_label_mask_stack(
-            label_vec=label_vec,
-            height=int(h),
-            width=int(w),
-            creation_mask=np.asarray(explicit_mask, dtype=np.float32),
-        )
-
-    heuristic_stack, heuristic_idx = build_term_mask_stack_from_image(
+    term_to_idx = {
+        _norm_txt(str(term)): int(idx)
+        for idx, term in ((idx_to_term or {}).items() if isinstance(idx_to_term, dict) else [])
+        if str(term).strip()
+    }
+    _, mixed_mask, inferred_stack, inferred_idx = assemble_semantic_mask_layers(
         image=chw,
         label_vec=label_vec,
         idx_to_term=idx_to_term,
+        term_to_idx=term_to_idx,
+        original_mixed_mask=np.asarray(explicit_mask, dtype=np.float32) if explicit_mask is not None else None,
+        original_parts=None,
+        deformation_term_masks=None,
     )
-    inferred_stack, inferred_idx = combine_label_mask_stacks(
-        label_vec,
-        (creation_stack, creation_idx),
-        (heuristic_stack, heuristic_idx),
-        height=int(h),
-        width=int(w),
-        fallback_creation_mask=explicit_mask,
-    )
-    if int(inferred_stack.shape[0]) <= 0 or int(inferred_idx.size) <= 0:
-        inferred_stack, inferred_idx = build_creation_label_mask_stack(
-            label_vec=label_vec,
-            height=int(h),
-            width=int(w),
-            creation_mask=np.asarray(explicit_mask, dtype=np.float32) if explicit_mask is not None else None,
-        )
-    mixed_mask = _composite_mask_stack(inferred_stack) if int(inferred_stack.shape[0]) > 0 else infer_semantic_support_mask(image=chw, terms=terms)
     mixed_mask = _normalize_attention_map(np.asarray(mixed_mask, dtype=np.float32), gamma=0.92, blur_kernel=5)
     try:
         np.savez_compressed(
@@ -2979,6 +3295,37 @@ def collect_semantic_disk_rows(
     berkeley_dataset_idx = int(class_lut.get("berkeley sbd dataset", -1))
     object_idx = int(class_lut.get("object", -1))
     signal_idx = int(class_lut.get("signal", -1))
+    try:
+        from berkeley_sbd_pretrain import VOC20_CLASSES as _VOC20_CLASSES
+        voc20_names = [str(x) for x in list(_VOC20_CLASSES)]
+    except Exception:
+        voc20_names = [
+            "aeroplane",
+            "bicycle",
+            "bird",
+            "boat",
+            "bottle",
+            "bus",
+            "car",
+            "cat",
+            "chair",
+            "cow",
+            "dining table",
+            "dog",
+            "horse",
+            "motorbike",
+            "person",
+            "potted plant",
+            "sheep",
+            "sofa",
+            "train",
+            "tv monitor",
+        ]
+    voc20_to_class_idx = {
+        int(voc_idx): int(class_lut[key])
+        for voc_idx, key in enumerate([_norm_txt(name) for name in voc20_names])
+        if key in class_lut
+    }
 
     def _augment_row_with_auto_color_terms(image_path: Path, label_vec: np.ndarray, terms_in: Sequence[str], mask_path: str = "") -> Tuple[np.ndarray, List[str]]:
         out_vec = np.asarray(label_vec, dtype=np.float32).reshape(-1).copy()
@@ -3013,10 +3360,16 @@ def collect_semantic_disk_rows(
         _split_images, _mask_paths = _read_sbd_split_file(root, split_name)
         label_path = root / "cache" / f"sbd_{split_name}_multilabel.npz"
         if not label_path.exists():
-            raise RuntimeError(
-                "Berkeley multilabel cache is missing for disk rows: "
-                f"{label_path}. Generate label caches before running the pipeline."
-            )
+            try:
+                from berkeley_sbd_pretrain import _labels_from_segmentation_masks, _load_sbd_split
+                print(f"[collect-disk-rows] label cache missing — auto-building for split={split_name}...", flush=True)
+                _ds = _load_sbd_split(root, image_set=split_name, download=False)
+                _labels_from_segmentation_masks(_ds, label_path)
+            except Exception as _build_exc:
+                raise RuntimeError(
+                    "Berkeley multilabel cache is missing and could not be auto-built: "
+                    f"{label_path}. Error: {_build_exc}"
+                ) from _build_exc
         with np.load(str(label_path), allow_pickle=False) as z:
             if "labels" not in z.files:
                 raise RuntimeError(f"'labels' key missing in {label_path}")
@@ -3033,12 +3386,12 @@ def collect_semantic_disk_rows(
             if not ip.exists():
                 split_missing += 1
                 continue
-            yv = np.asarray(labels_split[int(i)], dtype=np.float32).reshape(-1)
-            if int(yv.size) > int(n_classes):
-                yv = yv[: int(n_classes)]
-            elif int(yv.size) < int(n_classes):
-                pad = np.zeros((int(n_classes) - int(yv.size),), dtype=np.float32)
-                yv = np.concatenate([yv, pad], axis=0)
+            yv = np.zeros((int(n_classes),), dtype=np.float32)
+            voc_vec = np.asarray(labels_split[int(i)], dtype=np.float32).reshape(-1)
+            for voc_idx in np.flatnonzero(voc_vec > 0.5):
+                cls_idx = int(voc20_to_class_idx.get(int(voc_idx), -1))
+                if 0 <= int(cls_idx) < int(n_classes):
+                    yv[int(cls_idx)] = 1.0
             if int(berkeley_dataset_idx) >= 0:
                 yv[int(berkeley_dataset_idx)] = 1.0
             if int(object_idx) >= 0:
@@ -3078,7 +3431,7 @@ def collect_semantic_disk_rows(
                 mask_path=str(mask_path_local),
             )
 
-        for row in _ordered_thread_map(split_specs_rows, _build_berkeley_row, max_workers=int(split_workers)):
+        for row in _ordered_thread_map(split_specs_rows, _build_berkeley_row, max_workers=int(split_workers), desc=f"[berkeley/{split_name}] loading rows"):
             rows.append(row)
             source_counts[str(source_key)] = int(source_counts.get(str(source_key), 0)) + 1
             loaded_split_counts[str(split_name)] = int(loaded_split_counts.get(str(split_name), 0)) + 1
@@ -3147,7 +3500,7 @@ def collect_semantic_disk_rows(
                 layout=_sidecar_layout(fp),
             ), 0
 
-        for row, unmapped_skip in _ordered_thread_map(external_specs, _build_external_row, max_workers=int(external_workers)):
+        for row, unmapped_skip in _ordered_thread_map(external_specs, _build_external_row, max_workers=int(external_workers), desc="[external] loading rows"):
             external_unmapped_skipped += int(unmapped_skip)
             if row is None:
                 continue

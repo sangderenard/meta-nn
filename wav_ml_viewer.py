@@ -242,6 +242,12 @@ class _TransformerStatusOpenGLViewer:
         self._gl = None
         self._textures = None
         self._stop_requested = False
+        self._shutdown_save: Optional[bool] = None  # None=no shutdown, True=save, False=nosave
+        self._launch_script: Optional[str] = None   # .bat to re-launch training
+        self._output_dir: Optional[str] = None
+        self._port_file_path: Optional[str] = None
+        self._training_proc: Optional[Any] = None   # subprocess.Popen handle
+        self._ipc_server_ref: Optional[Any] = None   # ViewerIPCServer backref
 
         self._last_present_t = 0.0
         # Blocking queue: enqueue_frame() blocks when full, back-pressuring the
@@ -382,6 +388,64 @@ class _TransformerStatusOpenGLViewer:
     def gate_override_enabled(self) -> bool:
         return bool(self._gate_override)
 
+    def set_ipc_server(self, server: "ViewerIPCServer") -> None:
+        """Store a back-reference to the IPC server for connection checks."""
+        self._ipc_server_ref = server
+
+    def set_launch_info(
+        self,
+        launch_script: Optional[str] = None,
+        output_dir: Optional[str] = None,
+        port_file_path: Optional[str] = None,
+    ) -> None:
+        if launch_script:
+            self._launch_script = str(launch_script)
+        if output_dir:
+            self._output_dir = str(output_dir)
+        if port_file_path:
+            self._port_file_path = str(port_file_path)
+
+    def has_training_connection(self) -> bool:
+        srv = self._ipc_server_ref
+        if srv is None:
+            return False
+        return getattr(srv, "has_connection", False)
+
+    def shutdown_save(self) -> Optional[bool]:
+        return self._shutdown_save
+
+    def _start_training(self) -> None:
+        """Launch the training bat/script as a subprocess."""
+        import subprocess, os
+        script = self._launch_script
+        if not script:
+            print("[viewer] no launch script configured; cannot start training", flush=True)
+            return
+        if self.has_training_connection():
+            print("[viewer] training already connected; ignoring START", flush=True)
+            return
+        # Clear stop state so the next training run starts cleanly
+        self._stop_requested = False
+        self._shutdown_save = None
+        self._top_bar_dirty = True
+        try:
+            if str(script).lower().endswith(".bat"):
+                proc = subprocess.Popen(
+                    ["cmd", "/c", script],
+                    cwd=os.path.dirname(os.path.abspath(script)) or ".",
+                    creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
+                )
+            else:
+                import sys
+                proc = subprocess.Popen(
+                    [sys.executable, script],
+                    cwd=os.path.dirname(os.path.abspath(script)) or ".",
+                )
+            self._training_proc = proc
+            print(f"[viewer] launched training process (pid={proc.pid}): {script}", flush=True)
+        except Exception as e:
+            print(f"[viewer] failed to launch training: {e}", flush=True)
+
     def _init(self):
         if (not self.enabled) or self._ready or self._failed:
             return
@@ -515,11 +579,15 @@ class _TransformerStatusOpenGLViewer:
 
             draw.rectangle([(0, 0), (self.panel_w - 1, self.panel_h - 1)], fill=(20, 24, 30))
             draw.rectangle([(0, 0), (self.panel_w - 1, 15)], fill=(34, 42, 52))
-            draw.text((4, 2), str(title)[:48], fill=(255, 225, 70), font=font)
+            # Right-justify title
+            _tw = font.getlength(str(title)) if hasattr(font, 'getlength') else len(str(title)) * 6
+            draw.text((max(4, self.panel_w - 4 - int(_tw)), 2), str(title), fill=(255, 225, 70), font=font)
             draw.line([(0, 16), (self.panel_w - 1, 16)], fill=(70, 76, 88), width=1)
             y = 20
-            for r in list(rows)[: max(1, (self.panel_h - 20) // 11)]:
-                draw.text((4, y), str(r)[:72], fill=(230, 234, 240), font=font)
+            for r in list(rows):
+                txt = str(r)
+                _rw = font.getlength(txt) if hasattr(font, 'getlength') else len(txt) * 6
+                draw.text((max(4, self.panel_w - 4 - int(_rw)), y), txt, fill=(230, 234, 240), font=font)
                 y += 11
                 if y >= (self.panel_h - 10):
                     break
@@ -573,6 +641,60 @@ class _TransformerStatusOpenGLViewer:
                 draw.line([(o_box[0] + 5, o_box[1] + 9), (o_box[0] + 9, o_box[1] + 2)], fill=(236, 244, 248), width=1)
             draw.text((ox + 15, oy - 1), "Override gates", fill=(230, 208, 170), font=font)
             self._control_boxes.append(("override", -1, o_box))
+
+            # ── START / STOP buttons (right side of top bar, row y=4) ─────────
+            connected = self.has_training_connection()
+            stopping = self._shutdown_save is not None
+            btn_y = 4
+            btn_h = 13
+            btn_right_margin = 6
+            # Place buttons from right edge leftward.
+            bx = self.window_w - btn_right_margin
+
+            if connected and stopping:
+                # Shutdown in progress — show status label
+                label_pending = "STOPPING..."
+                lw_p = len(label_pending) * 7 + 10
+                p_box = (bx - lw_p, btn_y, bx, btn_y + btn_h)
+                draw.rectangle(
+                    [p_box[0], p_box[1], p_box[2], p_box[3]],
+                    outline=(120, 120, 60), fill=(80, 80, 30),
+                )
+                draw.text((p_box[0] + 5, btn_y + 1), label_pending, fill=(220, 220, 160), font=font)
+            elif connected:
+                # STOP (no save) — red
+                label_stop = "STOP"
+                lw_stop = len(label_stop) * 7 + 10
+                stop_box = (bx - lw_stop, btn_y, bx, btn_y + btn_h)
+                draw.rectangle(
+                    [stop_box[0], stop_box[1], stop_box[2], stop_box[3]],
+                    outline=(180, 60, 60), fill=(120, 36, 36),
+                )
+                draw.text((stop_box[0] + 5, btn_y + 1), label_stop, fill=(240, 200, 200), font=font)
+                self._control_boxes.append(("stop_nosave", -1, stop_box))
+                bx = stop_box[0] - 6
+
+                # STOP+SAVE — green
+                label_save = "STOP+SAVE"
+                lw_save = len(label_save) * 7 + 10
+                save_box = (bx - lw_save, btn_y, bx, btn_y + btn_h)
+                draw.rectangle(
+                    [save_box[0], save_box[1], save_box[2], save_box[3]],
+                    outline=(60, 160, 80), fill=(36, 100, 50),
+                )
+                draw.text((save_box[0] + 5, btn_y + 1), label_save, fill=(200, 240, 210), font=font)
+                self._control_boxes.append(("stop_save", -1, save_box))
+            elif self._launch_script:
+                # START — blue (only when disconnected and launch script available)
+                label_start = "START"
+                lw_start = len(label_start) * 7 + 10
+                start_box = (bx - lw_start, btn_y, bx, btn_y + btn_h)
+                draw.rectangle(
+                    [start_box[0], start_box[1], start_box[2], start_box[3]],
+                    outline=(60, 100, 180), fill=(36, 64, 130),
+                )
+                draw.text((start_box[0] + 5, btn_y + 1), label_start, fill=(200, 220, 250), font=font)
+                self._control_boxes.append(("start", -1, start_box))
 
             active = self.selected_cycle_ids()
             active_txt = ",".join(str(i) for i in active) if len(active) > 0 else "none"
@@ -1297,6 +1419,19 @@ class _TransformerStatusOpenGLViewer:
                     self._gate_override = not bool(self._gate_override)
                     self._top_bar_dirty = True
                     return True
+                elif kind == "stop_save":
+                    self._shutdown_save = True
+                    self._top_bar_dirty = True
+                    print("[viewer] STOP+SAVE requested", flush=True)
+                    return True
+                elif kind == "stop_nosave":
+                    self._shutdown_save = False
+                    self._top_bar_dirty = True
+                    print("[viewer] STOP (no save) requested", flush=True)
+                    return True
+                elif kind == "start":
+                    self._start_training()
+                    return True
         return False
 
     def _poll_events(self):
@@ -1937,6 +2072,11 @@ class ViewerIPCServer:
     def port(self) -> int:
         return self._port
 
+    @property
+    def has_connection(self) -> bool:
+        with self._lock:
+            return self._conn is not None
+
     def start(self) -> None:
         """Begin accepting connections in a background thread."""
         self._accept_thread = threading.Thread(
@@ -1957,6 +2097,9 @@ class ViewerIPCServer:
                             pass
                     self._conn = conn
                 print("[viewer-ipc] training process connected", flush=True)
+                # Reset shutdown state for the new connection
+                self._viewer._shutdown_save = None
+                self._viewer._top_bar_dirty = True
             except OSError:
                 break
             except Exception as e:
@@ -1982,6 +2125,9 @@ class ViewerIPCServer:
         except (EOFError, OSError):
             with self._lock:
                 self._conn = None
+            # Reset shutdown state so the GUI is ready for a new training run
+            self._viewer._shutdown_save = None
+            self._viewer._top_bar_dirty = True
             print("[viewer-ipc] training process disconnected", flush=True)
             return
         except Exception as e:
@@ -1994,9 +2140,13 @@ class ViewerIPCServer:
             return
         self._last_status_t = now
         try:
+            is_stopping = (
+                self._viewer.stop_requested()
+                or self._viewer.shutdown_save() is not None
+            )
             status = {
                 "type": "status",
-                "stop_requested": self._viewer.stop_requested(),
+                "stop_requested": is_stopping,
                 "gate_override": self._viewer.gate_override_enabled(),
                 "cycle_selected": list(self._viewer._cycle_selected),
             }
@@ -2005,12 +2155,17 @@ class ViewerIPCServer:
                 command="stop" if bool(status["stop_requested"]) else "resume",
                 selected_cycle_ids=self._viewer.selected_cycle_ids(),
                 gate_override=bool(status["gate_override"]),
-                metadata={"source": "viewer_ipc_status_loop"},
+                metadata={
+                    "source": "viewer_ipc_status_loop",
+                    "save": self._viewer.shutdown_save(),
+                },
             )
             conn.send(make_envelope(MESSAGE_TYPE_RUN_CONTROL, run_control).to_dict())
         except (EOFError, OSError):
             with self._lock:
                 self._conn = None
+            self._viewer._shutdown_save = None
+            self._viewer._top_bar_dirty = True
         except Exception:
             pass
 
@@ -2107,6 +2262,7 @@ class ViewerIPCProxy:
         self.image_h = max(8, int(image_hw[0]))
         self.image_w = max(8, int(image_hw[1]))
         self._stop_flag = False
+        self._shutdown_save: Optional[bool] = None
         self._gate_override = False
         self._cycle_selected: List[bool] = [True] * max(0, cycle_slots)
         self._last_run_control = RunControlPayload(
@@ -2196,6 +2352,10 @@ class ViewerIPCProxy:
                         self._last_run_control = payload
                         self._stop_flag = str(payload.command).lower() == "stop"
                         self._gate_override = bool(payload.gate_override)
+                        # Extract save preference from metadata
+                        meta = getattr(payload, "metadata", {}) or {}
+                        if self._stop_flag and "save" in meta:
+                            self._shutdown_save = meta["save"]
                         if payload.selected_cycle_ids:
                             max_cycle = max(payload.selected_cycle_ids)
                             selected = [False] * max(max_cycle, len(self._cycle_selected))
@@ -2243,6 +2403,10 @@ class ViewerIPCProxy:
         if self._connection_lost:
             return True  # GUI closed or crashed
         return self._stop_flag
+
+    def shutdown_save(self) -> Optional[bool]:
+        """Return the save preference for the current shutdown, or None if no shutdown."""
+        return self._shutdown_save
 
     def update_loss(self, stage_id: int, loss: float, aux: float = 0.0, ts: float = 0.0):
         self._send({

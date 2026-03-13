@@ -41,6 +41,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 import torch
+import torch.nn as nn
 
 from pipeline.context import PipelineContext
 from pipeline.graph import PipelineNode
@@ -560,10 +561,10 @@ def _log(msg: str) -> None:
 
 
 def _score_config_with_classifier(
-    records: Sequence[WaveRecord],
-    indices: Sequence[int],
-    cfg: RenderConfig,
-    image_hw: Tuple[int, int],
+    records,
+    indices,
+    cfg,
+    image_hw,
     classifier: nn.Module,
     device: torch.device,
     batch_size: int,
@@ -577,6 +578,8 @@ def _score_config_with_classifier(
     channels_last: bool = False,
     active_classes: int = 0,
 ):
+    from wav_ml_core import render_record, image_u8_to_tensor
+    from wav_ml_models import multilabel_feature_score
     if len(indices) == 0:
         return {
             "score": float("-inf"),
@@ -624,7 +627,8 @@ def _score_config_with_classifier(
     }
 
 
-def _random_configs(num_trials: int, rng: np.random.Generator, max_points: int):
+def _random_configs(num_trials: int, rng, max_points: int):
+    from wav_ml_core import COLOR_MODES, RenderConfig
     color_choices = [m[0] for m in COLOR_MODES]
     widths = [256, 384, 512, 768, 1024, 1536, 2048, 3072, 4096]
     downs = [1, 2, 3, 4, 6, 8]

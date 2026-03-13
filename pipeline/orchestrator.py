@@ -1628,8 +1628,19 @@ def run(args, output_dir: Path, initial_plan=None) -> None:
         round_idx = ctx.round_id
 
         if ctx.stop_requested():
-            _log("[orchestrator] GUI requested stop before next iteration; stopping run")
+            save_on_stop = ctx.shutdown_save()
+            _log(f"[orchestrator] GUI requested stop before next iteration (save={save_on_stop}); stopping run")
             stop_requested = True
+            if save_on_stop:
+                # Force a checkpoint save before exiting
+                for node_id, node in graph.nodes.items():
+                    if node_id == "checkpoint_save":
+                        try:
+                            _log("[orchestrator] saving checkpoint before stop...")
+                            node.execute(ctx)
+                        except Exception as _ckpt_exc:
+                            _log(f"[orchestrator] WARNING: stop-save checkpoint failed: {_ckpt_exc}")
+                        break
             break
 
         # READ POINT A — apply a new plan received from the GUI between cycles
@@ -1746,9 +1757,12 @@ def run(args, output_dir: Path, initial_plan=None) -> None:
 
 def _build_configs_from_args(args) -> dict:
     """Map every CLI argument to the appropriate typed config dataclass."""
+    from pipeline.utils import _resolve_semantic_stage_cache_cap_mb
 
     def _g(*names, default=None):
         return _arg_value(args, *names, default=default)
+
+    global_stage_cache_mb = int(_g("semantic_stage_cache_max_mb", default=0))
 
     classifier = ClassifierConfig(
         base_ch=int(_g("classifier_base_ch", default=64)),
@@ -1775,11 +1789,11 @@ def _build_configs_from_args(args) -> dict:
         stage0_epochs=int(_g("pregestation_stage_deck_passes", "pregestation_epochs", default=3)),
         stage0_samples_per_combo=int(_g("semantic_vocab_pregestation_samples_per_combo", "pregestation_samples_per_combo", default=64)),
         stage0_batch_size=int(_g("pregestation_stage_batch_size", "pregestation_batch_size", default=32)),
-        stage0_loss_target=float(_g("gate_pregestation_loss_target", "pregestation_loss_target", default=0.35)),
+        stage0_loss_target=float(_g("gate_pregestation_loss_target", "pregestation_loss_target", default=0.80)),
         stage0_required_consecutive=int(_g("gate_pregestation_maintain_rounds", "pregestation_required_consecutive", default=2)),
         stage1_epochs=int(_g("gestation_epochs", default=1)),
         stage1_batch_size=int(_g("gate_gestation_batch_size", "gestation_batch_size", default=32)),
-        stage1_loss_target=float(_g("gate_gestation_loss_target", "gestation_loss_target", default=0.30)),
+        stage1_loss_target=float(_g("gate_gestation_loss_target", "gestation_loss_target", default=0.80)),
         stage1_required_consecutive=int(_g("gate_gestation_maintain_rounds", "gestation_required_consecutive", default=2)),
         stage2_epochs=int(_g("berkeley_refresh_epochs", "berkeley_epochs", default=1)),
         stage2_batch_size=int(_g("berkeley_refresh_batch_size", "berkeley_batch_size", default=16)),
@@ -1934,7 +1948,12 @@ def _build_configs_from_args(args) -> dict:
         samples_per_combo=int(_g("semantic_vocab_pregestation_samples_per_combo", "pregestation_samples_per_combo", default=64)),
         image_size=int(_g("image_size", default=128)),
         batch_size=int(_g("pregestation_stage_batch_size", "pregestation_batch_size", default=32)),
-        cache_mb=int(_g("pregestation_stage_cache_max_mb", "pregestation_cache_mb", default=256)),
+        cache_mb=int(
+            _resolve_semantic_stage_cache_cap_mb(
+                global_cap_mb=int(global_stage_cache_mb),
+                specific_cap_mb=int(_g("pregestation_stage_cache_max_mb", "pregestation_cache_mb", default=-1)),
+            )
+        ),
         displacement_temperature=float(_g("pregestation_circle_displacement_temperature", default=0.4)),
         circle_radius_temperature=float(_g("pregestation_circle_radius_temperature", default=1.0)),
         seed=int(_g("seed", default=42)),
@@ -1944,7 +1963,12 @@ def _build_configs_from_args(args) -> dict:
         image_size=int(_g("image_size", default=128)),
         batch_size=int(_g("gate_gestation_batch_size", "gestation_batch_size", default=32)),
         samples_per_term=int(_g("semantic_vocab_symbol_samples_per_term", "gestation_samples_per_term", default=32)),
-        cache_mb=int(_g("gestation_stage_cache_max_mb", default=128)),
+        cache_mb=int(
+            _resolve_semantic_stage_cache_cap_mb(
+                global_cap_mb=int(global_stage_cache_mb),
+                specific_cap_mb=int(_g("gestation_stage_cache_max_mb", default=-1)),
+            )
+        ),
     )
 
     berkeley_payload = BerkeleyPayloadConfig(

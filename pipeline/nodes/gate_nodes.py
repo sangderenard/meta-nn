@@ -155,8 +155,8 @@ class GestationEvalNode(GatedNode):
         self.cfg = cfg
 
     def should_run(self, ctx: PipelineContext) -> bool:
-        if not super().should_run(ctx):
-            return False
+        # Bypass gate_pregestation dependency — even a single gestation image
+        # produces a valid loss signal that justifies a gate check.
         return ctx.gestation_eval_loader is not None and (ctx.classifier is not None or ctx.gate_classifier is not None)
 
     def execute(self, ctx: PipelineContext) -> None:
@@ -528,16 +528,19 @@ class CheckpointSaveNode(PipelineNode):
     def execute(self, ctx: PipelineContext) -> None:
 
         _save_training_segment_snapshot(
-            output_dir=ctx.output_dir,
+            enabled=True,
+            out_dir=ctx.output_dir,
+            objective_mode=getattr(ctx.args, "objective_mode", "berkeley_multilabel"),
+            run_tag=ctx.run_tag,
+            segment="checkpoint",
+            best_cfg=ctx.render_config,
             classifier=ctx.classifier,
             transformer=ctx.transformer,
             generator=ctx.generator,
             discriminator=ctx.discriminator,
             wave_classifier=ctx.wave_classifier,
-            render_config=ctx.render_config,
-            class_names=ctx.class_names,
-            label_embedding_bank=ctx.label_embedding_bank,
-            gate_state={
+            orchestration_history=ctx.metrics_history,
+            gate_status={
                 "pregestation": ctx.gate_pregestation.passed,
                 "gestation": ctx.gate_gestation.passed,
                 "berkeley": ctx.gate_berkeley.passed,
@@ -545,10 +548,11 @@ class CheckpointSaveNode(PipelineNode):
                 "generator": ctx.gate_generator.passed,
                 "wave": ctx.gate_wave.passed,
             },
-            metrics_history=ctx.metrics_history,
-            cycle=ctx.cycle,
-            round_id=ctx.round_id,
-            args=ctx.args,
+            extra={
+                "cycle": ctx.cycle,
+                "round_id": ctx.round_id,
+                "class_names": ctx.class_names,
+            },
         )
         _log(f"[checkpoint] saved round={ctx.round_id}")
 

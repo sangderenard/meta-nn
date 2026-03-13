@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c \"import tqdm\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\(''pipeline/nodes/data_nodes.py''\\).read\\(\\)\\); print\\(''data_nodes.py OK''\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\(''pipeline/semantic_wheel_cache.py''\\).read\\(\\)\\); print\\(''semantic_wheel_cache.py OK''\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\(''pipeline/nodes/vocab_node.py''\\).read\\(\\)\\); print\\(''OK''\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\(''pipeline/nodes/data_nodes.py''\\).read\\(\\)\\); print\\(''OK''\\)\")"
+    ]
+  }
+}
