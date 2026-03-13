@@ -137,6 +137,7 @@ class PipelineContext:
     #  Nodes use ``ctx.gpu_residence.require(model, name, device)`` to
     #  guarantee a model is on the GPU inside a managed context-manager.
     gpu_residence: Optional[Any] = None  # GPUResidenceManager (from pipeline.nodes.base)
+    semantic_tensor_workload: Optional[Any] = None
 
     # ---- models ---------------------------------------------------------
     #  Each model slot is populated by its node's first execution.

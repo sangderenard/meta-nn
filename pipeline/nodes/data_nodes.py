@@ -41,6 +41,7 @@ from torch.utils.data import DataLoader, Dataset
 from pipeline.context import PipelineContext
 from pipeline.graph import PipelineNode
 from pipeline.nodes.base import GatedNode, OneTimeNode
+from pipeline.semantic_gpu import semantic_processing_device
 from pipeline.semantic_wheel_cache import (
     SemanticWheelCandidate,
     SemanticWheelConfig,
@@ -303,6 +304,9 @@ class PregestationDataConfig:
     # RNG seed for reproducible generation
     seed: int = 42
 
+    # GPU-accelerated semantic preprocessing (deformations, mask ops)
+    gpu_preprocess: bool = False
+
     # How many rounds to keep pregestation data before rebuilding.
     # Vocab churns every round, but rebuilding pregestation for each small
     # vocab change is wasteful — the disk cache absorbs re-use when the same
@@ -324,6 +328,7 @@ class GestationDataConfig:
     num_workers: int = 0
     samples_per_term: int = 32
     cache_mb: int = 128
+    gpu_preprocess: bool = False
 
     # How many rounds to keep gestation data before rebuilding.
     rebuild_every_n_rounds: int = 20
@@ -390,6 +395,8 @@ class BerkeleyDataConfig:
     wheel_use_rare_term_deck: bool = True
     refresh_deformations_per_clean: int = 2
     refresh_include_clean: bool = True
+    gpu_preprocess: bool = False
+    preload_workers: int = 0
 
     # How many rounds between full Berkeley refresh loader rebuilds
     rebuild_every_n_rounds: int = 4
@@ -682,6 +689,7 @@ class DataNode(PipelineNode):
             all_label_indices = _raw_cached["all_label_indices"]
             all_targets = _raw_cached["all_targets"]
             all_term_rows = _raw_cached["all_term_rows"]
+            all_mask_stacks = all_label_stacks
         else:
             _log(f"[data-node] pregestation raw cache MISS ({_raw_cache_key[:8]}…) — generating")
             all_images: list = []
@@ -785,23 +793,25 @@ class DataNode(PipelineNode):
             _log("[data-node] WARNING: no pregestation images built")
             return
 
-        dataset, selected_indices, cache_info = _build_semantic_stage_cache_dataset(
-            ctx=ctx,
-            stage_name="pregestation",
-            images=all_images,
-            targets=all_targets,
-            masks=all_masks,
-            mask_stacks=all_label_stacks,
-            mask_indices=all_label_indices,
-            terms_rows=all_term_rows,
-            source_tag="pregestation",
-            image_size=int(self.preg_cfg.image_size),
-            batch_size=max(1, int(self.preg_cfg.batch_size)),
-            seed=int(self.preg_cfg.seed),
-            target_dim=int(target_dim),
-            semantic_term_to_idx=ctx.semantic_term_to_idx,
-            stage_cache_mb=int(self.preg_cfg.cache_mb),
-        )
+        with semantic_processing_device(ctx, enabled=bool(self.preg_cfg.gpu_preprocess)) as _processing_device:
+            dataset, selected_indices, cache_info = _build_semantic_stage_cache_dataset(
+                ctx=ctx,
+                stage_name="pregestation",
+                images=all_images,
+                targets=all_targets,
+                masks=all_masks,
+                mask_stacks=all_label_stacks,
+                mask_indices=all_label_indices,
+                terms_rows=all_term_rows,
+                source_tag="pregestation",
+                image_size=int(self.preg_cfg.image_size),
+                batch_size=max(1, int(self.preg_cfg.batch_size)),
+                seed=int(self.preg_cfg.seed),
+                target_dim=int(target_dim),
+                semantic_term_to_idx=ctx.semantic_term_to_idx,
+                stage_cache_mb=int(self.preg_cfg.cache_mb),
+                processing_device=_processing_device,
+            )
         selected_targets = [np.asarray(all_targets[int(i)], dtype=np.float32).reshape(-1) for i in selected_indices]
 
         ctx.pregestation_logic_rows = {
@@ -912,45 +922,52 @@ class DataNode(PipelineNode):
             # --- Step 2: infer support masks — one vectorised call for ALL images ---
             _images_np = np.stack([np.asarray(images[i], dtype=np.float32) for i in range(_n_gest)], axis=0)
             _targets_np = np.stack([np.asarray(targets[i], dtype=np.float32).reshape(-1) for i in range(_n_gest)], axis=0)
-            _base_masks = infer_semantic_support_masks(images=_images_np, terms_batch=_all_terms)  # [N, H, W]
+            with semantic_processing_device(ctx, enabled=bool(self.gest_cfg.gpu_preprocess)) as _processing_device:
+                _base_masks = infer_semantic_support_masks(
+                    images=_images_np,
+                    terms_batch=_all_terms,
+                    processing_device=_processing_device,
+                )  # [N, H, W]
 
-            # --- Step 3: heuristic term-mask stacks — one vectorised call for ALL images ---
-            _heuristic_stacks, _heuristic_indices = build_term_mask_stacks_from_images(
-                images=_images_np,
-                label_vecs=_targets_np,
-                idx_to_term=idx_to_term,
-            )
-
-            # --- Step 4: combine/fallback/composite per image ---
-            terms_rows: List[List[str]] = []
-            masks: List[np.ndarray] = []
-            mask_stacks: List[np.ndarray] = []
-            mask_indices: List[np.ndarray] = []
-            for i in tqdm(range(_n_gest), desc="[gestation] combining mask stacks", unit="img", leave=False, dynamic_ncols=True):
-                y = np.asarray(targets[int(i)], dtype=np.float32).reshape(-1)
-                base_mask = np.asarray(_base_masks[i], dtype=np.float32)
-                fallback_stack, fallback_idx = build_label_mask_stack(
-                    mixed_mask=base_mask,
-                    label_vec=y,
-                    treat_mixed_mask_as_creation=True,
+                # --- Step 3: heuristic term-mask stacks — one vectorised call for ALL images ---
+                _heuristic_stacks, _heuristic_indices = build_term_mask_stacks_from_images(
+                    images=_images_np,
+                    label_vecs=_targets_np,
+                    idx_to_term=idx_to_term,
+                    processing_device=_processing_device,
                 )
-                merged_stack, merged_idx = combine_label_mask_stacks(
-                    y,
-                    (np.asarray(_heuristic_stacks[i], dtype=np.float32), np.asarray(_heuristic_indices[i], dtype=np.int64)),
-                    (fallback_stack, fallback_idx),
-                    height=int(base_mask.shape[0]),
-                    width=int(base_mask.shape[1]),
-                    fallback_creation_mask=base_mask,
-                )
-                mixed_mask = (
-                    _composite_mask_stack(merged_stack)
-                    if int(np.asarray(merged_stack).size) > 0
-                    else base_mask
-                )
-                terms_rows.append(_all_terms[i])
-                masks.append(np.asarray(mixed_mask, dtype=np.float32))
-                mask_stacks.append(np.asarray(merged_stack, dtype=np.float32))
-                mask_indices.append(np.asarray(merged_idx, dtype=np.int64))
+                # --- Step 4: combine/fallback/composite per image ---
+                terms_rows: List[List[str]] = []
+                masks: List[np.ndarray] = []
+                mask_stacks: List[np.ndarray] = []
+                mask_indices: List[np.ndarray] = []
+                for i in tqdm(range(_n_gest), desc="[gestation] combining mask stacks", unit="img", leave=False, dynamic_ncols=True):
+                    y = np.asarray(targets[int(i)], dtype=np.float32).reshape(-1)
+                    base_mask = np.asarray(_base_masks[i], dtype=np.float32)
+                    fallback_stack, fallback_idx = build_label_mask_stack(
+                        mixed_mask=base_mask,
+                        label_vec=y,
+                        treat_mixed_mask_as_creation=True,
+                        processing_device=_processing_device,
+                    )
+                    merged_stack, merged_idx = combine_label_mask_stacks(
+                        y,
+                        (np.asarray(_heuristic_stacks[i], dtype=np.float32), np.asarray(_heuristic_indices[i], dtype=np.int64)),
+                        (fallback_stack, fallback_idx),
+                        height=int(base_mask.shape[0]),
+                        width=int(base_mask.shape[1]),
+                        fallback_creation_mask=base_mask,
+                        processing_device=_processing_device,
+                    )
+                    mixed_mask = (
+                        _composite_mask_stack(merged_stack, processing_device=_processing_device)
+                        if int(np.asarray(merged_stack).size) > 0
+                        else base_mask
+                    )
+                    terms_rows.append(_all_terms[i])
+                    masks.append(np.asarray(mixed_mask, dtype=np.float32))
+                    mask_stacks.append(np.asarray(merged_stack, dtype=np.float32))
+                    mask_indices.append(np.asarray(merged_idx, dtype=np.int64))
 
             # ---- Persist to disk cache ----
             _log(f"[data-node] gestation saving raw cache ({_raw_cache_key[:8]}…)")
@@ -963,23 +980,25 @@ class DataNode(PipelineNode):
                 })
                 _pbar.update(1)
 
-        dataset, selected_indices, _cache_info = _build_semantic_stage_cache_dataset(
-            ctx=ctx,
-            stage_name="gestation",
-            images=images,
-            targets=targets,
-            masks=masks,
-            mask_stacks=mask_stacks,
-            mask_indices=mask_indices,
-            terms_rows=terms_rows,
-            source_tag="gestation",
-            image_size=int(self.gest_cfg.image_size),
-            batch_size=max(1, int(self.gest_cfg.batch_size)),
-            seed=int(getattr(ctx.args, "seed", 0) or 0),
-            target_dim=max(1, int(len(ctx.class_names))),
-            semantic_term_to_idx=ctx.semantic_term_to_idx,
-            stage_cache_mb=int(self.gest_cfg.cache_mb),
-        )
+        with semantic_processing_device(ctx, enabled=bool(self.gest_cfg.gpu_preprocess)) as _processing_device:
+            dataset, selected_indices, _cache_info = _build_semantic_stage_cache_dataset(
+                ctx=ctx,
+                stage_name="gestation",
+                images=images,
+                targets=targets,
+                masks=masks,
+                mask_stacks=mask_stacks,
+                mask_indices=mask_indices,
+                terms_rows=terms_rows,
+                source_tag="gestation",
+                image_size=int(self.gest_cfg.image_size),
+                batch_size=max(1, int(self.gest_cfg.batch_size)),
+                seed=int(getattr(ctx.args, "seed", 0) or 0),
+                target_dim=max(1, int(len(ctx.class_names))),
+                semantic_term_to_idx=ctx.semantic_term_to_idx,
+                stage_cache_mb=int(self.gest_cfg.cache_mb),
+                processing_device=_processing_device,
+            )
         selected_targets = [np.asarray(targets[int(i)], dtype=np.float32).reshape(-1) for i in selected_indices]
         train_idx, val_idx = _orphan_free_split(
             targets=selected_targets, seed=int(getattr(ctx.args, "seed", 0) or 0),
@@ -1037,36 +1056,41 @@ class DataNode(PipelineNode):
             str(self.bdata_cfg.berkeley_data_root).strip()
             or getattr(ctx, "berkeley_data_root", "") or ""
         )
-        loader, _n_refresh = _build_berkeley_refresh_loader(
-            data_root=data_root, image_size=self.bdata_cfg.image_size,
-            auto_install_scipy=False, batch_size=self.bdata_cfg.batch_size,
-            num_workers=self.bdata_cfg.num_workers, max_train=self.bdata_cfg.max_train,
-            seed=self.bdata_cfg.seed, device=ctx.device,
-            external_val_fraction=self.bdata_cfg.external_val_fraction,
-            prefetch_factor=self.bdata_cfg.prefetch_factor,
-            wheel_max_bytes=self.bdata_cfg.wheel_max_bytes,
-            wheel_sanity_cap_bytes=self.bdata_cfg.wheel_sanity_cap_bytes,
-            wheel_allow_large_override=self.bdata_cfg.wheel_allow_large_override,
-            wheel_expiry_uses=self.bdata_cfg.wheel_expiry_uses,
-            wheel_lookahead_batches=self.bdata_cfg.wheel_lookahead_batches,
-            wheel_use_rare_term_deck=self.bdata_cfg.wheel_use_rare_term_deck,
-            deformations_per_clean=self.bdata_cfg.refresh_deformations_per_clean,
-            include_clean=self.bdata_cfg.refresh_include_clean,
-        )
-        gate_val_loader, _n_gate_val = _build_berkeley_gate_val_loader(
-            data_root=data_root, image_size=self.bdata_cfg.image_size,
-            auto_install_scipy=False, batch_size=self.bdata_cfg.gate_val_batch_size,
-            num_workers=self.bdata_cfg.gate_val_num_workers,
-            max_val=self.bdata_cfg.gate_val_max_val,
-            seed=self.bdata_cfg.seed, device=ctx.device,
-            prefetch_factor=self.bdata_cfg.prefetch_factor,
-            wheel_max_bytes=self.bdata_cfg.wheel_max_bytes,
-            wheel_sanity_cap_bytes=self.bdata_cfg.wheel_sanity_cap_bytes,
-            wheel_allow_large_override=self.bdata_cfg.wheel_allow_large_override,
-            wheel_expiry_uses=self.bdata_cfg.wheel_expiry_uses,
-            wheel_lookahead_batches=self.bdata_cfg.wheel_lookahead_batches,
-            wheel_use_rare_term_deck=self.bdata_cfg.wheel_use_rare_term_deck,
-        )
+        with semantic_processing_device(ctx, enabled=bool(self.bdata_cfg.gpu_preprocess)) as _processing_device:
+            loader, _n_refresh = _build_berkeley_refresh_loader(
+                data_root=data_root, image_size=self.bdata_cfg.image_size,
+                auto_install_scipy=False, batch_size=self.bdata_cfg.batch_size,
+                num_workers=self.bdata_cfg.num_workers, max_train=self.bdata_cfg.max_train,
+                seed=self.bdata_cfg.seed, device=ctx.device,
+                external_val_fraction=self.bdata_cfg.external_val_fraction,
+                prefetch_factor=self.bdata_cfg.prefetch_factor,
+                wheel_max_bytes=self.bdata_cfg.wheel_max_bytes,
+                wheel_sanity_cap_bytes=self.bdata_cfg.wheel_sanity_cap_bytes,
+                wheel_allow_large_override=self.bdata_cfg.wheel_allow_large_override,
+                wheel_expiry_uses=self.bdata_cfg.wheel_expiry_uses,
+                wheel_lookahead_batches=self.bdata_cfg.wheel_lookahead_batches,
+                wheel_use_rare_term_deck=self.bdata_cfg.wheel_use_rare_term_deck,
+                deformations_per_clean=self.bdata_cfg.refresh_deformations_per_clean,
+                include_clean=self.bdata_cfg.refresh_include_clean,
+                processing_device=_processing_device,
+                preload_workers=self.bdata_cfg.preload_workers,
+            )
+            gate_val_loader, _n_gate_val = _build_berkeley_gate_val_loader(
+                data_root=data_root, image_size=self.bdata_cfg.image_size,
+                auto_install_scipy=False, batch_size=self.bdata_cfg.gate_val_batch_size,
+                num_workers=self.bdata_cfg.gate_val_num_workers,
+                max_val=self.bdata_cfg.gate_val_max_val,
+                seed=self.bdata_cfg.seed, device=ctx.device,
+                prefetch_factor=self.bdata_cfg.prefetch_factor,
+                wheel_max_bytes=self.bdata_cfg.wheel_max_bytes,
+                wheel_sanity_cap_bytes=self.bdata_cfg.wheel_sanity_cap_bytes,
+                wheel_allow_large_override=self.bdata_cfg.wheel_allow_large_override,
+                wheel_expiry_uses=self.bdata_cfg.wheel_expiry_uses,
+                wheel_lookahead_batches=self.bdata_cfg.wheel_lookahead_batches,
+                wheel_use_rare_term_deck=self.bdata_cfg.wheel_use_rare_term_deck,
+                processing_device=_processing_device,
+                preload_workers=self.bdata_cfg.preload_workers,
+            )
         if self.bdata_cfg.prebuild_batches > 0 and loader is not None:
             ctx.berkeley_cache = _build_berkeley_refresh_cache(
                 loader=loader, device=ctx.device,
@@ -1098,22 +1122,25 @@ class DataNode(PipelineNode):
         _broot = _BPath(data_root or "data/berkeley_sbd")
         convert_sbd_mat_to_npz(_broot)
 
-        out_images, out_targets, _info, _out_terms, out_masks = _build_berkeley_payload_bank(
-            data_root=data_root,
-            image_size=self.payload_cfg.image_size,
-            auto_install_scipy=self.payload_cfg.auto_install_scipy,
-            max_samples=self.payload_cfg.max_images or 0,
-            seed=self.payload_cfg.seed,
-            build_batch_size=self.payload_cfg.build_batch_size,
-            source_root=str(self.payload_cfg.payload_bank_dir),
-            force_cache_rebuild=bool(self.payload_cfg.force_cache_rebuild),
-            wheel_max_bytes=self.bdata_cfg.wheel_max_bytes,
-            wheel_sanity_cap_bytes=self.bdata_cfg.wheel_sanity_cap_bytes,
-            wheel_allow_large_override=self.bdata_cfg.wheel_allow_large_override,
-            wheel_expiry_uses=self.bdata_cfg.wheel_expiry_uses,
-            wheel_lookahead_batches=self.bdata_cfg.wheel_lookahead_batches,
-            wheel_use_rare_term_deck=self.bdata_cfg.wheel_use_rare_term_deck,
-        )
+        with semantic_processing_device(ctx, enabled=bool(self.bdata_cfg.gpu_preprocess)) as _processing_device:
+            out_images, out_targets, _info, _out_terms, out_masks = _build_berkeley_payload_bank(
+                data_root=data_root,
+                image_size=self.payload_cfg.image_size,
+                auto_install_scipy=self.payload_cfg.auto_install_scipy,
+                max_samples=self.payload_cfg.max_images or 0,
+                seed=self.payload_cfg.seed,
+                build_batch_size=self.payload_cfg.build_batch_size,
+                source_root=str(self.payload_cfg.payload_bank_dir),
+                force_cache_rebuild=bool(self.payload_cfg.force_cache_rebuild),
+                wheel_max_bytes=self.bdata_cfg.wheel_max_bytes,
+                wheel_sanity_cap_bytes=self.bdata_cfg.wheel_sanity_cap_bytes,
+                wheel_allow_large_override=self.bdata_cfg.wheel_allow_large_override,
+                wheel_expiry_uses=self.bdata_cfg.wheel_expiry_uses,
+                wheel_lookahead_batches=self.bdata_cfg.wheel_lookahead_batches,
+                wheel_use_rare_term_deck=self.bdata_cfg.wheel_use_rare_term_deck,
+                processing_device=_processing_device,
+                preload_workers=self.bdata_cfg.preload_workers,
+            )
         ctx.payload_bank = out_images
         ctx.payload_masks = out_masks if out_masks else []
         ctx.payload_bank_ready = bool(out_images)
@@ -1139,20 +1166,23 @@ class DataNode(PipelineNode):
         )
         image_size = self.payload_cfg.image_size
         seed = self.payload_cfg.seed
-        dataset, _labels_np, _terms_rows, _info2 = _build_payload_validation_gate_dataset(
-            data_root=bdata_root,
-            image_size=image_size,
-            seed=seed,
-            source_root=str(self.payload_cfg.payload_bank_dir),
-            chunk_batch_size=max(1, int(self.payload_cfg.build_batch_size)),
-            wheel_max_bytes=self.bdata_cfg.wheel_max_bytes,
-            wheel_sanity_cap_bytes=self.bdata_cfg.wheel_sanity_cap_bytes,
-            wheel_allow_large_override=self.bdata_cfg.wheel_allow_large_override,
-            wheel_expiry_uses=self.bdata_cfg.wheel_expiry_uses,
-            wheel_lookahead_batches=self.bdata_cfg.wheel_lookahead_batches,
-            wheel_use_rare_term_deck=self.bdata_cfg.wheel_use_rare_term_deck,
-            force_rebuild=bool(self.payload_cfg.force_cache_rebuild),
-        )
+        with semantic_processing_device(ctx, enabled=bool(self.bdata_cfg.gpu_preprocess)) as _processing_device:
+            dataset, _labels_np, _terms_rows, _info2 = _build_payload_validation_gate_dataset(
+                data_root=bdata_root,
+                image_size=image_size,
+                seed=seed,
+                source_root=str(self.payload_cfg.payload_bank_dir),
+                chunk_batch_size=max(1, int(self.payload_cfg.build_batch_size)),
+                wheel_max_bytes=self.bdata_cfg.wheel_max_bytes,
+                wheel_sanity_cap_bytes=self.bdata_cfg.wheel_sanity_cap_bytes,
+                wheel_allow_large_override=self.bdata_cfg.wheel_allow_large_override,
+                wheel_expiry_uses=self.bdata_cfg.wheel_expiry_uses,
+                wheel_lookahead_batches=self.bdata_cfg.wheel_lookahead_batches,
+                wheel_use_rare_term_deck=self.bdata_cfg.wheel_use_rare_term_deck,
+                force_rebuild=bool(self.payload_cfg.force_cache_rebuild),
+                processing_device=_processing_device,
+                preload_workers=self.bdata_cfg.preload_workers,
+            )
         loader, _n_val = _build_gate_loader_from_dataset(
             dataset=dataset, batch_size=32, num_workers=0,
             device=ctx.device, seed=seed,
@@ -1835,6 +1865,7 @@ def _build_semantic_stage_cache_dataset(
     stage_cache_mb: int,
     deformations_per_clean: int = 2,
     include_clean: bool = True,
+    processing_device: Optional[Any] = None,
 ) -> Tuple[Dataset, List[int], Dict[str, Any]]:
     cache_args = _semantic_stage_cache_args(ctx=ctx, stage_cache_mb=int(stage_cache_mb))
     total_rows = min(
@@ -1898,6 +1929,7 @@ def _build_semantic_stage_cache_dataset(
                     base_row_position=int(_base_pos),
                     seed=int(seed),
                     term_to_idx=_term_to_idx,
+                    processing_device=processing_device,
                 )
             )
         return out
@@ -1937,6 +1969,7 @@ def _build_semantic_stage_cache_dataset(
             max_base_rows=int(max_rows),
             use_rare_term_deck=bool(cache_args.get("use_rare_term_deck", True)),
             force_rebuild=bool(cache_args.get("rebuild", False)),
+            processing_device=processing_device,
         ),
     )
     wheel_info = dict(wheel_result.get("info") or {})
@@ -1973,8 +2006,7 @@ def _selected_source_counts(rows: Sequence[Any], indices: Sequence[int]) -> Dict
 
 
 def _log_semantic_wheel_summary(purpose: str, wheel_info: Dict[str, Any]) -> None:
-    projected_full_raw = int(wheel_info.get("projected_full_raw_bytes", 0))
-    projected_selected_raw = int(wheel_info.get("projected_selected_raw_bytes", 0))
+    total_raw = int(wheel_info.get("total_raw_bytes", 0))
     effective_max = int(wheel_info.get("effective_max_bytes", 0))
     _log(
         "[semantic-wheel] "
@@ -1987,8 +2019,7 @@ def _log_semantic_wheel_summary(purpose: str, wheel_info: Dict[str, Any]) -> Non
         f"lookahead_batches={int(wheel_info.get('lookahead_batches', 0))} "
         f"deforms={int(wheel_info.get('deformations_per_clean', 0))} "
         f"include_clean={bool(wheel_info.get('include_clean', False))} "
-        f"projected_full_raw_mb={float(projected_full_raw) / (1024.0 * 1024.0):.1f} "
-        f"projected_selected_raw_mb={float(projected_selected_raw) / (1024.0 * 1024.0):.1f} "
+        f"total_raw_mb={float(total_raw) / (1024.0 * 1024.0):.1f} "
         f"effective_cap_mb={float(effective_max) / (1024.0 * 1024.0):.1f} "
         f"cache_dir={str(wheel_info.get('cache_dir', ''))}"
     )
@@ -2014,6 +2045,8 @@ def _ensure_berkeley_semantic_wheel(
     max_base_rows: int,
     wheel_use_rare_term_deck: bool,
     force_rebuild: bool = False,
+    processing_device: Optional[Any] = None,
+    preload_workers: int = 0,
 ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     wheel_cfg = SemanticWheelConfig(
         purpose=str(purpose),
@@ -2034,6 +2067,8 @@ def _ensure_berkeley_semantic_wheel(
         max_base_rows=max(0, int(max_base_rows)),
         use_rare_term_deck=bool(wheel_use_rare_term_deck),
         force_rebuild=bool(force_rebuild),
+        processing_device=processing_device,
+        preload_workers=max(0, int(preload_workers)),
     )
     wheel_result = ensure_semantic_wheel_cache(
         rows=rows,
@@ -2199,6 +2234,8 @@ def _build_berkeley_refresh_loader(
     wheel_use_rare_term_deck: bool = True,
     deformations_per_clean: int = 2,
     include_clean: bool = True,
+    processing_device: Optional[Any] = None,
+    preload_workers: int = 0,
 ):
     del auto_install_scipy
     rows, rows_info = collect_semantic_disk_rows(
@@ -2236,6 +2273,8 @@ def _build_berkeley_refresh_loader(
         wheel_expiry_uses=int(wheel_expiry_uses),
         max_base_rows=int(max_train),
         wheel_use_rare_term_deck=bool(wheel_use_rare_term_deck),
+        processing_device=processing_device,
+        preload_workers=int(preload_workers),
     )
     ds = SemanticWheelDataset(
         cache_dir=str(wheel_result.get("cache_dir", "")),
@@ -2412,6 +2451,8 @@ def _build_berkeley_gate_val_loader(
     wheel_expiry_uses: int = 1,
     wheel_lookahead_batches: int = 0,
     wheel_use_rare_term_deck: bool = True,
+    processing_device: Optional[Any] = None,
+    preload_workers: int = 0,
 ):
     del auto_install_scipy
     rows, rows_info = collect_semantic_disk_rows(
@@ -2444,6 +2485,8 @@ def _build_berkeley_gate_val_loader(
         wheel_expiry_uses=int(wheel_expiry_uses),
         max_base_rows=int(max_val),
         wheel_use_rare_term_deck=bool(wheel_use_rare_term_deck),
+        processing_device=processing_device,
+        preload_workers=int(preload_workers),
     )
     ds = SemanticWheelDataset(
         cache_dir=str(wheel_result.get("cache_dir", "")),
@@ -3028,6 +3071,8 @@ def _build_payload_validation_gate_dataset(
     wheel_lookahead_batches: int = 0,
     wheel_use_rare_term_deck: bool = True,
     force_rebuild: bool = False,
+    processing_device: Optional[Any] = None,
+    preload_workers: int = 0,
 ) -> Tuple[Optional[Dataset], np.ndarray, List[List[str]], Dict[str, Any]]:
     rows, rows_info = collect_semantic_disk_rows(
         data_root=str(data_root),
@@ -3063,6 +3108,8 @@ def _build_payload_validation_gate_dataset(
         max_base_rows=0,
         wheel_use_rare_term_deck=bool(wheel_use_rare_term_deck),
         force_rebuild=bool(force_rebuild),
+        processing_device=processing_device,
+        preload_workers=int(preload_workers),
     )
     ds = SemanticWheelDataset(
         cache_dir=str(wheel_result.get("cache_dir", "")),
@@ -3112,8 +3159,7 @@ def _build_payload_validation_gate_dataset(
         "row_build_seconds": float(rows_info.get("row_build_seconds", 0.0)),
         "inprocess_cache_hit": bool(rows_info.get("inprocess_cache_hit", False)),
         "used_source_counts": _selected_source_counts(rows=rows, indices=selected_base_rows),
-        "projected_full_raw_bytes": int(wheel_info.get("projected_full_raw_bytes", 0)),
-        "projected_selected_raw_bytes": int(wheel_info.get("projected_selected_raw_bytes", 0)),
+        "total_raw_bytes": int(wheel_info.get("total_raw_bytes", 0)),
     }
     return ds, labels_np, terms_rows, info
 
@@ -3498,6 +3544,8 @@ def _build_berkeley_payload_bank(
     wheel_expiry_uses: int = 1,
     wheel_lookahead_batches: int = 0,
     wheel_use_rare_term_deck: bool = True,
+    processing_device: Optional[Any] = None,
+    preload_workers: int = 0,
 ):
     _ = bool(auto_install_scipy)
     size = max(8, int(image_size))
@@ -3527,6 +3575,8 @@ def _build_berkeley_payload_bank(
         max_base_rows=int(max_samples),
         wheel_use_rare_term_deck=bool(wheel_use_rare_term_deck),
         force_rebuild=bool(force_cache_rebuild),
+        processing_device=processing_device,
+        preload_workers=int(preload_workers),
     )
     ds = SemanticWheelDataset(cache_dir=str(wheel_result.get("cache_dir", "")), return_mask_stack=False)
     selected_base_rows = [int(x) for x in list(wheel_result.get("base_row_indices") or [])]
@@ -3570,7 +3620,6 @@ def _build_berkeley_payload_bank(
         "row_build_threads": int(rows_info.get("row_build_threads", 0)),
         "row_build_seconds": float(rows_info.get("row_build_seconds", 0.0)),
         "inprocess_cache_hit": bool(rows_info.get("inprocess_cache_hit", False)),
-        "projected_full_raw_bytes": int(wheel_info.get("projected_full_raw_bytes", 0)),
-        "projected_selected_raw_bytes": int(wheel_info.get("projected_selected_raw_bytes", 0)),
+        "total_raw_bytes": int(wheel_info.get("total_raw_bytes", 0)),
     }
     return out_images, out_targets, info, out_terms, out_masks

@@ -25,7 +25,11 @@ from pipeline.semantic_wheel_cache import (
     build_semantic_cache_entry,
     ensure_semantic_candidate_cache,
 )
-from semantic_dataset_loaders import collect_semantic_disk_rows
+from semantic_dataset_loaders import (
+    build_term_mask_stacks_from_images,
+    collect_semantic_disk_rows,
+    infer_semantic_support_masks,
+)
 from wav_ml_models import TinyConvClassifier
 
 
@@ -130,8 +134,8 @@ def test_voc20_terms_enter_only_via_churn() -> None:
     _ok("VOC20 names are injected only at churn time and do not edit the fixed supervised slice")
 
 
-def test_semantic_candidate_cache_parallel_build_preserves_order() -> None:
-    print("\n--- test_semantic_candidate_cache_parallel_build_preserves_order ---")
+def test_semantic_candidate_cache_batch_build_preserves_order() -> None:
+    print("\n--- test_semantic_candidate_cache_batch_build_preserves_order ---")
     with tempfile.TemporaryDirectory(dir=".") as td:
         root = Path(td)
         label_dim = 4
@@ -148,15 +152,14 @@ def test_semantic_candidate_cache_parallel_build_preserves_order() -> None:
             targets.append(y)
             candidates.append(
                 SemanticWheelCandidate(
-                    cache_key=f"parallel-{i}",
+                    cache_key=f"batch-{i}",
                     terms=[f"term-{i}"],
                     source="synthetic",
                 )
             )
 
-        worker_ids: set[int] = set()
-        worker_lock = threading.Lock()
         row_calls = 0
+        batch_calls = 0
         batch_sizes: list[int] = []
 
         def _entry_group(base_idx: int, _base_pos: int) -> list[dict]:
@@ -165,10 +168,9 @@ def test_semantic_candidate_cache_parallel_build_preserves_order() -> None:
             return []
 
         def _entry_groups_batch(spec_batch: list[tuple[int, int]]) -> list[list[dict]]:
-            time.sleep(0.05)
-            with worker_lock:
-                worker_ids.add(int(threading.get_ident()))
-                batch_sizes.append(int(len(spec_batch)))
+            nonlocal batch_calls
+            batch_calls += 1
+            batch_sizes.append(int(len(spec_batch)))
             out: list[list[dict]] = []
             for base_idx, _base_pos in spec_batch:
                 out.append(
@@ -183,7 +185,7 @@ def test_semantic_candidate_cache_parallel_build_preserves_order() -> None:
             return out
 
         cfg = SemanticWheelConfig(
-            purpose="parallel_order",
+            purpose="batch_order",
             cache_root=str(root / "cache"),
             image_size=16,
             batch_size=2,
@@ -198,24 +200,18 @@ def test_semantic_candidate_cache_parallel_build_preserves_order() -> None:
             use_rare_term_deck=False,
         )
 
-        old_cpu_count = semantic_wheel_cache.os.cpu_count
-        semantic_wheel_cache.os.cpu_count = lambda: 4
-        try:
-            built = ensure_semantic_candidate_cache(
-                candidates=candidates,
-                candidate_indices=list(range(label_dim)),
-                build_entry_group=_entry_group,
-                build_entry_groups_batch=_entry_groups_batch,
-                label_dim=label_dim,
-                config=cfg,
-            )
-        finally:
-            semantic_wheel_cache.os.cpu_count = old_cpu_count
+        built = ensure_semantic_candidate_cache(
+            candidates=candidates,
+            candidate_indices=list(range(label_dim)),
+            build_entry_group=_entry_group,
+            build_entry_groups_batch=_entry_groups_batch,
+            label_dim=label_dim,
+            config=cfg,
+        )
 
-        assert int(built["info"].get("entry_group_workers", 0)) >= 2, built["info"]
         assert int(row_calls) == 0, row_calls
+        assert int(batch_calls) >= 1, batch_calls
         assert max(batch_sizes) >= 2, batch_sizes
-        assert len(worker_ids) >= 2, worker_ids
 
         ds = SemanticWheelDataset(cache_dir=str(built["cache_dir"]), return_mask_stack=True)
         selected = [int(x) for x in list(built.get("base_candidate_indices", []))]
@@ -227,9 +223,63 @@ def test_semantic_candidate_cache_parallel_build_preserves_order() -> None:
         _ok("semantic candidate cache dispatches ordered multi-image batch builders without reordering rows")
 
 
+def test_semantic_support_masks_torch_path_matches_default() -> None:
+    print("\n--- test_semantic_support_masks_torch_path_matches_default ---")
+    images = np.zeros((2, 3, 12, 12), dtype=np.float32)
+    images[0, 0, :, :] = 1.0
+    images[1, 1, :, :] = 1.0
+    terms = [["red", "signal"], ["green", "signal"]]
+
+    base = infer_semantic_support_masks(images=images, terms_batch=terms)
+    torch_cpu = infer_semantic_support_masks(
+        images=images,
+        terms_batch=terms,
+        processing_device=torch.device("cpu"),
+    )
+
+    assert tuple(base.shape) == tuple(torch_cpu.shape), (base.shape, torch_cpu.shape)
+    assert np.allclose(base, torch_cpu, atol=1e-5), float(np.max(np.abs(base - torch_cpu)))
+    _ok("torch-backed semantic support mask path matches default CPU implementation")
+
+
+def test_term_mask_stacks_torch_path_matches_default() -> None:
+    print("\n--- test_term_mask_stacks_torch_path_matches_default ---")
+    images = np.zeros((2, 3, 10, 10), dtype=np.float32)
+    images[0, 0, :, :] = 1.0
+    images[1, 2, :, :] = 1.0
+    labels = np.asarray(
+        [
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+        ],
+        dtype=np.float32,
+    )
+    idx_to_term = {0: "red", 1: "blue", 2: "signal"}
+
+    base_stacks, base_indices = build_term_mask_stacks_from_images(
+        images=images,
+        label_vecs=labels,
+        idx_to_term=idx_to_term,
+    )
+    torch_stacks, torch_indices = build_term_mask_stacks_from_images(
+        images=images,
+        label_vecs=labels,
+        idx_to_term=idx_to_term,
+        processing_device=torch.device("cpu"),
+    )
+
+    assert len(base_stacks) == len(torch_stacks) == 2
+    for i in range(2):
+        assert np.array_equal(np.asarray(base_indices[i], dtype=np.int64), np.asarray(torch_indices[i], dtype=np.int64)), (i, base_indices[i], torch_indices[i])
+        assert np.allclose(np.asarray(base_stacks[i], dtype=np.float32), np.asarray(torch_stacks[i], dtype=np.float32), atol=1e-5), i
+    _ok("torch-backed term-mask stack builder matches default CPU implementation")
+
+
 if __name__ == "__main__":
     test_gate_replica_sync_realigns_label_bank()
     test_collect_semantic_disk_rows_remaps_voc_bits_by_name()
     test_voc20_terms_enter_only_via_churn()
-    test_semantic_candidate_cache_parallel_build_preserves_order()
+    test_semantic_candidate_cache_batch_build_preserves_order()
+    test_semantic_support_masks_torch_path_matches_default()
+    test_term_mask_stacks_torch_path_matches_default()
     print("\nALL TESTS PASSED")

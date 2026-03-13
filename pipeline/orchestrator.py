@@ -1957,6 +1957,7 @@ def _build_configs_from_args(args) -> dict:
         displacement_temperature=float(_g("pregestation_circle_displacement_temperature", default=0.4)),
         circle_radius_temperature=float(_g("pregestation_circle_radius_temperature", default=1.0)),
         seed=int(_g("seed", default=42)),
+        gpu_preprocess=bool(_g("semantic_gpu_preprocess", default=False)),
     )
 
     gestation = GestationDataConfig(
@@ -1969,6 +1970,7 @@ def _build_configs_from_args(args) -> dict:
                 specific_cap_mb=int(_g("gestation_stage_cache_max_mb", default=-1)),
             )
         ),
+        gpu_preprocess=bool(_g("semantic_gpu_preprocess", default=False)),
     )
 
     berkeley_payload = BerkeleyPayloadConfig(
@@ -1999,6 +2001,8 @@ def _build_configs_from_args(args) -> dict:
         wheel_use_rare_term_deck=bool(_g("berkeley_wheel_use_rare_term_deck", default=True)),
         refresh_deformations_per_clean=int(_g("berkeley_refresh_deformations_per_clean", default=2)),
         refresh_include_clean=bool(_g("berkeley_refresh_include_clean", default=True)),
+        gpu_preprocess=bool(_g("semantic_gpu_preprocess", default=False)),
+        preload_workers=int(_g("semantic_preload_workers", default=0)),
         rebuild_every_n_rounds=int(_g("berkeley_refresh_round_every", "berkeley_refresh_every", default=4)),
         gate_val_batch_size=int(_g("gate_berkeley_batch_size", default=32)),
         gate_val_num_workers=int(_g("berkeley_refresh_workers", "num_workers", default=0)),

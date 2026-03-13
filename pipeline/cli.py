@@ -599,6 +599,25 @@ def parse_args():
     )
     p.add_argument("--no-semantic-stage-cache-rebuild", dest="semantic_stage_cache_rebuild", action="store_false")
     p.add_argument(
+        "--semantic-gpu-preprocess",
+        dest="semantic_gpu_preprocess",
+        action="store_true",
+        help=(
+            "Run semantic heuristics, stack normalization, and deformation prep through torch on the active CUDA device "
+            "while building semantic caches."
+        ),
+    )
+    p.add_argument("--no-semantic-gpu-preprocess", dest="semantic_gpu_preprocess", action="store_false")
+    p.add_argument(
+        "--semantic-preload-workers",
+        type=int,
+        default=0,
+        help=(
+            "Thread count for bulk semantic asset preloads during cache materialization. "
+            "0 chooses an automatic batch-sized preload policy."
+        ),
+    )
+    p.add_argument(
         "--gd-vocab-library-enabled",
         dest="gd_vocab_library_enabled",
         action="store_true",
@@ -1601,6 +1620,8 @@ def parse_args():
         semantic_stage_cache_rebuild=False,
         semantic_stage_cache_allow_large_override=False,
         semantic_stage_cache_use_rare_term_deck=True,
+        semantic_gpu_preprocess=False,
+        semantic_preload_workers=0,
         gd_vocab_library_enabled=True,
         gd_vocab_library_autoload=True,
         training_preview_enabled=True,

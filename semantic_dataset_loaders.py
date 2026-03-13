@@ -533,7 +533,7 @@ def _blend_attention_maps(maps: Sequence[Any], weights: Optional[Sequence[float]
     return _normalize_attention_map(acc, gamma=float(gamma), blur_kernel=5)
 
 
-def _composite_mask_stack(stack: Any) -> np.ndarray:
+def _composite_mask_stack(stack: Any, processing_device: Optional[Any] = None) -> np.ndarray:
     """Additive-sum all per-label masks, then normalize to [0, 1].
 
     Every mask in the stack contributes proportionally to the sum, so
@@ -544,19 +544,33 @@ def _composite_mask_stack(stack: Any) -> np.ndarray:
     arr = np.asarray(stack, dtype=np.float32)
     if int(arr.ndim) != 3 or int(arr.shape[0]) <= 0:
         return np.zeros((0, 0) if int(arr.ndim) < 2 else (int(arr.shape[-2]), int(arr.shape[-1])), dtype=np.float32)
-    composite = np.sum(arr, axis=0).astype(np.float32, copy=False)
-    return _normalize_attention_map(composite, gamma=1.0, blur_kernel=0)
+    resolved = _resolve_processing_device(processing_device)
+    if resolved is None:
+        composite = np.sum(arr, axis=0).astype(np.float32, copy=False)
+        return _normalize_attention_map(composite, gamma=1.0, blur_kernel=0)
+    composite_t = torch.sum(torch.as_tensor(arr, dtype=torch.float32, device=resolved), dim=0)
+    return np.asarray(
+        _normalize_attention_map_batch_torch(composite_t, gamma=1.0, blur_kernel=0, device=resolved).detach().cpu().numpy(),
+        dtype=np.float32,
+    )
 
 
 def _positive_label_indices(label_vec: Any) -> np.ndarray:
     return np.where(np.asarray(label_vec, dtype=np.float32).reshape(-1) >= 0.5)[0].astype(np.int64)
 
 
-def _normalize_stack_row(mask: Any, *, height: int, width: int) -> np.ndarray:
-    return _normalize_attention_map(
-        _normalize_mask_array(mask, height=int(height), width=int(width)),
-        gamma=1.0,
-        blur_kernel=0,
+def _normalize_stack_row(mask: Any, *, height: int, width: int, processing_device: Optional[Any] = None) -> np.ndarray:
+    clamped = _normalize_mask_array(mask, height=int(height), width=int(width))
+    resolved = _resolve_processing_device(processing_device)
+    if resolved is None:
+        return _normalize_attention_map(
+            clamped,
+            gamma=1.0,
+            blur_kernel=0,
+        )
+    return np.asarray(
+        _normalize_attention_map_batch_torch(clamped, gamma=1.0, blur_kernel=0, device=resolved).detach().cpu().numpy(),
+        dtype=np.float32,
     )
 
 
@@ -585,14 +599,26 @@ def _normalize_mask_array_batch(stack: np.ndarray, height: int, width: int) -> n
     return np.clip(out, 0.0, 1.0).astype(np.float32, copy=False)
 
 
-def _normalize_stack_row_batch(stack: np.ndarray, *, height: int, width: int) -> np.ndarray:
+def _normalize_stack_row_batch(
+    stack: np.ndarray,
+    *,
+    height: int,
+    width: int,
+    processing_device: Optional[Any] = None,
+) -> np.ndarray:
     """Batch version of _normalize_stack_row for [N, H, W] arrays.
 
     Returns [N, H, W] — each slice is resize-normalised then attention-normalised.
     Replaces per-element _normalize_stack_row calls inside tight loops.
     """
     clamped = _normalize_mask_array_batch(stack, height=int(height), width=int(width))
-    return _normalize_attention_map_batch(clamped, gamma=1.0, blur_kernel=0)
+    resolved = _resolve_processing_device(processing_device)
+    if resolved is None:
+        return _normalize_attention_map_batch(clamped, gamma=1.0, blur_kernel=0)
+    return np.asarray(
+        _normalize_attention_map_batch_torch(clamped, gamma=1.0, blur_kernel=0, device=resolved).detach().cpu().numpy(),
+        dtype=np.float32,
+    )
 
 
 def build_creation_label_mask_stack(
@@ -601,6 +627,7 @@ def build_creation_label_mask_stack(
     height: int = 0,
     width: int = 0,
     creation_mask: Optional[Any] = None,
+    processing_device: Optional[Any] = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
     positive_idx = _positive_label_indices(label_vec)
     if creation_mask is not None:
@@ -610,7 +637,12 @@ def build_creation_label_mask_stack(
         if int(height) <= 0 or int(width) <= 0:
             height = int(base.shape[-2]) if int(base.ndim) >= 2 else int(height)
             width = int(base.shape[-1]) if int(base.ndim) >= 2 else int(width)
-        base_mask = _normalize_stack_row(base, height=int(height), width=int(width))
+        base_mask = _normalize_stack_row(
+            base,
+            height=int(height),
+            width=int(width),
+            processing_device=processing_device,
+        )
     else:
         return np.zeros((0, int(max(0, height)), int(max(0, width))), dtype=np.float32), np.zeros((0,), dtype=np.int64)
     if int(positive_idx.size) <= 0:
@@ -627,6 +659,7 @@ def term_mask_map_to_label_stack(
     idx_to_term: Optional[Dict[int, str]] = None,
     height: int = 0,
     width: int = 0,
+    processing_device: Optional[Any] = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
     if not isinstance(term_mask_map, dict) or not term_mask_map:
         return np.zeros((0, int(max(0, height)), int(max(0, width))), dtype=np.float32), np.zeros((0,), dtype=np.int64)
@@ -660,7 +693,12 @@ def term_mask_map_to_label_stack(
         return np.zeros((0, int(max(0, height)), int(max(0, width))), dtype=np.float32), np.zeros((0,), dtype=np.int64)
     # Batch-normalise all collected masks at once
     stacked = np.stack(raw_masks, axis=0)  # [K, H, W]
-    normed = _normalize_stack_row_batch(stacked, height=int(height), width=int(width))  # [K, H, W]
+    normed = _normalize_stack_row_batch(
+        stacked,
+        height=int(height),
+        width=int(width),
+        processing_device=processing_device,
+    )  # [K, H, W]
     vmax_per = np.max(normed.reshape(len(raw_masks), -1), axis=1)
     keep = np.where(vmax_per > 1e-8)[0]
     if len(keep) == 0:
@@ -674,6 +712,7 @@ def combine_label_mask_stacks(
     height: int = 0,
     width: int = 0,
     fallback_creation_mask: Optional[Any] = None,
+    processing_device: Optional[Any] = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
     positive_idx = _positive_label_indices(label_vec)
     if int(positive_idx.size) <= 0:
@@ -704,7 +743,10 @@ def combine_label_mask_stacks(
         pair_count = min(int(stack_arr.shape[0]), int(idx_arr.size))
         # Batch-normalise all slices in this part at once, then filter
         batch_norm = _normalize_stack_row_batch(
-            stack_arr[:int(pair_count)], height=int(height), width=int(width)
+            stack_arr[:int(pair_count)],
+            height=int(height),
+            width=int(width),
+            processing_device=processing_device,
         )  # [pair_count, H, W]
         vmax_per = np.max(batch_norm.reshape(int(pair_count), -1), axis=1)  # [pair_count]
         valid_mask = (np.asarray(idx_arr[:int(pair_count)], dtype=np.int64) >= 0) & (vmax_per > 1e-8)
@@ -720,6 +762,7 @@ def combine_label_mask_stacks(
             fallback_creation_mask,
             height=int(height),
             width=int(width),
+            processing_device=processing_device,
         )
         for cls_idx in missing:
             rows.append(np.asarray(base_mask, dtype=np.float32))
@@ -826,17 +869,35 @@ def build_label_mask_stack(
     mask_stack_indices: Optional[Any] = None,
     *,
     treat_mixed_mask_as_creation: bool = False,
+    processing_device: Optional[Any] = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
     y = np.asarray(label_vec, dtype=np.float32).reshape(-1)
     positive_idx = np.where(y >= 0.5)[0].astype(np.int64)
     mixed_arr = np.asarray(mixed_mask, dtype=np.float32)
     h = int(mixed_arr.shape[-2]) if int(mixed_arr.ndim) >= 2 else 0
     w = int(mixed_arr.shape[-1]) if int(mixed_arr.ndim) >= 2 else 0
-    mixed = _normalize_attention_map(
-        _normalize_mask_array(mixed_mask, height=int(h), width=int(w)),
-        gamma=0.95,
-        blur_kernel=3,
-    ) if int(h) > 0 and int(w) > 0 else np.zeros((0, 0), dtype=np.float32)
+    if int(h) > 0 and int(w) > 0:
+        mixed_base = _normalize_mask_array(mixed_mask, height=int(h), width=int(w))
+        resolved = _resolve_processing_device(processing_device)
+        mixed = (
+            np.asarray(
+                _normalize_attention_map_batch_torch(
+                    mixed_base,
+                    gamma=0.95,
+                    blur_kernel=3,
+                    device=resolved,
+                ).detach().cpu().numpy(),
+                dtype=np.float32,
+            )
+            if resolved is not None
+            else _normalize_attention_map(
+                mixed_base,
+                gamma=0.95,
+                blur_kernel=3,
+            )
+        )
+    else:
+        mixed = np.zeros((0, 0), dtype=np.float32)
     if mask_stack_array is not None and mask_stack_indices is not None:
         fallback_mask = mixed if bool(treat_mixed_mask_as_creation) else None
         out_stack, out_idx = combine_label_mask_stacks(
@@ -845,6 +906,7 @@ def build_label_mask_stack(
             height=int(mixed.shape[0]),
             width=int(mixed.shape[1]),
             fallback_creation_mask=fallback_mask,
+            processing_device=processing_device,
         )
         if int(out_stack.shape[0]) > 0 and int(out_idx.size) > 0:
             return out_stack, out_idx
@@ -1099,6 +1161,194 @@ def _image_batch_to_bchw01(images: Any) -> np.ndarray:
     return np.clip(bchw, 0.0, 1.0).astype(np.float32, copy=False)
 
 
+def _resolve_processing_device(processing_device: Optional[Any]) -> Optional[torch.device]:
+    if processing_device is None:
+        return None
+    if isinstance(processing_device, torch.device):
+        return processing_device
+    text = str(processing_device).strip().lower()
+    if not text or text == "none":
+        return None
+    if text == "auto":
+        return torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    try:
+        return torch.device(str(processing_device))
+    except Exception:
+        return None
+
+
+def _normalize_attention_map_batch_torch(
+    mask: Any,
+    *,
+    gamma: float = 1.0,
+    blur_kernel: int = 0,
+    device: Optional[Any] = None,
+) -> torch.Tensor:
+    resolved = _resolve_processing_device(device) or torch.device("cpu")
+    arr = mask if torch.is_tensor(mask) else torch.as_tensor(mask, dtype=torch.float32, device=resolved)
+    if torch.is_tensor(arr):
+        arr = arr.to(device=resolved, dtype=torch.float32)
+    squeeze = False
+    if int(arr.ndim) == 2:
+        arr = arr.unsqueeze(0)
+        squeeze = True
+    if int(arr.ndim) != 3 or int(arr.numel()) <= 0:
+        out = torch.zeros_like(arr, dtype=torch.float32)
+        return out[0] if bool(squeeze) and int(out.ndim) == 3 and int(out.shape[0]) > 0 else out
+    arr = torch.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
+    arr = torch.clamp(arr, min=0.0)
+    vmax = torch.amax(arr, dim=(1, 2), keepdim=True)
+    valid = vmax > 1e-8
+    arr = torch.where(valid, arr / torch.where(valid, vmax, torch.ones_like(vmax)), torch.zeros_like(arr))
+    vmean = torch.mean(arr, dim=(1, 2), keepdim=True)
+    denom = torch.clamp(vmean * 2.0, min=1.0)
+    arr = torch.where(vmean > 1e-8, torch.clamp(arr / denom, 0.0, 1.0), arr)
+    gm = max(0.35, float(gamma))
+    if abs(gm - 1.0) > 1e-6:
+        arr = torch.pow(torch.clamp(arr, 0.0, 1.0), gm)
+    kk = int(blur_kernel)
+    if kk >= 3:
+        kk = int(kk) | 1
+        arr = F.avg_pool2d(arr[:, None, :, :], kernel_size=int(kk), stride=1, padding=int(kk // 2))[:, 0]
+        vmax = torch.amax(arr, dim=(1, 2), keepdim=True)
+        valid = vmax > 1e-8
+        arr = torch.where(valid, arr / torch.where(valid, vmax, torch.ones_like(vmax)), torch.zeros_like(arr))
+    arr = torch.clamp(arr, 0.0, 1.0).to(dtype=torch.float32)
+    return arr[0] if bool(squeeze) else arr
+
+
+def _blend_attention_maps_batch_torch(
+    maps: Sequence[Any],
+    *,
+    weights: Optional[Sequence[float]] = None,
+    gamma: float = 1.0,
+    device: Optional[Any] = None,
+) -> torch.Tensor:
+    resolved = _resolve_processing_device(device) or torch.device("cpu")
+    valid: List[torch.Tensor] = []
+    valid_weights: List[float] = []
+    ref_shape: Optional[Tuple[int, int, int]] = None
+    for i, m in enumerate(maps):
+        arr = m if torch.is_tensor(m) else torch.as_tensor(m, dtype=torch.float32, device=resolved)
+        arr = arr.to(device=resolved, dtype=torch.float32)
+        if int(arr.ndim) == 2:
+            arr = arr.unsqueeze(0)
+        if int(arr.ndim) != 3 or int(arr.numel()) <= 0:
+            continue
+        if ref_shape is None:
+            ref_shape = (int(arr.shape[0]), int(arr.shape[1]), int(arr.shape[2]))
+        w = 1.0 if weights is None or i >= int(len(weights)) else float(weights[i])
+        if w <= 0.0:
+            continue
+        norm = _normalize_attention_map_batch_torch(arr, gamma=1.0, blur_kernel=0, device=resolved)
+        if float(torch.amax(norm).detach().cpu().item()) <= 1e-8:
+            continue
+        valid.append(norm)
+        valid_weights.append(float(w))
+    if len(valid) <= 0:
+        if ref_shape is None:
+            return torch.zeros((0, 0, 0), dtype=torch.float32, device=resolved)
+        return torch.zeros(ref_shape, dtype=torch.float32, device=resolved)
+    weights_t = torch.as_tensor(valid_weights, dtype=torch.float32, device=resolved).view(-1, 1, 1, 1)
+    stack = torch.stack(valid, dim=0).to(dtype=torch.float32)
+    acc = torch.sum(weights_t * stack, dim=0)
+    wsum = float(torch.sum(torch.as_tensor(valid_weights, dtype=torch.float32)).item())
+    if wsum > 1e-8:
+        acc = acc / float(wsum)
+    return _normalize_attention_map_batch_torch(acc, gamma=float(gamma), blur_kernel=5, device=resolved)
+
+
+def _semantic_color_score_maps_batch_torch(
+    chw_batch: Any,
+    *,
+    device: Optional[Any] = None,
+) -> Dict[str, torch.Tensor]:
+    resolved = _resolve_processing_device(device) or torch.device("cpu")
+    arr = torch.as_tensor(_image_batch_to_bchw01(chw_batch), dtype=torch.float32, device=resolved)
+    arr = torch.clamp(arr, 0.0, 1.0)
+    if int(arr.ndim) != 4 or int(arr.shape[1]) < 3:
+        return {}
+    r = arr[:, 0]
+    g = arr[:, 1]
+    b = arr[:, 2]
+    vmax = torch.maximum(torch.maximum(r, g), b)
+    vmin = torch.minimum(torch.minimum(r, g), b)
+    sat = torch.clamp(vmax - vmin, 0.0, 1.0)
+
+    def _norm01_batch(x: torch.Tensor) -> torch.Tensor:
+        hi = torch.amax(x, dim=(1, 2), keepdim=True)
+        valid = hi > 1e-8
+        return torch.where(valid, torch.clamp(x / torch.where(valid, hi, torch.ones_like(hi)), 0.0, 1.0), torch.zeros_like(x))
+
+    red = _norm01_batch(torch.clamp(r - torch.maximum(g, b), 0.0, 1.0) * torch.clamp(sat - 0.05, 0.0, 1.0))
+    green = _norm01_batch(torch.clamp(g - torch.maximum(r, b), 0.0, 1.0) * torch.clamp(sat - 0.05, 0.0, 1.0))
+    blue = _norm01_batch(torch.clamp(b - torch.maximum(r, g), 0.0, 1.0) * torch.clamp(sat - 0.05, 0.0, 1.0))
+    yellow = _norm01_batch(torch.clamp(torch.minimum(r, g) - b, 0.0, 1.0) * torch.clamp(sat - 0.05, 0.0, 1.0))
+    cyan = _norm01_batch(torch.clamp(torch.minimum(g, b) - r, 0.0, 1.0) * torch.clamp(sat - 0.05, 0.0, 1.0))
+    magenta = _norm01_batch(torch.clamp(torch.minimum(r, b) - g, 0.0, 1.0) * torch.clamp(sat - 0.05, 0.0, 1.0))
+    brown = _norm01_batch(
+        torch.clamp(r - g, 0.0, 1.0)
+        * torch.clamp(g - b, 0.0, 1.0)
+        * torch.clamp(vmax, 0.15, 0.75)
+        * torch.clamp(0.85 - vmax, 0.0, 1.0)
+    )
+    orange = _norm01_batch(
+        torch.clamp(r - b - 0.05, 0.0, 1.0)
+        * torch.clamp(r - g - 0.08, 0.0, 1.0)
+        * torch.clamp(g - b - 0.02, 0.0, 1.0)
+        * torch.clamp(sat - 0.10, 0.0, 1.0)
+    )
+    black = _norm01_batch(torch.clamp(0.22 - vmax, 0.0, 1.0))
+    white = _norm01_batch(torch.clamp(vmin - 0.78, 0.0, 1.0) * torch.clamp(0.20 - sat, 0.0, 1.0))
+    gray = _norm01_batch(torch.clamp(0.18 - sat, 0.0, 1.0) * torch.clamp(1.0 - torch.abs(vmax - 0.5) * 2.2, 0.0, 1.0))
+    luma = torch.mean(arr[:, :3], dim=1)
+    gx = torch.zeros_like(luma)
+    gy = torch.zeros_like(luma)
+    gx[:, :, 1:-1] = luma[:, :, 2:] - luma[:, :, :-2]
+    gy[:, 1:-1, :] = luma[:, 2:, :] - luma[:, :-2, :]
+    edge = _norm01_batch(torch.sqrt((gx * gx) + (gy * gy)))
+    return {
+        "red": red,
+        "orange": orange,
+        "green": green,
+        "blue": blue,
+        "yellow": yellow,
+        "cyan": cyan,
+        "magenta": magenta,
+        "brown": brown,
+        "black": black,
+        "white": white,
+        "gray": gray,
+        "edge": edge,
+    }
+
+
+def _semantic_color_mask_from_score_batch_torch(
+    scores: Any,
+    *,
+    device: Optional[Any] = None,
+) -> torch.Tensor:
+    resolved = _resolve_processing_device(device) or torch.device("cpu")
+    arr = scores if torch.is_tensor(scores) else torch.as_tensor(scores, dtype=torch.float32, device=resolved)
+    arr = arr.to(device=resolved, dtype=torch.float32)
+    squeeze = False
+    if int(arr.ndim) == 2:
+        arr = arr.unsqueeze(0)
+        squeeze = True
+    n = int(arr.shape[0])
+    if int(n) <= 0 or int(arr.numel()) <= 0:
+        return arr[0] if bool(squeeze) else arr
+    flat = arr.view(int(n), -1)
+    try:
+        thr = torch.quantile(flat, q=0.82, dim=1)
+    except Exception:
+        thr = torch.as_tensor(np.percentile(flat.detach().cpu().numpy(), 82, axis=1), dtype=torch.float32, device=resolved)
+    thr = torch.clamp(thr * 0.75, min=0.20)
+    exact = (arr >= thr[:, None, None]).to(dtype=torch.float32) * arr
+    out = _normalize_attention_map_batch_torch(exact, gamma=0.78, blur_kernel=1, device=resolved)
+    return out[0] if bool(squeeze) else out
+
+
 def _avg_pool2d_batch(batch_hw: np.ndarray, kernel_size: int) -> np.ndarray:
     kk = max(1, int(kernel_size))
     if kk <= 1:
@@ -1328,7 +1578,11 @@ def _semantic_color_mask_from_score_batch(scores: Any) -> np.ndarray:
     return np.asarray(out[0], dtype=np.float32) if squeeze else out
 
 
-def infer_semantic_support_masks(images: Any, terms_batch: Optional[Sequence[Optional[Sequence[str]]]] = None) -> np.ndarray:
+def infer_semantic_support_masks(
+    images: Any,
+    terms_batch: Optional[Sequence[Optional[Sequence[str]]]] = None,
+    processing_device: Optional[Any] = None,
+) -> np.ndarray:
     bchw = _image_batch_to_bchw01(images)
     bsz = int(bchw.shape[0]) if int(bchw.ndim) == 4 else 0
     h = int(bchw.shape[2]) if int(bchw.ndim) == 4 else 0
@@ -1336,6 +1590,27 @@ def infer_semantic_support_masks(images: Any, terms_batch: Optional[Sequence[Opt
     if int(bsz) <= 0 or int(h) <= 0 or int(w) <= 0:
         return np.zeros((int(max(0, bsz)), int(max(0, h)), int(max(0, w))), dtype=np.float32)
     term_rows = _normalize_semantic_terms_batch(terms_batch, batch_size=int(bsz))
+    resolved = _resolve_processing_device(processing_device)
+    if resolved is not None:
+        color_maps_t = _semantic_color_score_maps_batch_torch(bchw, device=resolved)
+        score_acc_t = torch.zeros((int(bsz), int(h), int(w)), dtype=torch.float32, device=resolved)
+        _color_term_set = set(_SEMANTIC_COLOR_TERMS)
+        for term_key, term_scores_t in color_maps_t.items():
+            if term_key not in _color_term_set:
+                continue
+            wants = torch.as_tensor(
+                [term_key in {_norm_txt(t) for t in (row or []) if str(t).strip()} for row in term_rows],
+                dtype=torch.bool,
+                device=resolved,
+            )
+            if not bool(torch.any(wants).item()):
+                continue
+            score_acc_t[wants] = torch.maximum(score_acc_t[wants], term_scores_t[wants])
+        has_signal = torch.amax(score_acc_t.view(int(bsz), -1), dim=1) > 1e-8
+        out_t = torch.zeros((int(bsz), int(h), int(w)), dtype=torch.float32, device=resolved)
+        if bool(torch.any(has_signal).item()):
+            out_t[has_signal] = _semantic_color_mask_from_score_batch_torch(score_acc_t[has_signal], device=resolved)
+        return np.asarray(out_t.detach().cpu().numpy(), dtype=np.float32)
     color_maps = _semantic_color_score_maps_batch(bchw)
     # Accumulate max color score per image across relevant terms — no per-image loop.
     # For each color term present in color_maps, find which images request it, then
@@ -1374,6 +1649,7 @@ def build_term_mask_stacks_from_images(
     label_vecs: Any,
     idx_to_term: Optional[Dict[int, str]] = None,
     term_mask_overrides_batch: Optional[Sequence[Optional[Dict[str, Any]]]] = None,
+    processing_device: Optional[Any] = None,
 ) -> Tuple[List[np.ndarray], List[np.ndarray]]:
     bchw = _image_batch_to_bchw01(images)
     bsz = int(bchw.shape[0]) if int(bchw.ndim) == 4 else 0
@@ -1385,7 +1661,9 @@ def build_term_mask_stacks_from_images(
     if int(bsz) <= 0 or int(y.shape[0]) != int(bsz):
         return [np.zeros((0, int(h), int(w)), dtype=np.float32) for _ in range(int(max(0, bsz)))], [np.zeros((0,), dtype=np.int64) for _ in range(int(max(0, bsz)))]
 
-    color_maps = _semantic_color_score_maps_batch(bchw)
+    resolved = _resolve_processing_device(processing_device)
+    color_maps_t = _semantic_color_score_maps_batch_torch(bchw, device=resolved) if resolved is not None else {}
+    color_maps = _semantic_color_score_maps_batch(bchw) if resolved is None else {}
     override_rows = list(term_mask_overrides_batch) if term_mask_overrides_batch is not None else [None for _ in range(int(bsz))]
     if int(len(override_rows)) < int(bsz):
         override_rows.extend([None for _ in range(int(bsz) - int(len(override_rows)))])
@@ -1404,24 +1682,34 @@ def build_term_mask_stacks_from_images(
     n_classes = int(y.shape[1]) if int(y.ndim) >= 2 else 0
 
     # ---- Color-map path: loop over terms (~12), not over images (N can be large) ----
-    for term_key, term_scores in color_maps.items():
+    for term_key, term_scores in (color_maps_t.items() if resolved is not None else color_maps.items()):
         # Which class indices map to this color term?
         cls_for_term = [ci for ci, tk in cls_to_term_key.items() if tk == term_key and int(ci) < int(n_classes)]
         if not cls_for_term:
             continue
-        term_scores_arr = np.asarray(term_scores, dtype=np.float32)  # [N, H, W]
+        term_scores_arr = term_scores if resolved is not None else np.asarray(term_scores, dtype=np.float32)  # [N, H, W]
         for cls_idx in cls_for_term:
             # Which images have this class active? — vectorised boolean index
             active_imgs = np.where(active[:, int(cls_idx)])[0]  # [K]
             if len(active_imgs) == 0:
                 continue
             # Compute masks for ALL active images in one batch call, no Python loop
-            batch_masks = _semantic_color_mask_from_score_batch(term_scores_arr[active_imgs])  # [K, H, W]
-            vmax = np.max(batch_masks.reshape(len(active_imgs), -1), axis=1)  # [K]
-            for li in np.where(vmax > 1e-8)[0]:
-                gi = int(active_imgs[li])
-                masks_per_image[gi].append(batch_masks[int(li)])
-                idx_per_image[gi].append(int(cls_idx))
+            if resolved is not None:
+                active_imgs_t = torch.as_tensor(active_imgs.tolist(), dtype=torch.long, device=resolved)
+                batch_masks_t = _semantic_color_mask_from_score_batch_torch(term_scores_arr[active_imgs_t], device=resolved)  # [K, H, W]
+                vmax_t = torch.amax(batch_masks_t.view(len(active_imgs), -1), dim=1)
+                keep = torch.nonzero(vmax_t > 1e-8, as_tuple=False).view(-1).detach().cpu().numpy().tolist()
+                for li in keep:
+                    gi = int(active_imgs[int(li)])
+                    masks_per_image[gi].append(np.asarray(batch_masks_t[int(li)].detach().cpu().numpy(), dtype=np.float32))
+                    idx_per_image[gi].append(int(cls_idx))
+            else:
+                batch_masks = _semantic_color_mask_from_score_batch(term_scores_arr[active_imgs])  # [K, H, W]
+                vmax = np.max(batch_masks.reshape(len(active_imgs), -1), axis=1)  # [K]
+                for li in np.where(vmax > 1e-8)[0]:
+                    gi = int(active_imgs[li])
+                    masks_per_image[gi].append(batch_masks[int(li)])
+                    idx_per_image[gi].append(int(cls_idx))
 
     # ---- Override path: rare per-image user-supplied masks, stays per-image ----
     has_overrides = any(isinstance(r, dict) and r for r in override_rows)
