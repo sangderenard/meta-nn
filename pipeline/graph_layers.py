@@ -1282,7 +1282,7 @@ def _build_execution_program_from_specs(
             "display_order": int((len(sequence) + 1) * 10),
             "ordinal": int(len(sequence) + 1),
             "kind": "hold",
-            "node_id": hold_step_id,
+            "node_id": "",
             "label": "Hold / next round",
             "shape": "terminal",
             "call_ref": "scheduler.hold",
@@ -1318,7 +1318,7 @@ def _build_execution_program_from_specs(
                     "display_order": int(node_step.get("display_order", transition_ordinal * 10)) - 5,
                     "ordinal": float(transition_ordinal) + 0.5,
                     "kind": "decision",
-                    "node_id": decision_step_id,
+                    "node_id": "",
                     "label": _condition_display_label(guard_condition_ids, condition_blobs=condition_blobs, target_label=str(node_step.get("label", node_id))),
                     "shape": "decision",
                     "call_ref": "scheduler.guard",
@@ -1960,7 +1960,8 @@ def apply_mermaid_execution_edit(plan: TrainingGraphPlan, mermaid_text: str) -> 
     original.execution_program = build_execution_program_from_plan(original)
     original.graph_layers = build_graph_layers_from_plan(original)
     original.revision = int(getattr(original, "revision", 0) or 0) + 1
-    original.validate()
+    for w in original.validate():
+        print(f"[plan-validate] WARNING: {w}", flush=True)
     return original
 
 

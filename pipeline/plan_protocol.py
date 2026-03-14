@@ -442,23 +442,28 @@ class TrainingGraphPlan:
                             f"Subnode {subnode.subnode_id!r} references unknown action {aid!r}."
                         )
 
-        # -- Condition consistency: edges from the same source with data-delivery
-        #    labels should have compatible gate requirements. --
+        # -- Condition consistency: warn only when a single target edge is gated
+        #    while its sibling unconditioned edges go to the same source.  Fan-out
+        #    (some outputs always active, some conditional) is intentional DAG
+        #    design and should not be flagged.  We flag only when a source has
+        #    exactly one unconditional outgoing edge that could be mistaken for
+        #    a fallback bypass of a gated sibling. --
         source_edges: Dict[str, List["GraphEdgeRecord"]] = defaultdict(list)
         for edge in self.edges:
             if edge.enabled and edge.layer != "cycle":
                 source_edges[edge.source_node_id].append(edge)
         for src, edges in source_edges.items():
-            cond_ids = {e.condition_id or "" for e in edges if e.condition_id}
             unconditioned = [e for e in edges if not e.condition_id]
             conditioned = [e for e in edges if e.condition_id]
-            if unconditioned and conditioned:
-                uncond_targets = [e.target_node_id for e in unconditioned]
+            # Only suspicious when exactly one unconditioned edge sits alongside
+            # one or more conditioned edges (looks like an unconditional bypass).
+            if len(unconditioned) == 1 and conditioned:
+                cond_ids = {e.condition_id or "" for e in conditioned}
                 cond_summary = ", ".join(sorted(cond_ids))
                 warnings.append(
-                    f"Inconsistent gating from {src!r}: edges to "
-                    f"{uncond_targets} have no condition, but sibling edges "
-                    f"require [{cond_summary}]."
+                    f"Inconsistent gating from {src!r}: edge to "
+                    f"{unconditioned[0].target_node_id!r} has no condition, "
+                    f"but sibling edges require [{cond_summary}]."
                 )
 
         # -- Condition expression consistency: edges sharing a condition_id
@@ -474,22 +479,52 @@ class TrainingGraphPlan:
                     + ", ".join(f"{expr!r} (edges: {eids})" for expr, eids in expr_map.items())
                 )
 
-        # -- Execution program: warn when step node_ids reference unknown nodes. --
+        # -- Execution program: validate by step kind. --
+        #    "node" steps must reference a real graph node.
+        #    "decision" steps must have a config.target_node_id that is a real graph node.
+        #    All transition from_step_id / to_step_id must exist in the program's step set.
         if self.execution_program:
             prog_steps = list(self.execution_program.get("steps", []) or [])
             prog_seq = list(self.execution_program.get("sequence_node_ids", []) or [])
+            prog_transitions = list(self.execution_program.get("transitions", []) or [])
+
+            prog_step_ids = {str(step.get("step_id", "") or "") for step in prog_steps}
+
             for step in prog_steps:
-                step_nid = str(step.get("node_id", "") or "").strip()
-                if step_nid and step_nid not in known_nodes:
-                    warnings.append(
-                        f"execution_program step {step.get('step_id', '?')!r} "
-                        f"references unknown node {step_nid!r}."
-                    )
+                step_id = step.get("step_id", "?")
+                step_kind = str(step.get("kind", "node") or "node").strip()
+
+                if step_kind == "node":
+                    step_nid = str(step.get("node_id", "") or "").strip()
+                    if step_nid and step_nid not in known_nodes:
+                        warnings.append(
+                            f"execution_program step {step_id!r} references unknown node {step_nid!r}."
+                        )
+                elif step_kind == "decision":
+                    target_nid = str((step.get("config") or {}).get("target_node_id", "") or "").strip()
+                    if target_nid and target_nid not in known_nodes:
+                        warnings.append(
+                            f"execution_program decision step {step_id!r} targets unknown node {target_nid!r}."
+                        )
+                # hold / other synthetic steps: no node reference to validate
+
             for seq_nid in prog_seq:
                 if str(seq_nid).strip() and str(seq_nid).strip() not in known_nodes:
                     warnings.append(
-                        f"execution_program sequence_node_ids references "
-                        f"unknown node {seq_nid!r}."
+                        f"execution_program sequence_node_ids references unknown node {seq_nid!r}."
+                    )
+
+            for transition in prog_transitions:
+                tid = transition.get("transition_id", "?")
+                from_sid = str(transition.get("from_step_id", "") or "").strip()
+                to_sid = str(transition.get("to_step_id", "") or "").strip()
+                if from_sid and from_sid not in prog_step_ids:
+                    warnings.append(
+                        f"execution_program transition {tid!r} from_step_id {from_sid!r} not in step set."
+                    )
+                if to_sid and to_sid not in prog_step_ids:
+                    warnings.append(
+                        f"execution_program transition {tid!r} to_step_id {to_sid!r} not in step set."
                     )
 
         return warnings
@@ -501,9 +536,6 @@ class TrainingGraphPlan:
         return {edge.edge_id: edge for edge in self.edges}
 
     def to_dict(self) -> Dict[str, Any]:
-        warnings = self.validate()
-        for w in warnings:
-            print(f"[plan-validate] WARNING: {w}", flush=True)
         return {
             "schema_version": int(self.schema_version),
             "plan_id": str(self.plan_id),
@@ -553,7 +585,6 @@ class TrainingGraphPlan:
             layout=GraphLayoutRecord.from_dict(dict(data.get("layout", {}))),
             metadata=dict(data.get("metadata", {})),
         )
-        plan.validate()
         return plan
 
     def save_json(self, path: str | Path) -> None:
@@ -1492,5 +1523,6 @@ def plan_from_pipeline_graph(
         layout=build_layout_from_records(node_records, edge_records),
         metadata=_jsonable(dict(metadata or {})),
     )
-    plan.validate()
+    for w in plan.validate():
+        print(f"[plan-validate] WARNING: {w}", flush=True)
     return plan
