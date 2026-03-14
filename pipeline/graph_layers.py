@@ -1245,11 +1245,20 @@ def _build_execution_program_from_specs(
     for ordinal, node_id in enumerate(sequence, start=1):
         spec = dict(node_specs.get(str(node_id), {}) or {})
         incoming = list(incoming_by_target.get(str(node_id), []) or [])
+        # Collect sources that have at least one unconditional edge into this node.
+        # A conditional edge whose source also has an unconditional edge to the same
+        # target only gates the on_traverse callback — it must not block the node.
+        unconditional_sources = {
+            str(edge.get("source_node_id", "") or "")
+            for edge in incoming
+            if not str(edge.get("condition_id", "") or "").strip()
+        }
         guard_condition_ids = sorted(
             {
                 str(edge.get("condition_id", "") or "").strip()
                 for edge in incoming
                 if str(edge.get("condition_id", "") or "").strip()
+                and str(edge.get("source_node_id", "") or "") not in unconditional_sources
             }
         )
         step_id = f"step_{ordinal:03d}_{_sanitize_mermaid_token(str(node_id)) or 'node'}"

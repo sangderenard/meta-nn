@@ -387,7 +387,7 @@ class BerkeleyDataConfig:
 
     # How many Berkeley refresh batches to pre-cache in memory/GPU
     prebuild_batches: int = 0      # 0 = stream on-the-fly
-    cache_device: str = "cpu"
+    cache_device: str = "auto"
     channels_last: bool = False
     wheel_max_bytes: int = 0
     wheel_sanity_cap_bytes: int = 8 * 1024 * 1024 * 1024
@@ -1140,6 +1140,8 @@ class DataNode(PipelineNode):
                 cache_batches=self.bdata_cfg.prebuild_batches,
                 cache_device=self.bdata_cfg.cache_device,
                 channels_last=self.bdata_cfg.channels_last,
+                preferred_device=getattr(ctx, "non_training_device", None),
+                gpu_residence=getattr(ctx, "gpu_residence", None),
             )
         else:
             ctx.berkeley_cache = None
@@ -1859,6 +1861,58 @@ def _build_stage_loader_pair(
     shuffle_train: bool = True,
     train_sampler: Optional[Any] = None,
 ) -> Tuple[Optional[DataLoader], Optional[DataLoader]]:
+    # Semantic-wheel datasets are chunked on disk. Random sample-level access
+    # defeats their chunk cache and turns each batch into repeated .npz loads,
+    # so consume any train/eval subset sequentially over the subset view.
+    prefers_sequential_subset = bool(
+        hasattr(dataset, "read_numpy_entry")
+        and hasattr(dataset, "chunk_rows")
+        and hasattr(dataset, "lookahead_batches")
+    )
+    if bool(prefers_sequential_subset):
+        train_picks = [int(i) for i in train_indices if 0 <= int(i) < int(len(dataset))]
+        eval_picks = [int(i) for i in eval_indices if 0 <= int(i) < int(len(dataset))]
+        train_dataset: Dataset = dataset if int(len(train_picks)) == int(len(dataset)) else torch.utils.data.Subset(dataset, train_picks)
+        eval_dataset: Dataset = dataset if int(len(eval_picks)) == int(len(dataset)) else torch.utils.data.Subset(dataset, eval_picks)
+        local_train_sampler = train_sampler
+        if local_train_sampler is None or (
+            isinstance(local_train_sampler, StatefulSequentialDeckSampler)
+            and int(getattr(local_train_sampler, "length", -1)) != int(len(train_dataset))
+        ):
+            local_train_sampler = StatefulSequentialDeckSampler(len(train_dataset))
+        _log(
+            f"[data-node] {str(name)} loader: sequential subset access for chunked wheel "
+            f"(train_rows={int(len(train_dataset))} eval_rows={int(len(eval_dataset))})"
+        )
+        train_manifest = StageDatasetManifest(
+            name=str(name),
+            dataset=train_dataset,
+            batch_size=max(1, int(batch_size)),
+            seed=int(seed),
+            num_workers=max(0, int(num_workers)),
+            device_type=str(device_type),
+            ordered_indices=list(range(int(len(train_dataset)))),
+            prefetch_factor=int(prefetch_factor),
+            pin_memory=(str(device_type).strip().lower() == "cuda"),
+            shuffle=False,
+            sampler=local_train_sampler,
+        )
+        loader, _ = build_loader_from_manifest(manifest=train_manifest)
+        eval_manifest = StageDatasetManifest(
+            name=f"{str(name)}_eval",
+            dataset=eval_dataset,
+            batch_size=max(1, int(batch_size)),
+            seed=int(seed),
+            num_workers=max(0, int(num_workers)),
+            device_type=str(device_type),
+            ordered_indices=list(range(int(len(eval_dataset)))),
+            prefetch_factor=int(prefetch_factor),
+            pin_memory=(str(device_type).strip().lower() == "cuda"),
+            shuffle=False,
+        )
+        eval_loader, _ = build_loader_from_manifest(manifest=eval_manifest)
+        return loader, eval_loader
+
     train_manifest = StageDatasetManifest(
         name=str(name),
         dataset=dataset,
@@ -2351,14 +2405,18 @@ def _build_berkeley_refresh_cache(
     cache_batches: int,
     cache_device: str,
     channels_last: bool,
+    preferred_device: Optional[torch.device] = None,
+    gpu_residence: Optional[Any] = None,
 ):
     n_batches = max(0, int(cache_batches))
     mode = str(cache_device).strip().lower()
     if n_batches <= 0 or mode == "none":
         return None
 
-    if mode == "cuda":
-        target = torch.device(str(device))
+    if mode == "auto":
+        target = preferred_device or device
+    elif mode == "cuda":
+        target = preferred_device if (preferred_device is not None and preferred_device.type == "cuda") else torch.device(str(device))
     else:
         target = torch.device("cpu")
 
@@ -2388,30 +2446,33 @@ def _build_berkeley_refresh_cache(
     target_effective = torch.device(str(target))
     target_free_bytes = 0
     if target_effective.type == "cuda":
-        try:
-            target_free_bytes, _ = torch.cuda.mem_get_info(target_effective)
-        except Exception:
-            try:
-                target_free_bytes, _ = torch.cuda.mem_get_info()
-            except Exception:
-                target_free_bytes = 0
-        # PyTorch's caching allocator holds reserved-but-not-allocated blocks that
-        # CUDA considers occupied but are freely reusable by the allocator.  Add
-        # this cache back so the staging guard uses effective usable VRAM, not
-        # just the CUDA-reported free bytes.
-        try:
-            _pt_cache = max(0, int(torch.cuda.memory_reserved(target_effective)) - int(torch.cuda.memory_allocated(target_effective)))
-            target_free_bytes = int(target_free_bytes) + _pt_cache
-        except Exception:
-            pass
-        if int(target_free_bytes) > 0 and int(estimated_bytes) >= int(0.25 * float(target_free_bytes)):
+        manager_allows_cuda = True
+        if gpu_residence is not None and getattr(gpu_residence, "enabled", False):
+            manager_allows_cuda = bool(gpu_residence.make_room_for_bytes(int(estimated_bytes)))
+        if not manager_allows_cuda:
             target_effective = torch.device("cpu")
+        else:
+            try:
+                target_free_bytes, _ = torch.cuda.mem_get_info(target_effective)
+            except Exception:
+                try:
+                    target_free_bytes, _ = torch.cuda.mem_get_info()
+                except Exception:
+                    target_free_bytes = 0
+            try:
+                _pt_cache = max(0, int(torch.cuda.memory_reserved(target_effective)) - int(torch.cuda.memory_allocated(target_effective)))
+                target_free_bytes = int(target_free_bytes) + _pt_cache
+            except Exception:
+                pass
 
     if target_effective.type == "cuda":
-        x = x.to(target_effective, non_blocking=True)
-        y = y.to(target_effective, non_blocking=True)
-        m = m.to(target_effective, non_blocking=True)
-    elif device.type == "cuda":
+        try:
+            x = x.to(target_effective, non_blocking=True)
+            y = y.to(target_effective, non_blocking=True)
+            m = m.to(target_effective, non_blocking=True)
+        except RuntimeError:
+            target_effective = torch.device("cpu")
+    if target_effective.type != "cuda" and device.type == "cuda":
         x = x.pin_memory()
         y = y.pin_memory()
         m = m.pin_memory()

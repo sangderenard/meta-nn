@@ -7,7 +7,7 @@ import torch
 import torch.nn as nn
 
 from pipeline.context import PipelineContext
-from pipeline.nodes.base import gpu_resident, module_device
+from pipeline.nodes.base import gpu_resident, module_device, resolve_non_training_device
 
 
 class SemanticTensorWorkload(nn.Module):
@@ -45,10 +45,10 @@ def semantic_processing_device(
     if not bool(enabled):
         yield None
         return
-    device = getattr(ctx, "device", None) or torch.device("cpu")
+    device = resolve_non_training_device(ctx)
     if device.type != "cuda":
         yield None
         return
     workload = ensure_semantic_tensor_workload(ctx)
-    with gpu_resident(ctx, [(workload, "semantic_tensor_workload")]):
+    with gpu_resident(ctx, [(workload, "semantic_tensor_workload")], device=device):
         yield workload.processing_device

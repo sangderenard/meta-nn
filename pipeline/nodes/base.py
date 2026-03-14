@@ -232,6 +232,19 @@ class GPUResidenceManager:
         for name in names:
             self._pinned.discard(name)
 
+    def can_fit_bytes(self, incoming_bytes: int) -> bool:
+        incoming = max(0, int(incoming_bytes))
+        count_ok = self.max_models <= 0 or len(self._residents) < self.max_models
+        bytes_ok = self.max_bytes <= 0 or (
+            sum(e.byte_size for e in self._residents.values()) + incoming <= self.max_bytes
+        )
+        return bool(count_ok and bytes_ok)
+
+    def make_room_for_bytes(self, incoming_bytes: int) -> bool:
+        incoming = max(0, int(incoming_bytes))
+        self._evict_until_fits(incoming)
+        return self.can_fit_bytes(incoming)
+
     def park(self, name: str) -> None:
         """Force-evict a specific model to CPU immediately."""
         entry = self._residents.pop(name, None)
@@ -335,6 +348,28 @@ def _log_residence(msg: str) -> None:
     print(f"[gpu-residence] {msg}", flush=True)
 
 
+def resolve_non_training_device(ctx: "PipelineContext") -> torch.device:
+    requested = str(getattr(ctx, "non_training_device_preference", "auto") or "auto").strip().lower()
+    primary = getattr(ctx, "device", None) or torch.device("cpu")
+    resolved = getattr(ctx, "non_training_device", None)
+    if isinstance(resolved, torch.device):
+        return resolved
+    if requested in ("", "auto", "inherit", "same"):
+        return primary
+    if requested == "cpu":
+        return torch.device("cpu")
+    if requested == "cuda":
+        return primary if primary.type == "cuda" else torch.device("cpu")
+    if requested.startswith("cuda"):
+        if torch.cuda.is_available():
+            try:
+                return torch.device(requested)
+            except Exception:
+                return primary if primary.type == "cuda" else torch.device("cpu")
+        return torch.device("cpu")
+    return primary
+
+
 def make_training_progress_callback(
     ctx: "PipelineContext",
     node_id: str,
@@ -392,7 +427,12 @@ def make_training_progress_callback(
 
 
 @contextmanager
-def gpu_resident(ctx: "PipelineContext", models: List[Tuple[nn.Module, str]]):
+def gpu_resident(
+    ctx: "PipelineContext",
+    models: List[Tuple[nn.Module, str]],
+    *,
+    device: Optional[torch.device] = None,
+):
     """Pin *models* on ``ctx.device`` for the duration of the block.
 
     If ``ctx.gpu_residence`` is ``None`` (offload disabled) the models are
@@ -407,12 +447,12 @@ def gpu_resident(ctx: "PipelineContext", models: List[Tuple[nn.Module, str]]):
             train_one_epoch(ctx.classifier, ...)
     """
     mgr = getattr(ctx, "gpu_residence", None)
-    device = ctx.device or torch.device("cpu")
+    target_device = device or ctx.device or torch.device("cpu")
     if mgr is not None and mgr.enabled:
         names = []
         for module, name in models:
             if module is not None:
-                mgr._ensure_resident(module, name, device)
+                mgr._ensure_resident(module, name, target_device)
                 mgr._pinned.add(name)
                 names.append(name)
         try:
@@ -421,8 +461,8 @@ def gpu_resident(ctx: "PipelineContext", models: List[Tuple[nn.Module, str]]):
             mgr.release_many(names)
     else:
         for module, _name in models:
-            if module is not None and module_device(module) != device:
-                module.to(device)
+            if module is not None and module_device(module) != target_device:
+                module.to(target_device)
         yield
 
 

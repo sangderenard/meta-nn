@@ -1790,6 +1790,16 @@ def dataloader_perf_kwargs(num_workers: int, persistent_workers: bool, prefetch_
 
 
 def build_loader_from_manifest(manifest: StageDatasetManifest) -> Tuple[Optional[DataLoader], int]:
+    def _dataset_uses_semantic_mask_stack_collate(ds: Dataset) -> bool:
+        seen_ids = set()
+        cur = ds
+        while cur is not None and id(cur) not in seen_ids:
+            seen_ids.add(id(cur))
+            if bool(getattr(cur, "use_semantic_mask_stack_collate", False)):
+                return True
+            cur = getattr(cur, "dataset", None)
+        return False
+
     n = int(len(manifest.dataset))
     if n <= 0:
         return None, 0
@@ -1811,7 +1821,7 @@ def build_loader_from_manifest(manifest: StageDatasetManifest) -> Tuple[Optional
             "subset selection via ordered_indices/max_samples is not compatible."
         )
     ds_use: Dataset = manifest.dataset if int(picks.size) == int(n) else torch.utils.data.Subset(manifest.dataset, picks.tolist())
-    collate_fn = semantic_mask_stack_collate if bool(getattr(manifest.dataset, "use_semantic_mask_stack_collate", False)) else None
+    collate_fn = semantic_mask_stack_collate if _dataset_uses_semantic_mask_stack_collate(ds_use) else None
     loader_num_workers = effective_dataloader_num_workers(
         num_workers=manifest.num_workers,
         device_type=manifest.device_type,

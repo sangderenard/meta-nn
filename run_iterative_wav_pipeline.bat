@@ -94,6 +94,7 @@ REM Training schedule defaults
 set "ORCH_MODE=staged_cgrw"
 set "ORCH_CYCLES=8"
 set "ORCH_ROUNDS=2"
+set "NON_TRAINING_DEVICE=cuda:0"
 set "GLOBAL_GRAD_ACCUM_STEPS=4"
 set "CLASSIFIER_BATCH_SIZE=32"
 set "GEN_EPOCHS_PER_ROUND=5"
@@ -128,7 +129,7 @@ set "BERKELEY_REFRESH_MAX_STEPS=256"
 set "BERKELEY_REFRESH_BATCH_SIZE=0"
 set "BERKELEY_REFRESH_LOADER_BATCH_SIZE=64"
 set "BERKELEY_REFRESH_CACHE_BATCHES=0"
-set "BERKELEY_REFRESH_CACHE_DEVICE=cpu"
+set "BERKELEY_REFRESH_CACHE_DEVICE=auto"
 set "BERKELEY_REFRESH_WORKERS=4"
 set "BERKELEY_PAYLOAD_MAX_SAMPLES=2048"
 set "BERKELEY_PAYLOAD_SOURCE_ROOT="
@@ -548,6 +549,7 @@ set "RUN_EXTRA_ARG=%~2"
   --checkpoint-every-round %CHECKPOINT_EVERY_ROUND% %CKPT_SEGMENT_ARG% ^
   --seed %RUN_SEED% ^
   --device cuda:0 ^
+  --non-training-device %NON_TRAINING_DEVICE% ^
   --amp ^
   --amp-dtype bfloat16 ^
   --no-cudnn-benchmark ^

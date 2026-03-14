@@ -845,9 +845,10 @@ class StatefulSequentialDeckSampler(Sampler[int]):
         self.cursor = 0
 
     def __iter__(self):
+        start = int(self.cursor)
         emitted = 0
         while int(emitted) < int(self.length):
-            idx = int((int(self.cursor) + int(emitted)) % max(1, int(self.length)))
+            idx = int((int(start) + int(emitted)) % max(1, int(self.length)))
             emitted += 1
             self.cursor = int((idx + 1) % max(1, int(self.length)))
             yield int(idx)

@@ -23,6 +23,7 @@ from __future__ import annotations
 import copy
 import json
 import time
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -38,7 +39,9 @@ from pipeline.nodes.base import (
     GatedNode,
     autocast_context,
     cuda_supports_dtype,
+    gpu_resident,
     resolve_amp_dtype,
+    resolve_non_training_device,
     _save_pipeline_checkpoint,
 )
 from pipeline.nodes.data_nodes import (
@@ -59,8 +62,9 @@ CLASSIFIER_LOSS_SCALE = 1.0
 CLASSIFIER_SEMANTIC_COSINE_WEIGHT = 0.35
 
 
-def _gate_eval_model(ctx: PipelineContext, *, channels_last: bool = False) -> tuple[nn.Module, torch.device]:
+def _gate_eval_model(ctx: PipelineContext, *, channels_last: bool = False) -> tuple[nn.Module, torch.device, str]:
     model = getattr(ctx, "classifier", None)
+    gate_device = resolve_non_training_device(ctx)
     if model is not None:
         try:
             from pipeline.nodes.classifier_node import _sync_gate_classifier_replica
@@ -68,7 +72,7 @@ def _gate_eval_model(ctx: PipelineContext, *, channels_last: bool = False) -> tu
             ctx.gate_classifier, _info = _sync_gate_classifier_replica(
                 source_classifier=model,
                 gate_classifier=ctx.gate_classifier,
-                gate_device=torch.device("cpu"),
+                gate_device=gate_device,
                 channels_last=bool(channels_last),
             )
         except Exception:
@@ -80,7 +84,8 @@ def _gate_eval_model(ctx: PipelineContext, *, channels_last: bool = False) -> tu
         gate_device = next(gate_model.parameters()).device
     except StopIteration:
         gate_device = torch.device("cpu")
-    return gate_model, gate_device
+    gate_name = "gate_classifier" if getattr(ctx, "gate_classifier", None) is gate_model else "classifier"
+    return gate_model, gate_device, gate_name
 
 
 def _evaluate_loss_gate(
@@ -91,19 +96,20 @@ def _evaluate_loss_gate(
     channels_last: bool = False,
     semantic_cosine_weight: float = CLASSIFIER_SEMANTIC_COSINE_WEIGHT,
 ) -> Dict[str, Any]:
-    gate_model, gate_device = _gate_eval_model(ctx, channels_last=channels_last)
-    return _evaluate_berkeley_classifier_gate(
-        classifier=gate_model,
-        loader=loader,
-        device=gate_device,
-        max_steps=max(0, int(max_steps)),
-        active_classes=max(0, int(len(ctx.class_names))),
-        amp_enabled=False,
-        amp_dtype=str(getattr(ctx.args, "amp_dtype", "float16") or "float16"),
-        channels_last=bool(channels_last),
-        semantic_mask_supervision_mode=str(getattr(ctx.args, "semantic_mask_supervision_mode", "multihot_mix") or "multihot_mix"),
-        semantic_cosine_weight=float(semantic_cosine_weight),
-    )
+    gate_model, gate_device, gate_name = _gate_eval_model(ctx, channels_last=channels_last)
+    with gpu_resident(ctx, [(gate_model, gate_name)], device=gate_device) if gate_device.type == "cuda" else nullcontext():
+        return _evaluate_berkeley_classifier_gate(
+            classifier=gate_model,
+            loader=loader,
+            device=gate_device,
+            max_steps=max(0, int(max_steps)),
+            active_classes=max(0, int(len(ctx.class_names))),
+            amp_enabled=False,
+            amp_dtype=str(getattr(ctx.args, "amp_dtype", "float16") or "float16"),
+            channels_last=bool(channels_last),
+            semantic_mask_supervision_mode=str(getattr(ctx.args, "semantic_mask_supervision_mode", "multihot_mix") or "multihot_mix"),
+            semantic_cosine_weight=float(semantic_cosine_weight),
+        )
 
 
 class PregestationEvalNode(PipelineNode):
@@ -241,19 +247,20 @@ class BerkeleyGateNode(GatedNode):
         )
 
     def execute(self, ctx: PipelineContext) -> None:
-        gate_model, gate_device = _gate_eval_model(ctx, channels_last=False)
-        result = _evaluate_berkeley_classifier_gate(
-            classifier=gate_model,
-            loader=ctx.payload_validation_loader,
-            device=gate_device,
-            max_steps=int(getattr(ctx.args, "gate_berkeley_eval_max_steps", 0) or 0),
-            active_classes=max(0, int(len(ctx.class_names))),
-            amp_enabled=False,
-            amp_dtype=str(getattr(ctx.args, "amp_dtype", "float16") or "float16"),
-            channels_last=False,
-            semantic_mask_supervision_mode=str(getattr(ctx.args, "semantic_mask_supervision_mode", "multihot_mix") or "multihot_mix"),
-            semantic_cosine_weight=float(CLASSIFIER_SEMANTIC_COSINE_WEIGHT),
-        )
+        gate_model, gate_device, gate_name = _gate_eval_model(ctx, channels_last=False)
+        with gpu_resident(ctx, [(gate_model, gate_name)], device=gate_device) if gate_device.type == "cuda" else nullcontext():
+            result = _evaluate_berkeley_classifier_gate(
+                classifier=gate_model,
+                loader=ctx.payload_validation_loader,
+                device=gate_device,
+                max_steps=int(getattr(ctx.args, "gate_berkeley_eval_max_steps", 0) or 0),
+                active_classes=max(0, int(len(ctx.class_names))),
+                amp_enabled=False,
+                amp_dtype=str(getattr(ctx.args, "amp_dtype", "float16") or "float16"),
+                channels_last=False,
+                semantic_mask_supervision_mode=str(getattr(ctx.args, "semantic_mask_supervision_mode", "multihot_mix") or "multihot_mix"),
+                semantic_cosine_weight=float(CLASSIFIER_SEMANTIC_COSINE_WEIGHT),
+            )
 
         confidence = float(result.get("mean_confidence", 0.0))
         macro_f1 = float(result.get("macro_f1", 0.0))

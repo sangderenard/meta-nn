@@ -125,6 +125,8 @@ class PipelineContext:
 
     # ---- runtime / device -----------------------------------------------
     device: Optional[torch.device] = None
+    non_training_device: Optional[torch.device] = None
+    non_training_device_preference: str = "auto"
     output_dir: Optional[Path] = None
     raise_on_node_failure: bool = True
 

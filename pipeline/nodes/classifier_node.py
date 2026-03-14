@@ -55,6 +55,7 @@ from pipeline.nodes.base import (
     make_grad_scaler,
     module_device,
     resolve_amp_dtype,
+    resolve_non_training_device,
     unwrap_compiled,
     _extract_state_dict,
     _strip_module_prefix,
@@ -829,14 +830,10 @@ class FakeClassFeedbackNode(IRTrainingNode):
 # ---------------------------------------------------------------------------
 
 class SyncGateReplicaNode(PipelineNode):
-    """Keep the frozen CPU gate_classifier in sync with the training classifier.
-
-    The replica is a deepcopy on CPU used for gate evaluation so gradient
-    updates on the main model do not interfere with evaluation runs.
-    """
+    """Keep the frozen gate_classifier in sync with the training classifier."""
 
     node_id = "sync_gate_replica"
-    description = "Sync frozen CPU gate_classifier from main classifier"
+    description = "Sync frozen gate_classifier from main classifier"
     runtime_object_type = "service"
     runtime_faculty = "housekeeping"
     gpu_models = ["classifier"]
@@ -852,11 +849,11 @@ class SyncGateReplicaNode(PipelineNode):
         ctx.gate_classifier, info = _sync_gate_classifier_replica(
             source_classifier=ctx.classifier,
             gate_classifier=ctx.gate_classifier,
-            gate_device=torch.device("cpu"),
+            gate_device=resolve_non_training_device(ctx),
             channels_last=self.cfg.channels_last,
         )
         if info.get("created"):
-            _log("[gate-replica] created fresh CPU replica")
+            _log(f"[gate-replica] created fresh replica on {info.get('device', 'cpu')}")
 
 
 # ---------------------------------------------------------------------------
@@ -871,7 +868,10 @@ def _term_to_slot_name(term: str) -> str:
 
 def _build_gate_replica(model: nn.Module, ctx: PipelineContext) -> nn.Module:
     base = unwrap_compiled(model)
-    replica = copy.deepcopy(base).to(device=torch.device("cpu"), dtype=torch.float32)
+    target = resolve_non_training_device(ctx)
+    if target.type == "cuda" and getattr(ctx, "gpu_residence", None) is not None:
+        target = torch.device("cpu")
+    replica = copy.deepcopy(base).to(device=target, dtype=torch.float32)
     replica.eval()
     freeze(replica)
     return replica

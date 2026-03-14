@@ -152,6 +152,14 @@ def parse_args():
     p.add_argument("--cache-wave-cls-dataset-on-device", action="store_true", help="Cache rendered wave-classifier datasets on GPU.")
     p.add_argument("--cache-wave-streams-on-device", action="store_true", help="Cache waveform stream pools on GPU for vectorized batch sampling.")
     p.add_argument(
+        "--non-training-device",
+        default="auto",
+        help=(
+            "Preferred device for non-training workloads such as gate eval, semantic preprocessing, and staging caches. "
+            "Use auto, cpu, cuda, or a specific device like cuda:0."
+        ),
+    )
+    p.add_argument(
         "--stage-module-offload",
         dest="stage_module_offload",
         action="store_true",
@@ -702,7 +710,7 @@ def parse_args():
     p.add_argument(
         "--berkeley-refresh-cache-device",
         choices=["none", "auto", "cpu", "cuda"],
-        default="none",
+        default="auto",
         help="Storage device for cached Berkeley refresh pool.",
     )
     p.add_argument("--berkeley-refresh-vram-fraction", type=float, default=0.90, help="Target fraction of free VRAM to fill for auto refresh batch.")
@@ -1622,6 +1630,7 @@ def parse_args():
         semantic_stage_cache_use_rare_term_deck=True,
         semantic_gpu_preprocess=False,
         semantic_preload_workers=0,
+        non_training_device="auto",
         gd_vocab_library_enabled=True,
         gd_vocab_library_autoload=True,
         training_preview_enabled=True,

@@ -176,6 +176,28 @@ def _resolve_device(args) -> torch.device:
     return torch.device(requested)
 
 
+def _resolve_non_training_device(args, device: torch.device) -> torch.device:
+    requested = str(_arg_value(args, "non_training_device", default="auto") or "auto").strip()
+    lower = requested.lower()
+    if lower in ("", "auto", "inherit", "same"):
+        return device
+    if lower == "cpu":
+        return torch.device("cpu")
+    if lower == "cuda":
+        return device if device.type == "cuda" else torch.device("cpu")
+    if "cuda" in lower and not torch.cuda.is_available():
+        _log(
+            f"[orchestrator] requested non-training CUDA device {requested!r} but CUDA is unavailable; "
+            "falling back to CPU"
+        )
+        return torch.device("cpu")
+    try:
+        return torch.device(requested)
+    except Exception:
+        _log(f"[orchestrator] invalid non-training device {requested!r}; falling back to primary device {device}")
+        return device
+
+
 def _load_resume_state(args, output_dir: Path) -> dict:
     from pipeline.nodes.base import _load_json, _torch_load_cpu
 
@@ -707,6 +729,7 @@ def build_training_graph_plan(args, output_dir: Path, *, graph: Optional[Pipelin
     worker_hints = {
         "output_dir": str(Path(output_dir)),
         "device_preference": str(_arg_value(args, "device", default="auto") or "auto"),
+        "non_training_device_preference": str(_arg_value(args, "non_training_device", default="auto") or "auto"),
         "orchestration_mode": str(_arg_value(args, "orchestration_mode", default="staged_cgrw") or "staged_cgrw"),
         "orchestration_cycles": int(_arg_value(args, "orchestration_cycles", "cycles", default=1)),
         "orchestration_rounds": int(_arg_value(args, "orchestration_rounds", "rounds_per_cycle", default=1)),
@@ -1561,13 +1584,16 @@ def run(args, output_dir: Path, initial_plan=None) -> None:
 
     # -- Device / runtime -------------------------------------------------
     device = _resolve_device(args)
+    non_training_device = _resolve_non_training_device(args, device)
     runtime = _prepare_runtime(args, output_dir, device)
-    _log(f"[orchestrator] device={device}")
+    _log(f"[orchestrator] device={device} non_training_device={non_training_device}")
 
     # -- Context ----------------------------------------------------------
     ctx = PipelineContext(
         args=args,
         device=device,
+        non_training_device=non_training_device,
+        non_training_device_preference=str(_arg_value(args, "non_training_device", default="auto") or "auto"),
         output_dir=output_dir,
         berkeley_data_root=str(_arg_value(args, "berkeley_data_root", default="") or ""),
         semantic_stage_cache_dir=str(_arg_value(args, "semantic_stage_cache_dir", default="") or ""),
@@ -2140,6 +2166,7 @@ def _build_configs_from_args(args) -> dict:
         num_workers=int(_g("berkeley_refresh_workers", "num_workers", default=0)),
         prefetch_factor=int(_g("loader_prefetch_factor", default=0)),
         prebuild_batches=int(_g("berkeley_refresh_cache_batches", default=0)),
+        cache_device=str(_g("berkeley_refresh_cache_device", default="auto") or "auto"),
         seed=int(_g("seed", default=42)),
         wheel_max_bytes=int(max(0, int(_g("berkeley_wheel_max_mb", default=0)))) * 1024 * 1024,
         wheel_sanity_cap_bytes=int(max(1, int(_g("berkeley_wheel_sanity_cap_mb", default=8192)))) * 1024 * 1024,

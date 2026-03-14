@@ -3,8 +3,10 @@ from __future__ import annotations
 
 import numpy as np
 import torch
-from torch.utils.data import TensorDataset
+from torch.utils.data import Dataset, TensorDataset
 
+from pipeline.nodes.data_nodes import _build_stage_loader_pair
+from pipeline.semantic_wheel_cache import StatefulSequentialDeckSampler
 from pipeline.nodes.vocab_node import (
     _build_pregestation_logic_rows,
     _semantic_terms_with_tonal_tags,
@@ -129,7 +131,62 @@ def test_stage_manifest_shuffle_with_ordered_subset() -> None:
     _ok("ordered split subsets still shuffle across train iterations")
 
 
+def test_stateful_sequential_deck_sampler_continues_partial_pass() -> None:
+    print("\n--- test_stateful_sequential_deck_sampler_continues_partial_pass ---")
+    sampler = StatefulSequentialDeckSampler(6)
+    first_iter = iter(sampler)
+    first_two = [next(first_iter), next(first_iter)]
+    resumed = list(iter(sampler))
+    assert first_two == [0, 1], first_two
+    assert resumed == [2, 3, 4, 5, 0, 1], resumed
+    _ok("stateful sequential deck sampler resumes from the next unseen row")
+
+
+def test_chunked_stage_loader_uses_sequential_subset_access() -> None:
+    print("\n--- test_chunked_stage_loader_uses_sequential_subset_access ---")
+
+    class _ChunkedIndexDataset(Dataset):
+        def __init__(self, values):
+            self.values = [int(v) for v in values]
+            self.chunk_rows = [2, 2, 2, 2]
+            self.lookahead_batches = 2
+
+        def __len__(self):
+            return int(len(self.values))
+
+        def read_numpy_entry(self, index: int):
+            return {"value": int(self.values[int(index)])}
+
+        def __getitem__(self, index: int):
+            return torch.tensor(int(self.values[int(index)]), dtype=torch.int64)
+
+    ds = _ChunkedIndexDataset(range(8))
+    loader, eval_loader = _build_stage_loader_pair(
+        dataset=ds,
+        name="chunked_smoke",
+        batch_size=4,
+        num_workers=0,
+        seed=17,
+        device_type="cpu",
+        train_indices=[2, 4, 6, 7],
+        eval_indices=[1, 3],
+        prefetch_factor=2,
+        shuffle_train=True,
+    )
+    assert loader is not None
+    assert eval_loader is not None
+    first = next(iter(loader)).tolist()
+    second = next(iter(loader)).tolist()
+    eval_batch = next(iter(eval_loader)).tolist()
+    assert first == [2, 4, 6, 7], first
+    assert second == [2, 4, 6, 7], second
+    assert eval_batch == [1, 3], eval_batch
+    _ok("chunked semantic-wheel subsets stay sequential instead of randomizing chunk access")
+
+
 if __name__ == "__main__":
     test_pregestation_targets_include_observed_terms()
     test_stage_manifest_shuffle_with_ordered_subset()
+    test_stateful_sequential_deck_sampler_continues_partial_pass()
+    test_chunked_stage_loader_uses_sequential_subset_access()
     print("\nALL TESTS PASSED")

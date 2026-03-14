@@ -785,7 +785,17 @@ class PipelineGraph:
 
             incoming = [e for e in self._edges if e.target_id == node_id]
             incoming_edge_ids = [str(e.edge_id) for e in incoming]
-            inferred_guard_ids = sorted({str(e.condition_id) for e in incoming if str(e.condition_id or '').strip()})
+            # Sources with at least one unconditional edge — a conditional edge
+            # from the same source only gates on_traverse, not the node itself.
+            _unconditional_sources = {
+                str(e.source_id) for e in incoming
+                if not str(e.condition_id or '').strip()
+            }
+            inferred_guard_ids = sorted({
+                str(e.condition_id) for e in incoming
+                if str(e.condition_id or '').strip()
+                and str(e.source_id) not in _unconditional_sources
+            })
             configured_guard_ids = [
                 str(condition_id or '').strip()
                 for condition_id in list(step_spec.get("guard_condition_ids", []) or [])
