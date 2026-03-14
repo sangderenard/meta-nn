@@ -793,7 +793,8 @@ class SaveRestoreNode(PipelineNode):
         self.training_cache: Optional[TrainingMaterialCache] = None
 
         # -- Pull-model data stores (GUI queries these) -------------------
-        self.loss_accumulator: LossAccumulator = LossAccumulator()
+        from pipeline.nodus_loss_store import NodusLossStore as _NLS
+        self.loss_store: _NLS = _NLS(max_channels=64, max_records=100_000)
         self.result_store: ResultStore = ResultStore()
 
         # Pending restore request: (round_id, cycle) to restore to.
@@ -832,6 +833,10 @@ class SaveRestoreNode(PipelineNode):
         manifest_path = out_dir / "tm_manifest.json"
         self.training_cache.load_manifest(manifest_path)
 
+        # Load historical loss data from binary log files so the pull-model
+        # can serve the full history (including previous sessions) from round 0.
+        self._load_historical_losses(out_dir)
+
         # Register base weights for weight-tracking delta image
         _models = {
             "classifier": ctx.classifier,
@@ -847,6 +852,42 @@ class SaveRestoreNode(PipelineNode):
                 except Exception:
                     pass
 
+    def _load_historical_losses(self, out_dir: Path) -> None:
+        """Replay binary loss-log files into the LossAccumulator.
+
+        This ensures the pull-model serves complete history to the GUI,
+        including data from previous training sessions.
+        """
+        try:
+            from wav_ml_viewer import _LossFileLogger
+        except Exception:
+            return
+        loaded = 0
+        for fname in ("loss_log_prev.bin", "loss_log.bin"):
+            fpath = out_dir / fname
+            try:
+                recs = _LossFileLogger.load(fpath)
+                for rec in recs:
+                    ck_raw = rec["channel_key"]
+                    ck = ck_raw.decode("utf-8").rstrip("\x00") if isinstance(ck_raw, (bytes, np.bytes_)) else str(ck_raw)
+                    if not ck:
+                        ck = f"stage_{int(rec['stage'])}"
+                    loss_val = float(rec["loss"])
+                    if not math.isfinite(loss_val):
+                        continue
+                    self.loss_store.record(
+                        channel_key=ck,
+                        loss=loss_val,
+                        aux=float(rec["aux"]) if math.isfinite(float(rec["aux"])) else 0.0,
+                        round_id=int(rec["round"]),
+                        ts=float(rec["ts"]),
+                    )
+                    loaded += 1
+            except Exception as exc:
+                _log(f"[save-restore] could not load {fname}: {exc}")
+        if loaded > 0:
+            _log(f"[save-restore] loaded {loaded} historical loss records into accumulator")
+
     @property
     def runtime_execution_policy(self) -> tuple:
         return ("periodic", {"period": self.save_every_n_rounds, "counter": "round_id", "restore_overrides": True})
@@ -855,7 +896,7 @@ class SaveRestoreNode(PipelineNode):
         return [
             {"subnode_id": "seed_bank", "kind": "state_store", "label": "Seed Bank", "order": 0},
             {"subnode_id": "training_cache", "kind": "state_store", "label": "Training Material Cache", "order": 1},
-            {"subnode_id": "loss_accumulator", "kind": "metric_store", "label": "Loss Accumulator", "order": 2},
+            {"subnode_id": "loss_store", "kind": "metric_store", "label": "Nodus Loss Store (native)", "order": 2},
             {"subnode_id": "result_store", "kind": "metric_store", "label": "Result Store", "order": 3},
             {"subnode_id": "weight_tracker", "kind": "diagnostic", "label": "Weight Tracker", "order": 4},
         ]
@@ -1169,7 +1210,7 @@ class SaveRestoreNode(PipelineNode):
         Also emits a lightweight notification dict (caller can forward
         to the viewer proxy).
         """
-        return self.loss_accumulator.record(
+        return self.loss_store.record(
             channel_key=channel_key, loss=loss, aux=aux,
             round_id=round_id, ts=ts,
         )
@@ -1209,7 +1250,7 @@ class SaveRestoreNode(PipelineNode):
         return None
 
     def _resp_channel_list(self) -> Dict[str, Any]:
-        loss_keys = self.loss_accumulator.channel_keys()
+        loss_keys = self.loss_store.channel_keys()
         result_keys = self.result_store.channel_keys()
         tm_keys = self.training_cache.channel_keys() if self.training_cache else []
         all_keys = sorted(set(loss_keys) | set(result_keys) | set(tm_keys))
@@ -1219,7 +1260,7 @@ class SaveRestoreNode(PipelineNode):
                 {
                     "key": ck,
                     "has_loss": ck in loss_keys,
-                    "loss_length": self.loss_accumulator.channel_length(ck),
+                    "loss_length": self.loss_store.channel_length(ck),
                     "has_result": ck in result_keys,
                     "result_depth": self.result_store.channel_depth(ck),
                     "has_tm": ck in tm_keys,
@@ -1233,7 +1274,12 @@ class SaveRestoreNode(PipelineNode):
     def _resp_loss_history(self, query: Dict[str, Any]) -> Dict[str, Any]:
         ck = str(query.get("channel_key", ""))
         from_step = int(query.get("from_step", 0))
-        records = self.loss_accumulator.query_since(ck, from_step)
+        recs = self.loss_store.query_since(ck, from_step)
+        records = [
+            {"step": r.step, "round_id": r.round_id,
+             "loss": r.loss, "aux": r.aux, "ts": r.ts}
+            for r in recs
+        ]
         return {
             "type": RESP_LOSS_HISTORY,
             "channel_key": ck,
@@ -1326,7 +1372,7 @@ class SaveRestoreNode(PipelineNode):
         return {
             "type": NOTIFY_NEW_LOSS,
             "channel_key": str(channel_key),
-            "length": self.loss_accumulator.channel_length(channel_key),
+            "length": self.loss_store.channel_length(channel_key),
         }
 
     def make_result_notification(self, channel_key: str) -> Dict[str, Any]:
@@ -1340,7 +1386,7 @@ class SaveRestoreNode(PipelineNode):
             "type": NOTIFY_CHECKPOINT,
             "round_id": int(round_id),
             "cycle": int(cycle),
-            "loss_summary": self.loss_accumulator.summary(),
+            "loss_summary": self.loss_store.summary(),
         }
         if thumb_path is not None:
             d["thumb_path"] = str(thumb_path)

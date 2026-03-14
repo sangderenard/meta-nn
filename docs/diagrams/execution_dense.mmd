@@ -58,11 +58,11 @@ flowchart TD
     vocab_churn -- "per_round" --> build_symbol_pool
     build_symbol_pool -- "per_round" --> build_label_embedding
     build_label_embedding -- "per_round" --> data_node
-    data_node -- "provides:pregestation_loader" --> stage_0_pregestation
-    data_node -- "provides:pregestation_eval_loader" --> gate_0_pregestation_eval
-    data_node -- "provides:gestation_loader" --> stage_1_gestation
-    data_node -- "provides:gestation_eval_loader" --> gate_1_gestation_eval
-    data_node -- "provides:berkeley_refresh_loader" --> stage_2_berkeley
+    data_node -- "provides:pregestation_loader [data._preg_last_build_round < 0 OR (ctx.total_rounds_completed - data._preg_last_build_round) >= preg_cfg.rebuild_every_n_rounds]" --> stage_0_pregestation
+    data_node -- "provides:pregestation_eval_loader [data._preg_last_build_round < 0 OR (ctx.total_rounds_completed - data._preg_last_build_round) >= preg_cfg.rebuild_every_n_rounds]" --> gate_0_pregestation_eval
+    data_node -- "provides:gestation_loader [(GATE_OVERRIDE OR gate_pregestation.passed) AND (data._gest_last_build_round < 0 OR (ctx.total_rounds_completed - data._gest_last_build_round) >= gest_cfg.rebuild_every_n_rounds)]" --> stage_1_gestation
+    data_node -- "provides:gestation_eval_loader [(GATE_OVERRIDE OR gate_pregestation.passed) AND (data._gest_last_build_round < 0 OR (ctx.total_rounds_completed - data._gest_last_build_round) >= gest_cfg.rebuild_every_n_rounds)]" --> gate_1_gestation_eval
+    data_node -- "provides:berkeley_refresh_loader [(GATE_OVERRIDE OR early_gates_passed) AND (data._bdata_last_build_round < 0 OR (ctx.total_rounds_completed - data._bdata_last_build_round) >= bdata_cfg.rebuild_every_n_rounds)]" --> stage_2_berkeley
     data_node -- "provides:gate_val_loader+payload_val_loader [GATE_OVERRIDE OR early_gates_passed]" --> gate_berkeley
     data_node -- "provides:payload_bank [GATE_OVERRIDE OR all_base_gates_passed]" --> stage_g_generator
     data_node -- "provides:payload_images [GATE_OVERRIDE OR all_base_gates_passed]" --> build_flashcard_rows

@@ -36,8 +36,13 @@ def _probe_existing_viewer(port_file: Path) -> bool:
         return False
 
 
-def _load_history(viewer, out_dir: Path) -> None:
-    """Scan the output directory and load historical data into the viewer."""
+def _load_history(viewer, out_dir: Path, loss_store=None) -> None:
+    """Scan the output directory and load historical data into the viewer.
+
+    When *loss_store* is provided (a NodusLossStore instance), historical
+    loss values are written directly into the native store instead of the
+    viewer's local deques.
+    """
     from pipeline.plan_protocol import (
         DEFAULT_PLAN_FILENAME,
         DEFAULT_RUNTIME_SNAPSHOT_FILENAME,
@@ -46,14 +51,14 @@ def _load_history(viewer, out_dir: Path) -> None:
         parse_envelope,
     )
     from wav_ml_viewer import (
-        LOSS_STAGE_CLASSIFIER,
-        LOSS_STAGE_GENERATOR,
-        LOSS_STAGE_DISCRIMINATOR,
-        LOSS_STAGE_TRANSFORMER,
-        LOSS_STAGE_WAVE_CLASSIFIER,
-        LOSS_STAGE_WAVE_CLASSIFIER_EVAL,
         _LossFileLogger,
     )
+
+    def _record(ck: str, v: float, ts: float = 0.0):
+        if loss_store is not None:
+            loss_store.record(ck, v, ts=ts)
+        else:
+            viewer.update_loss(ck, v, ts=ts)
 
     loaded = 0
 
@@ -67,7 +72,7 @@ def _load_history(viewer, out_dir: Path) -> None:
                 try:
                     v = float(row.get("loss", float("nan")))
                     if math.isfinite(v):
-                        viewer.update_loss(LOSS_STAGE_CLASSIFIER, v)
+                        _record("berk", v)
                         loaded += 1
                 except Exception:
                     pass
@@ -76,10 +81,10 @@ def _load_history(viewer, out_dir: Path) -> None:
                     gv = float(row.get("g_loss", float("nan")))
                     dv = float(row.get("d_loss", float("nan")))
                     if math.isfinite(gv):
-                        viewer.update_loss(LOSS_STAGE_GENERATOR, gv)
+                        _record("gen", gv)
                         loaded += 1
                     if math.isfinite(dv):
-                        viewer.update_loss(LOSS_STAGE_DISCRIMINATOR, dv)
+                        _record("disc", dv)
                         loaded += 1
                 except Exception:
                     pass
@@ -87,7 +92,7 @@ def _load_history(viewer, out_dir: Path) -> None:
                 try:
                     v = float(row.get("train_loss", float("nan")))
                     if math.isfinite(v):
-                        viewer.update_loss(LOSS_STAGE_TRANSFORMER, v)
+                        _record("trans", v)
                         loaded += 1
                 except Exception:
                     pass
@@ -95,14 +100,14 @@ def _load_history(viewer, out_dir: Path) -> None:
                 try:
                     v = float(row.get("train_loss", float(row.get("loss", float("nan")))))
                     if math.isfinite(v):
-                        viewer.update_loss(LOSS_STAGE_WAVE_CLASSIFIER, v)
+                        _record("wcls", v)
                         loaded += 1
                 except Exception:
                     pass
                 try:
                     ev = float(row.get("val_loss", float("nan")))
                     if math.isfinite(ev):
-                        viewer.update_loss(LOSS_STAGE_WAVE_CLASSIFIER_EVAL, ev)
+                        _record("wcls_eval", ev)
                         loaded += 1
                 except Exception:
                     pass
@@ -150,7 +155,10 @@ def _load_history(viewer, out_dir: Path) -> None:
     try:
         recs = _LossFileLogger.load(prev_path)
         for rec in recs:
-            viewer.update_loss(int(rec["stage"]), float(rec["loss"]), ts=float(rec["ts"]))
+            ck = rec["channel_key"].decode("utf-8").rstrip("\x00") if rec["channel_key"] else ""
+            if not ck:
+                ck = f"stage_{int(rec['stage'])}"
+            _record(ck, float(rec["loss"]), ts=float(rec["ts"]))
         if len(recs) > 0:
             print(f"[gui] loaded {len(recs)} records from loss_log_prev.bin", flush=True)
     except Exception as e:
@@ -161,7 +169,10 @@ def _load_history(viewer, out_dir: Path) -> None:
     try:
         recs = _LossFileLogger.load(cur_path)
         for rec in recs:
-            viewer.update_loss(int(rec["stage"]), float(rec["loss"]), ts=float(rec["ts"]))
+            ck = rec["channel_key"].decode("utf-8").rstrip("\x00") if rec["channel_key"] else ""
+            if not ck:
+                ck = f"stage_{int(rec['stage'])}"
+            _record(ck, float(rec["loss"]), ts=float(rec["ts"]))
         if len(recs) > 0:
             print(f"[gui] loaded {len(recs)} records from loss_log.bin", flush=True)
     except Exception:
@@ -228,16 +239,21 @@ def main():
 
     # Import viewer after arg parse so the window opens as fast as possible
     from wav_ml_viewer import _TransformerStatusOpenGLViewer, ViewerIPCServer
+    from pipeline.nodus_loss_store import NodusLossStore
+
+    # Create the native loss store — single authoritative source for all loss data.
+    loss_store = NodusLossStore(max_channels=64, max_records=100_000)
 
     viewer = _TransformerStatusOpenGLViewer(
         enabled=True,
         image_hw=image_hw,
         scale=max(1, int(args.scale)),
         cycle_slots=max(0, int(args.cycle_slots)),
+        loss_store=loss_store,
     )
 
     # Load history from leftover files before any training connects
-    _load_history(viewer, out_dir)
+    _load_history(viewer, out_dir, loss_store=loss_store)
 
     # Start IPC server for training processes to connect
     server = ViewerIPCServer(viewer, port=int(args.port), port_file=str(port_file))

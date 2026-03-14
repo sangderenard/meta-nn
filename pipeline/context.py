@@ -15,50 +15,50 @@ import torch
 import torch.nn as nn
 
 
-_LOSS_STAGE_CLASSIFIER = 0
-_LOSS_STAGE_GENERATOR = 1
-_LOSS_STAGE_DISCRIMINATOR = 2
-_LOSS_STAGE_TRANSFORMER = 3
-_LOSS_STAGE_WAVE_CLASSIFIER = 4
-_LOSS_STAGE_WAVE_CLASSIFIER_EVAL = 5
+# ---------------------------------------------------------------------------
+# Channel-key builders: every loss series is identified by a short string.
+# ---------------------------------------------------------------------------
+
+# Known node-IDs that produce loss values.
+_NODE_CHANNEL_KEYS: Dict[str, str] = {
+    "stage_0_pregestation":    "preg",
+    "stage_1_gestation":      "gest",
+    "stage_2_berkeley":       "berk",
+    "gate_0_pregestation_eval": "preg_eval",
+    "gate_1_gestation_eval":  "gest_eval",
+    "gate_berkeley":          "berk_eval",
+    "stage_r_transformer":    "trans",
+    "stage_g_generator":      "gen",
+    "stage_w_wave_classifier": "wcls",
+}
 
 
-def _loss_stage_for_node(node_id: str) -> Optional[int]:
+def _channel_key_for_node(node_id: str) -> Optional[str]:
     key = str(node_id or "").strip().lower()
-    if key in {
-        "stage_0_pregestation",
-        "stage_1_gestation",
-        "stage_2_berkeley",
-        "gate_0_pregestation_eval",
-        "gate_1_gestation_eval",
-        "gate_berkeley",
-    }:
-        return _LOSS_STAGE_CLASSIFIER
-    if key == "stage_r_transformer":
-        return _LOSS_STAGE_TRANSFORMER
-    if key == "stage_g_generator":
-        return _LOSS_STAGE_GENERATOR
-    if key == "stage_w_wave_classifier":
-        return _LOSS_STAGE_WAVE_CLASSIFIER
-    return None
+    return _NODE_CHANNEL_KEYS.get(key)
 
 
-def _loss_stage_for_metric(stage: str, key: str) -> Optional[int]:
+# Metric (stage_label, metric_key) → channel key.
+_METRIC_CHANNEL_KEYS: Dict[Tuple[str, str], str] = {
+    ("stage0", "loss"): "preg",
+    ("stage1", "loss"): "gest",
+    ("stage2", "loss"): "berk",
+    ("gate0", "loss"):  "preg_eval",
+    ("gate1", "loss"):  "gest_eval",
+    ("gate2", "loss"):  "berk_eval",
+    ("stageg", "g_loss"): "gen",
+    ("stageg", "d_loss"): "disc",
+    ("stager", "loss"):   "trans",
+    ("stagew", "loss"):       "wcls",
+    ("stagew", "train_loss"): "wcls",
+    ("stagew", "val_loss"):   "wcls_eval",
+}
+
+
+def _channel_key_for_metric(stage: str, key: str) -> Optional[str]:
     stage_key = str(stage or "").strip().lower()
     metric_key = str(key or "").strip().lower()
-    if metric_key == "loss" and stage_key in {"stage0", "stage1", "stage2", "gate0", "gate1", "gate2"}:
-        return _LOSS_STAGE_CLASSIFIER
-    if stage_key == "stageg" and metric_key == "g_loss":
-        return _LOSS_STAGE_GENERATOR
-    if stage_key == "stageg" and metric_key == "d_loss":
-        return _LOSS_STAGE_DISCRIMINATOR
-    if stage_key == "stager" and metric_key == "loss":
-        return _LOSS_STAGE_TRANSFORMER
-    if stage_key == "stagew" and metric_key in {"loss", "train_loss"}:
-        return _LOSS_STAGE_WAVE_CLASSIFIER
-    if stage_key == "stagew" and metric_key == "val_loss":
-        return _LOSS_STAGE_WAVE_CLASSIFIER_EVAL
-    return None
+    return _METRIC_CHANNEL_KEYS.get((stage_key, metric_key))
 
 
 # ---------------------------------------------------------------------------
@@ -277,6 +277,12 @@ class PipelineContext:
     #  The interpreter consults these at hold points for repeat/exhaust decisions.
     cycle_gates: List[Any] = field(default_factory=list)
 
+    # ---- graph node references (used by condition_expr) ------------------
+    data: Optional[Any] = None           # DataNode instance
+    preg_cfg: Optional[Any] = None       # PregestationDataConfig
+    gest_cfg: Optional[Any] = None       # GestationDataConfig
+    bdata_cfg: Optional[Any] = None      # BerkeleyDataConfig
+
     # ---- viewer / preview -----------------------------------------------
     viewer_proxy: Optional[Any] = None
     loss_logger: Optional[Any] = None
@@ -395,39 +401,36 @@ class PipelineContext:
         except Exception:
             return True
 
-    def publish_loss(self, stage_id: int, loss: float, aux: float = 0.0) -> None:
-        stage = int(stage_id)
+    def publish_loss(self, channel_key: str, loss: float, aux: float = 0.0) -> None:
+        ck = str(channel_key)
         value = float(loss)
         aux_value = float(aux)
         now = time.time()
 
+        lora_slot = getattr(self, "lora_active_slot", "")
+        if lora_slot:
+            ck = f"{ck}|{lora_slot}"
+
         logger = self.loss_logger
         if logger is not None:
             try:
-                logger.log(int(self.round_id), stage, value, aux=aux_value)
+                logger.log(int(self.round_id), ck, value, aux=aux_value)
                 flush = getattr(logger, "flush", None)
                 if callable(flush):
                     flush()
             except Exception:
                 pass
 
-        # Route to SaveRestoreNode's pull-model accumulator
+        # Route to SaveRestoreNode — the single source of truth for loss data.
+        # The GUI pulls values from the accumulator via the IPC pull-model;
+        # no direct push to the viewer proxy.
         sr = self.save_restore_node
         if sr is not None:
             try:
-                _STAGE_NAMES = {
-                    0: "cls", 1: "gen", 2: "disc",
-                    3: "trans", 4: "wcls", 5: "wcls_eval",
-                }
-                ck = _STAGE_NAMES.get(stage, f"stage_{stage}")
-                lora_slot = getattr(self, "lora_active_slot", "")
-                if lora_slot:
-                    ck = f"{ck}|{lora_slot}"
                 sr.record_loss(
                     channel_key=ck, loss=value, aux=aux_value,
                     round_id=int(self.round_id), ts=now,
                 )
-                # Emit lightweight notification so the GUI knows new data exists
                 proxy = self.viewer_proxy
                 if proxy is not None:
                     send_notif = getattr(proxy, "send_notification", None)
@@ -436,28 +439,17 @@ class PipelineContext:
             except Exception:
                 pass
 
-        proxy = self.viewer_proxy
-        if proxy is None:
-            return
-        fn = getattr(proxy, "update_loss", None)
-        if not callable(fn):
-            return
-        try:
-            fn(stage, value, aux_value, now)
-        except Exception:
-            pass
-
     def publish_node_progress(self, node_id: str, loss: float, aux: float = 0.0) -> None:
-        stage_id = _loss_stage_for_node(node_id)
-        if stage_id is None:
+        ck = _channel_key_for_node(node_id)
+        if ck is None:
             return
-        self.publish_loss(stage_id, float(loss), aux=float(aux))
+        self.publish_loss(ck, float(loss), aux=float(aux))
 
     def log_metric(self, stage: str, key: str, value: float) -> None:
         value_f = float(value)
         self.metrics_history.append(
             {"cycle": self.cycle, "round": self.round_id, "stage": stage, "key": key, "value": value_f}
         )
-        stage_id = _loss_stage_for_metric(stage, key)
-        if stage_id is not None:
-            self.publish_loss(stage_id, value_f)
+        ck = _channel_key_for_metric(stage, key)
+        if ck is not None:
+            self.publish_loss(ck, value_f)

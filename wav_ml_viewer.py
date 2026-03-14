@@ -30,30 +30,15 @@ from pipeline.plan_protocol import (
 # ---------------------------------------------------------------------------
 # Loss logging constants and binary record format
 # ---------------------------------------------------------------------------
-LOSS_STAGE_CLASSIFIER = 0
-LOSS_STAGE_GENERATOR = 1
-LOSS_STAGE_DISCRIMINATOR = 2
-LOSS_STAGE_TRANSFORMER = 3
-LOSS_STAGE_WAVE_CLASSIFIER = 4
-LOSS_STAGE_WAVE_CLASSIFIER_EVAL = 5
 
-_LOSS_STAGE_NAMES: Dict[int, str] = {
-    LOSS_STAGE_CLASSIFIER: "cls",
-    LOSS_STAGE_GENERATOR: "gen",
-    LOSS_STAGE_DISCRIMINATOR: "disc",
-    LOSS_STAGE_TRANSFORMER: "trans",
-    LOSS_STAGE_WAVE_CLASSIFIER: "wcls",
-    LOSS_STAGE_WAVE_CLASSIFIER_EVAL: "wcls_eval",
-}
-
-# Legacy fixed colours kept for backward-compat history loading only.
-_LOSS_STAGE_COLORS_LEGACY: Dict[int, tuple] = {
-    LOSS_STAGE_CLASSIFIER:          (80,  200, 220),
-    LOSS_STAGE_GENERATOR:           (80,  200, 100),
-    LOSS_STAGE_DISCRIMINATOR:       (240, 140,  40),
-    LOSS_STAGE_TRANSFORMER:         (240, 220,  60),
-    LOSS_STAGE_WAVE_CLASSIFIER:     (220,  80, 220),
-    LOSS_STAGE_WAVE_CLASSIFIER_EVAL:(160, 120, 255),
+# Integer -> channel-key map used *only* when loading legacy v1 binary records.
+_LEGACY_STAGE_NAMES: Dict[int, str] = {
+    0: "cls",
+    1: "gen",
+    2: "disc",
+    3: "trans",
+    4: "wcls",
+    5: "wcls_eval",
 }
 
 
@@ -84,7 +69,7 @@ def _hsl_to_rgb(h: float, s: float, l: float) -> Tuple[int, int, int]:
 def _channel_color(index: int, total: int) -> Tuple[int, int, int]:
     """Equal-angular-spacing colour from the HSL wheel.
 
-    Uses the golden angle offset (137.508°) so that any prefix of N channels
+    Uses the golden angle offset (137.508deg) so that any prefix of N channels
     is well-distributed even if total changes over time.
     """
     if total <= 0:
@@ -92,33 +77,6 @@ def _channel_color(index: int, total: int) -> Tuple[int, int, int]:
     hue = (index * 137.508) % 360.0
     return _hsl_to_rgb(hue, 0.72, 0.58)
 
-
-def _channel_key_from_stage_id(stage_id: int) -> str:
-    """Convert legacy integer stage_id to a canonical channel key string."""
-    return _LOSS_STAGE_NAMES.get(int(stage_id), f"stage_{stage_id}")
-
-
-def make_channel_key(
-    node_id: str = "",
-    stage_id: int = -1,
-    lora_slot: str = "",
-) -> str:
-    """Build a unique channel key for loss graph tracking.
-
-    Format: ``<base>`` or ``<base>|<lora_slot>`` when a LoRA adapter is active.
-    ``base`` is derived from node_id (preferred) or stage_id (fallback).
-    """
-    base = ""
-    if node_id:
-        base = str(node_id).strip().lower()
-    elif stage_id >= 0:
-        base = _channel_key_from_stage_id(stage_id)
-    else:
-        base = "unknown"
-    lora = str(lora_slot).strip()
-    if lora:
-        return f"{base}|{lora}"
-    return base
 
 # 20 bytes per record: step(i4) round(i2) stage(u1) pad(u1) loss(f4) aux(f4) ts(f4)
 LOSS_RECORD_DTYPE = np.dtype([
@@ -153,28 +111,35 @@ class _LossFileLogger:
 
     def __init__(self, path, start_time: float = 0.0):
         self._path = Path(path)
-        # start_time retained for API compatibility but no longer used; ts is wall-clock.
         self._file = None
         try:
             existing_bytes = int(self._path.stat().st_size) if self._path.exists() else 0
-            self._counter = int(existing_bytes // LOSS_RECORD_DTYPE.itemsize)
+            # Detect existing format to count records correctly.
+            v2_sz = LOSS_RECORD_V2_DTYPE.itemsize
+            v1_sz = LOSS_RECORD_DTYPE.itemsize
+            if existing_bytes > 0 and (existing_bytes % v2_sz == 0):
+                self._counter = int(existing_bytes // v2_sz)
+            else:
+                self._counter = int(existing_bytes // v1_sz)
             self._file = open(self._path, "ab")
         except Exception as e:
             self._counter = 0
             print(f"[loss-logger] could not open {path}: {e}", flush=True)
 
-    def log(self, round_idx: int, stage_id: int, loss: float, aux: float = 0.0):
+    def log(self, round_idx: int, channel_key: str, loss: float, aux: float = 0.0):
         if self._file is None:
             return
         self._counter += 1
-        ts = time.time()  # wall-clock Unix timestamp; consistent across sessions
-        rec = np.zeros(1, dtype=LOSS_RECORD_DTYPE)
+        ts = time.time()
+        rec = np.zeros(1, dtype=LOSS_RECORD_V2_DTYPE)
         rec["step"][0]  = max(-(2**31), min(2**31 - 1, int(self._counter)))
         rec["round"][0] = max(-32768,   min(32767,     int(round_idx)))
-        rec["stage"][0] = int(stage_id) & 0xFF
+        rec["stage"][0] = 0
         rec["loss"][0]  = float(loss) if math.isfinite(float(loss)) else float("nan")
         rec["aux"][0]   = float(aux)  if math.isfinite(float(aux))  else float("nan")
         rec["ts"][0]    = min(float(ts), 3.4e38)
+        ck_bytes = str(channel_key).encode("utf-8")[:32]
+        rec["channel_key"][0] = ck_bytes
         try:
             self._file.write(rec.tobytes())
             if self._counter % self._FLUSH_EVERY == 0:
@@ -200,18 +165,43 @@ class _LossFileLogger:
 
     @staticmethod
     def load(path) -> np.ndarray:
-        """Load all records from a loss_log.bin file into a structured numpy array."""
+        """Load all records from a loss_log.bin file.
+
+        Detects v1 (20-byte) vs v2 (52-byte) format automatically.
+        V1 records get their channel_key filled from the legacy stage map.
+        """
         p = Path(path)
         if not p.exists() or p.stat().st_size == 0:
-            return np.zeros(0, dtype=LOSS_RECORD_DTYPE)
+            return np.zeros(0, dtype=LOSS_RECORD_V2_DTYPE)
         data = p.read_bytes()
-        n = len(data) // LOSS_RECORD_DTYPE.itemsize
-        return np.frombuffer(data[: n * LOSS_RECORD_DTYPE.itemsize], dtype=LOSS_RECORD_DTYPE).copy()
+        sz = len(data)
+        v2_n = sz // LOSS_RECORD_V2_DTYPE.itemsize
+        v1_n = sz // LOSS_RECORD_DTYPE.itemsize
+        # Prefer v2 if the file is evenly divisible by 52; fall back to v1.
+        if v2_n > 0 and (sz % LOSS_RECORD_V2_DTYPE.itemsize == 0):
+            return np.frombuffer(
+                data[: v2_n * LOSS_RECORD_V2_DTYPE.itemsize],
+                dtype=LOSS_RECORD_V2_DTYPE,
+            ).copy()
+        # v1 records -- upconvert to v2 with channel_key from legacy map.
+        if v1_n > 0:
+            v1 = np.frombuffer(
+                data[: v1_n * LOSS_RECORD_DTYPE.itemsize],
+                dtype=LOSS_RECORD_DTYPE,
+            ).copy()
+            v2 = np.zeros(v1_n, dtype=LOSS_RECORD_V2_DTYPE)
+            for f in ("step", "round", "stage", "loss", "aux", "ts"):
+                v2[f] = v1[f]
+            for i, stage_int in enumerate(v1["stage"]):
+                ck = _LEGACY_STAGE_NAMES.get(int(stage_int), f"stage_{int(stage_int)}")
+                v2["channel_key"][i] = ck.encode("utf-8")[:32]
+            return v2
+        return np.zeros(0, dtype=LOSS_RECORD_V2_DTYPE)
 
 
 def _wmap_thermal_rgb(t: np.ndarray) -> np.ndarray:
-    """Map normalised float array t ∈ [0,1] → (H, W, 3) uint8 thermal colours.
-    Ramp: black → blue → cyan → green → yellow → red."""
+    """Map normalised float array t in [0,1] -> (H, W, 3) uint8 thermal colours.
+    Ramp: black -> blue -> cyan -> green -> yellow -> red."""
     r = np.clip(t * 4.0 - 3.0, 0.0, 1.0)
     g = np.clip(np.minimum(t * 4.0 - 1.0, 3.0 - t * 4.0), 0.0, 1.0)
     b = np.clip(2.0 - t * 4.0, 0.0, 1.0)
@@ -219,7 +209,7 @@ def _wmap_thermal_rgb(t: np.ndarray) -> np.ndarray:
 
 
 def _wmap_flat_to_square(flat: torch.Tensor, sq: int) -> np.ndarray:
-    """Flatten live weights → (sq, sq, 3) thermal image, zero-padding to sq²."""
+    """Flatten live weights -> (sq, sq, 3) thermal image, zero-padding to sq^2."""
     n = sq * sq
     arr = flat.cpu().numpy().astype(np.float32)
     if arr.shape[0] < n:
@@ -231,7 +221,7 @@ def _wmap_flat_to_square(flat: torch.Tensor, sq: int) -> np.ndarray:
 
 
 def _wmap_diff_overlay(diff: torch.Tensor, sq: int) -> np.ndarray:
-    """Absolute diff tensor → (sq, sq) float32 in [0, 1] for overlay intensity."""
+    """Absolute diff tensor -> (sq, sq) float32 in [0, 1] for overlay intensity."""
     n = sq * sq
     arr = diff.cpu().numpy().astype(np.float32)
     if arr.shape[0] < n:
@@ -299,6 +289,7 @@ class _TransformerStatusOpenGLViewer:
         scale: int = 3,
         cycle_slots: int = 0,
         graph_h: int = 120,
+        loss_store=None,
     ):
         self.enabled = bool(enabled)
         self.image_h = max(8, int(image_hw[0]))
@@ -332,7 +323,7 @@ class _TransformerStatusOpenGLViewer:
         # Blocking queue: enqueue_frame() blocks when full, back-pressuring the
         # preview worker and, through it, the training loop.  This ensures no
         # preview frames are ever dropped when the user is scanning scrollback.
-        # 16384 frames × ~192 KB/frame ≈ 3 GB ceiling; tune as needed.
+        # 16384 frames x ~192 KB/frame ~= 3 GB ceiling; tune as needed.
         self._frame_buffer: _viewer_frame_queue.Queue = _viewer_frame_queue.Queue(maxsize=16384)
         # Slew: elapsed time controls how many buffered frames are drained per pump().
         # Buffer fill-depth drives target drain rate (fast when full, slow when empty).
@@ -366,35 +357,35 @@ class _TransformerStatusOpenGLViewer:
         self._graph_execution_events: deque = deque(maxlen=256)
         self.set_cycle_roster(total_cycles=int(cycle_slots))
 
-        self._loss_graph_data: Dict[int, deque] = {}
-        # Parallel wall-clock timestamps (time.time()) for each loss value, same maxlen.
-        self._loss_graph_ts: Dict[int, deque] = {}
+        # The native C loss store is the single source of truth.
+        # The viewer reads it directly -- no local deque copies.
+        self._loss_store = loss_store  # NodusLossStore or None
         self._graph_dirty = False
         self._graph_rgb: Optional[np.ndarray] = (
             np.full((self.graph_h, self.window_w, 3), 14, dtype=np.uint8)
             if self.graph_h > 0 else None
         )
 
-        # ── Sidebar state ─────────────────────────────────────────────────────
+        # -- Sidebar state -----------------------------------------------------
         # -inf forces an immediate first render on the first _present() call.
         self._sidebar_dirty: bool = True
         self._preview_work_queue_ref: Optional[Any] = None
         self._weight_model_refs: Dict[str, Any] = {}
         # Optional per-model state-dicts for the red diff overlay:
-        #   _weight_disk_states  – weights loaded from the on-disk checkpoint file
-        #   _weight_ckpt_states  – weights from the pipeline checkpoint (to-be-merged)
+        #   _weight_disk_states  - weights loaded from the on-disk checkpoint file
+        #   _weight_ckpt_states  - weights from the pipeline checkpoint (to-be-merged)
         self._weight_disk_states: Dict[str, Optional[Dict[str, Any]]] = {}
         self._weight_ckpt_states: Dict[str, Optional[Dict[str, Any]]] = {}
-        # ── Scrub / history ───────────────────────────────────────────────────
+        # -- Scrub / history ---------------------------------------------------
         # Weight-map snapshots accumulated at sidebar render rate (4 Hz).
-        # _scrub_offset = 0 → live; N → show the snapshot N ticks back.
+        # _scrub_offset = 0 -> live; N -> show the snapshot N ticks back.
         self._weight_history_maxlen: int = 512
         self._weight_snapshot_deque: deque = deque(maxlen=self._weight_history_maxlen)
-        # Played preview frames – paired 1-to-1 with weight_snapshot_deque so the
+        # Played preview frames - paired 1-to-1 with weight_snapshot_deque so the
         # same index yields the co-occurring preview image at that point in time.
         self._played_frames_deque: deque = deque(maxlen=self._weight_history_maxlen)
         # Loss series lengths recorded once per sidebar tick so the graph renderer
-        # can map each snapshot → x-pixel for the cache-region band and cursor.
+        # can map each snapshot -> x-pixel for the cache-region band and cursor.
         self._loss_count_at_snap_deque: deque = deque(maxlen=self._weight_history_maxlen)
         # Most-recently-uploaded preview frame (set each time a frame is consumed).
         self._last_displayed_frame: Optional[dict] = None
@@ -410,8 +401,8 @@ class _TransformerStatusOpenGLViewer:
         # Sparse weight-state snapshots: a small fixed count spread evenly across
         # the full visual cache so there are a couple of real restore points to
         # scrub to without copying enormous state_dicts constantly.
-        # e.g. 4 snapshots across 512-frame cache → stride 128 visual ticks
-        #      @ 4 Hz sidebar rate ≈ one snapshot every ~32 seconds.
+        # e.g. 4 snapshots across 512-frame cache -> stride 128 visual ticks
+        #      @ 4 Hz sidebar rate ~= one snapshot every ~32 seconds.
         _weight_snap_count: int = 4
         self._weight_snap_stride: int = max(1, self._weight_history_maxlen // _weight_snap_count)
         self._weight_state_sparse_deque: deque = deque(maxlen=_weight_snap_count)
@@ -422,11 +413,11 @@ class _TransformerStatusOpenGLViewer:
         # Loss-count positions recorded at each disk save, for graph markers.
         # Unbounded list: accumulates all markers including pre-existing ones loaded at startup.
         self._disk_save_loss_counts: list = []
-        # Checkpoint thumbnail registry — ordered list of discovered checkpoint
+        # Checkpoint thumbnail registry -- ordered list of discovered checkpoint
         # entries beyond the in-memory cache.  Each entry is a dict with keys:
         #   round_id, cycle, thumb_path (Path or None), loss_counts ({sid:int})
         # Populated by register_checkpoint_thumbnail() and set_checkpoint_backup_dir().
-        # Sorted oldest→newest (index 0 = oldest checkpoint).
+        # Sorted oldest->newest (index 0 = oldest checkpoint).
         self._checkpoint_thumbs: List[Dict[str, Any]] = []
         # Background thread for weight image + state_dict snapshot.
         # Main thread fires it and checks for completion; never blocks.
@@ -434,14 +425,12 @@ class _TransformerStatusOpenGLViewer:
         self._weight_snap_result: Optional[Dict[str, Any]] = None
         # Which model to display in the right sidebar (None = first available).
         self._active_weight_model_name: Optional[str] = None
-        # Delta logging: print param name when max|Δ| exceeds this threshold.
+        # Delta logging: print param name when max|D| exceeds this threshold.
         self._weight_delta_threshold: float = 0.01
         # Previous sparse snapshot for delta comparison.
         self._prev_weight_snap: Dict[str, Dict[str, Any]] = {}
 
-        # ── Pull-model data (populated by SaveRestoreNode responses) ──────
-        # Per-channel loss cursors: channel_key → highest step we have locally.
-        self._sr_loss_cursors: Dict[str, int] = {}
+        # -- Pull-model data (populated by SaveRestoreNode responses) ------
         # Pending responses waiting to be processed.
         self._sr_response_queue: deque = deque(maxlen=256)
         # Channel registry from the last query_channel_list response.
@@ -455,11 +444,11 @@ class _TransformerStatusOpenGLViewer:
         # Cache browse data from SaveRestoreNode.
         self._sr_cache_entries: List[Dict[str, Any]] = []
         self._sr_cache_total: int = 0
-        # Per-channel loss visibility (True = visible). Missing key → visible.
-        self._loss_channel_visible: Dict[int, bool] = {}
-        # Legend hit-boxes for channel toggle clicks: list of (sid, x0, y0, x1, y1)
+        # Per-channel loss visibility (True = visible). Missing key -> visible.
+        self._loss_channel_visible: Dict[str, bool] = {}
+        # Legend hit-boxes for channel toggle clicks: list of (ck, x0, y0, x1, y1)
         # in *graph-local* pixel coords. Translated to window coords at click time.
-        self._legend_hit_boxes: List[Tuple[int, int, int, int, int]] = []
+        self._legend_hit_boxes: List[Tuple[str, int, int, int, int]] = []
 
         # Left sidebar: button panel (top) + scrub dial (bottom).
         # Right sidebar: weight map spans from top_bar to window bottom (covers graph row).
@@ -754,7 +743,7 @@ class _TransformerStatusOpenGLViewer:
             draw.text((ox + 15, oy - 1), "Override gates", fill=(230, 208, 170), font=font)
             self._control_boxes.append(("override", -1, o_box))
 
-            # ── START / STOP buttons (right side of top bar, row y=4) ─────────
+            # -- START / STOP buttons (right side of top bar, row y=4) ---------
             connected = self.has_training_connection()
             stopping = self._shutdown_save is not None
             btn_y = 4
@@ -764,7 +753,7 @@ class _TransformerStatusOpenGLViewer:
             bx = self.window_w - btn_right_margin
 
             if connected and stopping:
-                # Shutdown in progress — show status label
+                # Shutdown in progress -- show status label
                 label_pending = "STOPPING..."
                 lw_p = len(label_pending) * 7 + 10
                 p_box = (bx - lw_p, btn_y, bx, btn_y + btn_h)
@@ -774,7 +763,7 @@ class _TransformerStatusOpenGLViewer:
                 )
                 draw.text((p_box[0] + 5, btn_y + 1), label_pending, fill=(220, 220, 160), font=font)
             elif connected:
-                # STOP (no save) — red
+                # STOP (no save) -- red
                 label_stop = "STOP"
                 lw_stop = len(label_stop) * 7 + 10
                 stop_box = (bx - lw_stop, btn_y, bx, btn_y + btn_h)
@@ -786,7 +775,7 @@ class _TransformerStatusOpenGLViewer:
                 self._control_boxes.append(("stop_nosave", -1, stop_box))
                 bx = stop_box[0] - 6
 
-                # STOP+SAVE — green
+                # STOP+SAVE -- green
                 label_save = "STOP+SAVE"
                 lw_save = len(label_save) * 7 + 10
                 save_box = (bx - lw_save, btn_y, bx, btn_y + btn_h)
@@ -797,7 +786,7 @@ class _TransformerStatusOpenGLViewer:
                 draw.text((save_box[0] + 5, btn_y + 1), label_save, fill=(200, 240, 210), font=font)
                 self._control_boxes.append(("stop_save", -1, save_box))
             elif self._launch_script:
-                # START — blue (only when disconnected and launch script available)
+                # START -- blue (only when disconnected and launch script available)
                 label_start = "START"
                 lw_start = len(label_start) * 7 + 10
                 start_box = (bx - lw_start, btn_y, bx, btn_y + btn_h)
@@ -839,7 +828,7 @@ class _TransformerStatusOpenGLViewer:
         except Exception:
             return out
 
-    # ── Checkpoint navigation helpers ──────────────────────────────────────────
+    # -- Checkpoint navigation helpers ------------------------------------------
 
     def _scrub_offset_for_checkpoint(self, direction: int) -> Optional[int]:
         """Find the scrub offset for the next (direction=+1) or previous (-1) checkpoint.
@@ -860,11 +849,8 @@ class _TransformerStatusOpenGLViewer:
             return None
 
         # Identify a reference sid (the one with the most data).
-        ref_sid = max(
-            self._loss_graph_data.keys(),
-            key=lambda s: len(self._loss_graph_data[s]),
-            default=None,
-        )
+        _lengths = self._loss_channel_lengths()
+        ref_sid = max(_lengths, key=_lengths.get, default=None)
         if ref_sid is None:
             return None
 
@@ -875,7 +861,7 @@ class _TransformerStatusOpenGLViewer:
             cur_loss_n = int(snap_list[cur_idx].get(ref_sid, 0))
         else:
             # Live position = total length
-            cur_loss_n = len(self._loss_graph_data.get(ref_sid, []))
+            cur_loss_n = _lengths.get(ref_sid, 0)
 
         # Collect unique checkpoint loss-counts and sort them.
         ckpt_positions: List[int] = []
@@ -914,20 +900,20 @@ class _TransformerStatusOpenGLViewer:
         # Scrub offset: slen - idx  (offset 1 = newest; slen = oldest).
         return max(1, slen - best_idx)
 
-    # ── Checkpoint thumbnail registry ──────────────────────────────────────────
+    # -- Checkpoint thumbnail registry ------------------------------------------
 
     def register_checkpoint_thumbnail(
         self,
         round_id: int,
         cycle: int,
         thumb_path: Optional["Path"] = None,
-        loss_counts: Optional[Dict[int, int]] = None,
+        loss_counts: Optional[Dict[str, int]] = None,
     ) -> None:
         """Register a checkpoint entry for extended scrub navigation.
 
         Called at checkpoint-save time (via notify) and at startup when
         discovering existing checkpoints on disk.  Entries are kept sorted
-        oldest→newest by (round_id, cycle).
+        oldest->newest by (round_id, cycle).
         """
         entry: Dict[str, Any] = {
             "round_id": int(round_id),
@@ -1012,7 +998,7 @@ class _TransformerStatusOpenGLViewer:
             pass
         return rgb
 
-    # ── Sidebar public API ─────────────────────────────────────────────────────
+    # -- Sidebar public API -----------------------------------------------------
 
     def set_queue_refs(self, work_queue: Any) -> None:
         """Register the preview work queue so the cache map can read its depth."""
@@ -1053,7 +1039,7 @@ class _TransformerStatusOpenGLViewer:
         n = len(self._checkpoint_thumbs)
         if n == 0 or ckpt_offset > n:
             return None
-        # _checkpoint_thumbs is sorted oldest→newest, so index for newest-first:
+        # _checkpoint_thumbs is sorted oldest->newest, so index for newest-first:
         return n - ckpt_offset
 
     def _clone_history_frame(self, frame: Optional[dict]) -> Optional[dict]:
@@ -1081,7 +1067,7 @@ class _TransformerStatusOpenGLViewer:
             return
         self._played_frames_deque.append(history_frame)
         self._loss_count_at_snap_deque.append(
-            {sid: len(dq) for sid, dq in self._loss_graph_data.items()}
+            self._loss_channel_lengths()
         )
         self._weight_snapshot_deque.append(
             {"weight_map": np.ascontiguousarray(np.asarray(self._weight_map_rgb, dtype=np.uint8)).copy()}
@@ -1171,13 +1157,13 @@ class _TransformerStatusOpenGLViewer:
     ) -> None:
         """Register the *currently active* nn.Module instances for weight-map display.
 
-        Pass only models that are actually being run right now – the map shows
+        Pass only models that are actually being run right now - the map shows
         exactly what is given.  Optionally supply state-dicts for the red diff
         overlay:
-          disk_states  – {name: state_dict} loaded straight from the on-disk file
-          ckpt_states  – {name: state_dict} from the pipeline checkpoint that
+          disk_states  - {name: state_dict} loaded straight from the on-disk file
+          ckpt_states  - {name: state_dict} from the pipeline checkpoint that
                          holds data to be integrated with the base model
-        The red overlay pixel intensity = normalised |disk_weight − ckpt_weight|.
+        The red overlay pixel intensity = normalised |disk_weight - ckpt_weight|.
         """
         self._weight_model_refs = dict(models)
         self._weight_disk_states = dict(disk_states) if disk_states else {}
@@ -1213,7 +1199,7 @@ class _TransformerStatusOpenGLViewer:
     def get_restore_state_dicts(self, offset: int) -> Optional[Dict[str, Dict]]:
         """Return the weight state-dicts for the snapshot at *offset* positions back.
 
-        offset=1 → most recent snapshot; offset=N → Nth most recent (oldest = N where
+        offset=1 -> most recent snapshot; offset=N -> Nth most recent (oldest = N where
         N == len(sparse deque)).  Mirrors the same indexing used by the scrub display.
         Returns ``None`` if the sparse deque is empty."""
         snaps = list(self._weight_state_sparse_deque)
@@ -1224,7 +1210,7 @@ class _TransformerStatusOpenGLViewer:
         idx = max(0, min(slen - 1, slen - off))
         return snaps[idx]["states"]
 
-    # ── Sidebar render methods ─────────────────────────────────────────────────
+    # -- Sidebar render methods -------------------------------------------------
 
     def _render_cache_map(self) -> np.ndarray:
         """Pixel-grid occupancy map: work queue (green) + frame buffer (blue)."""
@@ -1271,7 +1257,7 @@ class _TransformerStatusOpenGLViewer:
         fill_frac: float = 0.0,
         color: Tuple[int, int, int] = (80, 160, 220),
     ) -> np.ndarray:
-        """256×256 circular dial — arc sweeps 300° showing fill_frac [0, 1]."""
+        """256x256 circular dial -- arc sweeps 300deg showing fill_frac [0, 1]."""
         H, W = self.panel_h, self.panel_w
         out = np.full((H, W, 3), np.array([14, 16, 20], dtype=np.uint8), dtype=np.uint8)
         try:
@@ -1302,7 +1288,7 @@ class _TransformerStatusOpenGLViewer:
                 t1y = int(cy + (r - 1) * math.sin(a))
                 draw.line([(t0x, t0y), (t1x, t1y)],
                           fill=(95, 106, 122) if k % 3 == 0 else (48, 54, 66), width=1)
-            # Progress arc: 300° sweep starting at -210° (just past bottom-left)
+            # Progress arc: 300deg sweep starting at -210deg (just past bottom-left)
             sweep_deg = max(0.0, min(1.0, float(fill_frac))) * 300.0
             if sweep_deg > 0.5:
                 arc_r = max(2, r - max(4, r // 6))
@@ -1381,14 +1367,14 @@ class _TransformerStatusOpenGLViewer:
                 draw.text((4, y_info + 12), "wheel \u2191\u2193 to scrub back",
                           fill=(60, 70, 60), font=font)
 
-            # ── Step counter ──────────────────────────────────────────────
+            # -- Step counter ----------------------------------------------
             step_txt = str(self._last_step_txt)
             if step_txt:
                 _stw = font.getlength(step_txt) if hasattr(font, "getlength") else len(step_txt) * 6
                 draw.text((max(4, W - 4 - int(_stw)), y_info + 36),
                           step_txt, fill=(180, 200, 220), font=font)
 
-            # ── Prev / Next checkpoint buttons ────────────────────────────
+            # -- Prev / Next checkpoint buttons ----------------------------
             has_ckpts = len(self._disk_save_loss_counts) > 0
             nav_y0 = y_info + 40
             nav_h = 18
@@ -1499,16 +1485,16 @@ class _TransformerStatusOpenGLViewer:
         """Per-model square weight images with optional disk-vs-checkpoint diff overlay.
 
         Layout (N active models, stacked vertically):
-          Each model occupies a ``slot_h × W`` band, with a ``label_h`` strip below.
+          Each model occupies a ``slot_h x W`` band, with a ``label_h`` strip below.
 
         Square image logic:
-          sq = ceil(sqrt(n_params))  →  minimal-waste square for this model.
-          • If sq*sq ≤ slot_h*W  (fits 1:1): draw at 1:1, centred, waste = sq²−n_params.
-          • If sq*sq  > slot_h*W  (too big):  downscale sq×sq → slot_h×W with Lanczos
+          sq = ceil(sqrt(n_params))  ->  minimal-waste square for this model.
+          * If sq*sq <= slot_h*W  (fits 1:1): draw at 1:1, centred, waste = sq^2-n_params.
+          * If sq*sq  > slot_h*W  (too big):  downscale sqxsq -> slot_hxW with Lanczos
             (PIL LANCZOS preserves detail far better than stride-sampling).
 
         Red overlay (requires disk_states and ckpt_states passed to set_weight_model_refs):
-          For each pixel, saturation of red = normalised |disk_weight − ckpt_weight|.
+          For each pixel, saturation of red = normalised |disk_weight - ckpt_weight|.
           If either state dict is absent the overlay is skipped silently."""
         H, W = 2 * self.panel_h + self.graph_h, self.panel_w
         out = np.full((H, W, 3), np.array([14, 16, 20], dtype=np.uint8), dtype=np.uint8)
@@ -1525,7 +1511,7 @@ class _TransformerStatusOpenGLViewer:
                 pass
             return out
 
-        # Only render the single active model – it gets the full height.
+        # Only render the single active model - it gets the full height.
         _active_name = self._active_weight_model_name
         if _active_name is None or _active_name not in refs:
             _active_name = next(iter(refs))
@@ -1539,8 +1525,8 @@ class _TransformerStatusOpenGLViewer:
             try:
                 from PIL import Image as _PIL_Image, ImageDraw as _PIL_Draw, ImageFont as _PIL_Font
 
-                # ── Flatten live parameters in named_parameters order ──────────
-                # Use state_dict() for thread-safe snapshot — avoids racing
+                # -- Flatten live parameters in named_parameters order ----------
+                # Use state_dict() for thread-safe snapshot -- avoids racing
                 # with optimizer.step() which mutates parameter tensors in-place.
                 _sd_snap = {k: v.detach().float().reshape(-1).cpu()
                             for k, v in model.state_dict().items()}
@@ -1548,19 +1534,19 @@ class _TransformerStatusOpenGLViewer:
                 live_flat = torch.cat(list(_sd_snap.values()))
                 n_params = int(live_flat.numel())
 
-                # ── Minimal-waste square side length ──────────────────────────
+                # -- Minimal-waste square side length --------------------------
                 sq = math.isqrt(n_params)
                 if sq * sq < n_params:
-                    sq += 1          # sq*sq is the smallest perfect-square ≥ n_params
+                    sq += 1          # sq*sq is the smallest perfect-square >= n_params
                 waste = sq * sq - n_params
 
                 slot_px = slot_h * W
                 needs_reduction = (sq * sq > slot_px)
 
-                # ── Build base thermal image at sq×sq ─────────────────────────
+                # -- Build base thermal image at sqxsq -------------------------
                 sq_img = _wmap_flat_to_square(live_flat, sq)  # (sq, sq, 3) uint8
 
-                # ── Precompute diff map (sq×sq float32) if both states present ─
+                # -- Precompute diff map (sqxsq float32) if both states present -
                 disk_sd = self._weight_disk_states.get(name)
                 ckpt_sd = self._weight_ckpt_states.get(name)
                 diff_map: Optional[np.ndarray] = None
@@ -1569,9 +1555,9 @@ class _TransformerStatusOpenGLViewer:
                     ckpt_flat = _wmap_build_flat(ckpt_sd, param_keys, model)
                     diff_map = _wmap_diff_overlay((disk_flat - ckpt_flat).abs(), sq)
 
-                # ── Place into slot ───────────────────────────────────────────
+                # -- Place into slot -------------------------------------------
                 if not needs_reduction:
-                    # 1:1 – apply overlay then centre the sq×sq image in the slot
+                    # 1:1 - apply overlay then centre the sqxsq image in the slot
                     mode_str = f"1:1  waste={waste:,}"
                     if diff_map is not None:
                         sq_img = _wmap_apply_red(sq_img, diff_map)
@@ -1581,10 +1567,10 @@ class _TransformerStatusOpenGLViewer:
                     draw_w = min(sq, W)
                     out[y + cy: y + cy + draw_h, cx: cx + draw_w] = sq_img[:draw_h, :draw_w]
                 else:
-                    # Lanczos downscale sq×sq → slot_h×W (detail-preserving),
+                    # Lanczos downscale sqxsq -> slot_hxW (detail-preserving),
                     # then apply the diff overlay on the downscaled images so the
                     # per-pixel diff is computed at display resolution.
-                    mode_str = f"↓{sq}→{slot_h}×{W}"
+                    mode_str = f"v{sq}->{slot_h}x{W}"
                     slot_img = np.asarray(
                         _PIL_Image.fromarray(sq_img).resize((W, slot_h), _PIL_Image.LANCZOS),
                         dtype=np.uint8,
@@ -1602,7 +1588,7 @@ class _TransformerStatusOpenGLViewer:
             except Exception:
                 pass
 
-            # ── Label strip ───────────────────────────────────────────────────
+            # -- Label strip ---------------------------------------------------
             try:
                 from PIL import Image as _PIL_Image, ImageDraw as _PIL_Draw, ImageFont as _PIL_Font
                 ly = y + slot_h
@@ -1660,8 +1646,7 @@ class _TransformerStatusOpenGLViewer:
                 last_frame = self._frame_buffer.get_nowait()
             except _viewer_frame_queue.Empty:
                 break
-            for sid, lv in last_frame.get("losses", {}).items():
-                self.update_loss(int(sid), float(lv))
+            # Loss values are owned by SaveRestoreNode; ignore frame-embedded losses.
             self._record_history_frame(last_frame)
             self._last_anim_t += self._anim_frame_dt
         if self._scrub_offset == 0:
@@ -1706,7 +1691,7 @@ class _TransformerStatusOpenGLViewer:
                         self._prev_weight_snap = _sst
                     # Record loss-count position for the graph marker.
                     self._disk_save_loss_counts.append(
-                        {sid: len(dq) for sid, dq in self._loss_graph_data.items()}
+                        self._loss_channel_lengths()
                     )
                     self._weight_state_sparse_deque.append({
                         "snap_total": _res["snap_total"],
@@ -1824,7 +1809,7 @@ class _TransformerStatusOpenGLViewer:
                 x0, self.top_bar_h + self.panel_h, x1, self.top_bar_h + (2 * self.panel_h),
             )
 
-        # Right sidebar column – weight map spans the full content area including graph row.
+        # Right sidebar column - weight map spans the full content area including graph row.
         rx0 = int(self._col_x + self.num_panels * self.panel_w)
         self._draw_texture_px(int(self._textures["weight_map"]), rx0, self.top_bar_h, self.window_w, self.window_h)
 
@@ -1953,10 +1938,10 @@ class _TransformerStatusOpenGLViewer:
                         if self._legend_hit_boxes and graph_y0 <= yi < graph_y0 + self.graph_h:
                             gx = xi
                             gy = yi - graph_y0
-                            for sid, lx0, ly0, lx1, ly1 in self._legend_hit_boxes:
+                            for ck, lx0, ly0, lx1, ly1 in self._legend_hit_boxes:
                                 if lx0 <= gx <= lx1 and ly0 <= gy <= ly1:
-                                    cur = self._loss_channel_visible.get(sid, True)
-                                    self._loss_channel_visible[sid] = not cur
+                                    cur = self._loss_channel_visible.get(ck, True)
+                                    self._loss_channel_visible[ck] = not cur
                                     self._graph_dirty = True
                                     self._present(force=True)
                                     break
@@ -1981,10 +1966,10 @@ class _TransformerStatusOpenGLViewer:
         """Call this immediately after every _save_training_segment_snapshot call.
 
         Records the current loss-series lengths so the loss graph can draw a gold
-        vertical marker (\u25bc) at the exact loss position where each disk checkpoint
+        vertical marker at the exact loss position where each disk checkpoint
         was written.  Thread-safe: can be called from any thread.
         """
-        snapshot = {sid: len(dq) for sid, dq in self._loss_graph_data.items()}
+        snapshot = self._loss_channel_lengths()
         self._disk_save_loss_counts.append(snapshot)
         self._graph_dirty = True
 
@@ -1993,23 +1978,27 @@ class _TransformerStatusOpenGLViewer:
 
         Used at startup to place gold markers for checkpoint files that already
         existed on disk before this session (their mtime = wall_ts).  Finds the
-        loss record whose timestamp is closest to wall_ts by binary-searching the
-        parallel _loss_graph_ts deques, then records the corresponding deque index
-        into _disk_save_loss_counts so the graph renderer draws a gold \u25bc there.
+        loss record whose timestamp is closest to wall_ts by binary-searching
+        the C store ts arrays, then records the corresponding index into
+        _disk_save_loss_counts so the graph renderer draws a gold marker there.
         """
         import bisect
-        if not self._loss_graph_ts:
-            # No ts data loaded yet — fall back to marking at current position.
+        store = self._loss_store
+        if store is None:
+            return
+        keys = self._loss_channel_keys()
+        if not keys:
             self.notify_pipeline_checkpoint_saved()
             return
-        snapshot: Dict[int, int] = {}
-        for sid, ts_dq in self._loss_graph_ts.items():
-            if not ts_dq:
+        snapshot: Dict[str, int] = {}
+        for ck in keys:
+            ts_tensor = store.get_ts_array(ck)
+            if ts_tensor.numel() == 0:
                 continue
-            ts_list = list(ts_dq)
+            ts_list = ts_tensor.tolist()
             idx = bisect.bisect_left(ts_list, float(wall_ts))
             idx = max(0, min(len(ts_list) - 1, idx))
-            snapshot[sid] = idx + 1  # 1-based count mirrors len(dq) convention
+            snapshot[ck] = idx + 1  # 1-based count mirrors length convention
         if snapshot:
             self._disk_save_loss_counts.append(snapshot)
             self._graph_dirty = True
@@ -2060,12 +2049,13 @@ class _TransformerStatusOpenGLViewer:
             return
         # Find the minimum fractional position across all markers.
         min_frac = 1.0
+        _lengths = self._loss_channel_lengths()
         for snap in self._disk_save_loss_counts:
             for sid, count in snap.items():
-                dq = self._loss_graph_data.get(sid)
-                if dq is None or len(dq) == 0:
+                total = _lengths.get(sid, 0)
+                if total == 0:
                     continue
-                frac = float(count) / float(len(dq))
+                frac = float(count) / float(total)
                 min_frac = min(min_frac, frac)
         # 5% left of the first checkpoint, clamped to 0.
         self._graph_display_start_frac = max(0.0, min_frac - 0.05)
@@ -2074,88 +2064,74 @@ class _TransformerStatusOpenGLViewer:
     def stop_requested(self) -> bool:
         return bool(self._stop_requested)
 
-    def update_loss(self, stage_id: int, loss: float, aux: float = 0.0, ts: float = 0.0):
-        """Record a per-step loss value and mark the graph dirty for redraw.
+    def update_loss(self, channel_key: str, loss: float, aux: float = 0.0, ts: float = 0.0):
+        """Record a per-step loss value into the native C store.
 
-        ts -- wall-clock Unix timestamp (time.time()) for this record.  Pass 0.0
-              to use the current time (default for live updates).
+        Prefer writing to the store directly; this thin wrapper exists for
+        legacy callers that don't have a direct store reference.
         """
         if self.graph_h <= 0:
             return
-        sid = int(stage_id)
-        if sid not in self._loss_graph_data:
-            self._loss_graph_data[sid] = deque(maxlen=100_000)
-            self._loss_graph_ts[sid]   = deque(maxlen=100_000)
-        v = float(loss)
-        self._loss_graph_data[sid].append(v if math.isfinite(v) else float("nan"))
-        self._loss_graph_ts[sid].append(float(ts) if float(ts) > 0.0 else time.time())
+        store = self._loss_store
+        if store is not None:
+            store.record(str(channel_key), float(loss), aux=float(aux), ts=float(ts) if float(ts) > 0.0 else time.time())
         self._graph_dirty = True
 
-    # ── Pull-model handlers (SaveRestoreNode IPC integration) ──────────
+    # -- Helpers: read channel info from the C store --------------------
+
+    def _loss_channel_keys(self) -> List[str]:
+        """Return sorted channel keys from the native store."""
+        store = self._loss_store
+        if store is None:
+            return []
+        return sorted(store.channel_keys())
+
+    def _loss_channel_length(self, ck: str) -> int:
+        store = self._loss_store
+        return store.channel_length(ck) if store else 0
+
+    def _loss_channel_lengths(self) -> Dict[str, int]:
+        """Return {channel_key: length} for every channel."""
+        store = self._loss_store
+        if store is None:
+            return {}
+        return {ck: store.channel_length(ck) for ck in store.channel_keys()}
+
+    # -- Pull-model handlers (SaveRestoreNode IPC integration) ----------
 
     def _on_sr_notification(self, msg: dict) -> None:
-        """Handle a lightweight notification from the SaveRestoreNode.
-
-        Notifications tell us *new data is available* without pushing the
-        data itself.  We queue a query to pull the actual values.
-        """
+        """Handle a lightweight notification from the SaveRestoreNode."""
         t = msg.get("type", "")
         if t == "notify_new_loss":
-            ck = msg.get("channel_key", "")
-            remote_len = int(msg.get("length", 0))
-            local_cursor = self._sr_loss_cursors.get(ck, 0)
-            if remote_len > local_cursor:
-                # New data available — we'll pull it on the next _sr_poll cycle.
-                self._graph_dirty = True
+            # Loss data lives in the C store -- just mark redraw.
+            self._graph_dirty = True
         elif t == "notify_new_result":
-            # Mark that a new result is available for the given channel.
             pass  # Next poll will pull it
         elif t == "notify_checkpoint":
-            # Checkpoint marker — record it for the gold marker on the graph.
             self.notify_pipeline_checkpoint_saved()
-            # Register for extended scrub navigation
             r = int(msg.get("round_id", 0))
             c = int(msg.get("cycle", 0))
             tp = msg.get("thumb_path")
-            loss_counts = {sid: len(dq) for sid, dq in self._loss_graph_data.items()}
+            loss_counts = self._loss_channel_lengths()
             self.register_checkpoint_thumbnail(r, c, thumb_path=tp, loss_counts=loss_counts)
         elif t == "notify_weight_map":
-            # Weight map updated — request fresh image on next poll.
             self._sidebar_dirty = True
 
     def _on_sr_response(self, msg: dict) -> None:
-        """Handle a response to one of our queries from the SaveRestoreNode."""
+        """Handle a response to one of our queries from the SaveRestoreNode.
+
+        Loss data is no longer pulled over IPC -- it's read directly from
+        the C store.  Only non-loss responses are handled here.
+        """
         t = msg.get("type", "")
 
         if t == "resp_channel_list":
             self._sr_channel_registry = msg.get("channels", [])
 
-        elif t == "resp_loss_history":
-            ck = msg.get("channel_key", "")
-            records = msg.get("records", [])
-            if records and self.graph_h > 0:
-                # Merge into local loss graph data (stage-id indexed for
-                # backward compat; channel key → integer index mapping.)
-                sid = self._sr_channel_to_sid(ck)
-                if sid not in self._loss_graph_data:
-                    self._loss_graph_data[sid] = deque(maxlen=100_000)
-                    self._loss_graph_ts[sid] = deque(maxlen=100_000)
-                for rec in records:
-                    v = float(rec.get("loss", 0.0))
-                    self._loss_graph_data[sid].append(
-                        v if math.isfinite(v) else float("nan")
-                    )
-                    self._loss_graph_ts[sid].append(float(rec.get("ts", 0.0)))
-                # Update cursor so we only pull new records next time
-                if records:
-                    self._sr_loss_cursors[ck] = int(records[-1].get("step", 0)) + 1
-                self._graph_dirty = True
-
         elif t == "resp_latest_result":
             ck = msg.get("channel_key", "")
             result = msg.get("result")
             if result is not None:
-                # Turn the latest result into a displayable frame.
                 images = result.get("images")
                 if images is not None and isinstance(images, (list, np.ndarray)):
                     frame = {
@@ -2170,7 +2146,6 @@ class _TransformerStatusOpenGLViewer:
         elif t == "resp_weight_map":
             wmap = msg.get("map")
             if wmap is not None:
-                # Store the weight map RGB for right-panel rendering
                 try:
                     rgb_list = wmap.get("rgb")
                     if rgb_list is not None:
@@ -2179,7 +2154,6 @@ class _TransformerStatusOpenGLViewer:
                         self._sidebar_dirty = True
                 except Exception:
                     pass
-            # Store model names for weight model selector
             self._sr_weight_models = msg.get("models", [])
             self._sr_weight_active = msg.get("active")
 
@@ -2187,65 +2161,35 @@ class _TransformerStatusOpenGLViewer:
             self._sr_cache_entries = msg.get("entries", [])
             self._sr_cache_total = int(msg.get("total", 0))
 
-    def _sr_channel_to_sid(self, channel_key: str) -> int:
-        """Map a channel key string to a stable integer for graph data keying.
-
-        Legacy stage IDs 0-5 are preserved for known stage names.
-        New channels get incrementing IDs starting at 100.
-        """
-        _REV = {v: k for k, v in _LOSS_STAGE_NAMES.items()}
-        base = channel_key.split("|")[0] if "|" in channel_key else channel_key
-        if base in _REV:
-            return _REV[base]
-        # Assign a stable integer by hashing the channel key into the 100+ range
-        if not hasattr(self, "_sr_sid_map"):
-            self._sr_sid_map: Dict[str, int] = {}
-            self._sr_sid_next: int = 100
-        if channel_key not in self._sr_sid_map:
-            self._sr_sid_map[channel_key] = self._sr_sid_next
-            self._sr_sid_next += 1
-        return self._sr_sid_map[channel_key]
-
     def _sr_poll_data(self) -> None:
-        """Periodically request fresh data from the SaveRestoreNode.
+        """Periodically request fresh non-loss data from the SaveRestoreNode.
 
-        Called from the main pump() loop.  Sends queries over IPC via the
-        IPC server's send_query method.  Does nothing if no IPC server is
-        attached.
+        Loss data is not polled -- the viewer reads directly from the C store.
         """
         now = time.time()
         if now - self._sr_last_poll_t < self._sr_poll_interval:
             return
         self._sr_last_poll_t = now
 
+        # The C store may have new data -- always mark dirty.
+        if self._loss_store is not None:
+            self._graph_dirty = True
+
         srv = self._ipc_server_ref
         if srv is None or not getattr(srv, "has_connection", False):
             return
 
-        # Request channel list to discover new channels
         srv.send_query({"type": "query_channel_list"})
 
-        # Pull loss history for each known channel, only new records
         for ch_info in self._sr_channel_registry:
             ck = ch_info.get("key", "")
-            if ch_info.get("has_loss"):
-                cursor = self._sr_loss_cursors.get(ck, 0)
-                srv.send_query({
-                    "type": "query_loss_history",
-                    "channel_key": ck,
-                    "from_step": cursor,
-                })
-            # Pull latest result for display
             if ch_info.get("has_result"):
                 srv.send_query({
                     "type": "query_latest_result",
                     "channel_key": ck,
                 })
 
-        # Request weight map for right-panel display
         srv.send_query({"type": "query_weight_map"})
-
-        # Request cache summary for browsing
         srv.send_query({"type": "query_cache_browse", "offset": 0, "limit": 50})
 
     def _render_loss_graph(self) -> np.ndarray:
@@ -2255,10 +2199,10 @@ class _TransformerStatusOpenGLViewer:
             _gw = int(self._col_x + self.num_panels * self.panel_w)
             return np.full((self.graph_h, _gw, 3), 14, dtype=np.uint8)
 
-        W_full = int(self._col_x + self.num_panels * self.panel_w)  # only under left 4 cols
+        W_full = int(self._col_x + self.num_panels * self.panel_w)
         H = int(self.graph_h)
 
-        # Reserve the right portion for the pipeline graph canvas when a plan is loaded.
+        # Reserve the right portion for the pipeline graph canvas.
         pipeline_W = 0
         if isinstance(self._graph_plan_snapshot, dict) and self._graph_plan_snapshot.get("nodes"):
             pipeline_W = max(100, min(W_full // 3, 160))
@@ -2275,27 +2219,37 @@ class _TransformerStatusOpenGLViewer:
         plot_w = max(1, mx1 - mx0)
         plot_h = max(1, my1 - my0)
 
-        # Display trimming: _graph_display_start_frac defines the left edge of the
-        # visible window as a fraction of the full history.  All x-axis mapping
-        # below uses _view_frac() which maps a data-fraction into the visible window.
         _sf = max(0.0, min(0.99, float(self._graph_display_start_frac)))
         _view_span = max(1e-9, 1.0 - _sf)
 
         def _view_x(data_frac: float) -> int:
-            """Map a data-space fraction [0,1] to an x pixel, clamped to plot area."""
             vf = (float(data_frac) - _sf) / _view_span
             return max(mx0, min(mx1, int(mx0 + vf * plot_w)))
 
-        # Compute global Y range from visible finite values only
-        all_finite: List[float] = []
-        for sid, dq in self._loss_graph_data.items():
-            if not self._loss_channel_visible.get(sid, True):
+        # -- Collect visible channel keys and colours -----------------------
+        store = self._loss_store
+        all_keys = self._loss_channel_keys() if store is not None else []
+        vis_keys: List[str] = []
+        vis_colors: List[Tuple[int, int, int, int]] = []
+        n_all = len(all_keys)
+        sorted_keys = sorted(all_keys)
+        for ck in sorted_keys:
+            if not self._loss_channel_visible.get(ck, True):
                 continue
-            n_dq = len(dq)
-            i_start = int(_sf * n_dq)
-            all_finite.extend(v for v in list(dq)[i_start:] if math.isfinite(v) and v >= 0.0)
+            idx = sorted_keys.index(ck)
+            r, g, b = _channel_color(idx, n_all)
+            vis_keys.append(ck)
+            vis_colors.append((r, g, b, 200))
 
-        if len(all_finite) < 2:
+        # -- Single C call: render all channel lines + compute ranges -------
+        result = None
+        if store is not None and vis_keys and plot_w > 0 and plot_h > 0:
+            result = store.render_all_lines(
+                vis_keys, vis_colors, plot_w, plot_h,
+                display_start_frac=_sf,
+            )
+
+        if result is None or result["segments"] == 0:
             draw.text((mx0, my0 + plot_h // 2 - 4), "no data yet", fill=(80, 88, 100), font=font)
             im.paste(loss_im, (0, 0))
             if pipeline_W > 0:
@@ -2306,44 +2260,32 @@ class _TransformerStatusOpenGLViewer:
                     pass
             return np.asarray(im, dtype=np.uint8)
 
-        raw_min = min(all_finite)
-        raw_max = max(all_finite)
-        span = raw_max - raw_min
-        y_min = max(0.0, raw_min - span * 0.05)
-        y_max = raw_max + span * 0.05
-        if y_max <= y_min + 1e-9:
-            y_max = y_min + 1.0
+        y_min = result["y_min"]
+        y_max = result["y_max"]
 
         def _y_px(v: float) -> int:
             frac = (float(v) - y_min) / (y_max - y_min)
             return int(my1 - frac * plot_h)
 
-        # ── Cache-region and 2×-history overlay bands ─────────────────────────
-        # Map the scrub snapshot window onto the loss graph x-axis using the
-        # per-tick loss-count records stored alongside each weight snapshot.
+        # -- Cache-region and 2x-history overlay bands ----------------------
         try:
             if self._loss_count_at_snap_deque:
                 _scl = list(self._loss_count_at_snap_deque)
                 oldest_counts = _scl[0]
-                ref_sid = max(
-                    self._loss_graph_data.keys(),
-                    key=lambda s: len(self._loss_graph_data[s]),
-                    default=None,
-                )
+                _lengths = self._loss_channel_lengths()
+                ref_sid = max(_lengths, key=_lengths.get, default=None)
                 if ref_sid is not None and ref_sid in oldest_counts:
-                    total_n   = len(self._loss_graph_data[ref_sid])
+                    total_n = _lengths.get(ref_sid, 0)
                     cache_frac = float(max(0, int(oldest_counts[ref_sid]))) / float(max(1, total_n))
-                    cache_x0  = _view_x(cache_frac)
-                    cache_w   = max(0, mx1 - cache_x0)
-                    hist_x0   = max(mx0, cache_x0 - cache_w * 2)
+                    cache_x0 = _view_x(cache_frac)
+                    cache_w = max(0, mx1 - cache_x0)
+                    hist_x0 = max(mx0, cache_x0 - cache_w * 2)
                     _ov = Image.new("RGBA", (W, H), (0, 0, 0, 0))
                     _od = ImageDraw.Draw(_ov)
-                    # 2× history region – dim amber tint
                     if hist_x0 < cache_x0:
                         _od.rectangle(
                             [(hist_x0, my0), (cache_x0, my1)], fill=(80, 60, 0, 38)
                         )
-                    # Cache region – dim teal tint
                     if cache_x0 < mx1:
                         _od.rectangle(
                             [(cache_x0, my0), (mx1, my1)], fill=(0, 80, 100, 50)
@@ -2360,118 +2302,77 @@ class _TransformerStatusOpenGLViewer:
             lv = y_min + frac * (y_max - y_min)
             draw.text((2, gy - 5), f"{lv:.3f}", fill=(110, 120, 136), font=font)
 
-        # Plot each series (trimmed to the visible window)
-        for sid in sorted(self._loss_graph_data.keys()):
-            if not self._loss_channel_visible.get(sid, True):
-                continue
-            dq = self._loss_graph_data[sid]
-            if len(dq) == 0:
-                continue
-            all_vals = list(dq)
-            n_all = len(all_vals)
-            # Trim to visible range  (W used for the loss portion only)
-            i_start = int(_sf * n_all)
-            vals = all_vals[i_start:]
-            n = len(vals)
-            if n == 0:
-                continue
-            _sorted_sids = sorted(self._loss_graph_data.keys())
-            _sid_idx = _sorted_sids.index(sid) if sid in _sorted_sids else sid
-            color = _LOSS_STAGE_COLORS_LEGACY.get(sid, _channel_color(_sid_idx, len(_sorted_sids)))
+        # -- Composite the C-rendered RGBA line overlay ---------------------
+        overlay_arr = result["overlay"]  # (plot_h, plot_w, 4) uint8 RGBA
+        overlay_img = Image.fromarray(overlay_arr, "RGBA")
+        # Paste into the plot region of loss_im
+        loss_rgba = loss_im.convert("RGBA")
+        # The overlay covers (mx0..mx0+plot_w, my0..my0+plot_h)
+        loss_rgba.paste(
+            Image.alpha_composite(
+                loss_rgba.crop((mx0, my0, mx0 + plot_w, my0 + plot_h)),
+                overlay_img,
+            ),
+            (mx0, my0),
+        )
+        loss_im = loss_rgba.convert("RGB")
+        draw = ImageDraw.Draw(loss_im)
 
-            # Downsample to plot_w buckets via mean to avoid overdraw
-            if n > plot_w:
-                bucket = n / float(plot_w)
-                downsampled: List[float] = []
-                for bi in range(plot_w):
-                    i0 = int(bi * bucket)
-                    i1 = max(i0 + 1, int((bi + 1) * bucket))
-                    chunk = [vals[i] for i in range(i0, min(i1, n)) if math.isfinite(vals[i])]
-                    downsampled.append(sum(chunk) / len(chunk) if chunk else float("nan"))
-                vals = downsampled
-                n = plot_w
-
-            pts: List[Optional[Tuple[int, int]]] = []
-            for i, v in enumerate(vals):
-                if not math.isfinite(v):
-                    pts.append(None)
-                    continue
-                xp = int(mx0 + (float(i) / float(max(1, n - 1))) * float(plot_w))
-                yp = max(my0, min(my1, _y_px(v)))
-                pts.append((xp, yp))
-
-            prev = None
-            for pt in pts:
-                if pt is not None and prev is not None:
-                    draw.line([prev, pt], fill=color, width=1)
-                prev = pt if pt is not None else None
-
-        # ── Disk-save checkpoint markers ──────────────────────────────────────
+        # -- Disk-save checkpoint markers -----------------------------------
         try:
             if self._disk_save_loss_counts:
-                _ref_sid_d = max(
-                    self._loss_graph_data.keys(),
-                    key=lambda s: len(self._loss_graph_data[s]),
-                    default=None,
-                )
+                _lengths = self._loss_channel_lengths()
+                _ref_sid_d = max(_lengths, key=_lengths.get, default=None)
                 if _ref_sid_d is not None:
-                    _total_nd = len(self._loss_graph_data[_ref_sid_d])
+                    _total_nd = _lengths.get(_ref_sid_d, 0)
                     for _dsc in self._disk_save_loss_counts:
                         if _ref_sid_d in _dsc:
                             _cn = max(0, min(_total_nd, int(_dsc[_ref_sid_d])))
                             _frac = float(_cn) / float(max(1, _total_nd))
                             _dx = _view_x(_frac)
                             draw.line([(_dx, my0), (_dx, my1)], fill=(180, 150, 30), width=1)
-                            draw.text((_dx + 1, my1 - 10), "\u25bc", fill=(200, 170, 40), font=font)
+                            draw.text((_dx + 1, my1 - 10), "v", fill=(200, 170, 40), font=font)
         except Exception:
             pass
 
-        # ── Scrub cursor line ──────────────────────────────────────────────────
+        # -- Scrub cursor line ----------------------------------------------
         try:
             if self._scrub_offset > 0 and self._loss_count_at_snap_deque:
-                _sl   = list(self._loss_count_at_snap_deque)
+                _sl = list(self._loss_count_at_snap_deque)
                 _slen = len(_sl)
-                _off  = min(int(self._scrub_offset), _slen)
+                _off = min(int(self._scrub_offset), _slen)
                 _cidx = _slen - _off
                 if 0 <= _cidx < _slen:
                     _cc = _sl[_cidx]
-                    ref_sid = max(
-                        self._loss_graph_data.keys(),
-                        key=lambda s: len(self._loss_graph_data[s]),
-                        default=None,
-                    )
+                    _lengths = self._loss_channel_lengths()
+                    ref_sid = max(_lengths, key=_lengths.get, default=None)
                     if ref_sid is not None and ref_sid in _cc:
-                        total_n  = len(self._loss_graph_data[ref_sid])
+                        total_n = _lengths.get(ref_sid, 0)
                         cursor_n = max(0, min(total_n, int(_cc[ref_sid])))
-                        frac_c   = float(cursor_n) / float(max(1, total_n))
-                        cx       = _view_x(frac_c)
+                        frac_c = float(cursor_n) / float(max(1, total_n))
+                        cx = _view_x(frac_c)
                         draw.line([(cx, my0), (cx, my1)], fill=(200, 150, 255), width=2)
                         draw.text(
                             (cx + 3, my0 + 2),
-                            f"\u25c2{self._scrub_offset}",
+                            f"<{self._scrub_offset}",
                             fill=(200, 150, 255), font=font,
                         )
         except Exception:
             pass
 
-        # Legend (horizontal, top of graph) — clickable channel toggles
+        # Legend (horizontal, top of graph) -- clickable channel toggles
         lx = mx0
-        _legend_sids = sorted(self._loss_graph_data.keys())
-        _legend_boxes: List[Tuple[int, int, int, int, int]] = []
-        # Build reverse map: sid → channel_key for dynamic (100+) channels
-        _sid_to_ck: Dict[int, str] = {}
-        if hasattr(self, "_sr_sid_map"):
-            _sid_to_ck = {v: k for k, v in self._sr_sid_map.items()}
-        for _leg_idx, sid in enumerate(_legend_sids):
-            if len(self._loss_graph_data[sid]) == 0:
+        _legend_boxes: List[Tuple[str, int, int, int, int]] = []
+        _n_legend = len(sorted_keys)
+        for _leg_idx, ck in enumerate(sorted_keys):
+            ch_len = self._loss_channel_length(ck)
+            if ch_len == 0:
                 continue
-            vis = self._loss_channel_visible.get(sid, True)
-            color = _LOSS_STAGE_COLORS_LEGACY.get(sid, _channel_color(_leg_idx, len(_legend_sids)))
-            name = _LOSS_STAGE_NAMES.get(sid, _sid_to_ck.get(sid, f"ch{sid}"))
-            dq = self._loss_graph_data[sid]
-            last_v = next((v for v in reversed(dq) if math.isfinite(v)), float("nan"))
-            label = f"{name}={last_v:.4f}" if math.isfinite(last_v) else name
-            # Dim hidden channels
+            vis = self._loss_channel_visible.get(ck, True)
+            color = _channel_color(_leg_idx, _n_legend)
+            lat = store.latest(ck) if store is not None else None
+            last_v = lat.loss if lat is not None else float("nan")
+            label = f"{ck}={last_v:.4f}" if math.isfinite(last_v) else ck
             if vis:
                 draw.rectangle([(lx, 2), (lx + 7, 9)], fill=color)
                 draw.text((lx + 10, 1), label, fill=color, font=font)
@@ -2480,7 +2381,7 @@ class _TransformerStatusOpenGLViewer:
                 draw.rectangle([(lx, 2), (lx + 7, 9)], fill=dim, outline=(60, 60, 60))
                 draw.text((lx + 10, 1), label, fill=dim, font=font)
             entry_w = max(56, len(label) * 6 + 18)
-            _legend_boxes.append((sid, lx, 0, lx + entry_w, 12))
+            _legend_boxes.append((ck, lx, 0, lx + entry_w, 12))
             lx += entry_w
             if lx > W - 60:
                 break
@@ -2637,7 +2538,7 @@ class _TransformerStatusOpenGLViewer:
         caption: str,
         panel_titles: Optional[Sequence[str]] = None,
         panel_rows: Optional[Sequence[Sequence[str]]] = None,
-        frame_losses: Optional[Dict[int, float]] = None,
+        frame_losses: Optional[Dict[str, float]] = None,
     ):
         if not self.enabled:
             return
@@ -2689,18 +2590,18 @@ class _TransformerStatusOpenGLViewer:
 
 
 # ---------------------------------------------------------------------------
-# IPC layer — decoupled GUI ↔ training communication
+# IPC layer -- decoupled GUI <-> training communication
 # ---------------------------------------------------------------------------
 # The viewer window runs in a separate process (launched by wav_ml_gui_main.py).
 # The training pipeline talks to it over a localhost TCP connection managed by
 # multiprocessing.connection (length-prefixed pickle).  Two classes:
 #
-#   ViewerIPCServer  — runs in the GUI process; receives data, dispatches to viewer
-#   ViewerIPCProxy   — runs in the training process; same API as the viewer
+#   ViewerIPCServer  -- runs in the GUI process; receives data, dispatches to viewer
+#   ViewerIPCProxy   -- runs in the training process; same API as the viewer
 #
 # Message flow:
-#   training → GUI :  loss, frame, checkpoint_saved, cycle_roster, weight_map, ...
-#   GUI → training :  status (stop_requested, gate_override, cycle_selected)
+#   training -> GUI :  loss, frame, checkpoint_saved, cycle_roster, weight_map, ...
+#   GUI -> training :  status (stop_requested, gate_override, cycle_selected)
 # ---------------------------------------------------------------------------
 
 _IPC_AUTHKEY = b'nodus_viewer_v1'
@@ -2791,7 +2692,7 @@ class ViewerIPCServer:
         if conn is None:
             return
 
-        # Drain all available messages from training → GUI
+        # Drain all available messages from training -> GUI
         try:
             while conn.poll(0):
                 msg = conn.recv()
@@ -2854,6 +2755,13 @@ class ViewerIPCServer:
                 self._viewer._stop_requested = False
                 self._viewer._shutdown_save = None
                 self._viewer._top_bar_dirty = True
+                # Loss data is owned by the SaveRestoreNode.  Clear the
+                # viewer's local graph caches so the pull-model repopulates
+                # them from the authoritative source without duplicates.
+                if self._viewer._loss_store is not None:
+                    self._viewer._loss_store.clear()
+                self._viewer._sr_channel_registry.clear()
+                self._viewer._graph_dirty = True
             elif envelope.message_type == MESSAGE_TYPE_PLAN_SNAPSHOT:
                 if hasattr(self._viewer, "set_training_graph_plan"):
                     self._viewer.set_training_graph_plan(payload.plan.to_dict())
@@ -2868,9 +2776,9 @@ class ViewerIPCServer:
         t = msg.get("type")
         v = self._viewer
         if t == "loss":
-            v.update_loss(
-                msg["stage_id"], msg["loss"], msg.get("aux", 0.0), msg.get("ts", 0.0)
-            )
+            # Loss values are owned exclusively by the SaveRestoreNode.
+            # The GUI obtains them via pull-model queries; ignore direct pushes.
+            pass
         elif t == "frame":
             frame = msg["frame"]
             # Resize images to panel size if needed
@@ -2923,7 +2831,7 @@ class ViewerIPCServer:
     def send_query(self, query: dict) -> None:
         """Send a query_* message to the training process.
 
-        The response will arrive asynchronously via poll() → _dispatch()
+        The response will arrive asynchronously via poll() -> _dispatch()
         and be routed to the viewer's _on_sr_response handler.
         """
         with self._lock:
@@ -2975,7 +2883,7 @@ class ViewerIPCServer:
 
 
 class ViewerIPCProxy:
-    """Runs in the training process — drop-in replacement for
+    """Runs in the training process -- drop-in replacement for
     ``_TransformerStatusOpenGLViewer`` that forwards all calls over IPC to the
     standalone GUI process.
 
@@ -3065,7 +2973,7 @@ class ViewerIPCProxy:
             print(f"[viewer-ipc] connection failed: {e}", flush=True)
             self.enabled = False
 
-    # ── internal helpers ──────────────────────────────────────────────────
+    # -- internal helpers --------------------------------------------------
 
     def _send(self, msg: dict) -> None:
         if not self.enabled or self._conn is None:
@@ -3136,7 +3044,7 @@ class ViewerIPCProxy:
         except Exception:
             pass
 
-    # ── public API (mirrors _TransformerStatusOpenGLViewer) ───────────────
+    # -- public API (mirrors _TransformerStatusOpenGLViewer) ---------------
 
     def set_save_restore_node(self, node: Any) -> None:
         """Inject the SaveRestoreNode reference for pull-model query routing."""
@@ -3174,14 +3082,10 @@ class ViewerIPCProxy:
         """Return the save preference for the current shutdown, or None if no shutdown."""
         return self._shutdown_save
 
-    def update_loss(self, stage_id: int, loss: float, aux: float = 0.0, ts: float = 0.0):
-        self._send({
-            "type": "loss",
-            "stage_id": int(stage_id),
-            "loss": float(loss),
-            "aux": float(aux),
-            "ts": float(ts),
-        })
+    def update_loss(self, channel_key: str, loss: float, aux: float = 0.0, ts: float = 0.0):
+        # Loss values are owned exclusively by the SaveRestoreNode.
+        # The GUI pulls them via the IPC query protocol; no direct push.
+        pass
 
     def enqueue_frame(self, frame_dict: dict):
         self._send({"type": "frame", "frame": frame_dict})

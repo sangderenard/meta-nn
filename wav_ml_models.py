@@ -16,12 +16,6 @@ from wav_ml_core import COLOR_MODE_MAP, COLOR_MODES, RenderConfig, normalize_bit
 # Re-export viewer symbols so existing ``from wav_ml_models import ...`` works.
 from wav_ml_viewer import (  # noqa: F401
     LOSS_RECORD_DTYPE,
-    LOSS_STAGE_CLASSIFIER,
-    LOSS_STAGE_DISCRIMINATOR,
-    LOSS_STAGE_GENERATOR,
-    LOSS_STAGE_TRANSFORMER,
-    LOSS_STAGE_WAVE_CLASSIFIER,
-    LOSS_STAGE_WAVE_CLASSIFIER_EVAL,
     _LossFileLogger,
     _TransformerStatusOpenGLViewer,
     _tensor_to_rgb_u8_image,

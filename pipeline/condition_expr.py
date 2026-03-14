@@ -381,9 +381,15 @@ _CALLABLE_WHITELIST = frozenset({
 
 
 def _resolve_accessor(ctx: Any, parts: List[str]) -> Any:
-    """Safely walk a dotted attribute path on *ctx*."""
+    """Safely walk a dotted attribute path on *ctx*.
+
+    A leading ``ctx.`` segment is treated as a self-reference and skipped
+    so that expressions like ``ctx.total_rounds_completed`` evaluate the
+    same as ``total_rounds_completed``.
+    """
+    resolved_parts = parts[1:] if parts and parts[0] == "ctx" else parts
     obj = ctx
-    for part in parts:
+    for part in resolved_parts:
         if part in _BLOCKED_NAMES or part.startswith("__"):
             raise ExprSecurityError(f"Access to {part!r} is blocked")
         val = getattr(obj, part, _SENTINEL)

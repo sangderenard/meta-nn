@@ -1706,6 +1706,14 @@ def run(args, output_dir: Path, initial_plan=None) -> None:
                 # IPC proxy uses _on_restore callback
                 ctx.viewer_proxy._on_restore = _restore_from_scrub
 
+    # -- Wire DataNode references into context for condition_expr ----------
+    _data_node_ref = graph.nodes.get("data_node")
+    if _data_node_ref is not None:
+        ctx.data = _data_node_ref
+        ctx.preg_cfg = getattr(_data_node_ref, "preg_cfg", None)
+        ctx.gest_cfg = getattr(_data_node_ref, "gest_cfg", None)
+        ctx.bdata_cfg = getattr(_data_node_ref, "bdata_cfg", None)
+
     # -- Wire ViewerIPCNode -----------------------------------------------
     _ipc_node = graph.nodes.get("viewer_ipc")
     if isinstance(_ipc_node, ViewerIPCNode) and ctx.viewer_proxy is not None:

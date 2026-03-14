@@ -40,12 +40,6 @@ from wav_ml_models import (
     _TransformerStatusOpenGLViewer,
     _LossFileLogger,
     _tensor_to_rgb_u8_image,
-    LOSS_STAGE_CLASSIFIER,
-    LOSS_STAGE_DISCRIMINATOR,
-    LOSS_STAGE_GENERATOR,
-    LOSS_STAGE_TRANSFORMER,
-    LOSS_STAGE_WAVE_CLASSIFIER,
-    LOSS_STAGE_WAVE_CLASSIFIER_EVAL,
 )
 from wav_ml_viewer import ViewerIPCProxy
 from wav_ml_models import (
