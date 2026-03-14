@@ -280,6 +280,7 @@ class PipelineContext:
     # ---- viewer / preview -----------------------------------------------
     viewer_proxy: Optional[Any] = None
     loss_logger: Optional[Any] = None
+    save_restore_node: Optional[Any] = None
 
     # ---- checkpoint metadata --------------------------------------------
     checkpoint_path: Optional[Path] = None
@@ -398,6 +399,7 @@ class PipelineContext:
         stage = int(stage_id)
         value = float(loss)
         aux_value = float(aux)
+        now = time.time()
 
         logger = self.loss_logger
         if logger is not None:
@@ -409,6 +411,31 @@ class PipelineContext:
             except Exception:
                 pass
 
+        # Route to SaveRestoreNode's pull-model accumulator
+        sr = self.save_restore_node
+        if sr is not None:
+            try:
+                _STAGE_NAMES = {
+                    0: "cls", 1: "gen", 2: "disc",
+                    3: "trans", 4: "wcls", 5: "wcls_eval",
+                }
+                ck = _STAGE_NAMES.get(stage, f"stage_{stage}")
+                lora_slot = getattr(self, "lora_active_slot", "")
+                if lora_slot:
+                    ck = f"{ck}|{lora_slot}"
+                sr.record_loss(
+                    channel_key=ck, loss=value, aux=aux_value,
+                    round_id=int(self.round_id), ts=now,
+                )
+                # Emit lightweight notification so the GUI knows new data exists
+                proxy = self.viewer_proxy
+                if proxy is not None:
+                    send_notif = getattr(proxy, "send_notification", None)
+                    if callable(send_notif):
+                        send_notif(sr.make_loss_notification(ck))
+            except Exception:
+                pass
+
         proxy = self.viewer_proxy
         if proxy is None:
             return
@@ -416,7 +443,7 @@ class PipelineContext:
         if not callable(fn):
             return
         try:
-            fn(stage, value, aux_value, time.time())
+            fn(stage, value, aux_value, now)
         except Exception:
             pass
 

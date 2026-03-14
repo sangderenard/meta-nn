@@ -12,7 +12,7 @@ import re
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
-from pipeline.graph import PipelineGraph
+from pipeline.graph import PipelineGraph, _resolve_frame_hints
 from pipeline.plan_protocol import GraphEdgeRecord, GraphNodeRecord, TrainingGraphPlan
 
 README_EXECUTION_START = "<!-- BEGIN:GENERATED_EXECUTION_LAYER -->"
@@ -32,6 +32,8 @@ NODE_STYLE_MAP: Dict[str, Dict[str, str]] = {
     "train": {"fill": "#FFE8D6", "stroke": "#C05621", "color": "#4A1D05"},
     "gates": {"fill": "#FDE2E4", "stroke": "#C0392B", "color": "#4A0F13"},
     "housekeeping": {"fill": "#E8F5E9", "stroke": "#2E7D32", "color": "#102A12"},
+    "persistence": {"fill": "#EFE3FF", "stroke": "#7C3AED", "color": "#2E1065"},
+    "ipc": {"fill": "#DDEBFF", "stroke": "#2563EB", "color": "#0F172A"},
     "io": {"fill": "#DDEBFF", "stroke": "#2563EB", "color": "#0F172A"},
     "inference": {"fill": "#F4F1DE", "stroke": "#3D405B", "color": "#1B1F2A"},
     "buffer": {"fill": "#E0FBFC", "stroke": "#006D77", "color": "#00313A"},
@@ -52,6 +54,8 @@ EXECUTION_FACULTY_ORDER = [
     "train",
     "gates",
     "housekeeping",
+    "persistence",
+    "ipc",
     "other",
 ]
 
@@ -1443,26 +1447,7 @@ def _execution_frame_hints(node_id: str, incoming_resources: List[str]) -> List[
     for resource in list(incoming_resources or []):
         _push(resource)
 
-    if node_id == "data_node":
-        extras = ["class_names", "semantic_term_to_idx", "symbol_pool", "label_embedding_bank"]
-    elif "pregestation" in node_id or node_id == "stage_0_pregestation":
-        extras = ["classifier", "pregestation_loader", "pregestation_eval_loader", "gate_pregestation"]
-    elif "gestation" in node_id or node_id == "stage_1_gestation":
-        extras = ["classifier", "gestation_loader", "gestation_eval_loader", "gate_pregestation", "gate_gestation"]
-    elif "berkeley" in node_id or node_id in {"stage_c_lora", "stage_fake_feedback"}:
-        extras = ["classifier", "berkeley_refresh_loader", "payload_validation_loader", "payload_bank", "gate_gestation", "gate_berkeley"]
-    elif "transformer" in node_id or node_id == "config_search":
-        extras = ["transformer", "classifier", "payload_bank", "gate_berkeley", "gate_transformer"]
-    elif "generator" in node_id or "gan" in node_id:
-        extras = ["generator", "discriminator", "payload_bank", "payload_conditions", "gate_transformer", "gate_generator"]
-    elif "wave" in node_id:
-        extras = ["wave_classifier", "transformer", "gate_transformer", "gate_wave"]
-    elif node_id in {"sync_gate_replica", "checkpoint_save"}:
-        extras = ["classifier", "gate_classifier", "gate_berkeley", "gate_transformer", "gate_generator", "gate_wave"]
-    else:
-        extras = []
-
-    for extra in extras:
+    for extra in _resolve_frame_hints(node_id):
         _push(extra)
     return hints[:8]
 

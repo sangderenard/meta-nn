@@ -152,6 +152,8 @@ class ConfigSearchNode(PipelineNode):
 
     node_id = "config_search"
     description = "Score random RenderConfig candidates via classifier feature metric"
+    runtime_object_type = "optimizer"
+    runtime_faculty = "build"
     gpu_models = ["classifier"]
 
     def __init__(self, cfg: TransformerConfig) -> None:
@@ -236,6 +238,8 @@ class BuildTransformerNode(PipelineNode):
 
     node_id = "build_transformer"
     description = "Instantiate WavePatchTransformer + optimizer"
+    runtime_object_type = "builder"
+    runtime_faculty = "build"
     gpu_models = ["transformer"]
 
     def __init__(self, cfg: TransformerConfig) -> None:

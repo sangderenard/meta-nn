@@ -107,8 +107,14 @@ flowchart LR
     sync_gate_replica__should_run["Gate check"]
     sync_gate_replica__execute["Sync frozen CPU gate_classifier from main classifier"]
     checkpoint_save["Checkpoint Save"]
-    checkpoint_save__should_run["Gate check"]
-    checkpoint_save__execute["Save pipeline checkpoint to disk"]
+    seed_bank["Seed Bank"]
+    training_cache["Training Material Cache"]
+    loss_accumulator["Loss Accumulator"]
+    result_store["Result Store"]
+    weight_tracker["Weight Tracker"]
+    viewer_ipc["Viewer Ipc"]
+    viewer_ipc__should_run["Gate check"]
+    viewer_ipc__execute["IPC bridge to standalone GUI viewer"]
 
     wave_pool -- "gate_check | node.owns" --> wave_pool__should_run
     wave_pool -- "execute | node.owns" --> wave_pool__execute
@@ -189,8 +195,13 @@ flowchart LR
     gate_wave -- "execute | node.owns" --> gate_wave__execute
     sync_gate_replica -- "gate_check | node.owns" --> sync_gate_replica__should_run
     sync_gate_replica -- "execute | node.owns" --> sync_gate_replica__execute
-    checkpoint_save -- "gate_check | node.owns" --> checkpoint_save__should_run
-    checkpoint_save -- "execute | node.owns" --> checkpoint_save__execute
+    checkpoint_save -- "state_store | node.owns" --> seed_bank
+    checkpoint_save -- "state_store | node.owns" --> training_cache
+    checkpoint_save -- "metric_store | node.owns" --> loss_accumulator
+    checkpoint_save -- "metric_store | node.owns" --> result_store
+    checkpoint_save -- "diagnostic | node.owns" --> weight_tracker
+    viewer_ipc -- "gate_check | node.owns" --> viewer_ipc__should_run
+    viewer_ipc -- "execute | node.owns" --> viewer_ipc__execute
     wave_pool -- "startup | schedule.bootstrap" --> init_vocab
     init_vocab -- "startup | schedule.bootstrap" --> build_classifier
     build_classifier -- "startup | schedule.bootstrap" --> config_search
@@ -226,6 +237,7 @@ flowchart LR
     gate_transformer -- "end_of_round | schedule.finalize" --> sync_gate_replica
     gate_berkeley -- "end_of_round | schedule.finalize" --> sync_gate_replica
     sync_gate_replica -- "end_of_round | schedule.finalize" --> checkpoint_save
+    checkpoint_save -- "end_of_round | schedule.finalize" --> viewer_ipc
 
     linkStyle 0 stroke:#8B5CF6,stroke-width:2px,opacity:0.85,stroke-dasharray:4 2;
     linkStyle 1 stroke:#8B5CF6,stroke-width:2px,opacity:0.85,stroke-dasharray:4 2;
@@ -308,38 +320,44 @@ flowchart LR
     linkStyle 78 stroke:#8B5CF6,stroke-width:2px,opacity:0.85,stroke-dasharray:4 2;
     linkStyle 79 stroke:#8B5CF6,stroke-width:2px,opacity:0.85,stroke-dasharray:4 2;
     linkStyle 80 stroke:#8B5CF6,stroke-width:2px,opacity:0.85,stroke-dasharray:4 2;
-    linkStyle 81 stroke:#2A9D8F,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
-    linkStyle 82 stroke:#2A9D8F,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
-    linkStyle 83 stroke:#2A9D8F,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
-    linkStyle 84 stroke:#2A9D8F,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
-    linkStyle 85 stroke:#577590,stroke-width:3px,opacity:0.85,stroke-dasharray:8 3;
+    linkStyle 81 stroke:#8B5CF6,stroke-width:2px,opacity:0.85,stroke-dasharray:4 2;
+    linkStyle 82 stroke:#8B5CF6,stroke-width:2px,opacity:0.85,stroke-dasharray:4 2;
+    linkStyle 83 stroke:#8B5CF6,stroke-width:2px,opacity:0.85,stroke-dasharray:4 2;
+    linkStyle 84 stroke:#8B5CF6,stroke-width:2px,opacity:0.85,stroke-dasharray:4 2;
+    linkStyle 85 stroke:#8B5CF6,stroke-width:2px,opacity:0.85,stroke-dasharray:4 2;
     linkStyle 86 stroke:#2A9D8F,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
-    linkStyle 87 stroke:#E9C46A,stroke-width:3px,opacity:0.9,stroke-dasharray:2 2;
-    linkStyle 88 stroke:#E9C46A,stroke-width:3px,opacity:0.9,stroke-dasharray:2 2;
-    linkStyle 89 stroke:#E9C46A,stroke-width:3px,opacity:0.9,stroke-dasharray:2 2;
-    linkStyle 90 stroke:#E9C46A,stroke-width:3px,opacity:0.9,stroke-dasharray:2 2;
-    linkStyle 91 stroke:#1D70A2,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
-    linkStyle 92 stroke:#1D70A2,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
-    linkStyle 93 stroke:#1D70A2,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
-    linkStyle 94 stroke:#1D70A2,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
-    linkStyle 95 stroke:#1D70A2,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
+    linkStyle 87 stroke:#2A9D8F,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
+    linkStyle 88 stroke:#2A9D8F,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
+    linkStyle 89 stroke:#2A9D8F,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
+    linkStyle 90 stroke:#577590,stroke-width:3px,opacity:0.85,stroke-dasharray:8 3;
+    linkStyle 91 stroke:#2A9D8F,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
+    linkStyle 92 stroke:#E9C46A,stroke-width:3px,opacity:0.9,stroke-dasharray:2 2;
+    linkStyle 93 stroke:#E9C46A,stroke-width:3px,opacity:0.9,stroke-dasharray:2 2;
+    linkStyle 94 stroke:#E9C46A,stroke-width:3px,opacity:0.9,stroke-dasharray:2 2;
+    linkStyle 95 stroke:#E9C46A,stroke-width:3px,opacity:0.9,stroke-dasharray:2 2;
     linkStyle 96 stroke:#1D70A2,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
     linkStyle 97 stroke:#1D70A2,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
     linkStyle 98 stroke:#1D70A2,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
-    linkStyle 99 stroke:#F4A261,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
-    linkStyle 100 stroke:#F4A261,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
-    linkStyle 101 stroke:#F4A261,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
-    linkStyle 102 stroke:#F4A261,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
-    linkStyle 103 stroke:#F4A261,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
+    linkStyle 99 stroke:#1D70A2,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
+    linkStyle 100 stroke:#1D70A2,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
+    linkStyle 101 stroke:#1D70A2,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
+    linkStyle 102 stroke:#1D70A2,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
+    linkStyle 103 stroke:#1D70A2,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
     linkStyle 104 stroke:#F4A261,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
     linkStyle 105 stroke:#F4A261,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
-    linkStyle 106 stroke:#E76F51,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
-    linkStyle 107 stroke:#E76F51,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
-    linkStyle 108 stroke:#E76F51,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
-    linkStyle 109 stroke:#E76F51,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
-    linkStyle 110 stroke:#B56576,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
-    linkStyle 111 stroke:#B56576,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
-    linkStyle 112 stroke:#2B9348,stroke-width:3px,opacity:0.9,stroke-dasharray:4 2;
-    linkStyle 113 stroke:#2B9348,stroke-width:3px,opacity:0.9,stroke-dasharray:4 2;
-    linkStyle 114 stroke:#2B9348,stroke-width:3px,opacity:0.9,stroke-dasharray:4 2;
-    linkStyle 115 stroke:#2B9348,stroke-width:3px,opacity:0.9,stroke-dasharray:4 2;
+    linkStyle 106 stroke:#F4A261,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
+    linkStyle 107 stroke:#F4A261,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
+    linkStyle 108 stroke:#F4A261,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
+    linkStyle 109 stroke:#F4A261,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
+    linkStyle 110 stroke:#F4A261,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
+    linkStyle 111 stroke:#E76F51,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
+    linkStyle 112 stroke:#E76F51,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
+    linkStyle 113 stroke:#E76F51,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
+    linkStyle 114 stroke:#E76F51,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
+    linkStyle 115 stroke:#B56576,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
+    linkStyle 116 stroke:#B56576,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
+    linkStyle 117 stroke:#2B9348,stroke-width:3px,opacity:0.9,stroke-dasharray:4 2;
+    linkStyle 118 stroke:#2B9348,stroke-width:3px,opacity:0.9,stroke-dasharray:4 2;
+    linkStyle 119 stroke:#2B9348,stroke-width:3px,opacity:0.9,stroke-dasharray:4 2;
+    linkStyle 120 stroke:#2B9348,stroke-width:3px,opacity:0.9,stroke-dasharray:4 2;
+    linkStyle 121 stroke:#2B9348,stroke-width:3px,opacity:0.9,stroke-dasharray:4 2;

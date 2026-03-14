@@ -138,9 +138,11 @@ def build_classifier_preview_frames(
         target_mask = _normalize_mask_hw(payload.get("target_mask", None), height=height, width=width, fill=1.0)
         detected_mask = _normalize_mask_hw(payload.get("detected_mask", None), height=height, width=width, fill=0.0)
 
-        overlap = np.minimum(target_mask, detected_mask)
-        detected_only = np.clip(detected_mask - target_mask, 0.0, 1.0)
-        target_only = np.clip(target_mask - detected_mask, 0.0, 1.0)
+        target_bin = (target_mask >= 0.5).astype(np.float32)
+        detected_bin = (detected_mask >= 0.5).astype(np.float32)
+        overlap = np.minimum(target_bin, detected_bin)
+        detected_only = np.clip(detected_bin - target_bin, 0.0, 1.0)
+        target_only = np.clip(target_bin - detected_bin, 0.0, 1.0)
 
         panel_target = np.concatenate([image_chw, target_mask[None, :, :]], axis=0)
         panel_diff = np.clip(
@@ -155,6 +157,7 @@ def build_classifier_preview_frames(
         top_txt = top_lines[0] if top_lines else "n/a"
 
         loss_rows: List[str] = []
+        loss_scalars: Dict[str, float] = {}
         for key, label in (("loss", "loss"), ("batch_loss", "batch")):
             if key not in payload:
                 continue
@@ -164,12 +167,13 @@ def build_classifier_preview_frames(
                 value = float("nan")
             if math.isfinite(value):
                 loss_rows.append(f"{label}={value:.4f}")
+                loss_scalars[key] = value
 
         diff_rows = [
-            f"overlap={float(np.mean((target_mask >= 0.5) & (detected_mask >= 0.5))):.3f}",
-            f"target_only={float(np.mean(np.clip((target_mask >= 0.5).astype(np.float32) - (detected_mask >= 0.5).astype(np.float32), 0.0, 1.0))):.3f}",
-            f"detected_only={float(np.mean(np.clip((detected_mask >= 0.5).astype(np.float32) - (target_mask >= 0.5).astype(np.float32), 0.0, 1.0))):.3f}",
-            f"mean_abs={float(np.mean(np.abs(target_mask - detected_mask))):.3f}",
+            f"overlap={float(np.mean(overlap)):.3f}",
+            f"target_only={float(np.mean(target_only)):.3f}",
+            f"detected_only={float(np.mean(detected_only)):.3f}",
+            f"mean_abs={float(np.mean(np.abs(target_bin - detected_bin))):.3f}",
         ]
 
         frames.append(
@@ -182,10 +186,12 @@ def build_classifier_preview_frames(
                 "caption": f"[C] cycle={int(cycle_id)} round={int(round_id)} {step_txt} top={top_txt}",
                 "titles": ["C target +mask", "C mask diff", "C detected +mask"],
                 "rows": [
-                    [target_line, step_txt] + loss_rows,
+                    [target_line, step_txt],
                     diff_rows,
                     [target_line, "mask=detected"] + (top_lines or ["n/a"]),
                 ],
+                "loss_rows": loss_rows,
+                "loss_scalars": loss_scalars,
             }
         )
 

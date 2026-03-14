@@ -23,6 +23,7 @@ flowchart LR
     gate_generator["Gate Generator"]
     gate_wave["Gate Wave"]
     sync_gate_replica["Sync Gate Replica"]
+    build_gan["Build Gan"]
     build_transformer["Build Transformer"]
     build_wave_classifier["Build Wave Classifier"]
 
@@ -44,8 +45,10 @@ flowchart LR
     gate_generator -- "gpu-resident classifier | residency.acquire" --> model__classifier
     gate_wave -- "gpu-resident classifier | residency.acquire" --> model__classifier
     sync_gate_replica -- "gpu-resident classifier | residency.acquire" --> model__classifier
+    build_gan -- "gpu-resident discriminator | residency.acquire" --> model__discriminator
     stage_g_generator -- "gpu-resident discriminator | residency.acquire" --> model__discriminator
     stage_fake_feedback -- "gpu-resident discriminator | residency.acquire" --> model__discriminator
+    build_gan -- "gpu-resident generator | residency.acquire" --> model__generator
     stage_g_generator -- "gpu-resident generator | residency.acquire" --> model__generator
     stage_fake_feedback -- "gpu-resident generator | residency.acquire" --> model__generator
     gate_generator -- "gpu-resident generator | residency.acquire" --> model__generator
@@ -83,3 +86,5 @@ flowchart LR
     linkStyle 25 stroke:#6B7280,stroke-width:2px,opacity:0.75,stroke-dasharray:0;
     linkStyle 26 stroke:#6B7280,stroke-width:2px,opacity:0.75,stroke-dasharray:0;
     linkStyle 27 stroke:#6B7280,stroke-width:2px,opacity:0.75,stroke-dasharray:0;
+    linkStyle 28 stroke:#6B7280,stroke-width:2px,opacity:0.75,stroke-dasharray:0;
+    linkStyle 29 stroke:#6B7280,stroke-width:2px,opacity:0.75,stroke-dasharray:0;

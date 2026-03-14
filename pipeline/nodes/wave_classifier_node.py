@@ -138,6 +138,8 @@ class BuildWaveClassifierNode(PipelineNode):
 
     node_id = "build_wave_classifier"
     description = "Instantiate wave-feedback TinyConvClassifier"
+    runtime_object_type = "builder"
+    runtime_faculty = "build"
     gpu_models = ["wave_classifier"]
 
     def __init__(self, cfg: WaveClassifierConfig) -> None:

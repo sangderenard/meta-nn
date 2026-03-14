@@ -192,6 +192,8 @@ class BuildClassifierNode(PipelineNode):
 
     node_id = "build_classifier"
     description = "Instantiate TinyConvClassifier + optimizer"
+    runtime_object_type = "builder"
+    runtime_faculty = "build"
     gpu_models = ["classifier"]
 
     def __init__(self, cfg: ClassifierConfig) -> None:
@@ -835,6 +837,8 @@ class SyncGateReplicaNode(PipelineNode):
 
     node_id = "sync_gate_replica"
     description = "Sync frozen CPU gate_classifier from main classifier"
+    runtime_object_type = "service"
+    runtime_faculty = "housekeeping"
     gpu_models = ["classifier"]
 
     def __init__(self, cfg: ClassifierConfig) -> None:

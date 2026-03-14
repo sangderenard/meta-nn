@@ -107,8 +107,14 @@ flowchart LR
     sync_gate_replica__should_run["Gate check"]
     sync_gate_replica__execute["Sync frozen CPU gate_classifier from main classifier"]
     checkpoint_save["Checkpoint Save"]
-    checkpoint_save__should_run["Gate check"]
-    checkpoint_save__execute["Save pipeline checkpoint to disk"]
+    seed_bank["Seed Bank"]
+    training_cache["Training Material Cache"]
+    loss_accumulator["Loss Accumulator"]
+    result_store["Result Store"]
+    weight_tracker["Weight Tracker"]
+    viewer_ipc["Viewer Ipc"]
+    viewer_ipc__should_run["Gate check"]
+    viewer_ipc__execute["IPC bridge to standalone GUI viewer"]
 
     wave_pool --> wave_pool__should_run
     wave_pool --> wave_pool__execute
@@ -189,8 +195,13 @@ flowchart LR
     gate_wave --> gate_wave__execute
     sync_gate_replica --> sync_gate_replica__should_run
     sync_gate_replica --> sync_gate_replica__execute
-    checkpoint_save --> checkpoint_save__should_run
-    checkpoint_save --> checkpoint_save__execute
+    checkpoint_save --> seed_bank
+    checkpoint_save --> training_cache
+    checkpoint_save --> loss_accumulator
+    checkpoint_save --> result_store
+    checkpoint_save --> weight_tracker
+    viewer_ipc --> viewer_ipc__should_run
+    viewer_ipc --> viewer_ipc__execute
     wave_pool --> init_vocab
     init_vocab --> build_classifier
     build_classifier --> config_search
@@ -226,3 +237,4 @@ flowchart LR
     gate_transformer --> sync_gate_replica
     gate_berkeley --> sync_gate_replica
     sync_gate_replica --> checkpoint_save
+    checkpoint_save --> viewer_ipc

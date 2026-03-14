@@ -27,7 +27,8 @@ flowchart TD
     gate_generator["Generator Gate"]
     gate_wave["Wave Gate"]
     sync_gate_replica["Sync Gate Replica"]
-    checkpoint_save["Checkpoint Save"]
+    checkpoint_save["Save Restore"]
+    viewer_ipc["Viewer IPC"]
 
     wave_pool --> init_vocab
     init_vocab --> build_classifier
@@ -64,3 +65,4 @@ flowchart TD
     gate_transformer --> sync_gate_replica
     gate_berkeley --> sync_gate_replica
     sync_gate_replica --> checkpoint_save
+    checkpoint_save --> viewer_ipc

@@ -2681,6 +2681,8 @@ class BootstrapDynamicDataset(Dataset):
                         "dropout damage",
                         "quantization damage",
                         "stride skew damage",
+                        "edge highlight",
+                        "edge blur",
                         "texture",
                         "pattern",
                     }
@@ -2891,6 +2893,9 @@ class DiskSemanticRowsDataset(Dataset):
             "edge_highlight_blend_min": float(cfg.get("edge_highlight_blend_min", 0.05)),
             "edge_highlight_blend_max": float(cfg.get("edge_highlight_blend_max", 0.25)),
             "edge_highlight_ultra": bool(cfg.get("edge_highlight_ultra", str(os.environ.get("EDGE_HIGHLIGHT_ULTRA", "0")).strip() == "1")),
+            "edge_blur_prob": float(cfg.get("edge_blur_prob", 0.30)),
+            "edge_blur_kernel": int(cfg.get("edge_blur_kernel", 7)),
+            "edge_blur_spread": int(cfg.get("edge_blur_spread", 5)),
         }
 
     def __len__(self) -> int:
@@ -3090,8 +3095,30 @@ class DiskSemanticRowsDataset(Dataset):
             ))
             out = out + (float(blend) * edge_map[None, :, :]).astype(np.float32, copy=False)
             _accumulate_term_mask(
-                ["edge", "signal"],
+                ["edge highlight", "edge", "signal"],
                 edge_map,
+                scale=0.85,
+                gamma=0.95,
+            )
+        if float(rng.random()) < float(self.degrade_config["edge_blur_prob"]):
+            gray = np.mean(out[:3], axis=0).astype(np.float32, copy=False)
+            sx = np.array([[1, 0, -1], [2, 0, -2], [1, 0, -1]], dtype=np.float32)
+            gt = torch.from_numpy(gray[None, None, ...]).to(torch.float32)
+            gx = F.conv2d(gt, torch.from_numpy(sx[None, None, ...]), padding=1)
+            gy = F.conv2d(gt, torch.from_numpy(sx.T[None, None, ...]), padding=1)
+            edge_mask = (torch.sqrt(gx ** 2 + gy ** 2)[0, 0]).numpy().astype(np.float32)
+            edge_mask = edge_mask / max(float(np.max(edge_mask)), 1e-8)
+            blur_k = int(self.degrade_config["edge_blur_kernel"])
+            spread_k = int(self.degrade_config["edge_blur_spread"])
+            out_t = torch.from_numpy(out[None, ...]).to(torch.float32)
+            blurred = F.avg_pool2d(out_t, kernel_size=blur_k, stride=1, padding=blur_k // 2)[0].numpy().astype(np.float32)
+            em_t = torch.from_numpy(edge_mask[None, None, ...]).to(torch.float32)
+            spread_mask = F.avg_pool2d(em_t, kernel_size=spread_k, stride=1, padding=spread_k // 2)[0, 0].numpy().astype(np.float32)
+            spread_mask = spread_mask / max(float(np.max(spread_mask)), 1e-8)
+            out = np.clip(out * (1.0 - spread_mask[None]) + blurred * spread_mask[None], 0.0, 1.0).astype(np.float32, copy=False)
+            _accumulate_term_mask(
+                ["edge blur", "edge", "signal"],
+                spread_mask,
                 scale=0.85,
                 gamma=0.95,
             )

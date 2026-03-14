@@ -115,6 +115,8 @@ class InitVocabNode(OneTimeNode):
 
     node_id = "init_vocab"
     description = "Load and assemble initial semantic vocabulary"
+    runtime_object_type = "initializer"
+    runtime_faculty = "vocab"
 
     def __init__(self, cfg: VocabConfig) -> None:
         super().__init__()
@@ -173,6 +175,8 @@ class VocabChurnNode(PipelineNode):
 
     node_id = "vocab_churn"
     description = "Rotate extra vocab terms (churn) on schedule"
+    runtime_object_type = "mutator"
+    runtime_faculty = "vocab"
 
     def __init__(self, cfg: VocabConfig) -> None:
         self.cfg = cfg
@@ -254,6 +258,8 @@ class BuildSymbolPoolNode(PipelineNode):
 
     node_id = "build_symbol_pool"
     description = "Build per-term symbol image pool"
+    runtime_object_type = "builder"
+    runtime_faculty = "vocab"
 
     def __init__(self, cfg: VocabConfig) -> None:
         self.cfg = cfg
@@ -305,6 +311,8 @@ class BuildFlashcardRowsNode(PipelineNode):
 
     node_id = "build_flashcard_rows"
     description = "Build per-term GAN conditioning flashcard rows"
+    runtime_object_type = "builder"
+    runtime_faculty = "vocab"
 
     def __init__(self, cfg: VocabConfig) -> None:
         self.cfg = cfg
@@ -460,6 +468,34 @@ def _build_reference_flashcard_payload_rows(
             shift = int(max(1, min(6, int(size // 24))))
             out[:, 1::2, :] = np.roll(out[:, 1::2, :], shift=shift, axis=2)
             return np.clip(out, 0.0, 1.0).astype(np.float32, copy=False)
+        if key == "edge highlight":
+            gray = np.mean(x[:3], axis=0, keepdims=True).astype(np.float32)
+            sx = np.array([[1, 0, -1], [2, 0, -2], [1, 0, -1]], dtype=np.float32)
+            sy = sx.T
+            gt = torch.from_numpy(gray[None, ...]).to(torch.float32)
+            gx = F.conv2d(gt, torch.from_numpy(sx[None, None, ...]), padding=1)
+            gy = F.conv2d(gt, torch.from_numpy(sy[None, None, ...]), padding=1)
+            edge_map = torch.sqrt(gx ** 2 + gy ** 2)[0, 0].numpy().astype(np.float32)
+            edge_map = edge_map / max(float(np.max(edge_map)), 1e-8)
+            blend = float(rng.uniform(0.08, 0.30))
+            return np.clip(x + blend * edge_map[None, :, :], 0.0, 1.0).astype(np.float32, copy=False)
+        if key == "edge blur":
+            gray = np.mean(x[:3], axis=0, keepdims=True).astype(np.float32)
+            sx = np.array([[1, 0, -1], [2, 0, -2], [1, 0, -1]], dtype=np.float32)
+            sy = sx.T
+            gt = torch.from_numpy(gray[None, ...]).to(torch.float32)
+            gx = F.conv2d(gt, torch.from_numpy(sx[None, None, ...]), padding=1)
+            gy = F.conv2d(gt, torch.from_numpy(sy[None, None, ...]), padding=1)
+            edge_mask = torch.sqrt(gx ** 2 + gy ** 2)[0, 0].numpy().astype(np.float32)
+            edge_mask = edge_mask / max(float(np.max(edge_mask)), 1e-8)
+            xt = torch.from_numpy(x[None, ...]).to(torch.float32)
+            blurred = F.avg_pool2d(xt, kernel_size=7, stride=1, padding=3)[0].numpy().astype(np.float32)
+            spread_k = 5
+            spread_pad = spread_k // 2
+            em_t = torch.from_numpy(edge_mask[None, None, ...]).to(torch.float32)
+            spread_mask = F.avg_pool2d(em_t, kernel_size=spread_k, stride=1, padding=spread_pad)[0, 0].numpy().astype(np.float32)
+            spread_mask = spread_mask / max(float(np.max(spread_mask)), 1e-8)
+            return np.clip(x * (1.0 - spread_mask[None]) + blurred * spread_mask[None], 0.0, 1.0).astype(np.float32, copy=False)
         return x
 
     def _collect_symbol_rows(prefix: str) -> List[np.ndarray]:
@@ -516,7 +552,7 @@ def _build_reference_flashcard_payload_rows(
     cards_cond: List[np.ndarray] = []
     term_counts: Dict[str, int] = {}
 
-    damage_terms = {"blur damage", "noise damage", "dropout damage", "quantization damage", "stride skew damage"}
+    damage_terms = {"blur damage", "noise damage", "dropout damage", "quantization damage", "stride skew damage", "edge highlight", "edge blur"}
 
     def _emit(term: str, img: np.ndarray, base_supervised: Optional[np.ndarray], extra_terms: Sequence[str]):
         key = re.sub(r"\s+", " ", str(term)).strip().lower()
@@ -930,6 +966,8 @@ def _semantic_kind_keys_for_class_names(class_names: Sequence[str]) -> List[str]
         "dropout damage": ["dropout damage"],
         "quantization damage": ["quantization damage"],
         "stride skew damage": ["stride skew damage"],
+        "edge highlight": ["edge highlight", "edge"],
+        "edge blur": ["edge blur", "edge"],
         "gan image": ["gan image"],
         "regurgitated content": ["regurgitated content"],
         "berkeley sbd dataset": ["berkeley sbd dataset"],
@@ -967,6 +1005,8 @@ def _find_semantic_term_index(class_names: Sequence[str], term: str) -> int:
         "dropout damage",
         "quantization damage",
         "stride skew damage",
+        "edge highlight",
+        "edge blur",
         "gan image",
         "regurgitated content",
         "berkeley sbd dataset",
@@ -1007,6 +1047,8 @@ def _semantic_damage_tags(term: str) -> List[str]:
         "dropout damage": ["dropout damage", "signal"],
         "quantization damage": ["quantization damage", "signal"],
         "stride skew damage": ["stride skew damage", "signal"],
+        "edge highlight": ["edge highlight", "edge", "signal"],
+        "edge blur": ["edge blur", "edge", "blur damage", "signal"],
     }
     if key in lut:
         return _normalize_vocab_terms(lut[key])
@@ -2001,6 +2043,21 @@ def _build_synthetic_semantic_symbol_pool(
             out = np.array(src, dtype=np.float32, copy=True)
             out[1::2, :] = np.roll(out[1::2, :], shift=3, axis=1)
             g = np.clip(out, 0.0, 1.0)
+        elif key == "edge highlight":
+            src = _signal_pattern(phase=phase)
+            src_t = torch.from_numpy(src[None, None, ...]).to(torch.float32)
+            fine = F.avg_pool2d(src_t, kernel_size=3, stride=1, padding=1)[0, 0].numpy().astype(np.float32)
+            edge = np.clip(np.abs(src - fine) * 8.0, 0.0, 1.0)
+            g = np.clip(src + 0.20 * edge, 0.0, 1.0)
+        elif key == "edge blur":
+            src = _signal_pattern(phase=phase)
+            src_t = torch.from_numpy(src[None, None, ...]).to(torch.float32)
+            blurred = F.avg_pool2d(src_t, kernel_size=7, stride=1, padding=3)[0, 0].numpy().astype(np.float32)
+            fine = F.avg_pool2d(src_t, kernel_size=3, stride=1, padding=1)[0, 0].numpy().astype(np.float32)
+            edge = np.clip(np.abs(src - fine) * 8.0, 0.0, 1.0)
+            spread = F.avg_pool2d(torch.from_numpy(edge[None, None, ...]).to(torch.float32), kernel_size=5, stride=1, padding=2)[0, 0].numpy().astype(np.float32)
+            spread = spread / max(float(np.max(spread)), 1e-8)
+            g = np.clip(src * (1.0 - spread) + blurred * spread, 0.0, 1.0)
         elif key == "berkeley sbd dataset":
             g = np.clip((0.65 * _circle_object()) + (0.35 * _signal_pattern(phase=phase)), 0.0, 1.0)
         elif key == "mnist dataset":

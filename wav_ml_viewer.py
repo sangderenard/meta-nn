@@ -46,14 +46,79 @@ _LOSS_STAGE_NAMES: Dict[int, str] = {
     LOSS_STAGE_WAVE_CLASSIFIER_EVAL: "wcls_eval",
 }
 
-_LOSS_STAGE_COLORS: Dict[int, tuple] = {
-    LOSS_STAGE_CLASSIFIER:          (80,  200, 220),  # cyan
-    LOSS_STAGE_GENERATOR:           (80,  200, 100),  # green
-    LOSS_STAGE_DISCRIMINATOR:       (240, 140,  40),  # orange
-    LOSS_STAGE_TRANSFORMER:         (240, 220,  60),  # yellow
-    LOSS_STAGE_WAVE_CLASSIFIER:     (220,  80, 220),  # magenta
-    LOSS_STAGE_WAVE_CLASSIFIER_EVAL:(160, 120, 255),  # lavender
+# Legacy fixed colours kept for backward-compat history loading only.
+_LOSS_STAGE_COLORS_LEGACY: Dict[int, tuple] = {
+    LOSS_STAGE_CLASSIFIER:          (80,  200, 220),
+    LOSS_STAGE_GENERATOR:           (80,  200, 100),
+    LOSS_STAGE_DISCRIMINATOR:       (240, 140,  40),
+    LOSS_STAGE_TRANSFORMER:         (240, 220,  60),
+    LOSS_STAGE_WAVE_CLASSIFIER:     (220,  80, 220),
+    LOSS_STAGE_WAVE_CLASSIFIER_EVAL:(160, 120, 255),
 }
+
+
+def _hsl_to_rgb(h: float, s: float, l: float) -> Tuple[int, int, int]:
+    """Convert HSL (h in [0,360), s/l in [0,1]) to RGB (each 0-255)."""
+    c = (1.0 - abs(2.0 * l - 1.0)) * s
+    x = c * (1.0 - abs((h / 60.0) % 2.0 - 1.0))
+    m = l - c / 2.0
+    if h < 60:
+        r1, g1, b1 = c, x, 0.0
+    elif h < 120:
+        r1, g1, b1 = x, c, 0.0
+    elif h < 180:
+        r1, g1, b1 = 0.0, c, x
+    elif h < 240:
+        r1, g1, b1 = 0.0, x, c
+    elif h < 300:
+        r1, g1, b1 = x, 0.0, c
+    else:
+        r1, g1, b1 = c, 0.0, x
+    return (
+        int(round((r1 + m) * 255)),
+        int(round((g1 + m) * 255)),
+        int(round((b1 + m) * 255)),
+    )
+
+
+def _channel_color(index: int, total: int) -> Tuple[int, int, int]:
+    """Equal-angular-spacing colour from the HSL wheel.
+
+    Uses the golden angle offset (137.508°) so that any prefix of N channels
+    is well-distributed even if total changes over time.
+    """
+    if total <= 0:
+        total = 1
+    hue = (index * 137.508) % 360.0
+    return _hsl_to_rgb(hue, 0.72, 0.58)
+
+
+def _channel_key_from_stage_id(stage_id: int) -> str:
+    """Convert legacy integer stage_id to a canonical channel key string."""
+    return _LOSS_STAGE_NAMES.get(int(stage_id), f"stage_{stage_id}")
+
+
+def make_channel_key(
+    node_id: str = "",
+    stage_id: int = -1,
+    lora_slot: str = "",
+) -> str:
+    """Build a unique channel key for loss graph tracking.
+
+    Format: ``<base>`` or ``<base>|<lora_slot>`` when a LoRA adapter is active.
+    ``base`` is derived from node_id (preferred) or stage_id (fallback).
+    """
+    base = ""
+    if node_id:
+        base = str(node_id).strip().lower()
+    elif stage_id >= 0:
+        base = _channel_key_from_stage_id(stage_id)
+    else:
+        base = "unknown"
+    lora = str(lora_slot).strip()
+    if lora:
+        return f"{base}|{lora}"
+    return base
 
 # 20 bytes per record: step(i4) round(i2) stage(u1) pad(u1) loss(f4) aux(f4) ts(f4)
 LOSS_RECORD_DTYPE = np.dtype([
@@ -64,6 +129,20 @@ LOSS_RECORD_DTYPE = np.dtype([
     ("loss",  "<f4"),
     ("aux",   "<f4"),
     ("ts",    "<f4"),
+])
+
+# Channel-key aware record for the extended binary log (v2).
+# 52 bytes: step(i4) round(i2) stage(u1) pad(u1) loss(f4) aux(f4) ts(f4)
+#           + channel_key (32-byte fixed UTF-8, null-padded)
+LOSS_RECORD_V2_DTYPE = np.dtype([
+    ("step",  "<i4"),
+    ("round", "<i2"),
+    ("stage", "<u1"),
+    ("_pad",  "<u1"),
+    ("loss",  "<f4"),
+    ("aux",   "<f4"),
+    ("ts",    "<f4"),
+    ("channel_key", "S32"),
 ])
 
 
@@ -270,6 +349,7 @@ class _TransformerStatusOpenGLViewer:
         self._caption = ""
         self._panel_titles = ["target", "input", "output"]
         self._panel_rows = [[], [], []]
+        self._loss_display_rows: List[str] = []
         self._panel_text_rgb = [
             np.full((self.panel_h, self.panel_w, 3), 14, dtype=np.uint8),
             np.full((self.panel_h, self.panel_w, 3), 14, dtype=np.uint8),
@@ -348,6 +428,23 @@ class _TransformerStatusOpenGLViewer:
         self._weight_delta_threshold: float = 0.01
         # Previous sparse snapshot for delta comparison.
         self._prev_weight_snap: Dict[str, Dict[str, Any]] = {}
+
+        # ── Pull-model data (populated by SaveRestoreNode responses) ──────
+        # Per-channel loss cursors: channel_key → highest step we have locally.
+        self._sr_loss_cursors: Dict[str, int] = {}
+        # Pending responses waiting to be processed.
+        self._sr_response_queue: deque = deque(maxlen=256)
+        # Channel registry from the last query_channel_list response.
+        self._sr_channel_registry: List[Dict[str, Any]] = []
+        # Interval between automatic data-pull queries (seconds).
+        self._sr_poll_interval: float = 0.5
+        self._sr_last_poll_t: float = 0.0
+        # Weight-map data from SaveRestoreNode.
+        self._sr_weight_models: List[str] = []
+        self._sr_weight_active: Optional[str] = None
+        # Cache browse data from SaveRestoreNode.
+        self._sr_cache_entries: List[Dict[str, Any]] = []
+        self._sr_cache_total: int = 0
 
         # Left sidebar: button panel (top) + scrub dial (bottom).
         # Right sidebar: weight map spans from top_bar to window bottom (covers graph row).
@@ -586,8 +683,7 @@ class _TransformerStatusOpenGLViewer:
             y = 20
             for r in list(rows):
                 txt = str(r)
-                _rw = font.getlength(txt) if hasattr(font, 'getlength') else len(txt) * 6
-                draw.text((max(4, self.panel_w - 4 - int(_rw)), y), txt, fill=(230, 234, 240), font=font)
+                draw.text((4, y), txt, fill=(230, 234, 240), font=font)
                 y += 11
                 if y >= (self.panel_h - 10):
                     break
@@ -801,11 +897,20 @@ class _TransformerStatusOpenGLViewer:
         if isinstance(imgs, list) and len(imgs) == 3 and self._textures is not None:
             for i, tid in enumerate(self._textures["img"]):
                 self._upload_texture(int(tid), np.asarray(imgs[i], dtype=np.uint8))
-        self._caption = str(frame.get("caption", ""))
-        self._panel_titles = [str(x) for x in frame.get("titles", self._panel_titles)]
-        self._panel_rows = [list(r) for r in frame.get("rows", self._panel_rows)]
-        self._panel_text_dirty = True
-        self._top_bar_dirty = True
+        new_caption = str(frame.get("caption", ""))
+        new_titles = [str(x) for x in frame.get("titles", self._panel_titles)]
+        new_rows = [list(r) for r in frame.get("rows", self._panel_rows)]
+        if new_titles != self._panel_titles or new_rows != self._panel_rows:
+            self._panel_titles = new_titles
+            self._panel_rows = new_rows
+            self._panel_text_dirty = True
+        if new_caption != self._caption:
+            self._caption = new_caption
+            self._top_bar_dirty = True
+        new_loss_rows = list(frame.get("loss_rows", self._loss_display_rows))
+        if new_loss_rows != self._loss_display_rows:
+            self._loss_display_rows = new_loss_rows
+            self._sidebar_dirty = True
         self._last_displayed_frame = frame
 
     def set_training_graph_worker_hello(self, payload: Dict[str, Any]) -> None:
@@ -1030,6 +1135,35 @@ class _TransformerStatusOpenGLViewer:
                           fill=(80, 100, 80), font=font)
                 draw.text((4, y_info + 12), "wheel \u2191\u2193 to scrub back",
                           fill=(60, 70, 60), font=font)
+            # Loss display below scrub status
+            y_loss = y_info + 40
+            if self._loss_display_rows:
+                draw.line([(4, y_loss - 4), (W - 4, y_loss - 4)], fill=(50, 56, 68), width=1)
+                for lr in self._loss_display_rows:
+                    draw.text((4, y_loss), str(lr), fill=(220, 180, 90), font=font)
+                    y_loss += 12
+
+            # Cache summary below loss display
+            if self._sr_cache_total > 0:
+                y_cache = y_loss + 4
+                if y_cache < H - 24:
+                    draw.line([(4, y_cache - 2), (W - 4, y_cache - 2)], fill=(50, 56, 68), width=1)
+                    draw.text((4, y_cache), f"cache: {self._sr_cache_total} entries",
+                              fill=(100, 180, 180), font=font)
+                    y_cache += 12
+                    for ce in self._sr_cache_entries[:5]:
+                        if y_cache >= H - 12:
+                            break
+                        ck = ce.get("channel_key", "?")
+                        rnd = ce.get("round_id", 0)
+                        draw.text((4, y_cache), f"  {ck} r{rnd}",
+                                  fill=(80, 140, 140), font=font)
+                        y_cache += 10
+                    remaining = max(0, self._sr_cache_total - 5)
+                    if remaining > 0 and y_cache < H - 12:
+                        draw.text((4, y_cache), f"  +{remaining} more",
+                                  fill=(60, 110, 110), font=font)
+
             out = np.asarray(im, dtype=np.uint8)
         except Exception:
             pass
@@ -1253,7 +1387,7 @@ class _TransformerStatusOpenGLViewer:
                     else:
                         self._weight_snapshot_deque.append({"weight_map": _wmap.copy()})
                 _sst = _res.get("states")
-                if _sst:
+                if _sst is not None:
                     # Delete the file for the entry about to be evicted before it's gone.
                     _sd_maxlen = self._weight_state_sparse_deque.maxlen
                     if _sd_maxlen is not None and len(self._weight_state_sparse_deque) >= _sd_maxlen:
@@ -1264,7 +1398,8 @@ class _TransformerStatusOpenGLViewer:
                                 Path(_evict_file).unlink(missing_ok=True)
                             except Exception:
                                 pass
-                    self._prev_weight_snap = _sst
+                    if _sst:
+                        self._prev_weight_snap = _sst
                     # Record loss-count position for the graph marker.
                     self._disk_save_loss_counts.append(
                         {sid: len(dq) for sid, dq in self._loss_graph_data.items()}
@@ -1301,24 +1436,23 @@ class _TransformerStatusOpenGLViewer:
                             }
                         except Exception:
                             pass
-                    if _sparse:
-                        _box["states"] = _sparse
-                        # Log params whose weights shifted by more than threshold.
-                        _thresh = _self._weight_delta_threshold
-                        for _mn, _msd in _sparse.items():
-                            _prev_msd = _prev.get(_mn)
-                            if _prev_msd is None:
+                    _box["states"] = _sparse
+                    # Log params whose weights shifted by more than threshold.
+                    _thresh = _self._weight_delta_threshold
+                    for _mn, _msd in _sparse.items():
+                        _prev_msd = _prev.get(_mn)
+                        if _prev_msd is None:
+                            continue
+                        for _pkey, _ptens in _msd.items():
+                            _pprev = _prev_msd.get(_pkey)
+                            if _pprev is None or _pprev.shape != _ptens.shape:
                                 continue
-                            for _pkey, _ptens in _msd.items():
-                                _pprev = _prev_msd.get(_pkey)
-                                if _pprev is None or _pprev.shape != _ptens.shape:
-                                    continue
-                                try:
-                                    _d = (_ptens.float() - _pprev.float()).abs().max().item()
-                                    if _d > _thresh:
-                                        print(f"[weight_delta] {_mn}.{_pkey}: max|\u0394|={_d:.4f}")
-                                except Exception:
-                                    pass
+                            try:
+                                _d = (_ptens.float() - _pprev.float()).abs().max().item()
+                                if _d > _thresh:
+                                    print(f"[weight_delta] {_mn}.{_pkey}: max|\u0394|={_d:.4f}")
+                            except Exception:
+                                pass
                 self._weight_snap_result = _result_box
                 self._weight_snap_thread = threading.Thread(
                     target=_weight_snap_worker, daemon=True)
@@ -1471,12 +1605,22 @@ class _TransformerStatusOpenGLViewer:
                                         self._on_restore_state(int(self._scrub_offset))
                                     except Exception:
                                         pass
-                                    self._scrub_offset = 0
-                                    self._weight_snapshot_deque.clear()
-                                    self._played_frames_deque.clear()
-                                    self._loss_count_at_snap_deque.clear()
-                                    self._sidebar_dirty = True
-                                    self._present(force=True)
+                                # Also send via IPC for remote restore
+                                srv = self._ipc_server_ref
+                                if srv is not None and getattr(srv, "has_connection", False):
+                                    try:
+                                        srv.send_query({
+                                            "type": "restore",
+                                            "offset": int(self._scrub_offset),
+                                        })
+                                    except Exception:
+                                        pass
+                                self._scrub_offset = 0
+                                self._weight_snapshot_deque.clear()
+                                self._played_frames_deque.clear()
+                                self._loss_count_at_snap_deque.clear()
+                                self._sidebar_dirty = True
+                                self._present(force=True)
                                 continue
                         # Top-bar toggle controls.
                         if self._handle_click(xi, yi):
@@ -1491,6 +1635,7 @@ class _TransformerStatusOpenGLViewer:
         if not self._ready:
             return
         self._poll_events()
+        self._sr_poll_data()
         self._present(force=False)
 
     def notify_pipeline_checkpoint_saved(self) -> None:
@@ -1595,6 +1740,157 @@ class _TransformerStatusOpenGLViewer:
         self._loss_graph_data[sid].append(v if math.isfinite(v) else float("nan"))
         self._loss_graph_ts[sid].append(float(ts) if float(ts) > 0.0 else time.time())
         self._graph_dirty = True
+
+    # ── Pull-model handlers (SaveRestoreNode IPC integration) ──────────
+
+    def _on_sr_notification(self, msg: dict) -> None:
+        """Handle a lightweight notification from the SaveRestoreNode.
+
+        Notifications tell us *new data is available* without pushing the
+        data itself.  We queue a query to pull the actual values.
+        """
+        t = msg.get("type", "")
+        if t == "notify_new_loss":
+            ck = msg.get("channel_key", "")
+            remote_len = int(msg.get("length", 0))
+            local_cursor = self._sr_loss_cursors.get(ck, 0)
+            if remote_len > local_cursor:
+                # New data available — we'll pull it on the next _sr_poll cycle.
+                self._graph_dirty = True
+        elif t == "notify_new_result":
+            # Mark that a new result is available for the given channel.
+            pass  # Next poll will pull it
+        elif t == "notify_checkpoint":
+            # Checkpoint marker — record it for the gold marker on the graph.
+            self.notify_pipeline_checkpoint_saved()
+        elif t == "notify_weight_map":
+            # Weight map updated — request fresh image on next poll.
+            self._sidebar_dirty = True
+
+    def _on_sr_response(self, msg: dict) -> None:
+        """Handle a response to one of our queries from the SaveRestoreNode."""
+        t = msg.get("type", "")
+
+        if t == "resp_channel_list":
+            self._sr_channel_registry = msg.get("channels", [])
+
+        elif t == "resp_loss_history":
+            ck = msg.get("channel_key", "")
+            records = msg.get("records", [])
+            if records and self.graph_h > 0:
+                # Merge into local loss graph data (stage-id indexed for
+                # backward compat; channel key → integer index mapping.)
+                sid = self._sr_channel_to_sid(ck)
+                if sid not in self._loss_graph_data:
+                    self._loss_graph_data[sid] = deque(maxlen=100_000)
+                    self._loss_graph_ts[sid] = deque(maxlen=100_000)
+                for rec in records:
+                    v = float(rec.get("loss", 0.0))
+                    self._loss_graph_data[sid].append(
+                        v if math.isfinite(v) else float("nan")
+                    )
+                    self._loss_graph_ts[sid].append(float(rec.get("ts", 0.0)))
+                # Update cursor so we only pull new records next time
+                if records:
+                    self._sr_loss_cursors[ck] = int(records[-1].get("step", 0)) + 1
+                self._graph_dirty = True
+
+        elif t == "resp_latest_result":
+            ck = msg.get("channel_key", "")
+            result = msg.get("result")
+            if result is not None:
+                # Turn the latest result into a displayable frame.
+                images = result.get("images")
+                if images is not None and isinstance(images, (list, np.ndarray)):
+                    frame = {
+                        "images": images if isinstance(images, list) else [images],
+                        "caption": result.get("caption", ck),
+                        "titles": result.get("titles", [ck]),
+                        "rows": result.get("rows", [[]]),
+                        "losses": {},
+                    }
+                    self.enqueue_frame(frame)
+
+        elif t == "resp_weight_map":
+            wmap = msg.get("map")
+            if wmap is not None:
+                # Store the weight map RGB for right-panel rendering
+                try:
+                    rgb_list = wmap.get("rgb")
+                    if rgb_list is not None:
+                        rgb_arr = np.array(rgb_list, dtype=np.uint8)
+                        self._weight_map_rgb = rgb_arr
+                        self._sidebar_dirty = True
+                except Exception:
+                    pass
+            # Store model names for weight model selector
+            self._sr_weight_models = msg.get("models", [])
+            self._sr_weight_active = msg.get("active")
+
+        elif t == "resp_cache_browse":
+            self._sr_cache_entries = msg.get("entries", [])
+            self._sr_cache_total = int(msg.get("total", 0))
+
+    def _sr_channel_to_sid(self, channel_key: str) -> int:
+        """Map a channel key string to a stable integer for graph data keying.
+
+        Legacy stage IDs 0-5 are preserved for known stage names.
+        New channels get incrementing IDs starting at 100.
+        """
+        _REV = {v: k for k, v in _LOSS_STAGE_NAMES.items()}
+        base = channel_key.split("|")[0] if "|" in channel_key else channel_key
+        if base in _REV:
+            return _REV[base]
+        # Assign a stable integer by hashing the channel key into the 100+ range
+        if not hasattr(self, "_sr_sid_map"):
+            self._sr_sid_map: Dict[str, int] = {}
+            self._sr_sid_next: int = 100
+        if channel_key not in self._sr_sid_map:
+            self._sr_sid_map[channel_key] = self._sr_sid_next
+            self._sr_sid_next += 1
+        return self._sr_sid_map[channel_key]
+
+    def _sr_poll_data(self) -> None:
+        """Periodically request fresh data from the SaveRestoreNode.
+
+        Called from the main pump() loop.  Sends queries over IPC via the
+        IPC server's send_query method.  Does nothing if no IPC server is
+        attached.
+        """
+        now = time.time()
+        if now - self._sr_last_poll_t < self._sr_poll_interval:
+            return
+        self._sr_last_poll_t = now
+
+        srv = self._ipc_server_ref
+        if srv is None or not getattr(srv, "has_connection", False):
+            return
+
+        # Request channel list to discover new channels
+        srv.send_query({"type": "query_channel_list"})
+
+        # Pull loss history for each known channel, only new records
+        for ch_info in self._sr_channel_registry:
+            ck = ch_info.get("key", "")
+            if ch_info.get("has_loss"):
+                cursor = self._sr_loss_cursors.get(ck, 0)
+                srv.send_query({
+                    "type": "query_loss_history",
+                    "channel_key": ck,
+                    "from_step": cursor,
+                })
+            # Pull latest result for display
+            if ch_info.get("has_result"):
+                srv.send_query({
+                    "type": "query_latest_result",
+                    "channel_key": ck,
+                })
+
+        # Request weight map for right-panel display
+        srv.send_query({"type": "query_weight_map"})
+
+        # Request cache summary for browsing
+        srv.send_query({"type": "query_cache_browse", "offset": 0, "limit": 50})
 
     def _render_loss_graph(self) -> np.ndarray:
         try:
@@ -1719,7 +2015,9 @@ class _TransformerStatusOpenGLViewer:
             n = len(vals)
             if n == 0:
                 continue
-            color = _LOSS_STAGE_COLORS.get(sid, (200, 200, 200))
+            _sorted_sids = sorted(self._loss_graph_data.keys())
+            _sid_idx = _sorted_sids.index(sid) if sid in _sorted_sids else sid
+            color = _LOSS_STAGE_COLORS_LEGACY.get(sid, _channel_color(_sid_idx, len(_sorted_sids)))
 
             # Downsample to plot_w buckets via mean to avoid overdraw
             if n > plot_w:
@@ -1798,11 +2096,16 @@ class _TransformerStatusOpenGLViewer:
 
         # Legend (horizontal, top of graph)
         lx = mx0
-        for sid in sorted(_LOSS_STAGE_COLORS.keys()):
-            if sid not in self._loss_graph_data or len(self._loss_graph_data[sid]) == 0:
+        _legend_sids = sorted(self._loss_graph_data.keys())
+        # Build reverse map: sid → channel_key for dynamic (100+) channels
+        _sid_to_ck: Dict[int, str] = {}
+        if hasattr(self, "_sr_sid_map"):
+            _sid_to_ck = {v: k for k, v in self._sr_sid_map.items()}
+        for _leg_idx, sid in enumerate(_legend_sids):
+            if len(self._loss_graph_data[sid]) == 0:
                 continue
-            color = _LOSS_STAGE_COLORS[sid]
-            name = _LOSS_STAGE_NAMES.get(sid, f"s{sid}")
+            color = _LOSS_STAGE_COLORS_LEGACY.get(sid, _channel_color(_leg_idx, len(_legend_sids)))
+            name = _LOSS_STAGE_NAMES.get(sid, _sid_to_ck.get(sid, f"ch{sid}"))
             dq = self._loss_graph_data[sid]
             last_v = next((v for v in reversed(dq) if math.isfinite(v)), float("nan"))
             label = f"{name}={last_v:.4f}" if math.isfinite(last_v) else name
@@ -2222,6 +2525,63 @@ class ViewerIPCServer:
             v._loss_count_at_snap_deque.append(msg.get("loss_counts"))
         elif t == "exit":
             print("[viewer-ipc] training process exited cleanly", flush=True)
+        # -- Pull-model: notifications from SaveRestoreNode ----------------
+        elif t is not None and t.startswith("notify_"):
+            handler = getattr(v, "_on_sr_notification", None)
+            if callable(handler):
+                try:
+                    handler(msg)
+                except Exception:
+                    pass
+        # -- Pull-model: responses to our queries --------------------------
+        elif t is not None and t.startswith("resp_"):
+            handler = getattr(v, "_on_sr_response", None)
+            if callable(handler):
+                try:
+                    handler(msg)
+                except Exception:
+                    pass
+
+    # -- Pull-model: send queries to the training side ---------------------
+
+    def send_query(self, query: dict) -> None:
+        """Send a query_* message to the training process.
+
+        The response will arrive asynchronously via poll() → _dispatch()
+        and be routed to the viewer's _on_sr_response handler.
+        """
+        with self._lock:
+            conn = self._conn
+        if conn is None:
+            return
+        try:
+            conn.send(query)
+        except (EOFError, OSError):
+            pass
+        except Exception:
+            pass
+
+    def query_channel_list(self) -> None:
+        self.send_query({"type": "query_channel_list"})
+
+    def query_loss_history(self, channel_key: str, from_step: int = 0) -> None:
+        self.send_query({
+            "type": "query_loss_history",
+            "channel_key": str(channel_key),
+            "from_step": int(from_step),
+        })
+
+    def query_latest_result(self, channel_key: str) -> None:
+        self.send_query({
+            "type": "query_latest_result",
+            "channel_key": str(channel_key),
+        })
+
+    def query_tm_summary(self) -> None:
+        self.send_query({"type": "query_tm_summary"})
+
+    def query_checkpoint_info(self) -> None:
+        self.send_query({"type": "query_checkpoint_info"})
 
     def stop(self) -> None:
         self._stopped = True
@@ -2276,6 +2636,10 @@ class ViewerIPCProxy:
         self._connected_once = False
         self._connection_lost = False
         self._on_restore: Optional[Callable] = None
+
+        # Reference to SaveRestoreNode for pull-model query routing.
+        # Set via set_save_restore_node() after construction.
+        self._save_restore_node: Optional[Any] = None
 
         # Stub attributes that pipeline code may touch
         self._weight_snap_stride = 128
@@ -2387,6 +2751,9 @@ class ViewerIPCProxy:
                             self._on_restore(int(msg.get("offset", 0)))
                         except Exception:
                             pass
+                elif t is not None and t.startswith("query_"):
+                    # Pull-model: route query to SaveRestoreNode, send response
+                    self._handle_gui_query(msg)
         except (EOFError, OSError):
             self._connection_lost = True
             self.enabled = False
@@ -2394,6 +2761,29 @@ class ViewerIPCProxy:
             pass
 
     # ── public API (mirrors _TransformerStatusOpenGLViewer) ───────────────
+
+    def set_save_restore_node(self, node: Any) -> None:
+        """Inject the SaveRestoreNode reference for pull-model query routing."""
+        self._save_restore_node = node
+
+    def _handle_gui_query(self, query: dict) -> None:
+        """Route a query_* message from the GUI to the SaveRestoreNode."""
+        node = self._save_restore_node
+        if node is None:
+            return
+        handler = getattr(node, "handle_query", None)
+        if not callable(handler):
+            return
+        try:
+            response = handler(query)
+            if response is not None:
+                self._send(response)
+        except Exception as exc:
+            print(f"[viewer-ipc] query handler error: {exc}", flush=True)
+
+    def send_notification(self, notification: dict) -> None:
+        """Send a lightweight notify_* message to the GUI."""
+        self._send(notification)
 
     def pump(self):
         self._drain_status()

@@ -143,6 +143,9 @@ class BuildGANNode(PipelineNode):
 
     node_id = "build_gan"
     description = "Instantiate ConditionalBitPlaneGenerator + Discriminator"
+    runtime_object_type = "builder"
+    runtime_faculty = "build"
+    gpu_models = ["generator", "discriminator"]
 
     def __init__(self, cfg: GeneratorConfig) -> None:
         self.cfg = cfg

@@ -1271,24 +1271,39 @@ def _evaluate_program_guard(
     return any(edge.is_active(ctx) for edge in matching)
 
 
-def _node_frame_hints(node_id: str) -> List[str]:
-    if node_id == "data_node":
-        return ["class_names", "semantic_term_to_idx", "symbol_pool", "label_embedding_bank"]
-    if "pregestation" in node_id or node_id == "stage_0_pregestation":
-        return ["classifier", "gate_classifier", "pregestation_loader", "pregestation_eval_loader", "gate_pregestation"]
-    if "gestation" in node_id or node_id == "stage_1_gestation":
-        return ["classifier", "gate_classifier", "gestation_loader", "gestation_eval_loader", "gate_pregestation", "gate_gestation"]
-    if "berkeley" in node_id or node_id == "stage_c_lora" or node_id == "stage_fake_feedback":
-        return ["classifier", "gate_classifier", "berkeley_refresh_loader", "payload_validation_loader", "payload_bank", "gate_gestation", "gate_berkeley"]
-    if "transformer" in node_id or node_id == "config_search":
-        return ["transformer", "classifier", "payload_bank", "gate_berkeley", "gate_transformer"]
-    if "generator" in node_id or "gan" in node_id:
-        return ["generator", "discriminator", "payload_bank", "payload_conditions", "gate_transformer", "gate_generator"]
-    if "wave" in node_id:
-        return ["wave_classifier", "transformer", "gate_transformer", "gate_wave"]
-    if node_id in {"sync_gate_replica", "checkpoint_save"}:
-        return ["classifier", "gate_classifier", "gate_berkeley", "gate_transformer", "gate_generator", "gate_wave"]
+NODE_FRAME_HINT_TABLE: List[tuple] = [
+    # (match_type, match_value, hints)
+    # match_type: "exact" = node_id ==, "contains" = substring in node_id, "in_set" = node_id in set
+    ("exact", "data_node", ["class_names", "semantic_term_to_idx", "symbol_pool", "label_embedding_bank"]),
+    ("contains", "pregestation", ["classifier", "gate_classifier", "pregestation_loader", "pregestation_eval_loader", "gate_pregestation"]),
+    ("exact", "stage_0_pregestation", ["classifier", "gate_classifier", "pregestation_loader", "pregestation_eval_loader", "gate_pregestation"]),
+    ("contains", "gestation", ["classifier", "gate_classifier", "gestation_loader", "gestation_eval_loader", "gate_pregestation", "gate_gestation"]),
+    ("exact", "stage_1_gestation", ["classifier", "gate_classifier", "gestation_loader", "gestation_eval_loader", "gate_pregestation", "gate_gestation"]),
+    ("contains", "berkeley", ["classifier", "gate_classifier", "berkeley_refresh_loader", "payload_validation_loader", "payload_bank", "gate_gestation", "gate_berkeley"]),
+    ("in_set", {"stage_c_lora", "stage_fake_feedback"}, ["classifier", "gate_classifier", "berkeley_refresh_loader", "payload_validation_loader", "payload_bank", "gate_gestation", "gate_berkeley"]),
+    ("contains", "transformer", ["transformer", "classifier", "payload_bank", "gate_berkeley", "gate_transformer"]),
+    ("exact", "config_search", ["transformer", "classifier", "payload_bank", "gate_berkeley", "gate_transformer"]),
+    ("contains", "generator", ["generator", "discriminator", "payload_bank", "payload_conditions", "gate_transformer", "gate_generator"]),
+    ("contains", "gan", ["generator", "discriminator", "payload_bank", "payload_conditions", "gate_transformer", "gate_generator"]),
+    ("contains", "wave", ["wave_classifier", "transformer", "gate_transformer", "gate_wave"]),
+    ("in_set", {"sync_gate_replica", "checkpoint_save", "viewer_ipc"}, ["classifier", "gate_classifier", "gate_berkeley", "gate_transformer", "gate_generator", "gate_wave"]),
+]
+
+
+def _resolve_frame_hints(node_id: str) -> List[str]:
+    """Look up frame-hint resources for *node_id* from :data:`NODE_FRAME_HINT_TABLE`."""
+    for match_type, match_value, hints in NODE_FRAME_HINT_TABLE:
+        if match_type == "exact" and node_id == match_value:
+            return list(hints)
+        if match_type == "contains" and match_value in node_id:
+            return list(hints)
+        if match_type == "in_set" and node_id in match_value:
+            return list(hints)
     return []
+
+
+def _node_frame_hints(node_id: str) -> List[str]:
+    return _resolve_frame_hints(node_id)
 
 
 def _symbolic_attr_token(ctx: "PipelineContext", attr: str) -> str:  # noqa: F821

@@ -111,6 +111,8 @@ class PregestationEvalNode(PipelineNode):
 
     node_id = "gate_0_pregestation_eval"
     description = "Gate 0 Eval: pre-gestation validation loss"
+    runtime_object_type = "evaluator"
+    runtime_faculty = "gate"
     gpu_models = ["classifier"]
 
     def __init__(self, cfg: Any) -> None:
@@ -148,6 +150,8 @@ class GestationEvalNode(GatedNode):
 
     node_id = "gate_1_gestation_eval"
     description = "Gate 1 Eval: gestation validation loss"
+    runtime_object_type = "evaluator"
+    runtime_faculty = "gate"
     required_gates = ["gate_pregestation"]
     gpu_models = ["classifier"]
 
@@ -220,6 +224,8 @@ class BerkeleyGateNode(GatedNode):
 
     node_id = "gate_berkeley"
     description = "Gate 2 Eval: semantic classifier confidence + macro-F1"
+    runtime_object_type = "evaluator"
+    runtime_faculty = "gate"
     required_gates = ["gate_pregestation", "gate_gestation"]
     gpu_models = ["classifier"]
 
@@ -316,6 +322,8 @@ class TransformerGateNode(GatedNode):
 
     node_id = "gate_transformer"
     description = "Gate R Eval: transformer feature score + entropy"
+    runtime_object_type = "evaluator"
+    runtime_faculty = "gate"
     required_gates = ["gate_pregestation", "gate_gestation"]
     gpu_models = ["classifier"]
 
@@ -391,6 +399,8 @@ class GeneratorGateNode(GatedNode):
 
     node_id = "gate_generator"
     description = "Gate G Eval: generator feature score"
+    runtime_object_type = "evaluator"
+    runtime_faculty = "gate"
     required_gates = ["gate_pregestation", "gate_gestation", "gate_berkeley"]
     gpu_models = ["generator", "classifier"]
 
@@ -455,6 +465,8 @@ class WaveGateNode(GatedNode):
 
     node_id = "gate_wave"
     description = "Gate W Eval: wave entropy + feature score feedback"
+    runtime_object_type = "evaluator"
+    runtime_faculty = "gate"
     required_gates = ["gate_pregestation", "gate_gestation", "gate_transformer"]
     gpu_models = ["classifier"]
 
@@ -514,6 +526,8 @@ class CheckpointSaveNode(PipelineNode):
 
     node_id = "checkpoint_save"
     description = "Save pipeline checkpoint to disk"
+    runtime_object_type = "service"
+    runtime_faculty = "persistence"
 
     def __init__(self, save_every_n_rounds: int = 1) -> None:
         self.save_every_n_rounds = max(1, int(save_every_n_rounds))

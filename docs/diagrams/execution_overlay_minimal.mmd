@@ -27,10 +27,12 @@ flowchart TD
     gate_generator["Generator Gate"]
     gate_wave["Wave Gate"]
     sync_gate_replica["Sync Gate Replica"]
-    checkpoint_save["Checkpoint Save"]
+    checkpoint_save["Save Restore"]
+    viewer_ipc["Viewer IPC"]
     decision_004_stage_w_wave_classifier{"Wave stage ready?"}
     decision_007_gate_wave{"Wave stage ready?"}
     decision_010_build_gan{"GAN mode?"}
+    decision_014_build_flashcard_rows{"Gate 2 passed?"}
     decision_016_stage_1_gestation{"Gate 0 passed?"}
     decision_017_gate_1_gestation_eval{"Gate 0 passed?"}
     decision_018_stage_2_berkeley{"Gate 1 passed?"}
@@ -78,6 +80,7 @@ flowchart TD
     gate_transformer --> sync_gate_replica
     gate_berkeley --> sync_gate_replica
     sync_gate_replica --> checkpoint_save
+    checkpoint_save --> viewer_ipc
     wave_pool --> init_vocab
     init_vocab --> build_wave_classifier
     build_wave_classifier --> build_classifier
@@ -97,7 +100,9 @@ flowchart TD
     build_gan --> build_label_embedding
     build_label_embedding --> data_node
     data_node --> stage_0_pregestation
-    stage_0_pregestation --> build_flashcard_rows
+    stage_0_pregestation --> decision_014_build_flashcard_rows
+    decision_014_build_flashcard_rows --> build_flashcard_rows
+    decision_014_build_flashcard_rows --> gate_0_pregestation_eval
     build_flashcard_rows --> gate_0_pregestation_eval
     gate_0_pregestation_eval --> decision_016_stage_1_gestation
     decision_016_stage_1_gestation --> stage_1_gestation
@@ -131,3 +136,4 @@ flowchart TD
     decision_026_gate_generator --> gate_generator
     decision_026_gate_generator --> checkpoint_save
     gate_generator --> checkpoint_save
+    checkpoint_save --> viewer_ipc

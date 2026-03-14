@@ -27,7 +27,8 @@ flowchart TD
     gate_generator["Generator Gate"]
     gate_wave["Wave Gate"]
     sync_gate_replica["Sync Gate Replica"]
-    checkpoint_save["Checkpoint Save"]
+    checkpoint_save["Save Restore"]
+    viewer_ipc["Viewer IPC"]
 
     wave_pool -- "startup | schedule.bootstrap" --> init_vocab
     init_vocab -- "startup | schedule.bootstrap" --> build_classifier
@@ -64,6 +65,7 @@ flowchart TD
     gate_transformer -- "end_of_round | schedule.finalize" --> sync_gate_replica
     gate_berkeley -- "end_of_round | schedule.finalize" --> sync_gate_replica
     sync_gate_replica -- "end_of_round | schedule.finalize" --> checkpoint_save
+    checkpoint_save -- "end_of_round | schedule.finalize" --> viewer_ipc
 
     linkStyle 0 stroke:#2A9D8F,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
     linkStyle 1 stroke:#2A9D8F,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
@@ -100,3 +102,4 @@ flowchart TD
     linkStyle 32 stroke:#2B9348,stroke-width:3px,opacity:0.9,stroke-dasharray:4 2;
     linkStyle 33 stroke:#2B9348,stroke-width:3px,opacity:0.9,stroke-dasharray:4 2;
     linkStyle 34 stroke:#2B9348,stroke-width:3px,opacity:0.9,stroke-dasharray:4 2;
+    linkStyle 35 stroke:#2B9348,stroke-width:3px,opacity:0.9,stroke-dasharray:4 2;

@@ -142,8 +142,9 @@ from pipeline.nodes.gate_nodes import (
     GeneratorGateNode,
     WaveGateConfig,
     WaveGateNode,
-    CheckpointSaveNode,
 )
+from pipeline.nodes.save_restore_node import SaveRestoreNode
+from pipeline.nodes.viewer_ipc_node import ViewerIPCNode
 
 
 # ---------------------------------------------------------------------------
@@ -399,7 +400,7 @@ def _node_group_id(node_id: str) -> str:
         return "bootstrap"
     if node_id.startswith("gate_"):
         return "gates"
-    if node_id in {"sync_gate_replica", "checkpoint_save"}:
+    if node_id in {"sync_gate_replica", "checkpoint_save", "viewer_ipc"}:
         return "housekeeping"
     if node_id.endswith("_data") or node_id in {"data_node", "berkeley_payload", "payload_validation_data"}:
         return "data"
@@ -435,7 +436,7 @@ def _node_archetype(node_id: str) -> str:
         return "seed"
     if node_id in {"build_symbol_pool", "build_label_embedding", "build_flashcard_rows"}:
         return "materializer"
-    if node_id in {"sync_gate_replica", "checkpoint_save"}:
+    if node_id in {"sync_gate_replica", "checkpoint_save", "viewer_ipc"}:
         return "housekeeping"
     return "node"
 
@@ -544,6 +545,8 @@ def _node_icon(node_id: str) -> str:
         return "checkpoint"
     if node_id == "sync_gate_replica":
         return "sync"
+    if node_id == "viewer_ipc":
+        return "ipc"
     return "node"
 
 
@@ -579,6 +582,8 @@ def _node_config_id(node_id: str) -> str:
         "gate_transformer": "transformer_gate",
         "gate_generator": "generator_gate",
         "gate_wave": "wave_gate",
+        "checkpoint_save": "checkpoint",
+        "viewer_ipc": "viewer_ipc",
     }
     return mapping.get(node_id, "")
 
@@ -1258,7 +1263,8 @@ def build_pipeline_graph(
 
     # Housekeeping
     g.add_node(SyncGateReplicaNode(classifier_cfg))
-    g.add_node(CheckpointSaveNode(save_every_n_rounds))
+    g.add_node(SaveRestoreNode(save_every_n_rounds))
+    g.add_node(ViewerIPCNode())
 
     # ---------------------------------------------------------------
     # Edge sequences  (source → target, optional condition)
@@ -1321,8 +1327,10 @@ def build_pipeline_graph(
                condition_id=_CONDITION_ID_ALL_GATES,
                on_traverse=_data_node.provide_payload)
 
-    # Flashcard: data_node provides ctx.payload_bank (optional, always offered)
+    # Flashcard: data_node provides ctx.payload_bank (after all gates pass)
     g.add_edge("data_node", "build_flashcard_rows",
+               condition=_all_gates_passed,
+               condition_id=_CONDITION_ID_ALL_GATES,
                label="provides:payload_images",
                on_traverse=_data_node.provide_payload)
 
@@ -1375,6 +1383,7 @@ def build_pipeline_graph(
     g.add_edge("gate_transformer", "sync_gate_replica", label="end_of_round")
     g.add_edge("gate_berkeley", "sync_gate_replica", label="end_of_round")
     g.add_edge("sync_gate_replica", "checkpoint_save", label="end_of_round")
+    g.add_edge("checkpoint_save", "viewer_ipc", label="end_of_round")
 
     _apply_execution_layer_metadata(g)
     return g
@@ -1579,6 +1588,37 @@ def run(args, output_dir: Path, initial_plan=None) -> None:
         _log(f"[orchestrator] CycleGate instantiated from IR: {_gate!r}")
 
     _send_viewer_bootstrap(ctx)
+
+    # -- Wire SaveRestoreNode into context and viewer proxy ---------------
+    _sr_node = graph.nodes.get("checkpoint_save")
+    if isinstance(_sr_node, SaveRestoreNode):
+        _sr_node.initialise(ctx)
+        ctx.save_restore_node = _sr_node
+        if ctx.viewer_proxy is not None:
+            _set_sr = getattr(ctx.viewer_proxy, "set_save_restore_node", None)
+            if callable(_set_sr):
+                _set_sr(_sr_node)
+            # Wire restore: when the GUI clicks RESTORE STATE, translate scrub
+            # offset into the round/cycle that was checkpointed there and
+            # schedule a restore on the SaveRestoreNode.
+            def _restore_from_scrub(scrub_offset: int) -> None:
+                """Convert a visual scrub offset to (round,cycle) and request restore."""
+                if _sr_node.seed_bank is not None:
+                    snap = _sr_node.seed_bank.latest()
+                    if snap is not None:
+                        _sr_node.request_restore(snap.round_id, snap.cycle)
+                        _log(f"[orchestrator] restore requested: offset={scrub_offset} "
+                             f"→ round={snap.round_id} cycle={snap.cycle}")
+            _on_restore = getattr(ctx.viewer_proxy, "_on_restore", None)
+            if _on_restore is None:
+                # IPC proxy uses _on_restore callback
+                ctx.viewer_proxy._on_restore = _restore_from_scrub
+
+    # -- Wire ViewerIPCNode -----------------------------------------------
+    _ipc_node = graph.nodes.get("viewer_ipc")
+    if isinstance(_ipc_node, ViewerIPCNode) and ctx.viewer_proxy is not None:
+        _ipc_node.wire(ctx.viewer_proxy, _sr_node if isinstance(_sr_node, SaveRestoreNode) else None)
+        _ipc_node.start_background_pump()
 
     _log(graph.summary())
 

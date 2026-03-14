@@ -19,24 +19,24 @@ Run `python update_readme_graphs.py` after changing graph layers.
 %%{init: {'theme':'base','flowchart':{'curve':'basis','htmlLabels':true}}}%%
 flowchart TD
     subgraph group_bootstrap[Bootstrap]
-        wave_pool["Wave Pool<br/>object / bootstrap / seed  [once]"]
+        wave_pool["Wave Pool<br/>data_source / bootstrap / seed  [once]"]
     end
     subgraph group_build[Build]
-        build_classifier["Build Classifier<br/>object / build / builder  [once]"]
-        config_search["Config Search<br/>object / build / node  [once]"]
-        build_transformer["Build Transformer<br/>object / build / builder  [once]"]
-        build_gan["Build GAN<br/>object / build / builder  [once]"]
-        build_wave_classifier["Build Wave Classifier<br/>object / build / builder"]
+        build_classifier["Build Classifier<br/>builder / build / builder  [once]"]
+        config_search["Config Search<br/>optimizer / build / node  [once]"]
+        build_transformer["Build Transformer<br/>builder / build / builder  [once]"]
+        build_gan["Build GAN<br/>builder / build / builder  [once]"]
+        build_wave_classifier["Build Wave Classifier<br/>builder / build / builder"]
     end
     subgraph group_vocab[Vocab]
-        init_vocab["Init Vocab<br/>object / vocab / seed  [once]"]
-        vocab_churn["Vocab Churn<br/>object / vocab / seed"]
-        build_symbol_pool["Build Symbol Pool<br/>object / vocab / builder"]
-        build_label_embedding["Build Label Embedding<br/>object / vocab / builder"]
-        build_flashcard_rows["Build Flashcard Rows<br/>object / vocab / builder"]
+        init_vocab["Init Vocab<br/>initializer / vocab / seed  [once]"]
+        vocab_churn["Vocab Churn<br/>mutator / vocab / seed"]
+        build_symbol_pool["Build Symbol Pool<br/>builder / vocab / builder"]
+        build_label_embedding["Build Label Embedding<br/>builder / vocab / builder"]
+        build_flashcard_rows["Build Flashcard Rows<br/>builder / vocab / builder"]
     end
     subgraph group_data[Data]
-        data_node["Data Authority<br/>object / data / storage_authority"]
+        data_node["Data Authority<br/>data_hub / data / storage_authority"]
     end
     subgraph group_train[Train]
         stage_0_pregestation["Pregestation Train<br/>object / train / stage  [gated]"]
@@ -49,15 +49,10 @@ flowchart TD
         stage_fake_feedback["Fake Class Feedback<br/>object / train / stage  [gated]"]
     end
     subgraph group_gates[Gates]
-        gate_0_pregestation_eval["Pregestation Eval<br/>object / gates / gate"]
-        gate_1_gestation_eval["Gestation Eval<br/>object / gates / gate  [gated]"]
-        gate_berkeley["Berkeley Gate<br/>object / gates / gate  [gated]"]
-        gate_transformer["Transformer Gate<br/>object / gates / gate  [gated]"]
-        gate_generator["Generator Gate<br/>object / gates / gate  [gated]"]
-        gate_wave["Wave Gate<br/>object / gates / gate  [gated]"]
         decision_004_stage_w_wave_classifier{"Wave stage ready?<br/>control / gates / decision"}
         decision_007_gate_wave{"Wave stage ready?<br/>control / gates / decision"}
         decision_010_build_gan{"GAN mode?<br/>control / gates / decision"}
+        decision_014_build_flashcard_rows{"Gate 2 passed?<br/>control / gates / decision"}
         decision_016_stage_1_gestation{"Gate 0 passed?<br/>control / gates / decision"}
         decision_017_gate_1_gestation_eval{"Gate 0 passed?<br/>control / gates / decision"}
         decision_018_stage_2_berkeley{"Gate 1 passed?<br/>control / gates / decision"}
@@ -70,9 +65,22 @@ flowchart TD
         decision_026_gate_generator{"Gate 2 passed?<br/>control / gates / decision"}
     end
     subgraph group_housekeeping[Housekeeping]
-        sync_gate_replica["Sync Gate Replica<br/>object / housekeeping / housekeeping"]
-        checkpoint_save["Checkpoint Save<br/>object / housekeeping / housekeeping  [periodic]"]
+        sync_gate_replica["Sync Gate Replica<br/>service / housekeeping / housekeeping"]
         program_hold(["Hold / next round<br/>control / housekeeping / hold"])
+    end
+    subgraph group_persistence[Persistence]
+        checkpoint_save["Save Restore<br/>service / persistence / housekeeping  [periodic]"]
+    end
+    subgraph group_ipc[Ipc]
+        viewer_ipc["Viewer IPC<br/>service / ipc / housekeeping"]
+    end
+    subgraph group_gate[Gate]
+        gate_0_pregestation_eval["Pregestation Eval<br/>evaluator / gate / gate"]
+        gate_1_gestation_eval["Gestation Eval<br/>evaluator / gate / gate  [gated]"]
+        gate_berkeley["Berkeley Gate<br/>evaluator / gate / gate  [gated]"]
+        gate_transformer["Transformer Gate<br/>evaluator / gate / gate  [gated]"]
+        gate_generator["Generator Gate<br/>evaluator / gate / gate  [gated]"]
+        gate_wave["Wave Gate<br/>evaluator / gate / gate  [gated]"]
     end
 
     wave_pool -- "startup" --> init_vocab
@@ -92,7 +100,7 @@ flowchart TD
     data_node -- "provides:berkeley_refresh_loader [GATE_OVERRIDE OR early_gates_passed]" --> stage_2_berkeley
     data_node -- "provides:gate_val_loader+payload_val_loader [GATE_OVERRIDE OR early_gates_passed]" --> gate_berkeley
     data_node -- "provides:payload_bank [GATE_OVERRIDE OR all_base_gates_passed]" --> stage_g_generator
-    data_node -- "provides:payload_images" --> build_flashcard_rows
+    data_node -- "provides:payload_images [GATE_OVERRIDE OR all_base_gates_passed]" --> build_flashcard_rows
     stage_0_pregestation -- "after_stage0" --> gate_0_pregestation_eval
     gate_0_pregestation_eval -- "after_gate0 [GATE_OVERRIDE OR gate_pregestation.passed]" --> stage_1_gestation
     stage_1_gestation -- "after_stage1 [GATE_OVERRIDE OR gate_pregestation.passed]" --> gate_1_gestation_eval
@@ -110,6 +118,7 @@ flowchart TD
     gate_transformer -- "end_of_round" --> sync_gate_replica
     gate_berkeley -- "end_of_round" --> sync_gate_replica
     sync_gate_replica -- "end_of_round" --> checkpoint_save
+    checkpoint_save -- "end_of_round" --> viewer_ipc
     wave_pool -- "1" --> init_vocab
     init_vocab -- "2" --> build_wave_classifier
     build_wave_classifier -- "3" --> build_classifier
@@ -129,7 +138,9 @@ flowchart TD
     build_gan -- "11" --> build_label_embedding
     build_label_embedding -- "12" --> data_node
     data_node -- "13" --> stage_0_pregestation
-    stage_0_pregestation -- "14" --> build_flashcard_rows
+    stage_0_pregestation -- "14" --> decision_014_build_flashcard_rows
+    decision_014_build_flashcard_rows -- "14.1" --> build_flashcard_rows
+    decision_014_build_flashcard_rows -- "14.0" --> gate_0_pregestation_eval
     build_flashcard_rows -- "15" --> gate_0_pregestation_eval
     gate_0_pregestation_eval -- "16" --> decision_016_stage_1_gestation
     decision_016_stage_1_gestation -- "16.1" --> stage_1_gestation
@@ -163,6 +174,7 @@ flowchart TD
     decision_026_gate_generator -- "26.1" --> gate_generator
     decision_026_gate_generator -- "26.0" --> checkpoint_save
     gate_generator -- "27" --> checkpoint_save
+    checkpoint_save -- "28" --> viewer_ipc
 
     classDef faculty_bootstrap fill:#E9F1F7,stroke:#4B6B88,color:#102A43,stroke-width:2px;
     classDef faculty_build fill:#F8EFE5,stroke:#B07219,color:#40210F,stroke-width:2px;
@@ -171,6 +183,8 @@ flowchart TD
     classDef faculty_train fill:#FFE8D6,stroke:#C05621,color:#4A1D05,stroke-width:2px;
     classDef faculty_gates fill:#FDE2E4,stroke:#C0392B,color:#4A0F13,stroke-width:2px;
     classDef faculty_housekeeping fill:#E8F5E9,stroke:#2E7D32,color:#102A12,stroke-width:2px;
+    classDef faculty_persistence fill:#EFE3FF,stroke:#7C3AED,color:#2E1065,stroke-width:2px;
+    classDef faculty_ipc fill:#DDEBFF,stroke:#2563EB,color:#0F172A,stroke-width:2px;
     classDef faculty_io fill:#DDEBFF,stroke:#2563EB,color:#0F172A,stroke-width:2px;
     classDef faculty_inference fill:#F4F1DE,stroke:#3D405B,color:#1B1F2A,stroke-width:2px;
     classDef faculty_buffer fill:#E0FBFC,stroke:#006D77,color:#00313A,stroke-width:2px;
@@ -186,8 +200,11 @@ flowchart TD
     class build_classifier,config_search,build_transformer,build_gan,build_wave_classifier faculty_build;
     class data_node faculty_data;
     class stage_0_pregestation,stage_1_gestation,stage_2_berkeley,stage_r_transformer,stage_g_generator,stage_w_wave_classifier,stage_c_lora,stage_fake_feedback faculty_train;
-    class gate_0_pregestation_eval,gate_1_gestation_eval,gate_berkeley,gate_transformer,gate_generator,gate_wave,decision_004_stage_w_wave_classifier,decision_007_gate_wave,decision_010_build_gan,decision_016_stage_1_gestation,decision_017_gate_1_gestation_eval,decision_018_stage_2_berkeley,decision_019_gate_berkeley,decision_020_stage_r_transformer,decision_021_stage_c_lora,decision_022_gate_transformer,decision_023_stage_fake_feedback,decision_024_stage_g_generator,decision_026_gate_generator faculty_gates;
-    class sync_gate_replica,checkpoint_save,program_hold faculty_housekeeping;
+    class gate_0_pregestation_eval,gate_1_gestation_eval,gate_berkeley,gate_transformer,gate_generator,gate_wave faculty_gate;
+    class sync_gate_replica,program_hold faculty_housekeeping;
+    class checkpoint_save faculty_persistence;
+    class viewer_ipc faculty_ipc;
+    class decision_004_stage_w_wave_classifier,decision_007_gate_wave,decision_010_build_gan,decision_014_build_flashcard_rows,decision_016_stage_1_gestation,decision_017_gate_1_gestation_eval,decision_018_stage_2_berkeley,decision_019_gate_berkeley,decision_020_stage_r_transformer,decision_021_stage_c_lora,decision_022_gate_transformer,decision_023_stage_fake_feedback,decision_024_stage_g_generator,decision_026_gate_generator faculty_gates;
     linkStyle 0 stroke:#2A9D8F,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
     linkStyle 1 stroke:#2A9D8F,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
     linkStyle 2 stroke:#2A9D8F,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
@@ -223,30 +240,30 @@ flowchart TD
     linkStyle 32 stroke:#2B9348,stroke-width:3px,opacity:0.9,stroke-dasharray:4 2;
     linkStyle 33 stroke:#2B9348,stroke-width:3px,opacity:0.9,stroke-dasharray:4 2;
     linkStyle 34 stroke:#2B9348,stroke-width:3px,opacity:0.9,stroke-dasharray:4 2;
-    linkStyle 35 stroke:#111111,stroke-width:3px,opacity:0.98,stroke-dasharray:0;
+    linkStyle 35 stroke:#2B9348,stroke-width:3px,opacity:0.9,stroke-dasharray:4 2;
     linkStyle 36 stroke:#111111,stroke-width:3px,opacity:0.98,stroke-dasharray:0;
     linkStyle 37 stroke:#111111,stroke-width:3px,opacity:0.98,stroke-dasharray:0;
     linkStyle 38 stroke:#111111,stroke-width:3px,opacity:0.98,stroke-dasharray:0;
     linkStyle 39 stroke:#111111,stroke-width:3px,opacity:0.98,stroke-dasharray:0;
-    linkStyle 40 stroke:#111111,stroke-width:2px,opacity:0.95,stroke-dasharray:6 3;
-    linkStyle 41 stroke:#111111,stroke-width:3px,opacity:0.98,stroke-dasharray:0;
+    linkStyle 40 stroke:#111111,stroke-width:3px,opacity:0.98,stroke-dasharray:0;
+    linkStyle 41 stroke:#111111,stroke-width:2px,opacity:0.95,stroke-dasharray:6 3;
     linkStyle 42 stroke:#111111,stroke-width:3px,opacity:0.98,stroke-dasharray:0;
     linkStyle 43 stroke:#111111,stroke-width:3px,opacity:0.98,stroke-dasharray:0;
     linkStyle 44 stroke:#111111,stroke-width:3px,opacity:0.98,stroke-dasharray:0;
-    linkStyle 45 stroke:#111111,stroke-width:2px,opacity:0.95,stroke-dasharray:6 3;
-    linkStyle 46 stroke:#111111,stroke-width:3px,opacity:0.98,stroke-dasharray:0;
+    linkStyle 45 stroke:#111111,stroke-width:3px,opacity:0.98,stroke-dasharray:0;
+    linkStyle 46 stroke:#111111,stroke-width:2px,opacity:0.95,stroke-dasharray:6 3;
     linkStyle 47 stroke:#111111,stroke-width:3px,opacity:0.98,stroke-dasharray:0;
     linkStyle 48 stroke:#111111,stroke-width:3px,opacity:0.98,stroke-dasharray:0;
     linkStyle 49 stroke:#111111,stroke-width:3px,opacity:0.98,stroke-dasharray:0;
-    linkStyle 50 stroke:#111111,stroke-width:2px,opacity:0.95,stroke-dasharray:6 3;
-    linkStyle 51 stroke:#111111,stroke-width:3px,opacity:0.98,stroke-dasharray:0;
+    linkStyle 50 stroke:#111111,stroke-width:3px,opacity:0.98,stroke-dasharray:0;
+    linkStyle 51 stroke:#111111,stroke-width:2px,opacity:0.95,stroke-dasharray:6 3;
     linkStyle 52 stroke:#111111,stroke-width:3px,opacity:0.98,stroke-dasharray:0;
     linkStyle 53 stroke:#111111,stroke-width:3px,opacity:0.98,stroke-dasharray:0;
     linkStyle 54 stroke:#111111,stroke-width:3px,opacity:0.98,stroke-dasharray:0;
     linkStyle 55 stroke:#111111,stroke-width:3px,opacity:0.98,stroke-dasharray:0;
     linkStyle 56 stroke:#111111,stroke-width:3px,opacity:0.98,stroke-dasharray:0;
-    linkStyle 57 stroke:#111111,stroke-width:3px,opacity:0.98,stroke-dasharray:0;
-    linkStyle 58 stroke:#111111,stroke-width:2px,opacity:0.95,stroke-dasharray:6 3;
+    linkStyle 57 stroke:#111111,stroke-width:2px,opacity:0.95,stroke-dasharray:6 3;
+    linkStyle 58 stroke:#111111,stroke-width:3px,opacity:0.98,stroke-dasharray:0;
     linkStyle 59 stroke:#111111,stroke-width:3px,opacity:0.98,stroke-dasharray:0;
     linkStyle 60 stroke:#111111,stroke-width:3px,opacity:0.98,stroke-dasharray:0;
     linkStyle 61 stroke:#111111,stroke-width:2px,opacity:0.95,stroke-dasharray:6 3;
@@ -273,9 +290,13 @@ flowchart TD
     linkStyle 82 stroke:#111111,stroke-width:2px,opacity:0.95,stroke-dasharray:6 3;
     linkStyle 83 stroke:#111111,stroke-width:3px,opacity:0.98,stroke-dasharray:0;
     linkStyle 84 stroke:#111111,stroke-width:3px,opacity:0.98,stroke-dasharray:0;
-    linkStyle 85 stroke:#111111,stroke-width:3px,opacity:0.98,stroke-dasharray:0;
-    linkStyle 86 stroke:#111111,stroke-width:2px,opacity:0.95,stroke-dasharray:6 3;
+    linkStyle 85 stroke:#111111,stroke-width:2px,opacity:0.95,stroke-dasharray:6 3;
+    linkStyle 86 stroke:#111111,stroke-width:3px,opacity:0.98,stroke-dasharray:0;
     linkStyle 87 stroke:#111111,stroke-width:3px,opacity:0.98,stroke-dasharray:0;
+    linkStyle 88 stroke:#111111,stroke-width:3px,opacity:0.98,stroke-dasharray:0;
+    linkStyle 89 stroke:#111111,stroke-width:2px,opacity:0.95,stroke-dasharray:6 3;
+    linkStyle 90 stroke:#111111,stroke-width:3px,opacity:0.98,stroke-dasharray:0;
+    linkStyle 91 stroke:#111111,stroke-width:3px,opacity:0.98,stroke-dasharray:0;
 ```
 
 Downloads: [PNG](docs/diagrams/execution_overlay_dense.png) | [SVG](docs/diagrams/execution_overlay_dense.svg) | [MMD](docs/diagrams/execution_overlay_dense.mmd)
@@ -288,24 +309,24 @@ The colored edges retain topology and data/reaction structure. The black numbere
 %%{init: {'theme':'base','flowchart':{'curve':'basis','htmlLabels':true}}}%%
 flowchart TD
     subgraph group_bootstrap[Bootstrap]
-        wave_pool["Wave Pool<br/>object / bootstrap / seed  [once]"]
+        wave_pool["Wave Pool<br/>data_source / bootstrap / seed  [once]"]
     end
     subgraph group_build[Build]
-        build_classifier["Build Classifier<br/>object / build / builder  [once]"]
-        config_search["Config Search<br/>object / build / node  [once]"]
-        build_transformer["Build Transformer<br/>object / build / builder  [once]"]
-        build_gan["Build GAN<br/>object / build / builder  [once]"]
-        build_wave_classifier["Build Wave Classifier<br/>object / build / builder"]
+        build_classifier["Build Classifier<br/>builder / build / builder  [once]"]
+        config_search["Config Search<br/>optimizer / build / node  [once]"]
+        build_transformer["Build Transformer<br/>builder / build / builder  [once]"]
+        build_gan["Build GAN<br/>builder / build / builder  [once]"]
+        build_wave_classifier["Build Wave Classifier<br/>builder / build / builder"]
     end
     subgraph group_vocab[Vocab]
-        init_vocab["Init Vocab<br/>object / vocab / seed  [once]"]
-        vocab_churn["Vocab Churn<br/>object / vocab / seed"]
-        build_symbol_pool["Build Symbol Pool<br/>object / vocab / builder"]
-        build_label_embedding["Build Label Embedding<br/>object / vocab / builder"]
-        build_flashcard_rows["Build Flashcard Rows<br/>object / vocab / builder"]
+        init_vocab["Init Vocab<br/>initializer / vocab / seed  [once]"]
+        vocab_churn["Vocab Churn<br/>mutator / vocab / seed"]
+        build_symbol_pool["Build Symbol Pool<br/>builder / vocab / builder"]
+        build_label_embedding["Build Label Embedding<br/>builder / vocab / builder"]
+        build_flashcard_rows["Build Flashcard Rows<br/>builder / vocab / builder"]
     end
     subgraph group_data[Data]
-        data_node["Data Authority<br/>object / data / storage_authority"]
+        data_node["Data Authority<br/>data_hub / data / storage_authority"]
     end
     subgraph group_train[Train]
         stage_0_pregestation["Pregestation Train<br/>object / train / stage  [gated]"]
@@ -317,17 +338,22 @@ flowchart TD
         stage_c_lora["LoRA Round<br/>object / train / stage  [gated]"]
         stage_fake_feedback["Fake Class Feedback<br/>object / train / stage  [gated]"]
     end
-    subgraph group_gates[Gates]
-        gate_0_pregestation_eval["Pregestation Eval<br/>object / gates / gate"]
-        gate_1_gestation_eval["Gestation Eval<br/>object / gates / gate  [gated]"]
-        gate_berkeley["Berkeley Gate<br/>object / gates / gate  [gated]"]
-        gate_transformer["Transformer Gate<br/>object / gates / gate  [gated]"]
-        gate_generator["Generator Gate<br/>object / gates / gate  [gated]"]
-        gate_wave["Wave Gate<br/>object / gates / gate  [gated]"]
-    end
     subgraph group_housekeeping[Housekeeping]
-        sync_gate_replica["Sync Gate Replica<br/>object / housekeeping / housekeeping"]
-        checkpoint_save["Checkpoint Save<br/>object / housekeeping / housekeeping  [periodic]"]
+        sync_gate_replica["Sync Gate Replica<br/>service / housekeeping / housekeeping"]
+    end
+    subgraph group_persistence[Persistence]
+        checkpoint_save["Save Restore<br/>service / persistence / housekeeping  [periodic]"]
+    end
+    subgraph group_ipc[Ipc]
+        viewer_ipc["Viewer IPC<br/>service / ipc / housekeeping"]
+    end
+    subgraph group_gate[Gate]
+        gate_0_pregestation_eval["Pregestation Eval<br/>evaluator / gate / gate"]
+        gate_1_gestation_eval["Gestation Eval<br/>evaluator / gate / gate  [gated]"]
+        gate_berkeley["Berkeley Gate<br/>evaluator / gate / gate  [gated]"]
+        gate_transformer["Transformer Gate<br/>evaluator / gate / gate  [gated]"]
+        gate_generator["Generator Gate<br/>evaluator / gate / gate  [gated]"]
+        gate_wave["Wave Gate<br/>evaluator / gate / gate  [gated]"]
     end
 
     wave_pool -- "startup" --> init_vocab
@@ -347,7 +373,7 @@ flowchart TD
     data_node -- "provides:berkeley_refresh_loader [GATE_OVERRIDE OR early_gates_passed]" --> stage_2_berkeley
     data_node -- "provides:gate_val_loader+payload_val_loader [GATE_OVERRIDE OR early_gates_passed]" --> gate_berkeley
     data_node -- "provides:payload_bank [GATE_OVERRIDE OR all_base_gates_passed]" --> stage_g_generator
-    data_node -- "provides:payload_images" --> build_flashcard_rows
+    data_node -- "provides:payload_images [GATE_OVERRIDE OR all_base_gates_passed]" --> build_flashcard_rows
     stage_0_pregestation -- "after_stage0" --> gate_0_pregestation_eval
     gate_0_pregestation_eval -- "after_gate0 [GATE_OVERRIDE OR gate_pregestation.passed]" --> stage_1_gestation
     stage_1_gestation -- "after_stage1 [GATE_OVERRIDE OR gate_pregestation.passed]" --> gate_1_gestation_eval
@@ -365,6 +391,7 @@ flowchart TD
     gate_transformer -- "end_of_round" --> sync_gate_replica
     gate_berkeley -- "end_of_round" --> sync_gate_replica
     sync_gate_replica -- "end_of_round" --> checkpoint_save
+    checkpoint_save -- "end_of_round" --> viewer_ipc
 
     classDef faculty_bootstrap fill:#E9F1F7,stroke:#4B6B88,color:#102A43,stroke-width:2px;
     classDef faculty_build fill:#F8EFE5,stroke:#B07219,color:#40210F,stroke-width:2px;
@@ -373,6 +400,8 @@ flowchart TD
     classDef faculty_train fill:#FFE8D6,stroke:#C05621,color:#4A1D05,stroke-width:2px;
     classDef faculty_gates fill:#FDE2E4,stroke:#C0392B,color:#4A0F13,stroke-width:2px;
     classDef faculty_housekeeping fill:#E8F5E9,stroke:#2E7D32,color:#102A12,stroke-width:2px;
+    classDef faculty_persistence fill:#EFE3FF,stroke:#7C3AED,color:#2E1065,stroke-width:2px;
+    classDef faculty_ipc fill:#DDEBFF,stroke:#2563EB,color:#0F172A,stroke-width:2px;
     classDef faculty_io fill:#DDEBFF,stroke:#2563EB,color:#0F172A,stroke-width:2px;
     classDef faculty_inference fill:#F4F1DE,stroke:#3D405B,color:#1B1F2A,stroke-width:2px;
     classDef faculty_buffer fill:#E0FBFC,stroke:#006D77,color:#00313A,stroke-width:2px;
@@ -388,8 +417,10 @@ flowchart TD
     class build_classifier,config_search,build_transformer,build_gan,build_wave_classifier faculty_build;
     class data_node faculty_data;
     class stage_0_pregestation,stage_1_gestation,stage_2_berkeley,stage_r_transformer,stage_g_generator,stage_w_wave_classifier,stage_c_lora,stage_fake_feedback faculty_train;
-    class gate_0_pregestation_eval,gate_1_gestation_eval,gate_berkeley,gate_transformer,gate_generator,gate_wave faculty_gates;
-    class sync_gate_replica,checkpoint_save faculty_housekeeping;
+    class gate_0_pregestation_eval,gate_1_gestation_eval,gate_berkeley,gate_transformer,gate_generator,gate_wave faculty_gate;
+    class sync_gate_replica faculty_housekeeping;
+    class checkpoint_save faculty_persistence;
+    class viewer_ipc faculty_ipc;
     linkStyle 0 stroke:#2A9D8F,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
     linkStyle 1 stroke:#2A9D8F,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
     linkStyle 2 stroke:#2A9D8F,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
@@ -425,6 +456,7 @@ flowchart TD
     linkStyle 32 stroke:#2B9348,stroke-width:3px,opacity:0.9,stroke-dasharray:4 2;
     linkStyle 33 stroke:#2B9348,stroke-width:3px,opacity:0.9,stroke-dasharray:4 2;
     linkStyle 34 stroke:#2B9348,stroke-width:3px,opacity:0.9,stroke-dasharray:4 2;
+    linkStyle 35 stroke:#2B9348,stroke-width:3px,opacity:0.9,stroke-dasharray:4 2;
 ```
 
 Downloads: [PNG](docs/diagrams/execution_dense.png) | [SVG](docs/diagrams/execution_dense.svg) | [MMD](docs/diagrams/execution_dense.mmd)
@@ -467,7 +499,8 @@ flowchart TD
     gate_generator["Generator Gate"]
     gate_wave["Wave Gate"]
     sync_gate_replica["Sync Gate Replica"]
-    checkpoint_save["Checkpoint Save"]
+    checkpoint_save["Save Restore"]
+    viewer_ipc["Viewer IPC"]
 
     wave_pool --> init_vocab
     init_vocab --> build_classifier
@@ -504,6 +537,7 @@ flowchart TD
     gate_transformer --> sync_gate_replica
     gate_berkeley --> sync_gate_replica
     sync_gate_replica --> checkpoint_save
+    checkpoint_save --> viewer_ipc
 ```
 
 Downloads: [PNG](docs/diagrams/execution_minimal.png) | [SVG](docs/diagrams/execution_minimal.svg) | [MMD](docs/diagrams/execution_minimal.mmd)
@@ -546,7 +580,8 @@ flowchart TD
     gate_generator["Generator Gate"]
     gate_wave["Wave Gate"]
     sync_gate_replica["Sync Gate Replica"]
-    checkpoint_save["Checkpoint Save"]
+    checkpoint_save["Save Restore"]
+    viewer_ipc["Viewer IPC"]
 
     wave_pool -- "startup | schedule.bootstrap" --> init_vocab
     init_vocab -- "startup | schedule.bootstrap" --> build_classifier
@@ -583,6 +618,7 @@ flowchart TD
     gate_transformer -- "end_of_round | schedule.finalize" --> sync_gate_replica
     gate_berkeley -- "end_of_round | schedule.finalize" --> sync_gate_replica
     sync_gate_replica -- "end_of_round | schedule.finalize" --> checkpoint_save
+    checkpoint_save -- "end_of_round | schedule.finalize" --> viewer_ipc
 
     linkStyle 0 stroke:#2A9D8F,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
     linkStyle 1 stroke:#2A9D8F,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
@@ -619,6 +655,7 @@ flowchart TD
     linkStyle 32 stroke:#2B9348,stroke-width:3px,opacity:0.9,stroke-dasharray:4 2;
     linkStyle 33 stroke:#2B9348,stroke-width:3px,opacity:0.9,stroke-dasharray:4 2;
     linkStyle 34 stroke:#2B9348,stroke-width:3px,opacity:0.9,stroke-dasharray:4 2;
+    linkStyle 35 stroke:#2B9348,stroke-width:3px,opacity:0.9,stroke-dasharray:4 2;
 ```
 
 Downloads: [PNG](docs/diagrams/execution_reaction.png) | [SVG](docs/diagrams/execution_reaction.svg) | [MMD](docs/diagrams/execution_reaction.mmd)
@@ -671,6 +708,8 @@ flowchart LR
     classDef faculty_train fill:#FFE8D6,stroke:#C05621,color:#4A1D05,stroke-width:2px;
     classDef faculty_gates fill:#FDE2E4,stroke:#C0392B,color:#4A0F13,stroke-width:2px;
     classDef faculty_housekeeping fill:#E8F5E9,stroke:#2E7D32,color:#102A12,stroke-width:2px;
+    classDef faculty_persistence fill:#EFE3FF,stroke:#7C3AED,color:#2E1065,stroke-width:2px;
+    classDef faculty_ipc fill:#DDEBFF,stroke:#2563EB,color:#0F172A,stroke-width:2px;
     classDef faculty_io fill:#DDEBFF,stroke:#2563EB,color:#0F172A,stroke-width:2px;
     classDef faculty_inference fill:#F4F1DE,stroke:#3D405B,color:#1B1F2A,stroke-width:2px;
     classDef faculty_buffer fill:#E0FBFC,stroke:#006D77,color:#00313A,stroke-width:2px;
@@ -793,44 +832,70 @@ Downloads: [PNG](docs/diagrams/inference_reaction.png) | [SVG](docs/diagrams/inf
 ```mermaid
 %%{init: {'theme':'base','flowchart':{'curve':'basis','htmlLabels':true}}}%%
 flowchart LR
+    subgraph group_bootstrap[Bootstrap]
+        wave_pool["Wave Pool<br/>object / bootstrap / WavePoolNode"]
+        wave_pool__should_run["Gate check<br/>object / bootstrap / gate_check"]
+        wave_pool__execute["Discover WAV files and decode to float32 streams<br/>object / bootstrap / execute"]
+    end
+    subgraph group_build[Build]
+        build_classifier["Build Classifier<br/>object / build / BuildClassifierNode"]
+        build_classifier__should_run["Gate check<br/>object / build / gate_check"]
+        build_classifier__execute["Instantiate TinyConvClassifier + optimizer<br/>object / build / execute"]
+        config_search["Config Search<br/>object / build / ConfigSearchNode"]
+        config_search__should_run["Gate check<br/>object / build / gate_check"]
+        config_search__execute["Score random RenderConfig candidates via classifier feature metric<br/>object / build / execute"]
+        build_transformer["Build Transformer<br/>object / build / BuildTransformerNode"]
+        build_transformer__should_run["Gate check<br/>object / build / gate_check"]
+        build_transformer__execute["Instantiate WavePatchTransformer + optimizer<br/>object / build / execute"]
+        build_gan["Build Gan<br/>object / build / BuildGANNode"]
+        build_gan__should_run["Gate check<br/>object / build / gate_check"]
+        build_gan__execute["Instantiate ConditionalBitPlaneGenerator + Discriminator<br/>object / build / execute"]
+        build_wave_classifier["Build Wave Classifier<br/>object / build / BuildWaveClassifierNode"]
+        build_wave_classifier__should_run["Gate check<br/>object / build / gate_check"]
+        build_wave_classifier__execute["Instantiate wave-feedback TinyConvClassifier<br/>object / build / execute"]
+    end
+    subgraph group_vocab[Vocab]
+        init_vocab["Init Vocab<br/>object / vocab / InitVocabNode"]
+        init_vocab__execute["Load and assemble initial semantic vocabulary<br/>object / vocab / execute"]
+        vocab_churn["Vocab Churn<br/>object / vocab / VocabChurnNode"]
+        vocab_churn__should_run["Gate check<br/>object / vocab / gate_check"]
+        vocab_churn__execute["Rotate extra vocab terms (churn) on schedule<br/>object / vocab / execute"]
+        build_symbol_pool["Build Symbol Pool<br/>object / vocab / BuildSymbolPoolNode"]
+        build_symbol_pool__execute["Build per-term symbol image pool<br/>object / vocab / execute"]
+        build_label_embedding["Build Label Embedding<br/>object / vocab / BuildLabelEmbeddingNode"]
+        build_label_embedding__should_run["Gate check<br/>object / vocab / gate_check"]
+        build_label_embedding__execute["Build sentence-transformer label embedding bank<br/>object / vocab / execute"]
+        build_flashcard_rows["Build Flashcard Rows<br/>object / vocab / BuildFlashcardRowsNode"]
+        build_flashcard_rows__should_run["Gate check<br/>object / vocab / gate_check"]
+        build_flashcard_rows__execute["Build per-term GAN conditioning flashcard rows<br/>object / vocab / execute"]
+    end
+    subgraph group_data[Data]
+        data_node["Data Node<br/>object / data / DataNode"]
+        data_node__image_generator["Image Generator<br/>object / data / data_prep"]
+        data_node__creation_masks["Creation Masks<br/>object / data / data_prep"]
+        data_node__distortion_masks["Distortion Masks<br/>object / data / data_prep"]
+        data_node__heuristic_eye["Heuristic Eye<br/>object / data / data_prep"]
+        data_node__mask_flatten["Mask Flatten<br/>object / data / data_prep"]
+    end
+    subgraph group_housekeeping[Housekeeping]
+        sync_gate_replica["Sync Gate Replica<br/>object / housekeeping / SyncGateReplicaNode"]
+        sync_gate_replica__should_run["Gate check<br/>object / housekeeping / gate_check"]
+        sync_gate_replica__execute["Sync frozen CPU gate_classifier from main classifier<br/>object / housekeeping / execute"]
+    end
+    subgraph group_persistence[Persistence]
+        checkpoint_save["Checkpoint Save<br/>object / persistence / SaveRestoreNode"]
+        seed_bank["Seed Bank<br/>object / persistence / state_store"]
+        training_cache["Training Material Cache<br/>object / persistence / state_store"]
+        loss_accumulator["Loss Accumulator<br/>object / persistence / metric_store"]
+        result_store["Result Store<br/>object / persistence / metric_store"]
+        weight_tracker["Weight Tracker<br/>object / persistence / diagnostic"]
+    end
+    subgraph group_ipc[Ipc]
+        viewer_ipc["Viewer Ipc<br/>object / ipc / ViewerIPCNode"]
+        viewer_ipc__should_run["Gate check<br/>object / ipc / gate_check"]
+        viewer_ipc__execute["IPC bridge to standalone GUI viewer<br/>object / ipc / execute"]
+    end
     subgraph group_other[Other]
-        wave_pool["Wave Pool<br/>object / other / WavePoolNode"]
-        wave_pool__should_run["Gate check<br/>object / other / gate_check"]
-        wave_pool__execute["Discover WAV files and decode to float32 streams<br/>object / other / execute"]
-        init_vocab["Init Vocab<br/>object / other / InitVocabNode"]
-        init_vocab__execute["Load and assemble initial semantic vocabulary<br/>object / other / execute"]
-        build_classifier["Build Classifier<br/>object / other / BuildClassifierNode"]
-        build_classifier__should_run["Gate check<br/>object / other / gate_check"]
-        build_classifier__execute["Instantiate TinyConvClassifier + optimizer<br/>object / other / execute"]
-        config_search["Config Search<br/>object / other / ConfigSearchNode"]
-        config_search__should_run["Gate check<br/>object / other / gate_check"]
-        config_search__execute["Score random RenderConfig candidates via classifier feature metric<br/>object / other / execute"]
-        build_transformer["Build Transformer<br/>object / other / BuildTransformerNode"]
-        build_transformer__should_run["Gate check<br/>object / other / gate_check"]
-        build_transformer__execute["Instantiate WavePatchTransformer + optimizer<br/>object / other / execute"]
-        build_gan["Build Gan<br/>object / other / BuildGANNode"]
-        build_gan__should_run["Gate check<br/>object / other / gate_check"]
-        build_gan__execute["Instantiate ConditionalBitPlaneGenerator + Discriminator<br/>object / other / execute"]
-        build_wave_classifier["Build Wave Classifier<br/>object / other / BuildWaveClassifierNode"]
-        build_wave_classifier__should_run["Gate check<br/>object / other / gate_check"]
-        build_wave_classifier__execute["Instantiate wave-feedback TinyConvClassifier<br/>object / other / execute"]
-        vocab_churn["Vocab Churn<br/>object / other / VocabChurnNode"]
-        vocab_churn__should_run["Gate check<br/>object / other / gate_check"]
-        vocab_churn__execute["Rotate extra vocab terms (churn) on schedule<br/>object / other / execute"]
-        build_symbol_pool["Build Symbol Pool<br/>object / other / BuildSymbolPoolNode"]
-        build_symbol_pool__execute["Build per-term symbol image pool<br/>object / other / execute"]
-        build_label_embedding["Build Label Embedding<br/>object / other / BuildLabelEmbeddingNode"]
-        build_label_embedding__should_run["Gate check<br/>object / other / gate_check"]
-        build_label_embedding__execute["Build sentence-transformer label embedding bank<br/>object / other / execute"]
-        build_flashcard_rows["Build Flashcard Rows<br/>object / other / BuildFlashcardRowsNode"]
-        build_flashcard_rows__should_run["Gate check<br/>object / other / gate_check"]
-        build_flashcard_rows__execute["Build per-term GAN conditioning flashcard rows<br/>object / other / execute"]
-        data_node["Data Node<br/>object / other / DataNode"]
-        data_node__image_generator["Image Generator<br/>object / other / data_prep"]
-        data_node__creation_masks["Creation Masks<br/>object / other / data_prep"]
-        data_node__distortion_masks["Distortion Masks<br/>object / other / data_prep"]
-        data_node__heuristic_eye["Heuristic Eye<br/>object / other / data_prep"]
-        data_node__mask_flatten["Mask Flatten<br/>object / other / data_prep"]
         stage_0_pregestation["Stage 0 Pregestation<br/>object / other / PregestationTrainNode"]
         stage_0_pregestation__batch_prepare["Prepare tensors<br/>object / other / data_prep"]
         stage_0_pregestation__forward_pass["Forward pass<br/>object / other / training_core"]
@@ -879,30 +944,26 @@ flowchart LR
         stage_fake_feedback__objective_eval["Evaluate losses<br/>object / other / training_core"]
         stage_fake_feedback__optimizer_step["Backward + optimizer step<br/>object / other / sync"]
         stage_fake_feedback__state_emit["Emit updated state<br/>object / other / io"]
-        gate_0_pregestation_eval["Gate 0 Pregestation Eval<br/>object / other / PregestationEvalNode"]
-        gate_0_pregestation_eval__should_run["Gate check<br/>object / other / gate_check"]
-        gate_0_pregestation_eval__execute["Gate 0 Eval: pre-gestation validation loss<br/>object / other / execute"]
-        gate_1_gestation_eval["Gate 1 Gestation Eval<br/>object / other / GestationEvalNode"]
-        gate_1_gestation_eval__should_run["Gate check<br/>object / other / gate_check"]
-        gate_1_gestation_eval__execute["Gate 1 Eval: gestation validation loss<br/>object / other / execute"]
-        gate_berkeley["Gate Berkeley<br/>object / other / BerkeleyGateNode"]
-        gate_berkeley__should_run["Gate check<br/>object / other / gate_check"]
-        gate_berkeley__execute["Gate 2 Eval: semantic classifier confidence + macro-F1<br/>object / other / execute"]
-        gate_transformer["Gate Transformer<br/>object / other / TransformerGateNode"]
-        gate_transformer__should_run["Gate check<br/>object / other / gate_check"]
-        gate_transformer__execute["Gate R Eval: transformer feature score + entropy<br/>object / other / execute"]
-        gate_generator["Gate Generator<br/>object / other / GeneratorGateNode"]
-        gate_generator__should_run["Gate check<br/>object / other / gate_check"]
-        gate_generator__execute["Gate G Eval: generator feature score<br/>object / other / execute"]
-        gate_wave["Gate Wave<br/>object / other / WaveGateNode"]
-        gate_wave__should_run["Gate check<br/>object / other / gate_check"]
-        gate_wave__execute["Gate W Eval: wave entropy + feature score feedback<br/>object / other / execute"]
-        sync_gate_replica["Sync Gate Replica<br/>object / other / SyncGateReplicaNode"]
-        sync_gate_replica__should_run["Gate check<br/>object / other / gate_check"]
-        sync_gate_replica__execute["Sync frozen CPU gate_classifier from main classifier<br/>object / other / execute"]
-        checkpoint_save["Checkpoint Save<br/>object / other / CheckpointSaveNode"]
-        checkpoint_save__should_run["Gate check<br/>object / other / gate_check"]
-        checkpoint_save__execute["Save pipeline checkpoint to disk<br/>object / other / execute"]
+    end
+    subgraph group_gate[Gate]
+        gate_0_pregestation_eval["Gate 0 Pregestation Eval<br/>object / gate / PregestationEvalNode"]
+        gate_0_pregestation_eval__should_run["Gate check<br/>object / gate / gate_check"]
+        gate_0_pregestation_eval__execute["Gate 0 Eval: pre-gestation validation loss<br/>object / gate / execute"]
+        gate_1_gestation_eval["Gate 1 Gestation Eval<br/>object / gate / GestationEvalNode"]
+        gate_1_gestation_eval__should_run["Gate check<br/>object / gate / gate_check"]
+        gate_1_gestation_eval__execute["Gate 1 Eval: gestation validation loss<br/>object / gate / execute"]
+        gate_berkeley["Gate Berkeley<br/>object / gate / BerkeleyGateNode"]
+        gate_berkeley__should_run["Gate check<br/>object / gate / gate_check"]
+        gate_berkeley__execute["Gate 2 Eval: semantic classifier confidence + macro-F1<br/>object / gate / execute"]
+        gate_transformer["Gate Transformer<br/>object / gate / TransformerGateNode"]
+        gate_transformer__should_run["Gate check<br/>object / gate / gate_check"]
+        gate_transformer__execute["Gate R Eval: transformer feature score + entropy<br/>object / gate / execute"]
+        gate_generator["Gate Generator<br/>object / gate / GeneratorGateNode"]
+        gate_generator__should_run["Gate check<br/>object / gate / gate_check"]
+        gate_generator__execute["Gate G Eval: generator feature score<br/>object / gate / execute"]
+        gate_wave["Gate Wave<br/>object / gate / WaveGateNode"]
+        gate_wave__should_run["Gate check<br/>object / gate / gate_check"]
+        gate_wave__execute["Gate W Eval: wave entropy + feature score feedback<br/>object / gate / execute"]
     end
 
     wave_pool -- "gate_check" --> wave_pool__should_run
@@ -984,8 +1045,13 @@ flowchart LR
     gate_wave -- "execute" --> gate_wave__execute
     sync_gate_replica -- "gate_check" --> sync_gate_replica__should_run
     sync_gate_replica -- "execute" --> sync_gate_replica__execute
-    checkpoint_save -- "gate_check" --> checkpoint_save__should_run
-    checkpoint_save -- "execute" --> checkpoint_save__execute
+    checkpoint_save -- "state_store" --> seed_bank
+    checkpoint_save -- "state_store" --> training_cache
+    checkpoint_save -- "metric_store" --> loss_accumulator
+    checkpoint_save -- "metric_store" --> result_store
+    checkpoint_save -- "diagnostic" --> weight_tracker
+    viewer_ipc -- "gate_check" --> viewer_ipc__should_run
+    viewer_ipc -- "execute" --> viewer_ipc__execute
     wave_pool -- "startup" --> init_vocab
     init_vocab -- "startup" --> build_classifier
     build_classifier -- "startup" --> config_search
@@ -1021,6 +1087,7 @@ flowchart LR
     gate_transformer -- "end_of_round" --> sync_gate_replica
     gate_berkeley -- "end_of_round" --> sync_gate_replica
     sync_gate_replica -- "end_of_round" --> checkpoint_save
+    checkpoint_save -- "end_of_round" --> viewer_ipc
 
     classDef faculty_bootstrap fill:#E9F1F7,stroke:#4B6B88,color:#102A43,stroke-width:2px;
     classDef faculty_build fill:#F8EFE5,stroke:#B07219,color:#40210F,stroke-width:2px;
@@ -1029,6 +1096,8 @@ flowchart LR
     classDef faculty_train fill:#FFE8D6,stroke:#C05621,color:#4A1D05,stroke-width:2px;
     classDef faculty_gates fill:#FDE2E4,stroke:#C0392B,color:#4A0F13,stroke-width:2px;
     classDef faculty_housekeeping fill:#E8F5E9,stroke:#2E7D32,color:#102A12,stroke-width:2px;
+    classDef faculty_persistence fill:#EFE3FF,stroke:#7C3AED,color:#2E1065,stroke-width:2px;
+    classDef faculty_ipc fill:#DDEBFF,stroke:#2563EB,color:#0F172A,stroke-width:2px;
     classDef faculty_io fill:#DDEBFF,stroke:#2563EB,color:#0F172A,stroke-width:2px;
     classDef faculty_inference fill:#F4F1DE,stroke:#3D405B,color:#1B1F2A,stroke-width:2px;
     classDef faculty_buffer fill:#E0FBFC,stroke:#006D77,color:#00313A,stroke-width:2px;
@@ -1039,7 +1108,15 @@ flowchart LR
     classDef faculty_objectives fill:#FDE2E4,stroke:#C0392B,color:#4A0F13,stroke-width:2px;
     classDef faculty_updates fill:#E8F5E9,stroke:#2E7D32,color:#102A12,stroke-width:2px;
     classDef faculty_other fill:#F3F4F6,stroke:#6B7280,color:#111827,stroke-width:2px;
-    class wave_pool,wave_pool__should_run,wave_pool__execute,init_vocab,init_vocab__execute,build_classifier,build_classifier__should_run,build_classifier__execute,config_search,config_search__should_run,config_search__execute,build_transformer,build_transformer__should_run,build_transformer__execute,build_gan,build_gan__should_run,build_gan__execute,build_wave_classifier,build_wave_classifier__should_run,build_wave_classifier__execute,vocab_churn,vocab_churn__should_run,vocab_churn__execute,build_symbol_pool,build_symbol_pool__execute,build_label_embedding,build_label_embedding__should_run,build_label_embedding__execute,build_flashcard_rows,build_flashcard_rows__should_run,build_flashcard_rows__execute,data_node,data_node__image_generator,data_node__creation_masks,data_node__distortion_masks,data_node__heuristic_eye,data_node__mask_flatten,stage_0_pregestation,stage_0_pregestation__batch_prepare,stage_0_pregestation__forward_pass,stage_0_pregestation__objective_eval,stage_0_pregestation__optimizer_step,stage_0_pregestation__state_emit,stage_1_gestation,stage_1_gestation__batch_prepare,stage_1_gestation__forward_pass,stage_1_gestation__objective_eval,stage_1_gestation__optimizer_step,stage_1_gestation__state_emit,stage_2_berkeley,stage_2_berkeley__batch_prepare,stage_2_berkeley__forward_pass,stage_2_berkeley__objective_eval,stage_2_berkeley__optimizer_step,stage_2_berkeley__state_emit,stage_r_transformer,stage_r_transformer__batch_prepare,stage_r_transformer__forward_pass,stage_r_transformer__objective_eval,stage_r_transformer__optimizer_step,stage_r_transformer__state_emit,stage_g_generator,stage_g_generator__batch_prepare,stage_g_generator__forward_pass,stage_g_generator__objective_eval,stage_g_generator__optimizer_step,stage_g_generator__state_emit,stage_w_wave_classifier,stage_w_wave_classifier__batch_prepare,stage_w_wave_classifier__forward_pass,stage_w_wave_classifier__objective_eval,stage_w_wave_classifier__optimizer_step,stage_w_wave_classifier__state_emit,stage_c_lora,stage_c_lora__batch_prepare,stage_c_lora__forward_pass,stage_c_lora__objective_eval,stage_c_lora__optimizer_step,stage_c_lora__state_emit,stage_fake_feedback,stage_fake_feedback__batch_prepare,stage_fake_feedback__forward_pass,stage_fake_feedback__objective_eval,stage_fake_feedback__optimizer_step,stage_fake_feedback__state_emit,gate_0_pregestation_eval,gate_0_pregestation_eval__should_run,gate_0_pregestation_eval__execute,gate_1_gestation_eval,gate_1_gestation_eval__should_run,gate_1_gestation_eval__execute,gate_berkeley,gate_berkeley__should_run,gate_berkeley__execute,gate_transformer,gate_transformer__should_run,gate_transformer__execute,gate_generator,gate_generator__should_run,gate_generator__execute,gate_wave,gate_wave__should_run,gate_wave__execute,sync_gate_replica,sync_gate_replica__should_run,sync_gate_replica__execute,checkpoint_save,checkpoint_save__should_run,checkpoint_save__execute faculty_other;
+    class wave_pool,wave_pool__should_run,wave_pool__execute faculty_bootstrap;
+    class init_vocab,init_vocab__execute,vocab_churn,vocab_churn__should_run,vocab_churn__execute,build_symbol_pool,build_symbol_pool__execute,build_label_embedding,build_label_embedding__should_run,build_label_embedding__execute,build_flashcard_rows,build_flashcard_rows__should_run,build_flashcard_rows__execute faculty_vocab;
+    class build_classifier,build_classifier__should_run,build_classifier__execute,config_search,config_search__should_run,config_search__execute,build_transformer,build_transformer__should_run,build_transformer__execute,build_gan,build_gan__should_run,build_gan__execute,build_wave_classifier,build_wave_classifier__should_run,build_wave_classifier__execute faculty_build;
+    class data_node,data_node__image_generator,data_node__creation_masks,data_node__distortion_masks,data_node__heuristic_eye,data_node__mask_flatten faculty_data;
+    class stage_0_pregestation,stage_0_pregestation__batch_prepare,stage_0_pregestation__forward_pass,stage_0_pregestation__objective_eval,stage_0_pregestation__optimizer_step,stage_0_pregestation__state_emit,stage_1_gestation,stage_1_gestation__batch_prepare,stage_1_gestation__forward_pass,stage_1_gestation__objective_eval,stage_1_gestation__optimizer_step,stage_1_gestation__state_emit,stage_2_berkeley,stage_2_berkeley__batch_prepare,stage_2_berkeley__forward_pass,stage_2_berkeley__objective_eval,stage_2_berkeley__optimizer_step,stage_2_berkeley__state_emit,stage_r_transformer,stage_r_transformer__batch_prepare,stage_r_transformer__forward_pass,stage_r_transformer__objective_eval,stage_r_transformer__optimizer_step,stage_r_transformer__state_emit,stage_g_generator,stage_g_generator__batch_prepare,stage_g_generator__forward_pass,stage_g_generator__objective_eval,stage_g_generator__optimizer_step,stage_g_generator__state_emit,stage_w_wave_classifier,stage_w_wave_classifier__batch_prepare,stage_w_wave_classifier__forward_pass,stage_w_wave_classifier__objective_eval,stage_w_wave_classifier__optimizer_step,stage_w_wave_classifier__state_emit,stage_c_lora,stage_c_lora__batch_prepare,stage_c_lora__forward_pass,stage_c_lora__objective_eval,stage_c_lora__optimizer_step,stage_c_lora__state_emit,stage_fake_feedback,stage_fake_feedback__batch_prepare,stage_fake_feedback__forward_pass,stage_fake_feedback__objective_eval,stage_fake_feedback__optimizer_step,stage_fake_feedback__state_emit faculty_other;
+    class gate_0_pregestation_eval,gate_0_pregestation_eval__should_run,gate_0_pregestation_eval__execute,gate_1_gestation_eval,gate_1_gestation_eval__should_run,gate_1_gestation_eval__execute,gate_berkeley,gate_berkeley__should_run,gate_berkeley__execute,gate_transformer,gate_transformer__should_run,gate_transformer__execute,gate_generator,gate_generator__should_run,gate_generator__execute,gate_wave,gate_wave__should_run,gate_wave__execute faculty_gate;
+    class sync_gate_replica,sync_gate_replica__should_run,sync_gate_replica__execute faculty_housekeeping;
+    class checkpoint_save,seed_bank,training_cache,loss_accumulator,result_store,weight_tracker faculty_persistence;
+    class viewer_ipc,viewer_ipc__should_run,viewer_ipc__execute faculty_ipc;
     linkStyle 0 stroke:#8B5CF6,stroke-width:2px,opacity:0.85,stroke-dasharray:4 2;
     linkStyle 1 stroke:#8B5CF6,stroke-width:2px,opacity:0.85,stroke-dasharray:4 2;
     linkStyle 2 stroke:#8B5CF6,stroke-width:2px,opacity:0.85,stroke-dasharray:4 2;
@@ -1121,41 +1198,47 @@ flowchart LR
     linkStyle 78 stroke:#8B5CF6,stroke-width:2px,opacity:0.85,stroke-dasharray:4 2;
     linkStyle 79 stroke:#8B5CF6,stroke-width:2px,opacity:0.85,stroke-dasharray:4 2;
     linkStyle 80 stroke:#8B5CF6,stroke-width:2px,opacity:0.85,stroke-dasharray:4 2;
-    linkStyle 81 stroke:#2A9D8F,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
-    linkStyle 82 stroke:#2A9D8F,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
-    linkStyle 83 stroke:#2A9D8F,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
-    linkStyle 84 stroke:#2A9D8F,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
-    linkStyle 85 stroke:#577590,stroke-width:3px,opacity:0.85,stroke-dasharray:8 3;
+    linkStyle 81 stroke:#8B5CF6,stroke-width:2px,opacity:0.85,stroke-dasharray:4 2;
+    linkStyle 82 stroke:#8B5CF6,stroke-width:2px,opacity:0.85,stroke-dasharray:4 2;
+    linkStyle 83 stroke:#8B5CF6,stroke-width:2px,opacity:0.85,stroke-dasharray:4 2;
+    linkStyle 84 stroke:#8B5CF6,stroke-width:2px,opacity:0.85,stroke-dasharray:4 2;
+    linkStyle 85 stroke:#8B5CF6,stroke-width:2px,opacity:0.85,stroke-dasharray:4 2;
     linkStyle 86 stroke:#2A9D8F,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
-    linkStyle 87 stroke:#E9C46A,stroke-width:3px,opacity:0.9,stroke-dasharray:2 2;
-    linkStyle 88 stroke:#E9C46A,stroke-width:3px,opacity:0.9,stroke-dasharray:2 2;
-    linkStyle 89 stroke:#E9C46A,stroke-width:3px,opacity:0.9,stroke-dasharray:2 2;
-    linkStyle 90 stroke:#E9C46A,stroke-width:3px,opacity:0.9,stroke-dasharray:2 2;
-    linkStyle 91 stroke:#1D70A2,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
-    linkStyle 92 stroke:#1D70A2,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
-    linkStyle 93 stroke:#1D70A2,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
-    linkStyle 94 stroke:#1D70A2,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
-    linkStyle 95 stroke:#1D70A2,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
+    linkStyle 87 stroke:#2A9D8F,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
+    linkStyle 88 stroke:#2A9D8F,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
+    linkStyle 89 stroke:#2A9D8F,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
+    linkStyle 90 stroke:#577590,stroke-width:3px,opacity:0.85,stroke-dasharray:8 3;
+    linkStyle 91 stroke:#2A9D8F,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
+    linkStyle 92 stroke:#E9C46A,stroke-width:3px,opacity:0.9,stroke-dasharray:2 2;
+    linkStyle 93 stroke:#E9C46A,stroke-width:3px,opacity:0.9,stroke-dasharray:2 2;
+    linkStyle 94 stroke:#E9C46A,stroke-width:3px,opacity:0.9,stroke-dasharray:2 2;
+    linkStyle 95 stroke:#E9C46A,stroke-width:3px,opacity:0.9,stroke-dasharray:2 2;
     linkStyle 96 stroke:#1D70A2,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
     linkStyle 97 stroke:#1D70A2,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
     linkStyle 98 stroke:#1D70A2,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
-    linkStyle 99 stroke:#F4A261,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
-    linkStyle 100 stroke:#F4A261,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
-    linkStyle 101 stroke:#F4A261,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
-    linkStyle 102 stroke:#F4A261,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
-    linkStyle 103 stroke:#F4A261,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
+    linkStyle 99 stroke:#1D70A2,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
+    linkStyle 100 stroke:#1D70A2,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
+    linkStyle 101 stroke:#1D70A2,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
+    linkStyle 102 stroke:#1D70A2,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
+    linkStyle 103 stroke:#1D70A2,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
     linkStyle 104 stroke:#F4A261,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
     linkStyle 105 stroke:#F4A261,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
-    linkStyle 106 stroke:#E76F51,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
-    linkStyle 107 stroke:#E76F51,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
-    linkStyle 108 stroke:#E76F51,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
-    linkStyle 109 stroke:#E76F51,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
-    linkStyle 110 stroke:#B56576,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
-    linkStyle 111 stroke:#B56576,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
-    linkStyle 112 stroke:#2B9348,stroke-width:3px,opacity:0.9,stroke-dasharray:4 2;
-    linkStyle 113 stroke:#2B9348,stroke-width:3px,opacity:0.9,stroke-dasharray:4 2;
-    linkStyle 114 stroke:#2B9348,stroke-width:3px,opacity:0.9,stroke-dasharray:4 2;
-    linkStyle 115 stroke:#2B9348,stroke-width:3px,opacity:0.9,stroke-dasharray:4 2;
+    linkStyle 106 stroke:#F4A261,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
+    linkStyle 107 stroke:#F4A261,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
+    linkStyle 108 stroke:#F4A261,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
+    linkStyle 109 stroke:#F4A261,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
+    linkStyle 110 stroke:#F4A261,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
+    linkStyle 111 stroke:#E76F51,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
+    linkStyle 112 stroke:#E76F51,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
+    linkStyle 113 stroke:#E76F51,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
+    linkStyle 114 stroke:#E76F51,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
+    linkStyle 115 stroke:#B56576,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
+    linkStyle 116 stroke:#B56576,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
+    linkStyle 117 stroke:#2B9348,stroke-width:3px,opacity:0.9,stroke-dasharray:4 2;
+    linkStyle 118 stroke:#2B9348,stroke-width:3px,opacity:0.9,stroke-dasharray:4 2;
+    linkStyle 119 stroke:#2B9348,stroke-width:3px,opacity:0.9,stroke-dasharray:4 2;
+    linkStyle 120 stroke:#2B9348,stroke-width:3px,opacity:0.9,stroke-dasharray:4 2;
+    linkStyle 121 stroke:#2B9348,stroke-width:3px,opacity:0.9,stroke-dasharray:4 2;
 ```
 
 Downloads: [PNG](docs/diagrams/stack_view_dense.png) | [SVG](docs/diagrams/stack_view_dense.svg) | [MMD](docs/diagrams/stack_view_dense.mmd)
@@ -1278,8 +1361,14 @@ flowchart LR
     sync_gate_replica__should_run["Gate check"]
     sync_gate_replica__execute["Sync frozen CPU gate_classifier from main classifier"]
     checkpoint_save["Checkpoint Save"]
-    checkpoint_save__should_run["Gate check"]
-    checkpoint_save__execute["Save pipeline checkpoint to disk"]
+    seed_bank["Seed Bank"]
+    training_cache["Training Material Cache"]
+    loss_accumulator["Loss Accumulator"]
+    result_store["Result Store"]
+    weight_tracker["Weight Tracker"]
+    viewer_ipc["Viewer Ipc"]
+    viewer_ipc__should_run["Gate check"]
+    viewer_ipc__execute["IPC bridge to standalone GUI viewer"]
 
     wave_pool --> wave_pool__should_run
     wave_pool --> wave_pool__execute
@@ -1360,8 +1449,13 @@ flowchart LR
     gate_wave --> gate_wave__execute
     sync_gate_replica --> sync_gate_replica__should_run
     sync_gate_replica --> sync_gate_replica__execute
-    checkpoint_save --> checkpoint_save__should_run
-    checkpoint_save --> checkpoint_save__execute
+    checkpoint_save --> seed_bank
+    checkpoint_save --> training_cache
+    checkpoint_save --> loss_accumulator
+    checkpoint_save --> result_store
+    checkpoint_save --> weight_tracker
+    viewer_ipc --> viewer_ipc__should_run
+    viewer_ipc --> viewer_ipc__execute
     wave_pool --> init_vocab
     init_vocab --> build_classifier
     build_classifier --> config_search
@@ -1397,6 +1491,7 @@ flowchart LR
     gate_transformer --> sync_gate_replica
     gate_berkeley --> sync_gate_replica
     sync_gate_replica --> checkpoint_save
+    checkpoint_save --> viewer_ipc
 ```
 
 Downloads: [PNG](docs/diagrams/stack_view_minimal.png) | [SVG](docs/diagrams/stack_view_minimal.svg) | [MMD](docs/diagrams/stack_view_minimal.mmd)
@@ -1519,8 +1614,14 @@ flowchart LR
     sync_gate_replica__should_run["Gate check"]
     sync_gate_replica__execute["Sync frozen CPU gate_classifier from main classifier"]
     checkpoint_save["Checkpoint Save"]
-    checkpoint_save__should_run["Gate check"]
-    checkpoint_save__execute["Save pipeline checkpoint to disk"]
+    seed_bank["Seed Bank"]
+    training_cache["Training Material Cache"]
+    loss_accumulator["Loss Accumulator"]
+    result_store["Result Store"]
+    weight_tracker["Weight Tracker"]
+    viewer_ipc["Viewer Ipc"]
+    viewer_ipc__should_run["Gate check"]
+    viewer_ipc__execute["IPC bridge to standalone GUI viewer"]
 
     wave_pool -- "gate_check | node.owns" --> wave_pool__should_run
     wave_pool -- "execute | node.owns" --> wave_pool__execute
@@ -1601,8 +1702,13 @@ flowchart LR
     gate_wave -- "execute | node.owns" --> gate_wave__execute
     sync_gate_replica -- "gate_check | node.owns" --> sync_gate_replica__should_run
     sync_gate_replica -- "execute | node.owns" --> sync_gate_replica__execute
-    checkpoint_save -- "gate_check | node.owns" --> checkpoint_save__should_run
-    checkpoint_save -- "execute | node.owns" --> checkpoint_save__execute
+    checkpoint_save -- "state_store | node.owns" --> seed_bank
+    checkpoint_save -- "state_store | node.owns" --> training_cache
+    checkpoint_save -- "metric_store | node.owns" --> loss_accumulator
+    checkpoint_save -- "metric_store | node.owns" --> result_store
+    checkpoint_save -- "diagnostic | node.owns" --> weight_tracker
+    viewer_ipc -- "gate_check | node.owns" --> viewer_ipc__should_run
+    viewer_ipc -- "execute | node.owns" --> viewer_ipc__execute
     wave_pool -- "startup | schedule.bootstrap" --> init_vocab
     init_vocab -- "startup | schedule.bootstrap" --> build_classifier
     build_classifier -- "startup | schedule.bootstrap" --> config_search
@@ -1638,6 +1744,7 @@ flowchart LR
     gate_transformer -- "end_of_round | schedule.finalize" --> sync_gate_replica
     gate_berkeley -- "end_of_round | schedule.finalize" --> sync_gate_replica
     sync_gate_replica -- "end_of_round | schedule.finalize" --> checkpoint_save
+    checkpoint_save -- "end_of_round | schedule.finalize" --> viewer_ipc
 
     linkStyle 0 stroke:#8B5CF6,stroke-width:2px,opacity:0.85,stroke-dasharray:4 2;
     linkStyle 1 stroke:#8B5CF6,stroke-width:2px,opacity:0.85,stroke-dasharray:4 2;
@@ -1720,41 +1827,47 @@ flowchart LR
     linkStyle 78 stroke:#8B5CF6,stroke-width:2px,opacity:0.85,stroke-dasharray:4 2;
     linkStyle 79 stroke:#8B5CF6,stroke-width:2px,opacity:0.85,stroke-dasharray:4 2;
     linkStyle 80 stroke:#8B5CF6,stroke-width:2px,opacity:0.85,stroke-dasharray:4 2;
-    linkStyle 81 stroke:#2A9D8F,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
-    linkStyle 82 stroke:#2A9D8F,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
-    linkStyle 83 stroke:#2A9D8F,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
-    linkStyle 84 stroke:#2A9D8F,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
-    linkStyle 85 stroke:#577590,stroke-width:3px,opacity:0.85,stroke-dasharray:8 3;
+    linkStyle 81 stroke:#8B5CF6,stroke-width:2px,opacity:0.85,stroke-dasharray:4 2;
+    linkStyle 82 stroke:#8B5CF6,stroke-width:2px,opacity:0.85,stroke-dasharray:4 2;
+    linkStyle 83 stroke:#8B5CF6,stroke-width:2px,opacity:0.85,stroke-dasharray:4 2;
+    linkStyle 84 stroke:#8B5CF6,stroke-width:2px,opacity:0.85,stroke-dasharray:4 2;
+    linkStyle 85 stroke:#8B5CF6,stroke-width:2px,opacity:0.85,stroke-dasharray:4 2;
     linkStyle 86 stroke:#2A9D8F,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
-    linkStyle 87 stroke:#E9C46A,stroke-width:3px,opacity:0.9,stroke-dasharray:2 2;
-    linkStyle 88 stroke:#E9C46A,stroke-width:3px,opacity:0.9,stroke-dasharray:2 2;
-    linkStyle 89 stroke:#E9C46A,stroke-width:3px,opacity:0.9,stroke-dasharray:2 2;
-    linkStyle 90 stroke:#E9C46A,stroke-width:3px,opacity:0.9,stroke-dasharray:2 2;
-    linkStyle 91 stroke:#1D70A2,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
-    linkStyle 92 stroke:#1D70A2,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
-    linkStyle 93 stroke:#1D70A2,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
-    linkStyle 94 stroke:#1D70A2,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
-    linkStyle 95 stroke:#1D70A2,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
+    linkStyle 87 stroke:#2A9D8F,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
+    linkStyle 88 stroke:#2A9D8F,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
+    linkStyle 89 stroke:#2A9D8F,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
+    linkStyle 90 stroke:#577590,stroke-width:3px,opacity:0.85,stroke-dasharray:8 3;
+    linkStyle 91 stroke:#2A9D8F,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
+    linkStyle 92 stroke:#E9C46A,stroke-width:3px,opacity:0.9,stroke-dasharray:2 2;
+    linkStyle 93 stroke:#E9C46A,stroke-width:3px,opacity:0.9,stroke-dasharray:2 2;
+    linkStyle 94 stroke:#E9C46A,stroke-width:3px,opacity:0.9,stroke-dasharray:2 2;
+    linkStyle 95 stroke:#E9C46A,stroke-width:3px,opacity:0.9,stroke-dasharray:2 2;
     linkStyle 96 stroke:#1D70A2,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
     linkStyle 97 stroke:#1D70A2,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
     linkStyle 98 stroke:#1D70A2,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
-    linkStyle 99 stroke:#F4A261,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
-    linkStyle 100 stroke:#F4A261,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
-    linkStyle 101 stroke:#F4A261,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
-    linkStyle 102 stroke:#F4A261,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
-    linkStyle 103 stroke:#F4A261,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
+    linkStyle 99 stroke:#1D70A2,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
+    linkStyle 100 stroke:#1D70A2,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
+    linkStyle 101 stroke:#1D70A2,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
+    linkStyle 102 stroke:#1D70A2,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
+    linkStyle 103 stroke:#1D70A2,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
     linkStyle 104 stroke:#F4A261,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
     linkStyle 105 stroke:#F4A261,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
-    linkStyle 106 stroke:#E76F51,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
-    linkStyle 107 stroke:#E76F51,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
-    linkStyle 108 stroke:#E76F51,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
-    linkStyle 109 stroke:#E76F51,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
-    linkStyle 110 stroke:#B56576,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
-    linkStyle 111 stroke:#B56576,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
-    linkStyle 112 stroke:#2B9348,stroke-width:3px,opacity:0.9,stroke-dasharray:4 2;
-    linkStyle 113 stroke:#2B9348,stroke-width:3px,opacity:0.9,stroke-dasharray:4 2;
-    linkStyle 114 stroke:#2B9348,stroke-width:3px,opacity:0.9,stroke-dasharray:4 2;
-    linkStyle 115 stroke:#2B9348,stroke-width:3px,opacity:0.9,stroke-dasharray:4 2;
+    linkStyle 106 stroke:#F4A261,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
+    linkStyle 107 stroke:#F4A261,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
+    linkStyle 108 stroke:#F4A261,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
+    linkStyle 109 stroke:#F4A261,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
+    linkStyle 110 stroke:#F4A261,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
+    linkStyle 111 stroke:#E76F51,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
+    linkStyle 112 stroke:#E76F51,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
+    linkStyle 113 stroke:#E76F51,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
+    linkStyle 114 stroke:#E76F51,stroke-width:3px,opacity:0.95,stroke-dasharray:0;
+    linkStyle 115 stroke:#B56576,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
+    linkStyle 116 stroke:#B56576,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
+    linkStyle 117 stroke:#2B9348,stroke-width:3px,opacity:0.9,stroke-dasharray:4 2;
+    linkStyle 118 stroke:#2B9348,stroke-width:3px,opacity:0.9,stroke-dasharray:4 2;
+    linkStyle 119 stroke:#2B9348,stroke-width:3px,opacity:0.9,stroke-dasharray:4 2;
+    linkStyle 120 stroke:#2B9348,stroke-width:3px,opacity:0.9,stroke-dasharray:4 2;
+    linkStyle 121 stroke:#2B9348,stroke-width:3px,opacity:0.9,stroke-dasharray:4 2;
 ```
 
 Downloads: [PNG](docs/diagrams/stack_view_reaction.png) | [SVG](docs/diagrams/stack_view_reaction.svg) | [MMD](docs/diagrams/stack_view_reaction.mmd)
@@ -1768,10 +1881,20 @@ Downloads: [PNG](docs/diagrams/stack_view_reaction.png) | [SVG](docs/diagrams/st
 ```mermaid
 %%{init: {'theme':'base','flowchart':{'curve':'basis','htmlLabels':true}}}%%
 flowchart LR
+    subgraph group_build[Build]
+        build_classifier["Build Classifier<br/>object / build / BuildClassifierNode"]
+        config_search["Config Search<br/>object / build / ConfigSearchNode"]
+        build_gan["Build Gan<br/>object / build / BuildGANNode"]
+        build_transformer["Build Transformer<br/>object / build / BuildTransformerNode"]
+        build_wave_classifier["Build Wave Classifier<br/>object / build / BuildWaveClassifierNode"]
+    end
+    subgraph group_vocab[Vocab]
+        build_label_embedding["Build Label Embedding<br/>object / vocab / BuildLabelEmbeddingNode"]
+    end
+    subgraph group_housekeeping[Housekeeping]
+        sync_gate_replica["Sync Gate Replica<br/>object / housekeeping / SyncGateReplicaNode"]
+    end
     subgraph group_other[Other]
-        build_classifier["Build Classifier<br/>object / other / BuildClassifierNode"]
-        config_search["Config Search<br/>object / other / ConfigSearchNode"]
-        build_label_embedding["Build Label Embedding<br/>object / other / BuildLabelEmbeddingNode"]
         stage_0_pregestation["Stage 0 Pregestation<br/>object / other / PregestationTrainNode"]
         stage_1_gestation["Stage 1 Gestation<br/>object / other / GestationTrainNode"]
         stage_2_berkeley["Stage 2 Berkeley<br/>object / other / BerkeleyRefreshTrainNode"]
@@ -1780,15 +1903,6 @@ flowchart LR
         stage_w_wave_classifier["Stage W Wave Classifier<br/>object / other / WaveClassifierTrainNode"]
         stage_c_lora["Stage C Lora<br/>object / other / LoRARoundNode"]
         stage_fake_feedback["Stage Fake Feedback<br/>object / other / FakeClassFeedbackNode"]
-        gate_0_pregestation_eval["Gate 0 Pregestation Eval<br/>object / other / PregestationEvalNode"]
-        gate_1_gestation_eval["Gate 1 Gestation Eval<br/>object / other / GestationEvalNode"]
-        gate_berkeley["Gate Berkeley<br/>object / other / BerkeleyGateNode"]
-        gate_transformer["Gate Transformer<br/>object / other / TransformerGateNode"]
-        gate_generator["Gate Generator<br/>object / other / GeneratorGateNode"]
-        gate_wave["Gate Wave<br/>object / other / WaveGateNode"]
-        sync_gate_replica["Sync Gate Replica<br/>object / other / SyncGateReplicaNode"]
-        build_transformer["Build Transformer<br/>object / other / BuildTransformerNode"]
-        build_wave_classifier["Build Wave Classifier<br/>object / other / BuildWaveClassifierNode"]
     end
     subgraph group_inference[Inference]
         model__classifier["Classifier Model<br/>resource / inference / gpu_model"]
@@ -1796,6 +1910,14 @@ flowchart LR
         model__generator["GAN Generator<br/>resource / inference / gpu_model"]
         model__transformer["Transformer Model<br/>resource / inference / gpu_model"]
         model__wave_classifier["Wave Classifier Model<br/>resource / inference / gpu_model"]
+    end
+    subgraph group_gate[Gate]
+        gate_0_pregestation_eval["Gate 0 Pregestation Eval<br/>object / gate / PregestationEvalNode"]
+        gate_1_gestation_eval["Gate 1 Gestation Eval<br/>object / gate / GestationEvalNode"]
+        gate_berkeley["Gate Berkeley<br/>object / gate / BerkeleyGateNode"]
+        gate_transformer["Gate Transformer<br/>object / gate / TransformerGateNode"]
+        gate_generator["Gate Generator<br/>object / gate / GeneratorGateNode"]
+        gate_wave["Gate Wave<br/>object / gate / WaveGateNode"]
     end
 
     build_classifier -- "gpu-resident classifier" --> model__classifier
@@ -1816,8 +1938,10 @@ flowchart LR
     gate_generator -- "gpu-resident classifier" --> model__classifier
     gate_wave -- "gpu-resident classifier" --> model__classifier
     sync_gate_replica -- "gpu-resident classifier" --> model__classifier
+    build_gan -- "gpu-resident discriminator" --> model__discriminator
     stage_g_generator -- "gpu-resident discriminator" --> model__discriminator
     stage_fake_feedback -- "gpu-resident discriminator" --> model__discriminator
+    build_gan -- "gpu-resident generator" --> model__generator
     stage_g_generator -- "gpu-resident generator" --> model__generator
     stage_fake_feedback -- "gpu-resident generator" --> model__generator
     gate_generator -- "gpu-resident generator" --> model__generator
@@ -1834,6 +1958,8 @@ flowchart LR
     classDef faculty_train fill:#FFE8D6,stroke:#C05621,color:#4A1D05,stroke-width:2px;
     classDef faculty_gates fill:#FDE2E4,stroke:#C0392B,color:#4A0F13,stroke-width:2px;
     classDef faculty_housekeeping fill:#E8F5E9,stroke:#2E7D32,color:#102A12,stroke-width:2px;
+    classDef faculty_persistence fill:#EFE3FF,stroke:#7C3AED,color:#2E1065,stroke-width:2px;
+    classDef faculty_ipc fill:#DDEBFF,stroke:#2563EB,color:#0F172A,stroke-width:2px;
     classDef faculty_io fill:#DDEBFF,stroke:#2563EB,color:#0F172A,stroke-width:2px;
     classDef faculty_inference fill:#F4F1DE,stroke:#3D405B,color:#1B1F2A,stroke-width:2px;
     classDef faculty_buffer fill:#E0FBFC,stroke:#006D77,color:#00313A,stroke-width:2px;
@@ -1845,7 +1971,11 @@ flowchart LR
     classDef faculty_updates fill:#E8F5E9,stroke:#2E7D32,color:#102A12,stroke-width:2px;
     classDef faculty_other fill:#F3F4F6,stroke:#6B7280,color:#111827,stroke-width:2px;
     class model__classifier,model__discriminator,model__generator,model__transformer,model__wave_classifier faculty_inference;
-    class build_classifier,config_search,build_label_embedding,stage_0_pregestation,stage_1_gestation,stage_2_berkeley,stage_r_transformer,stage_g_generator,stage_w_wave_classifier,stage_c_lora,stage_fake_feedback,gate_0_pregestation_eval,gate_1_gestation_eval,gate_berkeley,gate_transformer,gate_generator,gate_wave,sync_gate_replica,build_transformer,build_wave_classifier faculty_other;
+    class build_classifier,config_search,build_gan,build_transformer,build_wave_classifier faculty_build;
+    class build_label_embedding faculty_vocab;
+    class stage_0_pregestation,stage_1_gestation,stage_2_berkeley,stage_r_transformer,stage_g_generator,stage_w_wave_classifier,stage_c_lora,stage_fake_feedback faculty_other;
+    class gate_0_pregestation_eval,gate_1_gestation_eval,gate_berkeley,gate_transformer,gate_generator,gate_wave faculty_gate;
+    class sync_gate_replica faculty_housekeeping;
     linkStyle 0 stroke:#6B7280,stroke-width:2px,opacity:0.75,stroke-dasharray:0;
     linkStyle 1 stroke:#6B7280,stroke-width:2px,opacity:0.75,stroke-dasharray:0;
     linkStyle 2 stroke:#6B7280,stroke-width:2px,opacity:0.75,stroke-dasharray:0;
@@ -1874,6 +2004,8 @@ flowchart LR
     linkStyle 25 stroke:#6B7280,stroke-width:2px,opacity:0.75,stroke-dasharray:0;
     linkStyle 26 stroke:#6B7280,stroke-width:2px,opacity:0.75,stroke-dasharray:0;
     linkStyle 27 stroke:#6B7280,stroke-width:2px,opacity:0.75,stroke-dasharray:0;
+    linkStyle 28 stroke:#6B7280,stroke-width:2px,opacity:0.75,stroke-dasharray:0;
+    linkStyle 29 stroke:#6B7280,stroke-width:2px,opacity:0.75,stroke-dasharray:0;
 ```
 
 Downloads: [PNG](docs/diagrams/provenance_dense.png) | [SVG](docs/diagrams/provenance_dense.svg) | [MMD](docs/diagrams/provenance_dense.mmd)
@@ -1912,6 +2044,7 @@ flowchart LR
     gate_generator["Gate Generator"]
     gate_wave["Gate Wave"]
     sync_gate_replica["Sync Gate Replica"]
+    build_gan["Build Gan"]
     build_transformer["Build Transformer"]
     build_wave_classifier["Build Wave Classifier"]
 
@@ -1933,8 +2066,10 @@ flowchart LR
     gate_generator --> model__classifier
     gate_wave --> model__classifier
     sync_gate_replica --> model__classifier
+    build_gan --> model__discriminator
     stage_g_generator --> model__discriminator
     stage_fake_feedback --> model__discriminator
+    build_gan --> model__generator
     stage_g_generator --> model__generator
     stage_fake_feedback --> model__generator
     gate_generator --> model__generator
@@ -1981,6 +2116,7 @@ flowchart LR
     gate_generator["Gate Generator"]
     gate_wave["Gate Wave"]
     sync_gate_replica["Sync Gate Replica"]
+    build_gan["Build Gan"]
     build_transformer["Build Transformer"]
     build_wave_classifier["Build Wave Classifier"]
 
@@ -2002,8 +2138,10 @@ flowchart LR
     gate_generator -- "gpu-resident classifier | residency.acquire" --> model__classifier
     gate_wave -- "gpu-resident classifier | residency.acquire" --> model__classifier
     sync_gate_replica -- "gpu-resident classifier | residency.acquire" --> model__classifier
+    build_gan -- "gpu-resident discriminator | residency.acquire" --> model__discriminator
     stage_g_generator -- "gpu-resident discriminator | residency.acquire" --> model__discriminator
     stage_fake_feedback -- "gpu-resident discriminator | residency.acquire" --> model__discriminator
+    build_gan -- "gpu-resident generator | residency.acquire" --> model__generator
     stage_g_generator -- "gpu-resident generator | residency.acquire" --> model__generator
     stage_fake_feedback -- "gpu-resident generator | residency.acquire" --> model__generator
     gate_generator -- "gpu-resident generator | residency.acquire" --> model__generator
@@ -2041,6 +2179,8 @@ flowchart LR
     linkStyle 25 stroke:#6B7280,stroke-width:2px,opacity:0.75,stroke-dasharray:0;
     linkStyle 26 stroke:#6B7280,stroke-width:2px,opacity:0.75,stroke-dasharray:0;
     linkStyle 27 stroke:#6B7280,stroke-width:2px,opacity:0.75,stroke-dasharray:0;
+    linkStyle 28 stroke:#6B7280,stroke-width:2px,opacity:0.75,stroke-dasharray:0;
+    linkStyle 29 stroke:#6B7280,stroke-width:2px,opacity:0.75,stroke-dasharray:0;
 ```
 
 Downloads: [PNG](docs/diagrams/provenance_reaction.png) | [SVG](docs/diagrams/provenance_reaction.svg) | [MMD](docs/diagrams/provenance_reaction.mmd)

@@ -364,7 +364,9 @@ class TrainingGraphPlan:
     layout: GraphLayoutRecord = field(default_factory=GraphLayoutRecord)
     metadata: Dict[str, Any] = field(default_factory=dict)
 
-    def validate(self) -> None:
+    def validate(self) -> List[str]:
+        """Validate plan consistency. Returns a list of non-fatal warnings."""
+        warnings: List[str] = []
         node_ids = [node.node_id for node in self.nodes]
         edge_ids = [edge.edge_id for edge in self.edges]
 
@@ -440,6 +442,58 @@ class TrainingGraphPlan:
                             f"Subnode {subnode.subnode_id!r} references unknown action {aid!r}."
                         )
 
+        # -- Condition consistency: edges from the same source with data-delivery
+        #    labels should have compatible gate requirements. --
+        source_edges: Dict[str, List["GraphEdgeRecord"]] = defaultdict(list)
+        for edge in self.edges:
+            if edge.enabled and edge.layer != "cycle":
+                source_edges[edge.source_node_id].append(edge)
+        for src, edges in source_edges.items():
+            cond_ids = {e.condition_id or "" for e in edges if e.condition_id}
+            unconditioned = [e for e in edges if not e.condition_id]
+            conditioned = [e for e in edges if e.condition_id]
+            if unconditioned and conditioned:
+                uncond_targets = [e.target_node_id for e in unconditioned]
+                cond_summary = ", ".join(sorted(cond_ids))
+                warnings.append(
+                    f"Inconsistent gating from {src!r}: edges to "
+                    f"{uncond_targets} have no condition, but sibling edges "
+                    f"require [{cond_summary}]."
+                )
+
+        # -- Condition expression consistency: edges sharing a condition_id
+        #    should have matching condition_expr. --
+        cond_exprs: Dict[str, Dict[str, List[str]]] = defaultdict(lambda: defaultdict(list))
+        for edge in self.edges:
+            if edge.condition_id and edge.condition_expr:
+                cond_exprs[edge.condition_id][edge.condition_expr].append(edge.edge_id)
+        for cid, expr_map in cond_exprs.items():
+            if len(expr_map) > 1:
+                warnings.append(
+                    f"Condition {cid!r} has conflicting expressions: "
+                    + ", ".join(f"{expr!r} (edges: {eids})" for expr, eids in expr_map.items())
+                )
+
+        # -- Execution program: warn when step node_ids reference unknown nodes. --
+        if self.execution_program:
+            prog_steps = list(self.execution_program.get("steps", []) or [])
+            prog_seq = list(self.execution_program.get("sequence_node_ids", []) or [])
+            for step in prog_steps:
+                step_nid = str(step.get("node_id", "") or "").strip()
+                if step_nid and step_nid not in known_nodes:
+                    warnings.append(
+                        f"execution_program step {step.get('step_id', '?')!r} "
+                        f"references unknown node {step_nid!r}."
+                    )
+            for seq_nid in prog_seq:
+                if str(seq_nid).strip() and str(seq_nid).strip() not in known_nodes:
+                    warnings.append(
+                        f"execution_program sequence_node_ids references "
+                        f"unknown node {seq_nid!r}."
+                    )
+
+        return warnings
+
     def node_map(self) -> Dict[str, GraphNodeRecord]:
         return {node.node_id: node for node in self.nodes}
 
@@ -447,7 +501,9 @@ class TrainingGraphPlan:
         return {edge.edge_id: edge for edge in self.edges}
 
     def to_dict(self) -> Dict[str, Any]:
-        self.validate()
+        warnings = self.validate()
+        for w in warnings:
+            print(f"[plan-validate] WARNING: {w}", flush=True)
         return {
             "schema_version": int(self.schema_version),
             "plan_id": str(self.plan_id),
@@ -1262,7 +1318,7 @@ def plan_from_pipeline_graph(
     for edge in raw_edges:
         source_id = str(getattr(edge, "source_id"))
         target_id = str(getattr(edge, "target_id"))
-        kind = str(getattr(edge, "label", "") or "flow")
+        label = str(getattr(edge, "label", "") or "flow")
         condition_id = str(getattr(edge, "condition_id", "") or "")
         pair_key = (source_id, target_id)
         pair_counts[pair_key] += 1
@@ -1273,22 +1329,29 @@ def plan_from_pipeline_graph(
         if not isinstance(serialized_defaults, dict):
             serialized_defaults = {"value": serialized_defaults}
 
+        # Derive semantic edge kind from the reaction template / layer.
+        _reaction_name = str(getattr(reaction, "reaction_name", "") or "")
+        if str(getattr(edge, "layer", "") or "") == "cycle":
+            kind = "cycle"
+        elif getattr(edge, "on_traverse", None) is not None or _reaction_name.startswith("data."):
+            kind = "data_provide"
+        elif condition_id:
+            kind = "conditional"
+        elif _reaction_name.startswith("schedule."):
+            kind = "schedule"
+        else:
+            kind = "flow"
+
         record_meta = dict(getattr(reaction, "metadata", {}) or {})
         record_meta.update(dict(getattr(edge, "metadata", {}) or {}))
-        record_meta.update(
-            _clean_dict(
-                {
-                    "label": str(getattr(edge, "label", "") or ""),
-                    "condition_callable": getattr(getattr(edge, "condition", None), "__name__", ""),
-                }
-            )
-        )
+        if label:
+            record_meta["label"] = label
 
         edge_records.append(
             GraphEdgeRecord(
                 edge_id=str(
                     getattr(edge, "edge_id", "")
-                    or _edge_identity(source_id, target_id, kind, condition_id, pair_counts[pair_key])
+                    or _edge_identity(source_id, target_id, label, condition_id, pair_counts[pair_key])
                 ),
                 kind=kind,
                 source_node_id=source_id,

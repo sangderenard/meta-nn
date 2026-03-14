@@ -162,6 +162,8 @@ class WavePoolNode(PipelineNode):
 
     node_id = "wave_pool"
     description = "Discover WAV files and decode to float32 streams"
+    runtime_object_type = "data_source"
+    runtime_faculty = "bootstrap"
 
     def __init__(self, cfg: WavePoolConfig) -> None:
         self.cfg = cfg
@@ -434,6 +436,8 @@ class DataNode(PipelineNode):
 
     node_id = "data_node"
     description = "Build/refresh all training dataloaders"
+    runtime_object_type = "data_hub"
+    runtime_faculty = "data"
 
     def __init__(
         self,

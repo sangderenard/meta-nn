@@ -390,6 +390,9 @@ def _apply_degrade(
         "edge_highlight_blend_min": float(cfg.get("edge_highlight_blend_min", 0.05)),
         "edge_highlight_blend_max": float(cfg.get("edge_highlight_blend_max", 0.25)),
         "edge_highlight_ultra": bool(cfg.get("edge_highlight_ultra", str(os.environ.get("EDGE_HIGHLIGHT_ULTRA", "0")).strip() == "1")),
+        "edge_blur_prob": float(cfg.get("edge_blur_prob", 0.30)),
+        "edge_blur_kernel": int(cfg.get("edge_blur_kernel", 7)),
+        "edge_blur_spread": int(cfg.get("edge_blur_spread", 5)),
     }
     rng = np.random.default_rng(int(seed) + (int(idx) * 104729))
     resolved = _resolve_processing_device(processing_device)
@@ -493,8 +496,23 @@ def _apply_degrade(
             ))
             out_t = out_t + (float(blend) * edge_map_t.unsqueeze(0))
             _accumulate_term_mask_t(
-                ["edge", "signal"],
+                ["edge highlight", "edge", "signal"],
                 edge_map_t,
+                scale=0.85,
+                gamma=0.95,
+            )
+        if float(rng.random()) < float(cfg_use["edge_blur_prob"]):
+            gray_t = torch.mean(out_t[:3], dim=0).to(dtype=torch.float32)
+            edge_mask_t = _sobel_edge_map_torch(gray_t)
+            blur_k = int(cfg_use["edge_blur_kernel"])
+            spread_k = int(cfg_use["edge_blur_spread"])
+            blurred_t = torch.nn.functional.avg_pool2d(out_t.unsqueeze(0), kernel_size=blur_k, stride=1, padding=blur_k // 2)[0]
+            spread_t = torch.nn.functional.avg_pool2d(edge_mask_t[None, None, ...], kernel_size=spread_k, stride=1, padding=spread_k // 2)[0, 0]
+            spread_t = spread_t / spread_t.amax().clamp(min=1e-8)
+            out_t = out_t * (1.0 - spread_t.unsqueeze(0)) + blurred_t * spread_t.unsqueeze(0)
+            _accumulate_term_mask_t(
+                ["edge blur", "edge", "signal"],
+                spread_t,
                 scale=0.85,
                 gamma=0.95,
             )
@@ -611,8 +629,25 @@ def _apply_degrade(
         ))
         out = out + (float(blend) * edge_map[None, :, :]).astype(np.float32, copy=False)
         _accumulate_term_mask(
-            ["edge", "signal"],
+            ["edge highlight", "edge", "signal"],
             edge_map,
+            scale=0.85,
+            gamma=0.95,
+        )
+    if float(rng.random()) < float(cfg_use["edge_blur_prob"]):
+        gray = np.mean(out[:3], axis=0).astype(np.float32, copy=False)
+        edge_mask = _sobel_edge_map(gray)
+        blur_k = int(cfg_use["edge_blur_kernel"])
+        spread_k = int(cfg_use["edge_blur_spread"])
+        out_t = torch.from_numpy(out[None, ...]).to(torch.float32)
+        blurred = torch.nn.functional.avg_pool2d(out_t, kernel_size=blur_k, stride=1, padding=blur_k // 2)[0].numpy().astype(np.float32)
+        em_t = torch.from_numpy(edge_mask[None, None, ...]).to(torch.float32)
+        spread_mask = torch.nn.functional.avg_pool2d(em_t, kernel_size=spread_k, stride=1, padding=spread_k // 2)[0, 0].numpy().astype(np.float32)
+        spread_mask = spread_mask / max(float(np.max(spread_mask)), 1e-8)
+        out = np.clip(out * (1.0 - spread_mask[None]) + blurred * spread_mask[None], 0.0, 1.0).astype(np.float32, copy=False)
+        _accumulate_term_mask(
+            ["edge blur", "edge", "signal"],
+            spread_mask,
             scale=0.85,
             gamma=0.95,
         )
