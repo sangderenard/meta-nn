@@ -72,6 +72,18 @@ def _format_target_line(target_vec: Any, class_names: Sequence[str], threshold: 
     return "target:" + ", ".join(hits)
 
 
+def _format_target_lines(target_vec: Any, class_names: Sequence[str], threshold: float = 0.5) -> List[str]:
+    """Return one line per active target label, for right-justified list display."""
+    if target_vec is None:
+        return ["target: none"]
+    arr = _to_np_float(target_vec).reshape(-1)
+    hits: List[str] = []
+    for idx, value in enumerate(arr):
+        if float(value) >= float(threshold):
+            hits.append(str(class_names[idx]) if 0 <= idx < len(class_names) else f"class_{idx}")
+    return hits if hits else ["none"]
+
+
 def _format_top_lines(probs: Any, class_names: Sequence[str], topk: int = 0) -> List[str]:
     if probs is None:
         return []
@@ -138,11 +150,9 @@ def build_classifier_preview_frames(
         target_mask = _normalize_mask_hw(payload.get("target_mask", None), height=height, width=width, fill=1.0)
         detected_mask = _normalize_mask_hw(payload.get("detected_mask", None), height=height, width=width, fill=0.0)
 
-        target_bin = (target_mask >= 0.5).astype(np.float32)
-        detected_bin = (detected_mask >= 0.5).astype(np.float32)
-        overlap = np.minimum(target_bin, detected_bin)
-        detected_only = np.clip(detected_bin - target_bin, 0.0, 1.0)
-        target_only = np.clip(target_bin - detected_bin, 0.0, 1.0)
+        overlap = np.minimum(target_mask, detected_mask)
+        detected_only = np.clip(detected_mask - target_mask, 0.0, 1.0)
+        target_only = np.clip(target_mask - detected_mask, 0.0, 1.0)
 
         panel_target = np.concatenate([image_chw, target_mask[None, :, :]], axis=0)
         panel_diff = np.clip(
@@ -152,7 +162,7 @@ def build_classifier_preview_frames(
         )
         panel_detected = np.concatenate([image_chw, detected_mask[None, :, :]], axis=0)
 
-        target_line = _format_target_line(payload.get("target_vec", None), class_names=class_names)
+        target_lines = _format_target_lines(payload.get("target_vec", None), class_names=class_names)
         top_lines = _format_top_lines(payload.get("probs", None), class_names=class_names)
         top_txt = top_lines[0] if top_lines else "n/a"
 
@@ -173,7 +183,7 @@ def build_classifier_preview_frames(
             f"overlap={float(np.mean(overlap)):.3f}",
             f"target_only={float(np.mean(target_only)):.3f}",
             f"detected_only={float(np.mean(detected_only)):.3f}",
-            f"mean_abs={float(np.mean(np.abs(target_bin - detected_bin))):.3f}",
+            f"mean_abs={float(np.mean(np.abs(target_mask - detected_mask))):.3f}",
         ]
 
         frames.append(
@@ -185,10 +195,11 @@ def build_classifier_preview_frames(
                 ],
                 "caption": f"[C] cycle={int(cycle_id)} round={int(round_id)} {step_txt} top={top_txt}",
                 "titles": ["C target +mask", "C mask diff", "C detected +mask"],
+                "step_txt": step_txt,
                 "rows": [
-                    [target_line, step_txt],
+                    target_lines,
                     diff_rows,
-                    [target_line, "mask=detected"] + (top_lines or ["n/a"]),
+                    ["mask:detected"] + (top_lines or ["n/a"]),
                 ],
                 "loss_rows": loss_rows,
                 "loss_scalars": loss_scalars,

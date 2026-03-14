@@ -1129,6 +1129,47 @@ def test_condition_expr_evaluator():
     ctx = types.SimpleNamespace(round_id=6)
     _assert(evaluate_condition_expr("round_id MOD 3 == 0", ctx) is True, "6 MOD 3 == 0")
     _assert(evaluate_condition_expr("round_id MOD 4 == 0", ctx) is False, "6 MOD 4 != 0")
+    _assert(evaluate_condition_expr("round_id % 4 == 2", ctx) is True, "6 % 4 == 2")
+
+    # Calculator signals.
+    ctx = types.SimpleNamespace(
+        lhs=4,
+        rhs=2,
+        scale=3,
+        divisor=2,
+        target=9,
+        ctx=types.SimpleNamespace(total_rounds_completed=10),
+        data=types.SimpleNamespace(_preg_last_build_round=6),
+        preg_cfg=types.SimpleNamespace(rebuild_every_n_rounds=4),
+    )
+    _assert(
+        evaluate_condition_expr("((lhs + rhs) * scale) / divisor == target", ctx) is True,
+        "calculator supports +, *, / with signal operands",
+    )
+    _assert(
+        evaluate_condition_expr(
+            "(ctx.total_rounds_completed - data._preg_last_build_round) >= preg_cfg.rebuild_every_n_rounds",
+            ctx,
+        ) is True,
+        "calculator supports subtraction with accessor signals on both sides of comparison",
+    )
+    ctx = types.SimpleNamespace(
+        gate_override_enabled=lambda: False,
+        gate_pregestation=types.SimpleNamespace(passed=True),
+        early_gates_passed=lambda: True,
+        ctx=types.SimpleNamespace(total_rounds_completed=10),
+        data=types.SimpleNamespace(_gest_last_build_round=4, _bdata_last_build_round=3),
+        gest_cfg=types.SimpleNamespace(rebuild_every_n_rounds=6),
+        bdata_cfg=types.SimpleNamespace(rebuild_every_n_rounds=7),
+    )
+    _assert(
+        evaluate_condition_expr(expr_for_condition_id("data.gestation_rebuild_due"), ctx) is True,
+        "gestation rebuild condition resolves through real gate signals",
+    )
+    _assert(
+        evaluate_condition_expr(expr_for_condition_id("data.berkeley_refresh_due"), ctx) is True,
+        "berkeley rebuild condition resolves through real early-gate signal",
+    )
 
     # AND / OR.
     ctx = types.SimpleNamespace(a=True, b=False)
@@ -1156,6 +1197,9 @@ def test_condition_expr_evaluator():
         "gates.early_passed",
         "gates.all_base_passed",
         "gates.wave_stage_ready",
+        "data.pregestation_rebuild_due",
+        "data.gestation_rebuild_due",
+        "data.berkeley_refresh_due",
     ]:
         expr = expr_for_condition_id(cid)
         _assert(bool(expr), f"expr_for_condition_id({cid!r}) returns non-empty string")

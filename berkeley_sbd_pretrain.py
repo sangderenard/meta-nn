@@ -238,8 +238,7 @@ def _transform_image_mask_pair(
         x = noise_inject(x)
     x = TF.normalize(x, mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
 
-    mask_t = TF.to_tensor(mask)
-    mask_t = (mask_t >= 0.5).to(dtype=torch.float32)
+    mask_t = TF.to_tensor(mask).to(dtype=torch.float32)
     return x, mask_t
 
 
@@ -400,18 +399,17 @@ def multilabel_metrics(logits: torch.Tensor, targets: torch.Tensor, threshold: f
 
 
 def mask_metrics(mask_logits: torch.Tensor, mask_targets: torch.Tensor, threshold: float = 0.5):
-    probs = torch.sigmoid(mask_logits)
-    preds = (probs >= float(threshold)).float()
-    t = (mask_targets >= 0.5).float()
+    probs = torch.sigmoid(mask_logits).float()
+    t = mask_targets.float()
 
-    inter = (preds * t).sum(dim=(1, 2, 3))
-    union = ((preds + t) > 0.0).float().sum(dim=(1, 2, 3))
-    pred_mass = preds.sum(dim=(1, 2, 3))
+    inter = (probs * t).sum(dim=(1, 2, 3))
+    union = (probs + t - probs * t).sum(dim=(1, 2, 3))
+    pred_mass = probs.sum(dim=(1, 2, 3))
     target_mass = t.sum(dim=(1, 2, 3))
 
     mean_iou = torch.mean(inter / (union + 1e-8)).item()
     mean_dice = torch.mean((2.0 * inter) / (pred_mass + target_mass + 1e-8)).item()
-    pixel_acc = preds.eq(t).float().mean().item()
+    pixel_acc = (1.0 - (probs - t).abs()).mean().item()
     return {
         "mask_iou": float(mean_iou),
         "mask_dice": float(mean_dice),

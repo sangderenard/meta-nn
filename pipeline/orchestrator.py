@@ -344,6 +344,10 @@ _CONDITION_ID_PREGESTATION_GATE = "gates.pregestation_passed"
 _CONDITION_ID_EARLY_GATES = "gates.early_passed"
 _CONDITION_ID_ALL_GATES = "gates.all_base_passed"
 _CONDITION_ID_WAVE_STAGE_READY = "gates.wave_stage_ready"
+# Data-rebuild schedule conditions (wired to the data-node "provides" edges)
+_CONDITION_ID_PREG_REBUILD = "data.pregestation_rebuild_due"
+_CONDITION_ID_GEST_REBUILD = "data.gestation_rebuild_due"
+_CONDITION_ID_BERKELEY_REFRESH = "data.berkeley_refresh_due"
 
 
 def _worker_id_for_output(output_dir: Path) -> str:
@@ -383,6 +387,46 @@ def _build_condition_blobs() -> dict:
             "description": "True when the transformer exists and the upstream gates allow the wave classifier stage.",
             "callable": "_wave_stage_ready",
             "condition_expr": expr_for_condition_id(_CONDITION_ID_WAVE_STAGE_READY),
+        },
+        # Data-rebuild schedule conditions — these gate the "provides" edges from data_node
+        # so the callbacks only fire when a cache rebuild is actually due.
+        _CONDITION_ID_PREG_REBUILD: {
+            "label": "Pregestation rebuild due",
+            "description": (
+                "True on the first round or when preg_cfg.rebuild_every_n_rounds have elapsed "
+                "since the last pregestation cache build."
+            ),
+            "callable": "_pregestation_rebuild_due",
+            "condition_expr": (
+                "data._preg_last_build_round < 0 OR "
+                "(ctx.total_rounds_completed - data._preg_last_build_round) >= preg_cfg.rebuild_every_n_rounds"
+            ),
+        },
+        _CONDITION_ID_GEST_REBUILD: {
+            "label": "Gestation rebuild due (gated)",
+            "description": (
+                "True when pregestation gate has cleared AND "
+                "gest_cfg.rebuild_every_n_rounds have elapsed since the last gestation cache build."
+            ),
+            "callable": "_gestation_rebuild_due",
+            "condition_expr": (
+                "(GATE_OVERRIDE OR gate_pregestation.passed) AND "
+                "(data._gest_last_build_round < 0 OR "
+                "(ctx.total_rounds_completed - data._gest_last_build_round) >= gest_cfg.rebuild_every_n_rounds)"
+            ),
+        },
+        _CONDITION_ID_BERKELEY_REFRESH: {
+            "label": "Berkeley data refresh due (gated)",
+            "description": (
+                "True when early gates have cleared AND "
+                "bdata_cfg.rebuild_every_n_rounds have elapsed since the last Berkeley data refresh."
+            ),
+            "callable": "_berkeley_refresh_due",
+            "condition_expr": (
+                "(GATE_OVERRIDE OR early_gates_passed) AND "
+                "(data._bdata_last_build_round < 0 OR "
+                "(ctx.total_rounds_completed - data._bdata_last_build_round) >= bdata_cfg.rebuild_every_n_rounds)"
+            ),
         },
     }
 
@@ -1175,10 +1219,45 @@ def _generator_exists(ctx: PipelineContext) -> bool:
     mode = str(ctx.orchestration_mode or getattr(ctx.args, "orchestration_mode", "")).lower()
     return "g" in mode
 
-def _berkeley_every_n_rounds(n: int):
+def _make_preg_rebuild_cond(data_node):
+    """Return an edge condition that fires when pregestation data is missing or rebuild period has elapsed."""
     def _cond(ctx: PipelineContext) -> bool:
-        return ctx.total_rounds_completed % max(1, n) == 0
+        return (
+            data_node._preg_last_build_round < 0
+            or (ctx.total_rounds_completed - data_node._preg_last_build_round)
+               >= data_node.preg_cfg.rebuild_every_n_rounds
+        )
+    _cond.__name__ = "_pregestation_rebuild_due"
     return _cond
+
+
+def _make_gest_rebuild_cond(data_node):
+    """Return an edge condition that fires when pregestation gate has cleared AND gestation data rebuild is due."""
+    def _cond(ctx: PipelineContext) -> bool:
+        if not _gate_pregestation_passed(ctx):
+            return False
+        return (
+            data_node._gest_last_build_round < 0
+            or (ctx.total_rounds_completed - data_node._gest_last_build_round)
+               >= data_node.gest_cfg.rebuild_every_n_rounds
+        )
+    _cond.__name__ = "_gestation_rebuild_due"
+    return _cond
+
+
+def _make_berk_refresh_cond(data_node):
+    """Return an edge condition that fires when early gates have cleared AND berkeley data refresh is due."""
+    def _cond(ctx: PipelineContext) -> bool:
+        if not _early_gates_passed(ctx):
+            return False
+        return (
+            data_node._bdata_last_build_round < 0
+            or (ctx.total_rounds_completed - data_node._bdata_last_build_round)
+               >= data_node.bdata_cfg.rebuild_every_n_rounds
+        )
+    _cond.__name__ = "_berkeley_refresh_due"
+    return _cond
+
 
 def _always(ctx: PipelineContext) -> bool:
     return True
@@ -1212,6 +1291,9 @@ def build_pipeline_graph(
     All nodes are registered; all edges with their conditions are defined here.
     The returned graph is stateless — the context carries all mutable state.
     """
+    # berkeley_refresh_every_n_rounds is the authoritative override; apply it to the config
+    # so the edge condition closures (which read bdata_cfg directly) stay in sync.
+    berkeley_data_cfg.rebuild_every_n_rounds = int(berkeley_refresh_every_n_rounds)
 
     g = PipelineGraph(name="wav_ml_pipeline")
 
@@ -1242,6 +1324,13 @@ def build_pipeline_graph(
         bdata_cfg=berkeley_data_cfg,
     )
     g.add_node(_data_node)
+
+    # Edge-condition closures for data-rebuild scheduling.
+    # These mirror the DataPossession.expiry_fn logic so the IR topology
+    # is the single authoritative description of when caches are rebuilt.
+    _preg_rebuild_cond = _make_preg_rebuild_cond(_data_node)
+    _gest_rebuild_cond = _make_gest_rebuild_cond(_data_node)
+    _berk_refresh_cond = _make_berk_refresh_cond(_data_node)
 
     # Training stages
     g.add_node(PregestationTrainNode(classifier_cfg))
@@ -1291,28 +1380,31 @@ def build_pipeline_graph(
     # DataNode runs after label embedding (needs latest vocab/embeddings)
     g.add_edge("build_label_embedding", "data_node", label="per_round")
 
-    # Pregestation: data_node provides ctx.pregestation_loader to stage 0
+    # Pregestation: data_node rebuilds ctx.pregestation_loader when the rebuild period is due.
+    # On non-rebuild rounds the edge is inactive but stage_0 still trains on the cached loader.
     g.add_edge("data_node", "stage_0_pregestation",
-               label="provides:pregestation_loader",
+               condition=_preg_rebuild_cond, label="provides:pregestation_loader",
+               condition_id=_CONDITION_ID_PREG_REBUILD,
                on_traverse=_data_node.provide_pregestation)
     g.add_edge("data_node", "gate_0_pregestation_eval",
-               label="provides:pregestation_eval_loader",
+               condition=_preg_rebuild_cond, label="provides:pregestation_eval_loader",
+               condition_id=_CONDITION_ID_PREG_REBUILD,
                on_traverse=_data_node.provide_pregestation_eval)
 
-    # Gestation: data_node provides ctx.gestation_loader to stage 1 (after gate 0)
+    # Gestation: gate condition is embedded in _gest_rebuild_cond (gate must clear AND rebuild due).
     g.add_edge("data_node", "stage_1_gestation",
-               condition=_gate_pregestation_passed, label="provides:gestation_loader",
-               condition_id=_CONDITION_ID_PREGESTATION_GATE,
+               condition=_gest_rebuild_cond, label="provides:gestation_loader",
+               condition_id=_CONDITION_ID_GEST_REBUILD,
                on_traverse=_data_node.provide_gestation)
     g.add_edge("data_node", "gate_1_gestation_eval",
-               condition=_gate_pregestation_passed, label="provides:gestation_eval_loader",
-               condition_id=_CONDITION_ID_PREGESTATION_GATE,
+               condition=_gest_rebuild_cond, label="provides:gestation_eval_loader",
+               condition_id=_CONDITION_ID_GEST_REBUILD,
                on_traverse=_data_node.provide_gestation_eval)
 
-    # Berkeley refresh: data_node provides ctx.berkeley_refresh_loader to stage 2 (after early gates)
+    # Berkeley refresh: gate + rebuild period embedded in _berk_refresh_cond.
     g.add_edge("data_node", "stage_2_berkeley",
-               condition=_early_gates_passed, label="provides:berkeley_refresh_loader",
-               condition_id=_CONDITION_ID_EARLY_GATES,
+               condition=_berk_refresh_cond, label="provides:berkeley_refresh_loader",
+               condition_id=_CONDITION_ID_BERKELEY_REFRESH,
                on_traverse=_data_node.provide_berkeley_data)
 
     # Gate 2 eval: data_node provides berkeley loaders + payload validation loader
@@ -1789,6 +1881,7 @@ def run(args, output_dir: Path, initial_plan=None) -> None:
         except Exception:
             pass
     _log(f"[orchestrator] run complete. summary -> {summary_path}")
+    return stop_requested
 
 
 # ---------------------------------------------------------------------------

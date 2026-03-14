@@ -9,7 +9,8 @@
       "Bash(ls -la /c/dev/Powershell/meta-nn/pipeline/nodes/*.py)",
       "Bash(xargs -I {} basename {})",
       "Bash(grep \"\\\\.py$\")",
-      "Bash(xargs grep:*)"
+      "Bash(xargs grep:*)",
+      "Bash(grep -n \"save_every_n_rounds\\\\|rebuild_every_n_rounds\" /c/dev/Powershell/meta-nn/pipeline/nodes/*.py)"
     ]
   }
 }

@@ -534,7 +534,7 @@ class CheckpointSaveNode(PipelineNode):
 
     @property
     def runtime_execution_policy(self) -> tuple:
-        return ("periodic", {"period": self.save_every_n_rounds})
+        return ("periodic", {"period": self.save_every_n_rounds, "counter": "round_id"})
 
     def should_run(self, ctx: PipelineContext) -> bool:
         return (ctx.round_id % self.save_every_n_rounds) == 0

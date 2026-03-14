@@ -23,12 +23,8 @@ from torch.utils.data import Dataset, Sampler
 from semantic_dataset_loaders import (
     SemanticDiskRow,
     _apply_degrade as _canonical_apply_degrade,
-    _blend_attention_maps,
-    _blend_attention_maps_batch_torch,
     _composite_mask_stack,
     _norm_txt,
-    _normalize_attention_map,
-    _normalize_attention_map_batch_torch,
     _resolve_processing_device,
     build_creation_label_mask_stack,
     build_label_mask_stack,
@@ -78,23 +74,21 @@ def _load_fit_rgb_u8(path: str, image_size: int) -> np.ndarray:
     return np.transpose(arr, (2, 0, 1)).astype(np.uint8, copy=False)
 
 
-def _fit_mask_array_u8(mask: np.ndarray, image_size: int) -> np.ndarray:
+def _fit_mask_array(mask: np.ndarray, image_size: int) -> np.ndarray:
+    """Resize a float32 [0,1] mask to (image_size, image_size).  No quantization."""
     arr = np.asarray(mask, dtype=np.float32)
     if int(arr.ndim) == 3:
         arr = np.mean(arr, axis=0).astype(np.float32, copy=False)
-    arr_u8 = np.clip(np.rint(np.clip(arr, 0.0, 1.0) * 255.0), 0.0, 255.0).astype(np.uint8)
-    pil = Image.fromarray(arr_u8, mode="L")
-    fitted = _fit_pil_to_square(pil, image_size=int(image_size), fill=0)
-    return np.asarray(fitted, dtype=np.uint8)
-
-
-def _encode_mask_u8(mask: Any) -> np.ndarray:
-    arr = np.asarray(mask, dtype=np.float32)
-    return np.clip(np.rint(np.clip(arr, 0.0, 1.0) * 255.0), 0.0, 255.0).astype(np.uint8, copy=False)
-
-
-def _decode_mask_u8(mask: np.ndarray) -> np.ndarray:
-    return np.clip(np.asarray(mask, dtype=np.float32) / 255.0, 0.0, 1.0).astype(np.float32, copy=False)
+    arr = np.clip(arr, 0.0, 1.0).astype(np.float32, copy=False)
+    size = max(8, int(image_size))
+    h, w = int(arr.shape[0]), int(arr.shape[1])
+    if h != size or w != size:
+        arr = torch.nn.functional.interpolate(
+            torch.from_numpy(arr[None, None, ...]),
+            size=(size, size),
+            mode='nearest',
+        )[0, 0].numpy().astype(np.float32, copy=False)
+    return np.clip(arr, 0.0, 1.0).astype(np.float32, copy=False)
 
 
 def _positive_label_bits(label_vec: np.ndarray) -> np.ndarray:
@@ -114,7 +108,7 @@ def _resolve_preload_workers(row_count: int, requested_workers: int = 0, max_cap
 def _load_row_assets(row: SemanticDiskRow, image_size: int) -> Tuple[np.ndarray, Optional[np.ndarray]]:
     return (
         _load_fit_rgb_u8(row.image_path, image_size=int(image_size)),
-        _row_creation_mask_u8(row, image_size=int(image_size)),
+        _row_creation_mask(row, image_size=int(image_size)),
     )
 
 
@@ -178,15 +172,14 @@ def build_semantic_cache_entry(
     if mixed_mask is None:
         mixed_mask_arr = infer_semantic_support_mask(image=image_f32, terms=[])
     else:
-        mixed_mask_arr = _fit_mask_array_u8(np.asarray(mixed_mask, dtype=np.float32), image_size=size)
-        mixed_mask_arr = _decode_mask_u8(np.asarray(mixed_mask_arr, dtype=np.uint8))
+        mixed_mask_arr = _fit_mask_array(np.asarray(mixed_mask, dtype=np.float32), image_size=size)
     stack_arr = np.asarray(mask_stack) if mask_stack is not None else np.zeros((0, size, size), dtype=np.float32)
     idx_arr = np.asarray(mask_indices, dtype=np.int64).reshape(-1) if mask_indices is not None else np.zeros((0,), dtype=np.int64)
     if int(stack_arr.ndim) == 2:
         stack_arr = stack_arr[None, ...]
     if int(stack_arr.ndim) == 3 and int(stack_arr.shape[0]) > 0:
         fitted_parts = [
-            _decode_mask_u8(_fit_mask_array_u8(np.asarray(stack_arr[int(i)], dtype=np.float32), image_size=size))
+            _fit_mask_array(np.asarray(stack_arr[int(i)], dtype=np.float32), image_size=size)
             for i in range(int(stack_arr.shape[0]))
         ]
         stack_arr = np.stack(fitted_parts, axis=0).astype(np.float32, copy=False)
@@ -197,12 +190,11 @@ def build_semantic_cache_entry(
     idx_arr = np.asarray(idx_arr[: int(pair_count)], dtype=np.int64)
     if int(stack_arr.shape[0]) > 0:
         mixed_mask_arr = _composite_mask_stack(stack_arr)
-    mixed_mask_arr = _normalize_attention_map(np.asarray(mixed_mask_arr, dtype=np.float32), gamma=0.92, blur_kernel=1)
     return {
         "image_u8": np.asarray(image_u8, dtype=np.uint8),
         "label_vec_u8": _positive_label_bits(label_arr),
-        "mixed_mask_u8": _encode_mask_u8(mixed_mask_arr),
-        "mask_stack_u8": _encode_mask_u8(stack_arr) if int(np.asarray(stack_arr).size) > 0 else np.zeros((0, size, size), dtype=np.uint8),
+        "mixed_mask": np.clip(np.asarray(mixed_mask_arr, dtype=np.float32), 0.0, 1.0),
+        "mask_stack": np.asarray(stack_arr, dtype=np.float32),
         "mask_indices": np.asarray(idx_arr, dtype=np.int32).reshape(-1),
     }
 
@@ -214,10 +206,11 @@ class SemanticWheelCandidate:
     source: str = ""
 
 
-def _row_creation_mask_u8(row: SemanticDiskRow, image_size: int) -> Optional[np.ndarray]:
+def _row_creation_mask(row: SemanticDiskRow, image_size: int) -> Optional[np.ndarray]:
+    """Load or derive a float32 [0,1] creation mask for *row*.  No normalization."""
     size = max(8, int(image_size))
     if row.mask_array is not None:
-        return _fit_mask_array_u8(np.asarray(row.mask_array, dtype=np.float32), image_size=size)
+        return _fit_mask_array(np.asarray(row.mask_array, dtype=np.float32), image_size=size)
     if str(row.mask_path).strip():
         mask_path = Path(str(row.mask_path))
         if mask_path.exists():
@@ -245,21 +238,21 @@ def _row_creation_mask_u8(row: SemanticDiskRow, image_size: int) -> Optional[np.
                     seg = None
                 if seg is not None:
                     seg01 = (np.asarray(seg, dtype=np.float32) > 0.0).astype(np.float32, copy=False)
-                    return _fit_mask_array_u8(seg01, image_size=size)
+                    return _fit_mask_array(seg01, image_size=size)
             try:
                 with Image.open(str(mask_path)) as im:
                     gray = _fit_pil_to_square(im.convert("L"), image_size=size, fill=0)
-                    return np.asarray(gray, dtype=np.uint8)
+                    arr = np.asarray(gray, dtype=np.float32)
+                    if float(np.max(arr)) > 1.0:
+                        arr = arr / 255.0
+                    return np.clip(arr, 0.0, 1.0).astype(np.float32, copy=False)
             except Exception:
                 pass
     if isinstance(row.layout, dict):
-        return _encode_mask_u8(
-            _normalize_attention_map(
-                build_layout_mask(row.layout, height=size, width=size),
-                gamma=0.95,
-                blur_kernel=1,
-            )
-        )
+        return np.clip(
+            np.asarray(build_layout_mask(row.layout, height=size, width=size), dtype=np.float32),
+            0.0, 1.0,
+        ).astype(np.float32, copy=False)
     return None
 
 
@@ -433,7 +426,7 @@ def _build_clean_entries_batch(
     for row_idx, row in tqdm(enumerate(rows), total=len(rows), desc="[wheel cache] building entries", unit="row", leave=False, dynamic_ncols=True):
         label_vec = np.asarray(label_batch[int(row_idx)], dtype=np.float32)
         creation_mask_u8 = creation_masks_u8[int(row_idx)]
-        creation_mask = _decode_mask_u8(creation_mask_u8) if creation_mask_u8 is not None else None
+        creation_mask = np.asarray(creation_mask_u8, dtype=np.float32) if creation_mask_u8 is not None else None
         creation_stack = np.zeros((0, size, size), dtype=np.float32)
         creation_idx = np.zeros((0,), dtype=np.int64)
         if creation_mask is not None:
@@ -466,8 +459,8 @@ def _build_clean_entries_batch(
             {
                 "image_u8": np.asarray(image_u8_batch[int(row_idx)], dtype=np.uint8),
                 "label_vec_u8": _positive_label_bits(label_vec),
-                "mixed_mask_u8": _encode_mask_u8(mixed_mask),
-                "mask_stack_u8": _encode_mask_u8(mask_stack) if int(mask_stack.size) > 0 else np.zeros((0, size, size), dtype=np.uint8),
+                "mixed_mask": np.clip(np.asarray(mixed_mask, dtype=np.float32), 0.0, 1.0),
+                "mask_stack": np.asarray(mask_stack, dtype=np.float32),
                 "mask_indices": np.asarray(mask_indices, dtype=np.int32).reshape(-1),
             }
         )
@@ -484,7 +477,7 @@ def _build_deformed_entry(
     processing_device: Optional[Any] = None,
 ) -> Dict[str, Any]:
     image = np.clip(np.asarray(clean_entry["image_u8"], dtype=np.float32) / 255.0, 0.0, 1.0).astype(np.float32, copy=False)
-    base_mask = _decode_mask_u8(np.asarray(clean_entry["mixed_mask_u8"], dtype=np.uint8))
+    base_mask = np.asarray(clean_entry["mixed_mask"], dtype=np.float32)
     x, mask_out, term_masks = _apply_degrade(
         x=image,
         mask=base_mask,
@@ -499,7 +492,7 @@ def _build_deformed_entry(
         if 0 <= int(ti) < int(label_vec.size):
             label_vec[int(ti)] = 1.0
     size = int(x.shape[1])
-    base_stack = _decode_mask_u8(np.asarray(clean_entry["mask_stack_u8"], dtype=np.uint8))
+    base_stack = np.asarray(clean_entry["mask_stack"], dtype=np.float32)
     base_idx = np.asarray(clean_entry["mask_indices"], dtype=np.int64).reshape(-1)
     distortion_stack, distortion_idx = term_mask_map_to_label_stack(
         term_masks,
@@ -522,25 +515,11 @@ def _build_deformed_entry(
         if int(mask_stack.shape[0]) > 0
         else np.zeros((size, size), dtype=np.float32)
     )
-    _resolved = _resolve_processing_device(processing_device)
-    mixed_mask = (
-        np.asarray(
-            _normalize_attention_map_batch_torch(
-                np.asarray(mixed_mask, dtype=np.float32),
-                gamma=0.92,
-                blur_kernel=5,
-                device=_resolved,
-            ).detach().cpu().numpy(),
-            dtype=np.float32,
-        )
-        if _resolved is not None
-        else _normalize_attention_map(np.asarray(mixed_mask, dtype=np.float32), gamma=0.92, blur_kernel=5)
-    )
     return {
         "image_u8": np.clip(np.rint(np.clip(x, 0.0, 1.0) * 255.0), 0.0, 255.0).astype(np.uint8, copy=False),
         "label_vec_u8": _positive_label_bits(label_vec),
-        "mixed_mask_u8": _encode_mask_u8(mixed_mask),
-        "mask_stack_u8": _encode_mask_u8(mask_stack) if int(mask_stack.size) > 0 else np.zeros((0, size, size), dtype=np.uint8),
+        "mixed_mask": np.clip(np.asarray(mixed_mask, dtype=np.float32), 0.0, 1.0),
+        "mask_stack": np.asarray(mask_stack, dtype=np.float32),
         "mask_indices": np.asarray(mask_indices, dtype=np.int32).reshape(-1),
     }
 
@@ -631,7 +610,7 @@ def _chunk_payload(entries: Sequence[Dict[str, Any]], label_dim: int, image_size
         raise RuntimeError("semantic wheel chunk payload requires at least one entry")
     size = max(8, int(image_size))
     images = np.stack([np.asarray(entry["image_u8"], dtype=np.uint8) for entry in entries], axis=0).astype(np.uint8, copy=False)
-    mixed_masks = np.stack([np.asarray(entry["mixed_mask_u8"], dtype=np.uint8) for entry in entries], axis=0).astype(np.uint8, copy=False)
+    mixed_masks = np.stack([np.asarray(entry["mixed_mask"], dtype=np.float32) for entry in entries], axis=0).astype(np.float16, copy=False)
     label_bank_rows: List[np.ndarray] = []
     label_bank_lut: Dict[bytes, int] = {}
     label_refs: List[int] = []
@@ -652,27 +631,27 @@ def _chunk_payload(entries: Sequence[Dict[str, Any]], label_dim: int, image_size
             label_bank_rows.append(np.asarray(label_vec, dtype=np.uint8))
         label_refs.append(int(label_id))
 
-        stack_u8 = np.asarray(entry["mask_stack_u8"], dtype=np.uint8)
+        stack_f = np.asarray(entry["mask_stack"], dtype=np.float32)
         stack_idx = np.asarray(entry["mask_indices"], dtype=np.int32).reshape(-1)
-        if int(stack_u8.ndim) == 2:
-            stack_u8 = stack_u8[None, ...]
-        if int(stack_u8.ndim) != 3:
-            stack_u8 = np.zeros((0, size, size), dtype=np.uint8)
-        pair_count = min(int(stack_u8.shape[0]), int(stack_idx.size))
+        if int(stack_f.ndim) == 2:
+            stack_f = stack_f[None, ...]
+        if int(stack_f.ndim) != 3:
+            stack_f = np.zeros((0, size, size), dtype=np.float32)
+        pair_count = min(int(stack_f.shape[0]), int(stack_idx.size))
         for pos in range(int(pair_count)):
-            mask_u8 = np.asarray(stack_u8[int(pos)], dtype=np.uint8)
-            mask_key = bytes(mask_u8.tobytes())
+            mask_f16 = np.asarray(stack_f[int(pos)], dtype=np.float16)
+            mask_key = bytes(mask_f16.tobytes())
             mask_id = mask_bank_lut.get(mask_key, -1)
             if int(mask_id) < 0:
                 mask_id = int(len(mask_bank_rows))
                 mask_bank_lut[mask_key] = int(mask_id)
-                mask_bank_rows.append(np.asarray(mask_u8, dtype=np.uint8))
+                mask_bank_rows.append(mask_f16)
             assoc_mask_ids.append(int(mask_id))
             assoc_label_indices.append(int(stack_idx[int(pos)]))
         assoc_offsets.append(int(len(assoc_mask_ids)))
 
     label_bank = np.stack(label_bank_rows, axis=0).astype(np.uint8, copy=False) if len(label_bank_rows) > 0 else np.zeros((0, int(label_dim)), dtype=np.uint8)
-    mask_bank = np.stack(mask_bank_rows, axis=0).astype(np.uint8, copy=False) if len(mask_bank_rows) > 0 else np.zeros((0, size, size), dtype=np.uint8)
+    mask_bank = np.stack(mask_bank_rows, axis=0).astype(np.float16, copy=False) if len(mask_bank_rows) > 0 else np.zeros((0, size, size), dtype=np.float16)
     payload = {
         "images": images,
         "mixed_masks": mixed_masks,
@@ -786,10 +765,10 @@ class SemanticWheelDataset(Dataset):
         chunk_idx, row_offset = self._locate(int(index))
         payload = self._load_chunk(int(chunk_idx))
         images = np.asarray(payload["images"], dtype=np.uint8)
-        mixed_masks = np.asarray(payload["mixed_masks"], dtype=np.uint8)
+        mixed_masks = np.asarray(payload["mixed_masks"], dtype=np.float32)
         label_bank = np.asarray(payload["label_bank"], dtype=np.uint8)
         label_refs = np.asarray(payload["label_refs"], dtype=np.int32).reshape(-1)
-        mask_bank = np.asarray(payload["mask_bank"], dtype=np.uint8)
+        mask_bank = np.asarray(payload["mask_bank"], dtype=np.float32)
         assoc_offsets = np.asarray(payload["assoc_offsets"], dtype=np.int64).reshape(-1)
         assoc_mask_ids = np.asarray(payload["assoc_mask_ids"], dtype=np.int32).reshape(-1)
         assoc_label_indices = np.asarray(payload["assoc_label_indices"], dtype=np.int32).reshape(-1)
@@ -803,16 +782,16 @@ class SemanticWheelDataset(Dataset):
         a1 = int(assoc_offsets[int(row_offset) + 1]) if int(row_offset + 1) < int(assoc_offsets.size) else int(a0)
         mask_ids = np.asarray(assoc_mask_ids[int(a0): int(a1)], dtype=np.int32)
         label_indices = np.asarray(assoc_label_indices[int(a0): int(a1)], dtype=np.int32)
-        stack_u8 = (
-            np.asarray(mask_bank[mask_ids.tolist()], dtype=np.uint8)
+        stack_f32 = (
+            np.asarray(mask_bank[mask_ids.tolist()], dtype=np.float32)
             if int(mask_ids.size) > 0 and int(mask_bank.shape[0]) > 0
-            else np.zeros((0, int(self.image_size), int(self.image_size)), dtype=np.uint8)
+            else np.zeros((0, int(self.image_size), int(self.image_size)), dtype=np.float32)
         )
         return {
             "image_u8": np.asarray(images[int(row_offset)], dtype=np.uint8),
             "label_vec_u8": np.asarray(label_vec, dtype=np.uint8),
-            "mixed_mask_u8": np.asarray(mixed_masks[int(row_offset)], dtype=np.uint8),
-            "mask_stack_u8": np.asarray(stack_u8, dtype=np.uint8),
+            "mixed_mask": np.asarray(mixed_masks[int(row_offset)], dtype=np.float32),
+            "mask_stack": np.asarray(stack_f32, dtype=np.float32),
             "mask_indices": np.asarray(label_indices, dtype=np.int32),
         }
 
@@ -820,9 +799,9 @@ class SemanticWheelDataset(Dataset):
         item = self.read_numpy_entry(int(index))
         x_t = torch.from_numpy(np.asarray(item["image_u8"], dtype=np.float32) / 255.0)
         y_t = torch.from_numpy(np.asarray(item["label_vec_u8"], dtype=np.float32))
-        mask_t = torch.from_numpy(np.asarray(item["mixed_mask_u8"], dtype=np.uint8)[None, ...])
+        mask_t = torch.from_numpy(np.asarray(item["mixed_mask"], dtype=np.float32)).unsqueeze(0)
         if bool(self.return_mask_stack):
-            stack_t = torch.from_numpy(np.asarray(item["mask_stack_u8"], dtype=np.uint8))
+            stack_t = torch.from_numpy(np.asarray(item["mask_stack"], dtype=np.float32))
             idx_t = torch.from_numpy(np.asarray(item["mask_indices"], dtype=np.int64))
             return x_t, y_t, mask_t, stack_t, idx_t
         return x_t, y_t, mask_t
@@ -841,7 +820,7 @@ class SemanticWheelPayloadBank:
 
     def get_mask(self, index: int) -> np.ndarray:
         item = self.dataset.read_numpy_entry(int(index))
-        return (np.asarray(item["mixed_mask_u8"], dtype=np.float32) / 255.0).astype(np.float32, copy=False)
+        return np.asarray(item["mixed_mask"], dtype=np.float32)
 
 
 class SemanticWheelPayloadView(Sequence[np.ndarray]):
@@ -1063,9 +1042,9 @@ def ensure_semantic_candidate_cache(
     def _estimate_chunk_bytes(entries: Sequence[Dict[str, Any]]) -> int:
         return int(sum(
             int(np.asarray(e.get("image_u8", np.zeros(0)), dtype=np.uint8).nbytes)
-            + int(np.asarray(e.get("mixed_mask_u8", np.zeros(0)), dtype=np.uint8).nbytes)
+            + int(np.asarray(e.get("mixed_mask", np.zeros(0)), dtype=np.float32).nbytes)
             + int(np.asarray(e.get("label_vec_u8", np.zeros(0)), dtype=np.uint8).nbytes)
-            + int(np.asarray(e.get("mask_stack_u8", np.zeros(0)), dtype=np.uint8).nbytes)
+            + int(np.asarray(e.get("mask_stack", np.zeros(0)), dtype=np.float32).nbytes)
             for e in entries
         ))
 

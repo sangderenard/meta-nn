@@ -459,17 +459,14 @@ def _normalize_mask_array(mask: Any, height: int, width: int) -> np.ndarray:
     arr = np.asarray(mask, dtype=np.float32)
     if int(arr.ndim) == 3:
         arr = np.mean(arr, axis=0).astype(np.float32, copy=False)
-    if int(arr.shape[0]) != int(height) or int(arr.shape[1]) != int(width):
-        arr = np.asarray(
-            TF.resize(
-                Image.fromarray(np.clip(arr * 255.0, 0.0, 255.0).astype(np.uint8), mode="L"),
-                [int(height), int(width)],
-                interpolation=InterpolationMode.NEAREST,
-            ),
-            dtype=np.float32,
-        )
     if float(np.max(arr)) > 1.0:
         arr = arr / 255.0
+    if int(arr.shape[0]) != int(height) or int(arr.shape[1]) != int(width):
+        arr = torch.nn.functional.interpolate(
+            torch.from_numpy(arr[None, None, ...]),
+            size=(int(height), int(width)),
+            mode='nearest',
+        )[0, 0].numpy().astype(np.float32, copy=False)
     return np.clip(arr, 0.0, 1.0).astype(np.float32, copy=False)
 
 
@@ -543,7 +540,7 @@ def _composite_mask_stack(stack: Any, processing_device: Optional[Any] = None) -
     _normalize_stack_row_batch).  The sum is divided by its maximum so that
     pixels covered by the most labels reach 1.0; no vmean/gamma distortion is
     applied here.  Attention-style normalization belongs on the final
-    mixed_mask_u8 stored in the cache entry, not on the raw stack composite.
+    mixed_mask stored in the cache entry, not on the raw stack composite.
     """
     arr = np.asarray(stack, dtype=np.float32)
     if int(arr.ndim) != 3 or int(arr.shape[0]) <= 0:
@@ -2115,13 +2112,12 @@ def _cache_decode_image_u8(img: np.ndarray) -> np.ndarray:
     return (np.asarray(img, dtype=np.float32) / 255.0).astype(np.float32, copy=False)
 
 
-def _cache_encode_mask_u8(mask: np.ndarray) -> np.ndarray:
-    arr = np.clip(np.asarray(mask, dtype=np.float32), 0.0, 1.0)
-    return np.round(arr * 255.0).astype(np.uint8, copy=False)
+def _cache_encode_mask_f16(mask: np.ndarray) -> np.ndarray:
+    return np.clip(np.asarray(mask, dtype=np.float32), 0.0, 1.0).astype(np.float16, copy=False)
 
 
-def _cache_decode_mask_u8(mask: np.ndarray) -> np.ndarray:
-    return (np.asarray(mask, dtype=np.float32) / 255.0).astype(np.float32, copy=False)
+def _cache_decode_mask_f16(mask: np.ndarray) -> np.ndarray:
+    return np.asarray(mask, dtype=np.float32)
 
 
 def _cache_encode_target_f16(target: np.ndarray) -> np.ndarray:
@@ -2487,26 +2483,26 @@ class BootstrapDynamicDataset(Dataset):
             images_rows.append(_cache_encode_image_u8(img_np))
             target_rows.append(_cache_encode_target_f16(tgt_np))
             if bool(self.return_masks):
-                mask_rows.append(_cache_encode_mask_u8(mask_np))
+                mask_rows.append(_cache_encode_mask_f16(mask_np))
             if bool(self.return_mask_stack):
-                stack_u8 = _cache_encode_mask_u8(mask_stack_np) if int(np.asarray(mask_stack_np).size) > 0 else np.zeros((0, int(img_np.shape[1]), int(img_np.shape[2])), dtype=np.uint8)
+                stack_f16 = _cache_encode_mask_f16(mask_stack_np) if int(np.asarray(mask_stack_np).size) > 0 else np.zeros((0, int(img_np.shape[1]), int(img_np.shape[2])), dtype=np.float16)
                 idx_np = np.asarray(mask_idx_np, dtype=np.int64).reshape(-1)
-                if int(stack_u8.shape[0]) != int(idx_np.size):
-                    raise RuntimeError(f"{str(self.dataset_name)} mask stack cache mismatch: stack_rows={int(stack_u8.shape[0])} idx={int(idx_np.size)}")
-                mask_stack_rows.append(np.asarray(stack_u8, dtype=np.uint8))
+                if int(stack_f16.shape[0]) != int(idx_np.size):
+                    raise RuntimeError(f"{str(self.dataset_name)} mask stack cache mismatch: stack_rows={int(stack_f16.shape[0])} idx={int(idx_np.size)}")
+                mask_stack_rows.append(np.asarray(stack_f16, dtype=np.float16))
                 mask_index_rows.append(idx_np)
-                mask_offsets.append(int(mask_offsets[-1] + int(stack_u8.shape[0])))
+                mask_offsets.append(int(mask_offsets[-1] + int(stack_f16.shape[0])))
         if int(len(images_rows)) <= 0:
             return 0
         images_np = np.stack(images_rows, axis=0).astype(np.uint8, copy=False)
         targets_np = np.stack(target_rows, axis=0).astype(np.float16, copy=False)
-        masks_np = np.stack(mask_rows, axis=0).astype(np.uint8, copy=False) if bool(self.return_masks) else None
+        masks_np = np.stack(mask_rows, axis=0).astype(np.float16, copy=False) if bool(self.return_masks) else None
         if bool(self.return_mask_stack):
             if int(mask_offsets[-1]) > 0:
-                mask_stacks_np = np.concatenate(mask_stack_rows, axis=0).astype(np.uint8, copy=False)
+                mask_stacks_np = np.concatenate(mask_stack_rows, axis=0).astype(np.float16, copy=False)
                 mask_indices_np = np.concatenate(mask_index_rows, axis=0).astype(np.int64, copy=False)
             else:
-                mask_stacks_np = np.zeros((0, int(images_np.shape[2]), int(images_np.shape[3])), dtype=np.uint8)
+                mask_stacks_np = np.zeros((0, int(images_np.shape[2]), int(images_np.shape[3])), dtype=np.float16)
                 mask_indices_np = np.zeros((0,), dtype=np.int64)
             mask_offsets_np = np.asarray(mask_offsets, dtype=np.int64)
         else:
@@ -2757,7 +2753,7 @@ class BootstrapDynamicDataset(Dataset):
         img = _cache_decode_image_u8(self._cache_images_mm[int(index)])
         tgt = _cache_decode_target_f16(self._cache_targets_mm[int(index)]).reshape(-1)
         if bool(self.return_masks) and self._cache_masks_mm is not None:
-            mask = _cache_decode_mask_u8(self._cache_masks_mm[int(index)])
+            mask = _cache_decode_mask_f16(self._cache_masks_mm[int(index)])
         else:
             mask = np.zeros((int(img.shape[1]), int(img.shape[2])), dtype=np.float32)
         if bool(self.return_mask_stack):
@@ -2771,7 +2767,7 @@ class BootstrapDynamicDataset(Dataset):
                 start = int(self._cache_mask_offsets_mm[int(index)])
                 stop = int(self._cache_mask_offsets_mm[int(index) + 1])
                 if int(stop) > int(start):
-                    mask_stack_np = _cache_decode_mask_u8(self._cache_mask_stacks_mm[int(start):int(stop)])
+                    mask_stack_np = _cache_decode_mask_f16(self._cache_mask_stacks_mm[int(start):int(stop)])
                     mask_idx_np = np.asarray(self._cache_mask_indices_mm[int(start):int(stop)], dtype=np.int64)
                 else:
                     mask_stack_np = np.zeros((0, int(mask.shape[0]), int(mask.shape[1])), dtype=np.float32)
@@ -2942,23 +2938,11 @@ class DiskSemanticRowsDataset(Dataset):
         return np.transpose(arr, (2, 0, 1)).astype(np.float32, copy=False)
 
     def _load_creation_mask01(self, row: SemanticDiskRow, h: int, w: int) -> Optional[np.ndarray]:
-        def _exact_mask(base_mask: Any) -> np.ndarray:
-            return _normalize_attention_map(
-                _normalize_mask_array(base_mask, height=int(h), width=int(w)),
-                gamma=0.95,
-                blur_kernel=1,
-            )
-
         if row.mask_array is not None:
             arr = np.asarray(row.mask_array, dtype=np.float32)
             if int(arr.ndim) == 3:
                 arr = np.mean(arr, axis=0).astype(np.float32, copy=False)
-            if int(arr.shape[0]) != int(h) or int(arr.shape[1]) != int(w):
-                arr = np.asarray(
-                    TF.resize(Image.fromarray(np.clip(arr * 255.0, 0.0, 255.0).astype(np.uint8), mode="L"), [int(h), int(w)], interpolation=InterpolationMode.NEAREST),
-                    dtype=np.float32,
-                )
-            return _exact_mask(arr / 255.0 if float(np.max(arr)) > 1.0 else arr)
+            return _normalize_mask_array(arr, height=int(h), width=int(w))
         if str(row.mask_path).strip():
             mask_path = Path(str(row.mask_path))
             if mask_path.exists():
@@ -2996,21 +2980,19 @@ class DiskSemanticRowsDataset(Dataset):
                         seg = None
                     if seg is not None:
                         arr = (np.asarray(seg, dtype=np.float32) > 0.0).astype(np.float32, copy=False)
-                        if int(arr.shape[1]) != int(w) or int(arr.shape[0]) != int(h):
-                            arr = np.asarray(
-                                TF.resize(Image.fromarray((arr * 255.0).astype(np.uint8), mode="L"), [int(h), int(w)], interpolation=InterpolationMode.NEAREST),
-                                dtype=np.float32,
-                            )
-                        return _exact_mask(arr / 255.0)
+                        return _normalize_mask_array(arr, height=int(h), width=int(w))
                     # fall through to next branch if seg is None
                 with Image.open(str(mask_path)) as im:
                     gray = im.convert("L")
                     if int(gray.size[0]) != int(w) or int(gray.size[1]) != int(h):
                         gray = gray.resize((int(w), int(h)), resample=Image.NEAREST)
-                    arr = np.asarray(gray, dtype=np.float32)
-                return _exact_mask(arr / 255.0)
+                    arr = np.asarray(gray, dtype=np.float32) / 255.0
+                return np.clip(arr, 0.0, 1.0).astype(np.float32, copy=False)
         if isinstance(row.layout, dict):
-            return _exact_mask(build_layout_mask(row.layout, height=int(h), width=int(w)))
+            return np.clip(
+                np.asarray(build_layout_mask(row.layout, height=int(h), width=int(w)), dtype=np.float32),
+                0.0, 1.0,
+            ).astype(np.float32, copy=False)
         return None
 
     def _load_mask01(self, row: SemanticDiskRow, h: int, w: int, image_rgb01: Optional[np.ndarray] = None) -> np.ndarray:
@@ -3022,11 +3004,7 @@ class DiskSemanticRowsDataset(Dataset):
             arr = np.asarray(cached_bundle.get("mixed_mask"), dtype=np.float32)
             if int(arr.ndim) == 3:
                 arr = np.mean(arr, axis=0).astype(np.float32, copy=False)
-            return _normalize_attention_map(
-                _normalize_mask_array(arr, height=int(h), width=int(w)),
-                gamma=0.95,
-                blur_kernel=1,
-            )
+            return _normalize_mask_array(arr, height=int(h), width=int(w))
         single_mask = _single_label_whole_image_mask(row.label_vec, height=int(h), width=int(w))
         if single_mask is not None:
             return np.asarray(single_mask, dtype=np.float32)

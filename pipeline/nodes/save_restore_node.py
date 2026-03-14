@@ -849,7 +849,7 @@ class SaveRestoreNode(PipelineNode):
 
     @property
     def runtime_execution_policy(self) -> tuple:
-        return ("periodic", {"period": self.save_every_n_rounds})
+        return ("periodic", {"period": self.save_every_n_rounds, "counter": "round_id", "restore_overrides": True})
 
     def declare_subnodes(self) -> list:
         return [

@@ -93,9 +93,9 @@ def test_roundtrip() -> None:
         assert len(ds) == 6, len(ds)
         sample = ds.read_numpy_entry(0)
         assert sample["image_u8"].dtype == np.uint8
-        assert sample["mixed_mask_u8"].dtype == np.uint8
-        assert sample["mask_stack_u8"].dtype == np.uint8
-        _ok("wheel dataset round-trips uint8 payloads")
+        assert sample["mixed_mask"].dtype == np.float32
+        assert sample["mask_stack"].dtype == np.float32
+        _ok("wheel dataset round-trips float32 mask payloads")
 
         loader = DataLoader(
             ds,

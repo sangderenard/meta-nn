@@ -2,33 +2,41 @@
 Portable condition expression evaluator for the pipeline IR.
 
 Expressions are small, safe, declarative predicates that can be stored in
-JSON plan files and evaluated against a PipelineContext at runtime.  They
-replace the hardcoded ``condition_id → Python function`` registry so that
-**any** condition can be fully described in the IR without new Python code.
+JSON plan files and evaluated against a PipelineContext at runtime. They
+replace the hardcoded ``condition_id -> Python function`` registry so that
+the IR can carry executable guard logic without new Python code.
+
+Every primitive or accessor resolves to a *signal*. Signals can be composed
+with a small *calculator* that supports five basic math operators before the
+final boolean guard is evaluated.
 
 Grammar (case-insensitive keywords, case-sensitive attribute names)::
 
-    expr        := or_expr
-    or_expr     := and_expr ( 'OR' and_expr )*
-    and_expr    := not_expr ( 'AND' not_expr )*
-    not_expr    := 'NOT' not_expr | atom
-    atom        := '(' expr ')'
-                 | accessor 'IS_NONE'
-                 | accessor 'IS_NOT_NONE'
-                 | accessor 'CONTAINS' STRING
-                 | accessor 'MOD' INTEGER '==' INTEGER
-                 | accessor ( '==' | '!=' | '>' | '>=' | '<' | '<=' ) value
-                 | 'GATE_OVERRIDE'
-                 | 'TRUE'
-                 | 'FALSE'
-                 | accessor               -- truthy test
-    accessor    := IDENT ( '.' IDENT )*
-    value       := STRING | INTEGER | FLOAT | 'TRUE' | 'FALSE' | 'NONE'
-    STRING      := '"' ... '"'
-    IDENT       := [a-zA-Z_][a-zA-Z0-9_]*
+    expr            := or_expr
+    or_expr         := and_expr ( 'OR' and_expr )*
+    and_expr        := not_expr ( 'AND' not_expr )*
+    not_expr        := 'NOT' not_expr | comparison_expr
+    comparison_expr := signal_expr (
+                           'IS_NONE'
+                         | 'IS_NOT_NONE'
+                         | 'CONTAINS' signal_expr
+                         | ( '==' | '!=' | '>' | '>=' | '<' | '<=' ) signal_expr
+                       )?
+    signal_expr     := add_expr
+    add_expr        := mul_expr ( ( '+' | '-' ) mul_expr )*
+    mul_expr        := unary_expr ( ( '*' | '/' | '%' | 'MOD' ) unary_expr )*
+    unary_expr      := ( '+' | '-' ) unary_expr | primary
+    primary         := '(' expr ')'
+                     | accessor
+                     | primitive
+                     | 'GATE_OVERRIDE'
+    accessor        := IDENT ( '.' IDENT )*
+    primitive       := STRING | INTEGER | FLOAT | 'TRUE' | 'FALSE' | 'NONE'
+    STRING          := '"' ... '"'
+    IDENT           := [a-zA-Z_][a-zA-Z0-9_]*
 
 Security: only whitelisted dotted attribute access is performed on the
-context object.  No ``__dunder__`` access, no calls except to pre-approved
+context object. No ``__dunder__`` access, no calls except to pre-approved
 zero-arg methods, no mutation.
 """
 from __future__ import annotations
@@ -47,6 +55,7 @@ _TOKEN_RE = re.compile(
     (?P<FLOAT>\d+\.\d+)        |   # float literal
     (?P<INT>\d+)                |   # integer literal
     (?P<OP>==|!=|>=|<=|>|<)    |   # comparison operators
+    (?P<ARITH>[+\-*/%])         |   # calculator operators
     (?P<DOT>\.)                 |   # dot accessor
     (?P<LPAREN>\()              |   # left paren
     (?P<RPAREN>\))              |   # right paren
@@ -92,6 +101,8 @@ def _tokenize(expr: str) -> List[Token]:
             tokens.append(("FLOAT", m.group()))
         elif m.lastgroup == "OP":
             tokens.append(("OP", m.group()))
+        elif m.lastgroup == "ARITH":
+            tokens.append(("ARITH", m.group()))
         elif m.lastgroup == "DOT":
             tokens.append(("DOT", "."))
         elif m.lastgroup == "LPAREN":
@@ -111,12 +122,12 @@ class _Expr:
     """Base class for AST nodes."""
 
 
-class _BoolLit(_Expr):
+class _SignalLit(_Expr):
     __slots__ = ("value",)
-    def __init__(self, value: bool):
+    def __init__(self, value: Any):
         self.value = value
     def __repr__(self):
-        return f"BoolLit({self.value})"
+        return f"SignalLit({self.value!r})"
 
 
 class _GateOverride(_Expr):
@@ -130,6 +141,21 @@ class _Accessor(_Expr):
         self.parts = parts
     def __repr__(self):
         return f"Accessor({'.'.join(self.parts)})"
+
+
+class _CalculatorUnary(_Expr):
+    __slots__ = ("op", "child")
+    def __init__(self, op: str, child: _Expr):
+        self.op = op
+        self.child = child
+
+
+class _CalculatorBinary(_Expr):
+    __slots__ = ("left", "op", "right")
+    def __init__(self, left: _Expr, op: str, right: _Expr):
+        self.left = left
+        self.op = op
+        self.right = right
 
 
 class _Not(_Expr):
@@ -151,44 +177,30 @@ class _Or(_Expr):
 
 
 class _IsNone(_Expr):
-    __slots__ = ("accessor",)
-    def __init__(self, accessor: _Accessor):
-        self.accessor = accessor
+    __slots__ = ("signal",)
+    def __init__(self, signal: _Expr):
+        self.signal = signal
 
 
 class _IsNotNone(_Expr):
-    __slots__ = ("accessor",)
-    def __init__(self, accessor: _Accessor):
-        self.accessor = accessor
+    __slots__ = ("signal",)
+    def __init__(self, signal: _Expr):
+        self.signal = signal
 
 
 class _Contains(_Expr):
-    __slots__ = ("accessor", "substring")
-    def __init__(self, accessor: _Accessor, substring: str):
-        self.accessor = accessor
-        self.substring = substring
-
-
-class _Mod(_Expr):
-    __slots__ = ("accessor", "divisor", "remainder")
-    def __init__(self, accessor: _Accessor, divisor: int, remainder: int):
-        self.accessor = accessor
-        self.divisor = divisor
-        self.remainder = remainder
+    __slots__ = ("signal", "needle")
+    def __init__(self, signal: _Expr, needle: _Expr):
+        self.signal = signal
+        self.needle = needle
 
 
 class _Compare(_Expr):
-    __slots__ = ("accessor", "op", "value")
-    def __init__(self, accessor: _Accessor, op: str, value: Any):
-        self.accessor = accessor
+    __slots__ = ("left", "op", "right")
+    def __init__(self, left: _Expr, op: str, right: _Expr):
+        self.left = left
         self.op = op
-        self.value = value
-
-
-class _Truthy(_Expr):
-    __slots__ = ("accessor",)
-    def __init__(self, accessor: _Accessor):
-        self.accessor = accessor
+        self.right = right
 
 
 # ---------------------------------------------------------------------------
@@ -244,69 +256,80 @@ class _Parser:
         if self._peek() == ("KW", "NOT"):
             self._advance()
             return _Not(self._not_expr())
-        return self._atom()
+        return self._comparison_expr()
 
-    def _atom(self) -> _Expr:
+    def _comparison_expr(self) -> _Expr:
+        left = self._signal_expr()
+        nxt = self._peek()
+        if nxt == ("KW", "IS_NOT_NONE"):
+            self._advance()
+            return _IsNotNone(left)
+        if nxt == ("KW", "IS_NONE"):
+            self._advance()
+            return _IsNone(left)
+        if nxt == ("KW", "CONTAINS"):
+            self._advance()
+            return _Contains(left, self._signal_expr())
+        if nxt is not None and nxt[0] == "OP":
+            op = self._advance()[1]
+            return _Compare(left, op, self._signal_expr())
+        return left
+
+    def _signal_expr(self) -> _Expr:
+        return self._add_expr()
+
+    def _add_expr(self) -> _Expr:
+        expr = self._mul_expr()
+        while True:
+            tok = self._peek()
+            if tok is None or tok[0] != "ARITH" or tok[1] not in {"+", "-"}:
+                return expr
+            op = self._advance()[1]
+            expr = _CalculatorBinary(expr, op, self._mul_expr())
+
+    def _mul_expr(self) -> _Expr:
+        expr = self._unary_expr()
+        while True:
+            tok = self._peek()
+            if tok is None:
+                return expr
+            if tok == ("KW", "MOD"):
+                op = self._advance()[1]
+                expr = _CalculatorBinary(expr, op, self._unary_expr())
+                continue
+            if tok[0] == "ARITH" and tok[1] in {"*", "/", "%"}:
+                op = self._advance()[1]
+                expr = _CalculatorBinary(expr, op, self._unary_expr())
+                continue
+            return expr
+
+    def _unary_expr(self) -> _Expr:
+        tok = self._peek()
+        if tok is not None and tok[0] == "ARITH" and tok[1] in {"+", "-"}:
+            op = self._advance()[1]
+            return _CalculatorUnary(op, self._unary_expr())
+        return self._primary()
+
+    def _primary(self) -> _Expr:
         tok = self._peek()
         if tok is None:
             raise ExprSyntaxError("Unexpected end of expression")
-
-        # Parenthesised sub-expression
         if tok[0] == "LPAREN":
             self._advance()
             inner = self._or_expr()
             self._expect("RPAREN")
             return inner
-
-        # Boolean literals
-        if tok == ("KW", "TRUE"):
-            self._advance()
-            return _BoolLit(True)
-        if tok == ("KW", "FALSE"):
-            self._advance()
-            return _BoolLit(False)
-
-        # GATE_OVERRIDE special
         if tok == ("KW", "GATE_OVERRIDE"):
             self._advance()
             return _GateOverride()
-
-        # Accessor-leading expressions
         if tok[0] == "IDENT":
-            accessor = self._accessor()
-            nxt = self._peek()
-
-            # IS_NONE / IS_NOT_NONE
-            if nxt == ("KW", "IS_NOT_NONE"):
-                self._advance()
-                return _IsNotNone(accessor)
-            if nxt == ("KW", "IS_NONE"):
-                self._advance()
-                return _IsNone(accessor)
-
-            # CONTAINS "substring"
-            if nxt == ("KW", "CONTAINS"):
-                self._advance()
-                s = self._expect("STRING")
-                return _Contains(accessor, s[1])
-
-            # MOD int == int
-            if nxt == ("KW", "MOD"):
-                self._advance()
-                d = self._expect("INT")
-                self._expect("OP", "==")
-                r = self._expect("INT")
-                return _Mod(accessor, int(d[1]), int(r[1]))
-
-            # Comparison
-            if nxt is not None and nxt[0] == "OP":
-                op = self._advance()[1]
-                val = self._value()
-                return _Compare(accessor, op, val)
-
-            # Bare accessor → truthy
-            return _Truthy(accessor)
-
+            return self._accessor()
+        if tok[0] in {"STRING", "INT", "FLOAT"} or tok in {
+            ("KW", "TRUE"),
+            ("KW", "FALSE"),
+            ("KW", "NONE"),
+        }:
+            return _SignalLit(self._value())
         raise ExprSyntaxError(f"Unexpected token {tok}")
 
     def _accessor(self) -> _Accessor:
@@ -346,7 +369,6 @@ class _Parser:
 # ---------------------------------------------------------------------------
 
 # Attributes that are NEVER accessible (security boundary).
-_BLOCKED_PREFIXES = ("__", "_")
 _BLOCKED_NAMES = frozenset({"__class__", "__dict__", "__module__", "__init__"})
 
 # Zero-arg methods that the evaluator is allowed to call.
@@ -385,46 +407,94 @@ class ExprSecurityError(RuntimeError):
     """Raised when an expression tries to access a blocked attribute."""
 
 
+def _coerce_calculator_signal(value: Any) -> Optional[float]:
+    if isinstance(value, bool):
+        return float(int(value))
+    if isinstance(value, (int, float)):
+        return float(value)
+    return None
+
+
+def _apply_calculator_unary(op: str, value: Any) -> Any:
+    numeric = _coerce_calculator_signal(value)
+    if numeric is None:
+        return None
+    if op == "+":
+        return numeric
+    if op == "-":
+        return -numeric
+    return None
+
+
+def _apply_calculator_binary(op: str, left: Any, right: Any) -> Any:
+    lhs = _coerce_calculator_signal(left)
+    rhs = _coerce_calculator_signal(right)
+    if lhs is None or rhs is None:
+        return None
+    if op == "+":
+        return lhs + rhs
+    if op == "-":
+        return lhs - rhs
+    if op == "*":
+        return lhs * rhs
+    if op == "/":
+        return None if rhs == 0 else (lhs / rhs)
+    if op in {"MOD", "%"}:
+        return None if rhs == 0 else (lhs % rhs)
+    return None
+
+
 def _eval_node(node: _Expr, ctx: Any) -> Any:
-    if isinstance(node, _BoolLit):
+    if isinstance(node, _SignalLit):
         return node.value
 
     if isinstance(node, _GateOverride):
         fn = getattr(ctx, "gate_override_enabled", None)
         return bool(fn()) if callable(fn) else False
 
-    if isinstance(node, _Truthy):
-        val = _resolve_accessor(ctx, node.accessor.parts)
-        return bool(val)
+    if isinstance(node, _Accessor):
+        return _resolve_accessor(ctx, node.parts)
+
+    if isinstance(node, _CalculatorUnary):
+        return _apply_calculator_unary(node.op, _eval_node(node.child, ctx))
+
+    if isinstance(node, _CalculatorBinary):
+        return _apply_calculator_binary(
+            node.op,
+            _eval_node(node.left, ctx),
+            _eval_node(node.right, ctx),
+        )
 
     if isinstance(node, _IsNone):
-        val = _resolve_accessor(ctx, node.accessor.parts)
+        val = _eval_node(node.signal, ctx)
         return val is None
 
     if isinstance(node, _IsNotNone):
-        val = _resolve_accessor(ctx, node.accessor.parts)
+        val = _eval_node(node.signal, ctx)
         return val is not None
 
     if isinstance(node, _Contains):
-        val = _resolve_accessor(ctx, node.accessor.parts)
-        return node.substring in str(val or "")
-
-    if isinstance(node, _Mod):
-        val = _resolve_accessor(ctx, node.accessor.parts)
-        return (int(val or 0) % max(1, node.divisor)) == node.remainder
+        val = _eval_node(node.signal, ctx)
+        needle = _eval_node(node.needle, ctx)
+        haystack_text = "" if val is None else str(val)
+        needle_text = "" if needle is None else str(needle)
+        return needle_text in haystack_text
 
     if isinstance(node, _Compare):
-        val = _resolve_accessor(ctx, node.accessor.parts)
-        return _compare(val, node.op, node.value)
+        return _compare(
+            _eval_node(node.left, ctx),
+            node.op,
+            _eval_node(node.right, ctx),
+        )
 
     if isinstance(node, _Not):
-        return not _eval_node(node.child, ctx)
+        return not bool(_eval_node(node.child, ctx))
 
     if isinstance(node, _And):
-        return all(_eval_node(c, ctx) for c in node.children)
+        return all(bool(_eval_node(c, ctx)) for c in node.children)
 
     if isinstance(node, _Or):
-        return any(_eval_node(c, ctx) for c in node.children)
+        return any(bool(_eval_node(c, ctx)) for c in node.children)
 
     raise ExprSyntaxError(f"Unknown AST node type: {type(node).__name__}")
 
@@ -513,6 +583,17 @@ def expr_for_condition_id(condition_id: str) -> str:
             "GATE_OVERRIDE OR all_base_gates_passed",
         "gates.wave_stage_ready":
             "(GATE_OVERRIDE AND transformer IS_NOT_NONE) OR wave_stage_ready",
+        "data.pregestation_rebuild_due":
+            "data._preg_last_build_round < 0 OR "
+            "(ctx.total_rounds_completed - data._preg_last_build_round) >= preg_cfg.rebuild_every_n_rounds",
+        "data.gestation_rebuild_due":
+            "(GATE_OVERRIDE OR gate_pregestation.passed) AND "
+            "(data._gest_last_build_round < 0 OR "
+            "(ctx.total_rounds_completed - data._gest_last_build_round) >= gest_cfg.rebuild_every_n_rounds)",
+        "data.berkeley_refresh_due":
+            "(GATE_OVERRIDE OR early_gates_passed) AND "
+            "(data._bdata_last_build_round < 0 OR "
+            "(ctx.total_rounds_completed - data._bdata_last_build_round) >= bdata_cfg.rebuild_every_n_rounds)",
     }
     return _MAP.get(str(condition_id or "").strip(), "")
 

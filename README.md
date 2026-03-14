@@ -30,7 +30,7 @@ flowchart TD
     end
     subgraph group_vocab[Vocab]
         init_vocab["Init Vocab<br/>initializer / vocab / seed  [once]"]
-        vocab_churn["Vocab Churn<br/>mutator / vocab / seed"]
+        vocab_churn["Vocab Churn<br/>mutator / vocab / seed  [periodic]"]
         build_symbol_pool["Build Symbol Pool<br/>builder / vocab / builder"]
         build_label_embedding["Build Label Embedding<br/>builder / vocab / builder"]
         build_flashcard_rows["Build Flashcard Rows<br/>builder / vocab / builder"]
@@ -52,10 +52,12 @@ flowchart TD
         decision_004_stage_w_wave_classifier{"Wave stage ready?<br/>control / gates / decision"}
         decision_007_gate_wave{"Wave stage ready?<br/>control / gates / decision"}
         decision_010_build_gan{"GAN mode?<br/>control / gates / decision"}
+        decision_013_stage_0_pregestation{"Pregestation Rebuild Due?<br/>control / gates / decision"}
         decision_014_build_flashcard_rows{"Gate 2 passed?<br/>control / gates / decision"}
-        decision_016_stage_1_gestation{"Gate 0 passed?<br/>control / gates / decision"}
-        decision_017_gate_1_gestation_eval{"Gate 0 passed?<br/>control / gates / decision"}
-        decision_018_stage_2_berkeley{"Gate 1 passed?<br/>control / gates / decision"}
+        decision_015_gate_0_pregestation_eval{"Pregestation Rebuild Due?<br/>control / gates / decision"}
+        decision_016_stage_1_gestation{"Gestation Rebuild Due?<br/>control / gates / decision"}
+        decision_017_gate_1_gestation_eval{"Gestation Rebuild Due?<br/>control / gates / decision"}
+        decision_018_stage_2_berkeley{"Berkeley Refresh Due?<br/>control / gates / decision"}
         decision_019_gate_berkeley{"Gate 1 passed?<br/>control / gates / decision"}
         decision_020_stage_r_transformer{"Gate 1 passed?<br/>control / gates / decision"}
         decision_021_stage_c_lora{"Gate 2 passed?<br/>control / gates / decision"}
@@ -95,9 +97,9 @@ flowchart TD
     build_label_embedding -- "per_round" --> data_node
     data_node -- "provides:pregestation_loader" --> stage_0_pregestation
     data_node -- "provides:pregestation_eval_loader" --> gate_0_pregestation_eval
-    data_node -- "provides:gestation_loader [GATE_OVERRIDE OR gate_pregestation.passed]" --> stage_1_gestation
-    data_node -- "provides:gestation_eval_loader [GATE_OVERRIDE OR gate_pregestation.passed]" --> gate_1_gestation_eval
-    data_node -- "provides:berkeley_refresh_loader [GATE_OVERRIDE OR early_gates_passed]" --> stage_2_berkeley
+    data_node -- "provides:gestation_loader" --> stage_1_gestation
+    data_node -- "provides:gestation_eval_loader" --> gate_1_gestation_eval
+    data_node -- "provides:berkeley_refresh_loader" --> stage_2_berkeley
     data_node -- "provides:gate_val_loader+payload_val_loader [GATE_OVERRIDE OR early_gates_passed]" --> gate_berkeley
     data_node -- "provides:payload_bank [GATE_OVERRIDE OR all_base_gates_passed]" --> stage_g_generator
     data_node -- "provides:payload_images [GATE_OVERRIDE OR all_base_gates_passed]" --> build_flashcard_rows
@@ -137,11 +139,15 @@ flowchart TD
     decision_010_build_gan -- "10.0" --> build_label_embedding
     build_gan -- "11" --> build_label_embedding
     build_label_embedding -- "12" --> data_node
-    data_node -- "13" --> stage_0_pregestation
+    data_node -- "13" --> decision_013_stage_0_pregestation
+    decision_013_stage_0_pregestation -- "13.1" --> stage_0_pregestation
+    decision_013_stage_0_pregestation -- "13.0" --> build_flashcard_rows
     stage_0_pregestation -- "14" --> decision_014_build_flashcard_rows
     decision_014_build_flashcard_rows -- "14.1" --> build_flashcard_rows
     decision_014_build_flashcard_rows -- "14.0" --> gate_0_pregestation_eval
-    build_flashcard_rows -- "15" --> gate_0_pregestation_eval
+    build_flashcard_rows -- "15" --> decision_015_gate_0_pregestation_eval
+    decision_015_gate_0_pregestation_eval -- "15.1" --> gate_0_pregestation_eval
+    decision_015_gate_0_pregestation_eval -- "15.0" --> stage_1_gestation
     gate_0_pregestation_eval -- "16" --> decision_016_stage_1_gestation
     decision_016_stage_1_gestation -- "16.1" --> stage_1_gestation
     decision_016_stage_1_gestation -- "16.0" --> gate_1_gestation_eval
@@ -204,7 +210,7 @@ flowchart TD
     class sync_gate_replica,program_hold faculty_housekeeping;
     class checkpoint_save faculty_persistence;
     class viewer_ipc faculty_ipc;
-    class decision_004_stage_w_wave_classifier,decision_007_gate_wave,decision_010_build_gan,decision_014_build_flashcard_rows,decision_016_stage_1_gestation,decision_017_gate_1_gestation_eval,decision_018_stage_2_berkeley,decision_019_gate_berkeley,decision_020_stage_r_transformer,decision_021_stage_c_lora,decision_022_gate_transformer,decision_023_stage_fake_feedback,decision_024_stage_g_generator,decision_026_gate_generator faculty_gates;
+    class decision_004_stage_w_wave_classifier,decision_007_gate_wave,decision_010_build_gan,decision_013_stage_0_pregestation,decision_014_build_flashcard_rows,decision_015_gate_0_pregestation_eval,decision_016_stage_1_gestation,decision_017_gate_1_gestation_eval,decision_018_stage_2_berkeley,decision_019_gate_berkeley,decision_020_stage_r_transformer,decision_021_stage_c_lora,decision_022_gate_transformer,decision_023_stage_fake_feedback,decision_024_stage_g_generator,decision_026_gate_generator faculty_gates;
     linkStyle 0 stroke:#2A9D8F,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
     linkStyle 1 stroke:#2A9D8F,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
     linkStyle 2 stroke:#2A9D8F,stroke-width:3px,opacity:0.9,stroke-dasharray:0;
@@ -261,42 +267,46 @@ flowchart TD
     linkStyle 53 stroke:#111111,stroke-width:3px,opacity:0.98,stroke-dasharray:0;
     linkStyle 54 stroke:#111111,stroke-width:3px,opacity:0.98,stroke-dasharray:0;
     linkStyle 55 stroke:#111111,stroke-width:3px,opacity:0.98,stroke-dasharray:0;
-    linkStyle 56 stroke:#111111,stroke-width:3px,opacity:0.98,stroke-dasharray:0;
-    linkStyle 57 stroke:#111111,stroke-width:2px,opacity:0.95,stroke-dasharray:6 3;
+    linkStyle 56 stroke:#111111,stroke-width:2px,opacity:0.95,stroke-dasharray:6 3;
+    linkStyle 57 stroke:#111111,stroke-width:3px,opacity:0.98,stroke-dasharray:0;
     linkStyle 58 stroke:#111111,stroke-width:3px,opacity:0.98,stroke-dasharray:0;
-    linkStyle 59 stroke:#111111,stroke-width:3px,opacity:0.98,stroke-dasharray:0;
+    linkStyle 59 stroke:#111111,stroke-width:2px,opacity:0.95,stroke-dasharray:6 3;
     linkStyle 60 stroke:#111111,stroke-width:3px,opacity:0.98,stroke-dasharray:0;
-    linkStyle 61 stroke:#111111,stroke-width:2px,opacity:0.95,stroke-dasharray:6 3;
-    linkStyle 62 stroke:#111111,stroke-width:3px,opacity:0.98,stroke-dasharray:0;
+    linkStyle 61 stroke:#111111,stroke-width:3px,opacity:0.98,stroke-dasharray:0;
+    linkStyle 62 stroke:#111111,stroke-width:2px,opacity:0.95,stroke-dasharray:6 3;
     linkStyle 63 stroke:#111111,stroke-width:3px,opacity:0.98,stroke-dasharray:0;
-    linkStyle 64 stroke:#111111,stroke-width:2px,opacity:0.95,stroke-dasharray:6 3;
-    linkStyle 65 stroke:#111111,stroke-width:3px,opacity:0.98,stroke-dasharray:0;
+    linkStyle 64 stroke:#111111,stroke-width:3px,opacity:0.98,stroke-dasharray:0;
+    linkStyle 65 stroke:#111111,stroke-width:2px,opacity:0.95,stroke-dasharray:6 3;
     linkStyle 66 stroke:#111111,stroke-width:3px,opacity:0.98,stroke-dasharray:0;
-    linkStyle 67 stroke:#111111,stroke-width:2px,opacity:0.95,stroke-dasharray:6 3;
-    linkStyle 68 stroke:#111111,stroke-width:3px,opacity:0.98,stroke-dasharray:0;
+    linkStyle 67 stroke:#111111,stroke-width:3px,opacity:0.98,stroke-dasharray:0;
+    linkStyle 68 stroke:#111111,stroke-width:2px,opacity:0.95,stroke-dasharray:6 3;
     linkStyle 69 stroke:#111111,stroke-width:3px,opacity:0.98,stroke-dasharray:0;
-    linkStyle 70 stroke:#111111,stroke-width:2px,opacity:0.95,stroke-dasharray:6 3;
-    linkStyle 71 stroke:#111111,stroke-width:3px,opacity:0.98,stroke-dasharray:0;
+    linkStyle 70 stroke:#111111,stroke-width:3px,opacity:0.98,stroke-dasharray:0;
+    linkStyle 71 stroke:#111111,stroke-width:2px,opacity:0.95,stroke-dasharray:6 3;
     linkStyle 72 stroke:#111111,stroke-width:3px,opacity:0.98,stroke-dasharray:0;
-    linkStyle 73 stroke:#111111,stroke-width:2px,opacity:0.95,stroke-dasharray:6 3;
-    linkStyle 74 stroke:#111111,stroke-width:3px,opacity:0.98,stroke-dasharray:0;
+    linkStyle 73 stroke:#111111,stroke-width:3px,opacity:0.98,stroke-dasharray:0;
+    linkStyle 74 stroke:#111111,stroke-width:2px,opacity:0.95,stroke-dasharray:6 3;
     linkStyle 75 stroke:#111111,stroke-width:3px,opacity:0.98,stroke-dasharray:0;
-    linkStyle 76 stroke:#111111,stroke-width:2px,opacity:0.95,stroke-dasharray:6 3;
-    linkStyle 77 stroke:#111111,stroke-width:3px,opacity:0.98,stroke-dasharray:0;
+    linkStyle 76 stroke:#111111,stroke-width:3px,opacity:0.98,stroke-dasharray:0;
+    linkStyle 77 stroke:#111111,stroke-width:2px,opacity:0.95,stroke-dasharray:6 3;
     linkStyle 78 stroke:#111111,stroke-width:3px,opacity:0.98,stroke-dasharray:0;
-    linkStyle 79 stroke:#111111,stroke-width:2px,opacity:0.95,stroke-dasharray:6 3;
-    linkStyle 80 stroke:#111111,stroke-width:3px,opacity:0.98,stroke-dasharray:0;
+    linkStyle 79 stroke:#111111,stroke-width:3px,opacity:0.98,stroke-dasharray:0;
+    linkStyle 80 stroke:#111111,stroke-width:2px,opacity:0.95,stroke-dasharray:6 3;
     linkStyle 81 stroke:#111111,stroke-width:3px,opacity:0.98,stroke-dasharray:0;
-    linkStyle 82 stroke:#111111,stroke-width:2px,opacity:0.95,stroke-dasharray:6 3;
-    linkStyle 83 stroke:#111111,stroke-width:3px,opacity:0.98,stroke-dasharray:0;
+    linkStyle 82 stroke:#111111,stroke-width:3px,opacity:0.98,stroke-dasharray:0;
+    linkStyle 83 stroke:#111111,stroke-width:2px,opacity:0.95,stroke-dasharray:6 3;
     linkStyle 84 stroke:#111111,stroke-width:3px,opacity:0.98,stroke-dasharray:0;
-    linkStyle 85 stroke:#111111,stroke-width:2px,opacity:0.95,stroke-dasharray:6 3;
-    linkStyle 86 stroke:#111111,stroke-width:3px,opacity:0.98,stroke-dasharray:0;
+    linkStyle 85 stroke:#111111,stroke-width:3px,opacity:0.98,stroke-dasharray:0;
+    linkStyle 86 stroke:#111111,stroke-width:2px,opacity:0.95,stroke-dasharray:6 3;
     linkStyle 87 stroke:#111111,stroke-width:3px,opacity:0.98,stroke-dasharray:0;
     linkStyle 88 stroke:#111111,stroke-width:3px,opacity:0.98,stroke-dasharray:0;
     linkStyle 89 stroke:#111111,stroke-width:2px,opacity:0.95,stroke-dasharray:6 3;
     linkStyle 90 stroke:#111111,stroke-width:3px,opacity:0.98,stroke-dasharray:0;
     linkStyle 91 stroke:#111111,stroke-width:3px,opacity:0.98,stroke-dasharray:0;
+    linkStyle 92 stroke:#111111,stroke-width:3px,opacity:0.98,stroke-dasharray:0;
+    linkStyle 93 stroke:#111111,stroke-width:2px,opacity:0.95,stroke-dasharray:6 3;
+    linkStyle 94 stroke:#111111,stroke-width:3px,opacity:0.98,stroke-dasharray:0;
+    linkStyle 95 stroke:#111111,stroke-width:3px,opacity:0.98,stroke-dasharray:0;
 ```
 
 Downloads: [PNG](docs/diagrams/execution_overlay_dense.png) | [SVG](docs/diagrams/execution_overlay_dense.svg) | [MMD](docs/diagrams/execution_overlay_dense.mmd)
@@ -320,7 +330,7 @@ flowchart TD
     end
     subgraph group_vocab[Vocab]
         init_vocab["Init Vocab<br/>initializer / vocab / seed  [once]"]
-        vocab_churn["Vocab Churn<br/>mutator / vocab / seed"]
+        vocab_churn["Vocab Churn<br/>mutator / vocab / seed  [periodic]"]
         build_symbol_pool["Build Symbol Pool<br/>builder / vocab / builder"]
         build_label_embedding["Build Label Embedding<br/>builder / vocab / builder"]
         build_flashcard_rows["Build Flashcard Rows<br/>builder / vocab / builder"]
@@ -368,9 +378,9 @@ flowchart TD
     build_label_embedding -- "per_round" --> data_node
     data_node -- "provides:pregestation_loader" --> stage_0_pregestation
     data_node -- "provides:pregestation_eval_loader" --> gate_0_pregestation_eval
-    data_node -- "provides:gestation_loader [GATE_OVERRIDE OR gate_pregestation.passed]" --> stage_1_gestation
-    data_node -- "provides:gestation_eval_loader [GATE_OVERRIDE OR gate_pregestation.passed]" --> gate_1_gestation_eval
-    data_node -- "provides:berkeley_refresh_loader [GATE_OVERRIDE OR early_gates_passed]" --> stage_2_berkeley
+    data_node -- "provides:gestation_loader" --> stage_1_gestation
+    data_node -- "provides:gestation_eval_loader" --> gate_1_gestation_eval
+    data_node -- "provides:berkeley_refresh_loader" --> stage_2_berkeley
     data_node -- "provides:gate_val_loader+payload_val_loader [GATE_OVERRIDE OR early_gates_passed]" --> gate_berkeley
     data_node -- "provides:payload_bank [GATE_OVERRIDE OR all_base_gates_passed]" --> stage_g_generator
     data_node -- "provides:payload_images [GATE_OVERRIDE OR all_base_gates_passed]" --> build_flashcard_rows

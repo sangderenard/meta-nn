@@ -92,7 +92,7 @@ def main() -> None:
     # -- Run ---------------------------------------------------------------
     from pipeline.orchestrator import run
     try:
-        run(args=args, output_dir=output_dir)
+        stop_requested = run(args=args, output_dir=output_dir)
     except KeyboardInterrupt:
         print("\n[wav_pipeline_graph] interrupted by user", flush=True)
         sys.exit(0)
@@ -101,6 +101,9 @@ def main() -> None:
         print(f"[wav_pipeline_graph] FATAL: {exc}", flush=True)
         traceback.print_exc()
         sys.exit(1)
+    if stop_requested:
+        print("[wav_pipeline_graph] GUI stop requested — exiting with code 42", flush=True)
+        sys.exit(42)
 
 
 def _parse_graph_cli(argv):
@@ -178,7 +181,7 @@ def _run_from_plan(plan_path: Path, override_output_dir: str = None) -> None:
     )
 
     try:
-        run(args=args, output_dir=output_dir, initial_plan=plan)
+        stop_requested = run(args=args, output_dir=output_dir, initial_plan=plan)
     except KeyboardInterrupt:
         print("\n[wav_pipeline_graph] interrupted by user", flush=True)
         sys.exit(0)
@@ -187,6 +190,9 @@ def _run_from_plan(plan_path: Path, override_output_dir: str = None) -> None:
         print(f"[wav_pipeline_graph] FATAL (from-plan): {exc}", flush=True)
         traceback.print_exc()
         sys.exit(1)
+    if stop_requested:
+        print("[wav_pipeline_graph] GUI stop requested — exiting with code 42", flush=True)
+        sys.exit(42)
 
 
 def _print_graph_summary(args=None) -> None:

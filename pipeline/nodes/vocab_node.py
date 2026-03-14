@@ -47,7 +47,6 @@ from pipeline.graph import PipelineNode
 from pipeline.nodes.base import OneTimeNode
 from semantic_dataset_loaders import (
     _composite_mask_stack,
-    _normalize_attention_map,
     _semantic_color_score_maps,
     detect_semantic_color_terms,
 )
@@ -185,6 +184,12 @@ class VocabChurnNode(PipelineNode):
 
     def __init__(self, cfg: VocabConfig) -> None:
         self.cfg = cfg
+
+    @property
+    def runtime_execution_policy(self) -> tuple:
+        if self.cfg.churn_n <= 0:
+            return ("disabled", {})
+        return ("periodic", {"period": max(1, self.cfg.churn_every_n_cycles), "counter": "vocab_rotation_cycle"})
 
     def should_run(self, ctx: PipelineContext) -> bool:
         if self.cfg.churn_n <= 0:

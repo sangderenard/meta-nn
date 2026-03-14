@@ -12,7 +12,7 @@ flowchart TD
     end
     subgraph group_vocab[Vocab]
         init_vocab["Init Vocab<br/>initializer / vocab / seed  [once]"]
-        vocab_churn["Vocab Churn<br/>mutator / vocab / seed"]
+        vocab_churn["Vocab Churn<br/>mutator / vocab / seed  [periodic]"]
         build_symbol_pool["Build Symbol Pool<br/>builder / vocab / builder"]
         build_label_embedding["Build Label Embedding<br/>builder / vocab / builder"]
         build_flashcard_rows["Build Flashcard Rows<br/>builder / vocab / builder"]
@@ -60,9 +60,9 @@ flowchart TD
     build_label_embedding -- "per_round" --> data_node
     data_node -- "provides:pregestation_loader" --> stage_0_pregestation
     data_node -- "provides:pregestation_eval_loader" --> gate_0_pregestation_eval
-    data_node -- "provides:gestation_loader [GATE_OVERRIDE OR gate_pregestation.passed]" --> stage_1_gestation
-    data_node -- "provides:gestation_eval_loader [GATE_OVERRIDE OR gate_pregestation.passed]" --> gate_1_gestation_eval
-    data_node -- "provides:berkeley_refresh_loader [GATE_OVERRIDE OR early_gates_passed]" --> stage_2_berkeley
+    data_node -- "provides:gestation_loader" --> stage_1_gestation
+    data_node -- "provides:gestation_eval_loader" --> gate_1_gestation_eval
+    data_node -- "provides:berkeley_refresh_loader" --> stage_2_berkeley
     data_node -- "provides:gate_val_loader+payload_val_loader [GATE_OVERRIDE OR early_gates_passed]" --> gate_berkeley
     data_node -- "provides:payload_bank [GATE_OVERRIDE OR all_base_gates_passed]" --> stage_g_generator
     data_node -- "provides:payload_images [GATE_OVERRIDE OR all_base_gates_passed]" --> build_flashcard_rows

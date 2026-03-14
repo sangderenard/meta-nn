@@ -32,10 +32,12 @@ flowchart TD
     decision_004_stage_w_wave_classifier{"Wave stage ready?"}
     decision_007_gate_wave{"Wave stage ready?"}
     decision_010_build_gan{"GAN mode?"}
+    decision_013_stage_0_pregestation{"Pregestation Rebuild Due?"}
     decision_014_build_flashcard_rows{"Gate 2 passed?"}
-    decision_016_stage_1_gestation{"Gate 0 passed?"}
-    decision_017_gate_1_gestation_eval{"Gate 0 passed?"}
-    decision_018_stage_2_berkeley{"Gate 1 passed?"}
+    decision_015_gate_0_pregestation_eval{"Pregestation Rebuild Due?"}
+    decision_016_stage_1_gestation{"Gestation Rebuild Due?"}
+    decision_017_gate_1_gestation_eval{"Gestation Rebuild Due?"}
+    decision_018_stage_2_berkeley{"Berkeley Refresh Due?"}
     decision_019_gate_berkeley{"Gate 1 passed?"}
     decision_020_stage_r_transformer{"Gate 1 passed?"}
     decision_021_stage_c_lora{"Gate 2 passed?"}
@@ -99,11 +101,15 @@ flowchart TD
     decision_010_build_gan -- "10.0 | scheduler.guard.hold" --> build_label_embedding
     build_gan -- "11 | scheduler.advance" --> build_label_embedding
     build_label_embedding -- "12 | scheduler.advance" --> data_node
-    data_node -- "13 | scheduler.advance" --> stage_0_pregestation
+    data_node -- "13 | scheduler.advance" --> decision_013_stage_0_pregestation
+    decision_013_stage_0_pregestation -- "13.1 | scheduler.guard.pass" --> stage_0_pregestation
+    decision_013_stage_0_pregestation -- "13.0 | scheduler.guard.hold" --> build_flashcard_rows
     stage_0_pregestation -- "14 | scheduler.advance" --> decision_014_build_flashcard_rows
     decision_014_build_flashcard_rows -- "14.1 | scheduler.guard.pass" --> build_flashcard_rows
     decision_014_build_flashcard_rows -- "14.0 | scheduler.guard.hold" --> gate_0_pregestation_eval
-    build_flashcard_rows -- "15 | scheduler.advance" --> gate_0_pregestation_eval
+    build_flashcard_rows -- "15 | scheduler.advance" --> decision_015_gate_0_pregestation_eval
+    decision_015_gate_0_pregestation_eval -- "15.1 | scheduler.guard.pass" --> gate_0_pregestation_eval
+    decision_015_gate_0_pregestation_eval -- "15.0 | scheduler.guard.hold" --> stage_1_gestation
     gate_0_pregestation_eval -- "16 | scheduler.advance" --> decision_016_stage_1_gestation
     decision_016_stage_1_gestation -- "16.1 | scheduler.guard.pass" --> stage_1_gestation
     decision_016_stage_1_gestation -- "16.0 | scheduler.guard.hold" --> gate_1_gestation_eval
@@ -194,39 +200,43 @@ flowchart TD
     linkStyle 53 stroke:#111111,stroke-width:3px,opacity:0.98,stroke-dasharray:0;
     linkStyle 54 stroke:#111111,stroke-width:3px,opacity:0.98,stroke-dasharray:0;
     linkStyle 55 stroke:#111111,stroke-width:3px,opacity:0.98,stroke-dasharray:0;
-    linkStyle 56 stroke:#111111,stroke-width:3px,opacity:0.98,stroke-dasharray:0;
-    linkStyle 57 stroke:#111111,stroke-width:2px,opacity:0.95,stroke-dasharray:6 3;
+    linkStyle 56 stroke:#111111,stroke-width:2px,opacity:0.95,stroke-dasharray:6 3;
+    linkStyle 57 stroke:#111111,stroke-width:3px,opacity:0.98,stroke-dasharray:0;
     linkStyle 58 stroke:#111111,stroke-width:3px,opacity:0.98,stroke-dasharray:0;
-    linkStyle 59 stroke:#111111,stroke-width:3px,opacity:0.98,stroke-dasharray:0;
+    linkStyle 59 stroke:#111111,stroke-width:2px,opacity:0.95,stroke-dasharray:6 3;
     linkStyle 60 stroke:#111111,stroke-width:3px,opacity:0.98,stroke-dasharray:0;
-    linkStyle 61 stroke:#111111,stroke-width:2px,opacity:0.95,stroke-dasharray:6 3;
-    linkStyle 62 stroke:#111111,stroke-width:3px,opacity:0.98,stroke-dasharray:0;
+    linkStyle 61 stroke:#111111,stroke-width:3px,opacity:0.98,stroke-dasharray:0;
+    linkStyle 62 stroke:#111111,stroke-width:2px,opacity:0.95,stroke-dasharray:6 3;
     linkStyle 63 stroke:#111111,stroke-width:3px,opacity:0.98,stroke-dasharray:0;
-    linkStyle 64 stroke:#111111,stroke-width:2px,opacity:0.95,stroke-dasharray:6 3;
-    linkStyle 65 stroke:#111111,stroke-width:3px,opacity:0.98,stroke-dasharray:0;
+    linkStyle 64 stroke:#111111,stroke-width:3px,opacity:0.98,stroke-dasharray:0;
+    linkStyle 65 stroke:#111111,stroke-width:2px,opacity:0.95,stroke-dasharray:6 3;
     linkStyle 66 stroke:#111111,stroke-width:3px,opacity:0.98,stroke-dasharray:0;
-    linkStyle 67 stroke:#111111,stroke-width:2px,opacity:0.95,stroke-dasharray:6 3;
-    linkStyle 68 stroke:#111111,stroke-width:3px,opacity:0.98,stroke-dasharray:0;
+    linkStyle 67 stroke:#111111,stroke-width:3px,opacity:0.98,stroke-dasharray:0;
+    linkStyle 68 stroke:#111111,stroke-width:2px,opacity:0.95,stroke-dasharray:6 3;
     linkStyle 69 stroke:#111111,stroke-width:3px,opacity:0.98,stroke-dasharray:0;
-    linkStyle 70 stroke:#111111,stroke-width:2px,opacity:0.95,stroke-dasharray:6 3;
-    linkStyle 71 stroke:#111111,stroke-width:3px,opacity:0.98,stroke-dasharray:0;
+    linkStyle 70 stroke:#111111,stroke-width:3px,opacity:0.98,stroke-dasharray:0;
+    linkStyle 71 stroke:#111111,stroke-width:2px,opacity:0.95,stroke-dasharray:6 3;
     linkStyle 72 stroke:#111111,stroke-width:3px,opacity:0.98,stroke-dasharray:0;
-    linkStyle 73 stroke:#111111,stroke-width:2px,opacity:0.95,stroke-dasharray:6 3;
-    linkStyle 74 stroke:#111111,stroke-width:3px,opacity:0.98,stroke-dasharray:0;
+    linkStyle 73 stroke:#111111,stroke-width:3px,opacity:0.98,stroke-dasharray:0;
+    linkStyle 74 stroke:#111111,stroke-width:2px,opacity:0.95,stroke-dasharray:6 3;
     linkStyle 75 stroke:#111111,stroke-width:3px,opacity:0.98,stroke-dasharray:0;
-    linkStyle 76 stroke:#111111,stroke-width:2px,opacity:0.95,stroke-dasharray:6 3;
-    linkStyle 77 stroke:#111111,stroke-width:3px,opacity:0.98,stroke-dasharray:0;
+    linkStyle 76 stroke:#111111,stroke-width:3px,opacity:0.98,stroke-dasharray:0;
+    linkStyle 77 stroke:#111111,stroke-width:2px,opacity:0.95,stroke-dasharray:6 3;
     linkStyle 78 stroke:#111111,stroke-width:3px,opacity:0.98,stroke-dasharray:0;
-    linkStyle 79 stroke:#111111,stroke-width:2px,opacity:0.95,stroke-dasharray:6 3;
-    linkStyle 80 stroke:#111111,stroke-width:3px,opacity:0.98,stroke-dasharray:0;
+    linkStyle 79 stroke:#111111,stroke-width:3px,opacity:0.98,stroke-dasharray:0;
+    linkStyle 80 stroke:#111111,stroke-width:2px,opacity:0.95,stroke-dasharray:6 3;
     linkStyle 81 stroke:#111111,stroke-width:3px,opacity:0.98,stroke-dasharray:0;
-    linkStyle 82 stroke:#111111,stroke-width:2px,opacity:0.95,stroke-dasharray:6 3;
-    linkStyle 83 stroke:#111111,stroke-width:3px,opacity:0.98,stroke-dasharray:0;
+    linkStyle 82 stroke:#111111,stroke-width:3px,opacity:0.98,stroke-dasharray:0;
+    linkStyle 83 stroke:#111111,stroke-width:2px,opacity:0.95,stroke-dasharray:6 3;
     linkStyle 84 stroke:#111111,stroke-width:3px,opacity:0.98,stroke-dasharray:0;
-    linkStyle 85 stroke:#111111,stroke-width:2px,opacity:0.95,stroke-dasharray:6 3;
-    linkStyle 86 stroke:#111111,stroke-width:3px,opacity:0.98,stroke-dasharray:0;
+    linkStyle 85 stroke:#111111,stroke-width:3px,opacity:0.98,stroke-dasharray:0;
+    linkStyle 86 stroke:#111111,stroke-width:2px,opacity:0.95,stroke-dasharray:6 3;
     linkStyle 87 stroke:#111111,stroke-width:3px,opacity:0.98,stroke-dasharray:0;
     linkStyle 88 stroke:#111111,stroke-width:3px,opacity:0.98,stroke-dasharray:0;
     linkStyle 89 stroke:#111111,stroke-width:2px,opacity:0.95,stroke-dasharray:6 3;
     linkStyle 90 stroke:#111111,stroke-width:3px,opacity:0.98,stroke-dasharray:0;
     linkStyle 91 stroke:#111111,stroke-width:3px,opacity:0.98,stroke-dasharray:0;
+    linkStyle 92 stroke:#111111,stroke-width:3px,opacity:0.98,stroke-dasharray:0;
+    linkStyle 93 stroke:#111111,stroke-width:2px,opacity:0.95,stroke-dasharray:6 3;
+    linkStyle 94 stroke:#111111,stroke-width:3px,opacity:0.98,stroke-dasharray:0;
+    linkStyle 95 stroke:#111111,stroke-width:3px,opacity:0.98,stroke-dasharray:0;

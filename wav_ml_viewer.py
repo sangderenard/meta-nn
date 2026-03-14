@@ -398,6 +398,7 @@ class _TransformerStatusOpenGLViewer:
         self._loss_count_at_snap_deque: deque = deque(maxlen=self._weight_history_maxlen)
         # Most-recently-uploaded preview frame (set each time a frame is consumed).
         self._last_displayed_frame: Optional[dict] = None
+        self._last_step_txt: str = ""
         self._scrub_offset: int = 0
         # Pipeline registers fn(scrub_offset) to handle "RESTORE STATE".
         self._on_restore_state: Optional[Callable] = None
@@ -697,7 +698,8 @@ class _TransformerStatusOpenGLViewer:
             y = 20
             for r in list(rows):
                 txt = str(r)
-                draw.text((4, y), txt, fill=(230, 234, 240), font=font)
+                _rw = font.getlength(txt) if hasattr(font, "getlength") else len(txt) * 6
+                draw.text((max(4, self.panel_w - 4 - int(_rw)), y), txt, fill=(230, 234, 240), font=font)
                 y += 11
                 if y >= (self.panel_h - 10):
                     break
@@ -1070,6 +1072,7 @@ class _TransformerStatusOpenGLViewer:
             "caption": str(frame.get("caption", "")),
             "titles": [str(x) for x in frame.get("titles", self._panel_titles)],
             "rows": [list(r) for r in frame.get("rows", self._panel_rows)],
+            "step_txt": str(frame.get("step_txt", "")),
         }
 
     def _record_history_frame(self, frame: Optional[dict]) -> None:
@@ -1136,6 +1139,9 @@ class _TransformerStatusOpenGLViewer:
         if new_loss_rows != self._loss_display_rows:
             self._loss_display_rows = new_loss_rows
             self._sidebar_dirty = True
+        new_step_txt = str(frame.get("step_txt", ""))
+        if new_step_txt != self._last_step_txt:
+            self._last_step_txt = new_step_txt
         self._last_displayed_frame = frame
 
     def set_training_graph_worker_hello(self, payload: Dict[str, Any]) -> None:
@@ -1374,6 +1380,13 @@ class _TransformerStatusOpenGLViewer:
                           fill=(80, 100, 80), font=font)
                 draw.text((4, y_info + 12), "wheel \u2191\u2193 to scrub back",
                           fill=(60, 70, 60), font=font)
+
+            # ── Step counter ──────────────────────────────────────────────
+            step_txt = str(self._last_step_txt)
+            if step_txt:
+                _stw = font.getlength(step_txt) if hasattr(font, "getlength") else len(step_txt) * 6
+                draw.text((max(4, W - 4 - int(_stw)), y_info + 36),
+                          step_txt, fill=(180, 200, 220), font=font)
 
             # ── Prev / Next checkpoint buttons ────────────────────────────
             has_ckpts = len(self._disk_save_loss_counts) > 0
@@ -2836,6 +2849,11 @@ class ViewerIPCServer:
             if envelope.message_type == MESSAGE_TYPE_WORKER_HELLO:
                 if hasattr(self._viewer, "set_training_graph_worker_hello"):
                     self._viewer.set_training_graph_worker_hello(payload.to_dict())
+                # Clear stale stop state from any previous run so the new
+                # training process is not immediately told to stop.
+                self._viewer._stop_requested = False
+                self._viewer._shutdown_save = None
+                self._viewer._top_bar_dirty = True
             elif envelope.message_type == MESSAGE_TYPE_PLAN_SNAPSHOT:
                 if hasattr(self._viewer, "set_training_graph_plan"):
                     self._viewer.set_training_graph_plan(payload.plan.to_dict())

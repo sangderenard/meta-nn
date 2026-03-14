@@ -650,10 +650,10 @@ class DataNode(PipelineNode):
     # ------------------------------------------------------------------
 
     def provide_pregestation(self, ctx: PipelineContext) -> None:
-        if ctx.pregestation_loader is not None and self._preg_last_build_round >= 0:
-            rounds_since_build = ctx.total_rounds_completed - self._preg_last_build_round
-            if rounds_since_build < self.preg_cfg.rebuild_every_n_rounds:
-                return
+        # Idempotency guard: the edge condition schedules rebuilds; this prevents a
+        # double-build when both preg edges fire for the same target on the same round.
+        if self._preg_last_build_round == ctx.total_rounds_completed:
+            return
 
         # Release stale loaders before rebuild
         ctx.pregestation_loader = None
@@ -852,6 +852,22 @@ class DataNode(PipelineNode):
             targets=selected_targets, seed=self.preg_cfg.seed,
             val_fraction=0.15, min_val=1,
         )
+        # Expand base-image indices to cover all wheel rows (clean + deforms).
+        # The orphan-free split operates on base images, but the SemanticWheelDataset
+        # stores entries_per_clean rows per base image (clean + N deforms).  Without
+        # expansion only the first ~1/entries_per_clean of the wheel is ever used.
+        entries_per_clean = max(1, int(cache_info.get("entries_per_clean", 1) or 1))
+        if entries_per_clean > 1:
+            train_idx = [
+                pos * entries_per_clean + j
+                for pos in train_idx
+                for j in range(entries_per_clean)
+            ]
+            val_idx = [
+                pos * entries_per_clean + j
+                for pos in val_idx
+                for j in range(entries_per_clean)
+            ]
         loader, eval_loader = _build_stage_loader_pair(
             dataset=dataset,
             name="pregestation",
@@ -878,14 +894,15 @@ class DataNode(PipelineNode):
         poss.train_indices = train_idx
         poss.val_indices = val_idx
         poss.mark_built()
-        _log(f"[data-node] pregestation: {len(selected_indices)} images "
-             f"(train={len(train_idx)} val={len(val_idx)}) batch_size={self.preg_cfg.batch_size}")
+        _log(f"[data-node] pregestation: {len(selected_indices)} base images "
+             f"→ {len(train_idx)} train / {len(val_idx)} val wheel rows "
+             f"(entries_per_clean={entries_per_clean}) batch_size={self.preg_cfg.batch_size}")
 
     def provide_gestation(self, ctx: PipelineContext) -> None:
-        if ctx.gestation_loader is not None and self._gest_last_build_round >= 0:
-            rounds_since_build = ctx.total_rounds_completed - self._gest_last_build_round
-            if rounds_since_build < self.gest_cfg.rebuild_every_n_rounds:
-                return
+        # Idempotency guard: the edge condition schedules rebuilds; this prevents a
+        # double-build when both gestation edges fire for the same target on the same round.
+        if self._gest_last_build_round == ctx.total_rounds_completed:
+            return
 
         # Release stale loaders before rebuild
         ctx.gestation_loader = None
@@ -1018,6 +1035,19 @@ class DataNode(PipelineNode):
             targets=selected_targets, seed=int(getattr(ctx.args, "seed", 0) or 0),
             val_fraction=0.15, min_val=1,
         )
+        # Expand base-image indices to include deformed variants in the wheel.
+        _gest_entries_per_clean = max(1, int(_cache_info.get("entries_per_clean", 1) or 1))
+        if _gest_entries_per_clean > 1:
+            train_idx = [
+                pos * _gest_entries_per_clean + j
+                for pos in train_idx
+                for j in range(_gest_entries_per_clean)
+            ]
+            val_idx = [
+                pos * _gest_entries_per_clean + j
+                for pos in val_idx
+                for j in range(_gest_entries_per_clean)
+            ]
         loader, eval_loader = _build_stage_loader_pair(
             dataset=dataset,
             name="gestation",
@@ -1044,8 +1074,9 @@ class DataNode(PipelineNode):
         poss.train_indices = train_idx
         poss.val_indices = val_idx
         poss.mark_built()
-        _log(f"[data-node] gestation: {len(selected_indices)} images "
-             f"(train={len(train_idx)} val={len(val_idx)}) batch_size={self.gest_cfg.batch_size}")
+        _log(f"[data-node] gestation: {len(selected_indices)} base images "
+             f"→ {len(train_idx)} train / {len(val_idx)} val wheel rows "
+             f"(entries_per_clean={_gest_entries_per_clean}) batch_size={self.gest_cfg.batch_size}")
 
     def provide_pregestation_eval(self, ctx: PipelineContext) -> None:
         self.provide_pregestation(ctx)
@@ -1054,11 +1085,9 @@ class DataNode(PipelineNode):
         self.provide_gestation(ctx)
 
     def provide_berkeley_data(self, ctx: PipelineContext) -> None:
-        needs_build = ctx.berkeley_refresh_loader is None
-        if not needs_build:
-            rounds_since = ctx.total_rounds_completed - self._bdata_last_build_round
-            needs_build = rounds_since >= self.bdata_cfg.rebuild_every_n_rounds
-        if not needs_build:
+        # Idempotency guard: the edge condition (_berk_refresh_cond) gates when this
+        # callback fires; guard only against an unexpected double-call on the same round.
+        if self._bdata_last_build_round == ctx.total_rounds_completed:
             return
 
         # Release old loaders/cache before building replacements

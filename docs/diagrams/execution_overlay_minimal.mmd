@@ -32,10 +32,12 @@ flowchart TD
     decision_004_stage_w_wave_classifier{"Wave stage ready?"}
     decision_007_gate_wave{"Wave stage ready?"}
     decision_010_build_gan{"GAN mode?"}
+    decision_013_stage_0_pregestation{"Pregestation Rebuild Due?"}
     decision_014_build_flashcard_rows{"Gate 2 passed?"}
-    decision_016_stage_1_gestation{"Gate 0 passed?"}
-    decision_017_gate_1_gestation_eval{"Gate 0 passed?"}
-    decision_018_stage_2_berkeley{"Gate 1 passed?"}
+    decision_015_gate_0_pregestation_eval{"Pregestation Rebuild Due?"}
+    decision_016_stage_1_gestation{"Gestation Rebuild Due?"}
+    decision_017_gate_1_gestation_eval{"Gestation Rebuild Due?"}
+    decision_018_stage_2_berkeley{"Berkeley Refresh Due?"}
     decision_019_gate_berkeley{"Gate 1 passed?"}
     decision_020_stage_r_transformer{"Gate 1 passed?"}
     decision_021_stage_c_lora{"Gate 2 passed?"}
@@ -99,11 +101,15 @@ flowchart TD
     decision_010_build_gan --> build_label_embedding
     build_gan --> build_label_embedding
     build_label_embedding --> data_node
-    data_node --> stage_0_pregestation
+    data_node --> decision_013_stage_0_pregestation
+    decision_013_stage_0_pregestation --> stage_0_pregestation
+    decision_013_stage_0_pregestation --> build_flashcard_rows
     stage_0_pregestation --> decision_014_build_flashcard_rows
     decision_014_build_flashcard_rows --> build_flashcard_rows
     decision_014_build_flashcard_rows --> gate_0_pregestation_eval
-    build_flashcard_rows --> gate_0_pregestation_eval
+    build_flashcard_rows --> decision_015_gate_0_pregestation_eval
+    decision_015_gate_0_pregestation_eval --> gate_0_pregestation_eval
+    decision_015_gate_0_pregestation_eval --> stage_1_gestation
     gate_0_pregestation_eval --> decision_016_stage_1_gestation
     decision_016_stage_1_gestation --> stage_1_gestation
     decision_016_stage_1_gestation --> gate_1_gestation_eval
