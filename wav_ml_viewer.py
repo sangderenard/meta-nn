@@ -1,5 +1,4 @@
 import math
-import queue as _viewer_frame_queue
 import threading
 import time
 from collections import deque
@@ -10,6 +9,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+from pipeline.nodus_loss_store import NodusScrubRing, NodusCompositeCache, SCRUB_FLAG_HAS_IMAGE, SCRUB_FLAG_HAS_OUTPUT, SCRUB_FLAG_HAS_TARGET
 from pipeline.plan_protocol import (
     MESSAGE_TYPE_EXECUTION_EVENT,
     MESSAGE_TYPE_PLAN_APPLY,
@@ -281,6 +281,8 @@ def _tensor_to_rgb_u8_image(x: torch.Tensor) -> np.ndarray:
     return np.ascontiguousarray(img)
 
 
+
+
 class _TransformerStatusOpenGLViewer:
     def __init__(
         self,
@@ -320,13 +322,8 @@ class _TransformerStatusOpenGLViewer:
         self._ipc_server_ref: Optional[Any] = None   # ViewerIPCServer backref
 
         self._last_present_t = 0.0
-        # Blocking queue: enqueue_frame() blocks when full, back-pressuring the
-        # preview worker and, through it, the training loop.  This ensures no
-        # preview frames are ever dropped when the user is scanning scrollback.
-        # 16384 frames x ~192 KB/frame ~= 3 GB ceiling; tune as needed.
-        self._frame_buffer: _viewer_frame_queue.Queue = _viewer_frame_queue.Queue(maxsize=16384)
-        # Slew: elapsed time controls how many buffered frames are drained per pump().
-        # Buffer fill-depth drives target drain rate (fast when full, slow when empty).
+        # Slew: elapsed time controls how many scrub-ring entries are drained per pump().
+        # Ring fill-depth drives target drain rate (fast when full, slow when empty).
         self._anim_frame_dt: float = 0.5
         self._anim_dt_slow: float = 0.5
         self._anim_dt_fast: float = 1.0 / 120.0
@@ -366,6 +363,21 @@ class _TransformerStatusOpenGLViewer:
             if self.graph_h > 0 else None
         )
 
+        # -- Shared-memory scrub ring + GUI-local composite cache --------------
+        try:
+            self._scrub_ring: Optional[NodusScrubRing] = NodusScrubRing.get_global()
+        except Exception:
+            self._scrub_ring = None
+        self._composite_cache: Optional[NodusCompositeCache] = (
+            NodusCompositeCache(capacity=512) if self._scrub_ring is not None else None
+        )
+        self._last_ring_cursor: int = 0
+        # Text metadata for the most-recently consumed frame (set from IPC signal
+        # or directly by same-process update()).
+        self._ring_text_caption: str = ""
+        self._ring_text_titles: List[str] = ["target", "input", "output"]
+        self._ring_text_rows: List[List[str]] = [[], [], []]
+
         # -- Sidebar state -----------------------------------------------------
         # -inf forces an immediate first render on the first _present() call.
         self._sidebar_dirty: bool = True
@@ -381,14 +393,9 @@ class _TransformerStatusOpenGLViewer:
         # _scrub_offset = 0 -> live; N -> show the snapshot N ticks back.
         self._weight_history_maxlen: int = 512
         self._weight_snapshot_deque: deque = deque(maxlen=self._weight_history_maxlen)
-        # Played preview frames - paired 1-to-1 with weight_snapshot_deque so the
-        # same index yields the co-occurring preview image at that point in time.
-        self._played_frames_deque: deque = deque(maxlen=self._weight_history_maxlen)
         # Loss series lengths recorded once per sidebar tick so the graph renderer
         # can map each snapshot -> x-pixel for the cache-region band and cursor.
         self._loss_count_at_snap_deque: deque = deque(maxlen=self._weight_history_maxlen)
-        # Most-recently-uploaded preview frame (set each time a frame is consumed).
-        self._last_displayed_frame: Optional[dict] = None
         self._last_step_txt: str = ""
         self._scrub_offset: int = 0
         # Pipeline registers fn(scrub_offset) to handle "RESTORE STATE".
@@ -1006,18 +1013,20 @@ class _TransformerStatusOpenGLViewer:
 
     def _history_snap_count(self) -> int:
         """Total scrub positions: in-memory cache + on-disk checkpoint thumbnails."""
+        cc_len = self._composite_cache.length() if self._composite_cache else 0
         cache_len = max(
             len(self._weight_snapshot_deque),
-            len(self._played_frames_deque),
+            cc_len,
             len(self._loss_count_at_snap_deque),
         )
         return cache_len + len(self._checkpoint_thumbs)
 
     def _cache_snap_count(self) -> int:
         """In-memory cache positions only (without checkpoint thumbnails)."""
+        cc_len = self._composite_cache.length() if self._composite_cache else 0
         return max(
             len(self._weight_snapshot_deque),
-            len(self._played_frames_deque),
+            cc_len,
             len(self._loss_count_at_snap_deque),
         )
 
@@ -1042,30 +1051,9 @@ class _TransformerStatusOpenGLViewer:
         # _checkpoint_thumbs is sorted oldest->newest, so index for newest-first:
         return n - ckpt_offset
 
-    def _clone_history_frame(self, frame: Optional[dict]) -> Optional[dict]:
-        if not isinstance(frame, dict):
-            return None
-        images = frame.get("images", None)
-        if not isinstance(images, list) or len(images) != 3:
-            return None
-        out_images: List[np.ndarray] = []
-        for img in images:
-            if img is None:
-                return None
-            out_images.append(np.ascontiguousarray(np.asarray(img, dtype=np.uint8)).copy())
-        return {
-            "images": out_images,
-            "caption": str(frame.get("caption", "")),
-            "titles": [str(x) for x in frame.get("titles", self._panel_titles)],
-            "rows": [list(r) for r in frame.get("rows", self._panel_rows)],
-            "step_txt": str(frame.get("step_txt", "")),
-        }
-
-    def _record_history_frame(self, frame: Optional[dict]) -> None:
-        history_frame = self._clone_history_frame(frame)
-        if history_frame is None:
-            return
-        self._played_frames_deque.append(history_frame)
+    def _record_history_snap(self) -> None:
+        """Record a weight-map snapshot and loss-count position for the latest
+        composite-cache entry.  Called once per composite built in _present()."""
         self._loss_count_at_snap_deque.append(
             self._loss_channel_lengths()
         )
@@ -1073,17 +1061,49 @@ class _TransformerStatusOpenGLViewer:
             {"weight_map": np.ascontiguousarray(np.asarray(self._weight_map_rgb, dtype=np.uint8)).copy()}
         )
 
-    def _history_frame_at_offset(self, offset: int) -> Optional[dict]:
+    def _apply_composite_to_display(self, cache_index: int) -> None:
+        """Upload the three RGB panels from the composite cache to OpenGL textures
+        and apply the current ring text metadata."""
+        cache = self._composite_cache
+        if cache is None:
+            return
+        panels = cache.copy_all_panels(cache_index)
+        if panels is None:
+            return
+        if self._textures is not None:
+            for i, tid in enumerate(self._textures["img"]):
+                self._upload_texture(int(tid), panels[i])
+        new_caption = self._ring_text_caption
+        new_titles = list(self._ring_text_titles)
+        new_rows = [list(r) for r in self._ring_text_rows]
+        if new_titles != self._panel_titles or new_rows != self._panel_rows:
+            self._panel_titles = new_titles
+            self._panel_rows = new_rows
+            self._panel_text_dirty = True
+        if new_caption != self._caption:
+            self._caption = new_caption
+            self._top_bar_dirty = True
+
+    def _apply_composite_at_offset(self, offset: int) -> None:
+        """Display the composite cache entry at the given scrub offset."""
+        cache = self._composite_cache
+        if cache is None:
+            return
         # If in checkpoint zone, no preview frame is available.
         if self._scrub_in_checkpoint_zone() and offset > self._cache_snap_count():
-            return None
-        history = list(self._played_frames_deque)
-        hlen = len(history)
-        if hlen <= 0:
-            return None
-        off = max(1, min(hlen, int(offset)))
-        idx = max(0, min(hlen - 1, hlen - off))
-        return history[idx]
+            return
+        clen = cache.length()
+        if clen <= 0:
+            return
+        off = max(1, min(clen, int(offset)))
+        idx = max(0, min(clen - 1, clen - off))
+        panels = cache.copy_all_panels(idx)
+        if panels is None:
+            return
+        if self._textures is not None:
+            for i, tid in enumerate(self._textures["img"]):
+                self._upload_texture(int(tid), panels[i])
+
 
     def _history_weight_map_at_offset(self, offset: int) -> Optional[np.ndarray]:
         # Check checkpoint zone first
@@ -1103,32 +1123,6 @@ class _TransformerStatusOpenGLViewer:
         if weight_map is None:
             return None
         return np.ascontiguousarray(np.asarray(weight_map, dtype=np.uint8))
-
-    def _apply_frame_to_display(self, frame: Optional[dict]) -> None:
-        if not isinstance(frame, dict):
-            return
-        imgs = frame.get("images", None)
-        if isinstance(imgs, list) and len(imgs) == 3 and self._textures is not None:
-            for i, tid in enumerate(self._textures["img"]):
-                self._upload_texture(int(tid), np.asarray(imgs[i], dtype=np.uint8))
-        new_caption = str(frame.get("caption", ""))
-        new_titles = [str(x) for x in frame.get("titles", self._panel_titles)]
-        new_rows = [list(r) for r in frame.get("rows", self._panel_rows)]
-        if new_titles != self._panel_titles or new_rows != self._panel_rows:
-            self._panel_titles = new_titles
-            self._panel_rows = new_rows
-            self._panel_text_dirty = True
-        if new_caption != self._caption:
-            self._caption = new_caption
-            self._top_bar_dirty = True
-        new_loss_rows = list(frame.get("loss_rows", self._loss_display_rows))
-        if new_loss_rows != self._loss_display_rows:
-            self._loss_display_rows = new_loss_rows
-            self._sidebar_dirty = True
-        new_step_txt = str(frame.get("step_txt", ""))
-        if new_step_txt != self._last_step_txt:
-            self._last_step_txt = new_step_txt
-        self._last_displayed_frame = frame
 
     def set_training_graph_worker_hello(self, payload: Dict[str, Any]) -> None:
         self._graph_worker_hello = dict(payload or {})
@@ -1218,8 +1212,8 @@ class _TransformerStatusOpenGLViewer:
         out = np.full((H, W, 3), np.array([14, 16, 20], dtype=np.uint8), dtype=np.uint8)
         wq_cap  = 1024
         wq_used = int(self._preview_work_queue_ref.qsize()) if self._preview_work_queue_ref is not None else 0
-        fb_cap  = 16384
-        fb_used = int(self._frame_buffer.qsize())
+        fb_cap  = (self._scrub_ring.capacity() if self._scrub_ring else 1536)
+        fb_used = (self._scrub_ring.length() if self._scrub_ring else 0)
         margin  = 3
         label_h = 12
         section_h = max(1, (H - 2 * label_h - 3 * margin) // 2)
@@ -1245,7 +1239,7 @@ class _TransformerStatusOpenGLViewer:
             draw = ImageDraw.Draw(im)
             font = ImageFont.load_default()
             draw.text((margin, margin),                      f"work q  {wq_used}/{wq_cap}",  fill=(180, 220, 190), font=font)
-            draw.text((margin, y0_wq + section_h + margin), f"frame buf  {fb_used}/{fb_cap}", fill=(170, 200, 240), font=font)
+            draw.text((margin, y0_wq + section_h + margin), f"scrub ring  {fb_used}/{fb_cap}", fill=(170, 200, 240), font=font)
             out = np.asarray(im, dtype=np.uint8)
         except Exception:
             pass
@@ -1367,16 +1361,9 @@ class _TransformerStatusOpenGLViewer:
                 draw.text((4, y_info + 12), "wheel \u2191\u2193 to scrub back",
                           fill=(60, 70, 60), font=font)
 
-            # -- Step counter ----------------------------------------------
-            step_txt = str(self._last_step_txt)
-            if step_txt:
-                _stw = font.getlength(step_txt) if hasattr(font, "getlength") else len(step_txt) * 6
-                draw.text((max(4, W - 4 - int(_stw)), y_info + 36),
-                          step_txt, fill=(180, 200, 220), font=font)
-
             # -- Prev / Next checkpoint buttons ----------------------------
             has_ckpts = len(self._disk_save_loss_counts) > 0
-            nav_y0 = y_info + 40
+            nav_y0 = y_info + 36
             nav_h = 18
             half_w = (W - 24) // 2
             # PREV button
@@ -1412,8 +1399,14 @@ class _TransformerStatusOpenGLViewer:
                 draw.text(((W - len(ck_lbl) * 6) // 2, nav_y0 + nav_h + 2),
                           ck_lbl, fill=(130, 120, 160), font=font)
 
-            # Loss display below checkpoint nav
-            y_loss = nav_y0 + nav_h + 16
+            # -- Step counter (below checkpoint nav) -----------------------
+            step_txt = str(self._last_step_txt)
+            if step_txt:
+                draw.text((4, nav_y0 + nav_h + 16),
+                          step_txt, fill=(220, 180, 90), font=font)
+
+            # Loss display below step counter
+            y_loss = nav_y0 + nav_h + 30
             if self._loss_display_rows:
                 draw.line([(4, y_loss - 4), (W - 4, y_loss - 4)], fill=(50, 56, 68), width=1)
                 for lr in self._loss_display_rows:
@@ -1630,32 +1623,52 @@ class _TransformerStatusOpenGLViewer:
             return
         now = time.perf_counter()
 
-        # Slew the drain rate: buffer fill-depth drives target frame interval.
-        _pending = self._frame_buffer.qsize()
-        fill = float(min(_pending, 256)) / 256.0
-        target_dt = self._anim_dt_fast + (self._anim_dt_slow - self._anim_dt_fast) * ((1.0 - fill) ** 2)
-        _slew_elapsed = max(1e-4, now - self._last_slew_t)
-        self._last_slew_t = now
-        alpha = 1.0 - math.exp(-_slew_elapsed / max(1e-4, self._anim_slew_tau))
-        self._anim_frame_dt += alpha * (target_dt - self._anim_frame_dt)
+        # -- Drain new scrub ring entries into the composite cache ----------
+        ring = self._scrub_ring
+        cache = self._composite_cache
+        drained_any = False
+        if ring is not None and cache is not None:
+            with ring.locked():
+                ring_wc = ring.write_cursor()
+                ring_len = ring.length()
+            new_count = ring_wc - self._last_ring_cursor
+            if new_count < 0:
+                # Ring was cleared; reset tracking.
+                cache.clear()
+                self._last_ring_cursor = ring_wc
+                new_count = 0
+            if new_count > ring_len:
+                # Entries evicted past our tracking point; skip to valid range.
+                self._last_ring_cursor = ring_wc - ring_len
+                new_count = ring_len
 
-        # Drain all frames due according to elapsed time.
-        last_frame = None
-        while not self._frame_buffer.empty() and (now - self._last_anim_t) >= self._anim_frame_dt:
-            try:
-                last_frame = self._frame_buffer.get_nowait()
-            except _viewer_frame_queue.Empty:
-                break
-            # Loss values are owned by SaveRestoreNode; ignore frame-embedded losses.
-            self._record_history_frame(last_frame)
-            self._last_anim_t += self._anim_frame_dt
-        if self._scrub_offset == 0:
-            if last_frame is not None:
-                self._apply_frame_to_display(last_frame)
+            # Slew the drain rate: pending composite builds drive target interval.
+            fill = float(min(new_count, 256)) / 256.0
+            target_dt = self._anim_dt_fast + (self._anim_dt_slow - self._anim_dt_fast) * ((1.0 - fill) ** 2)
+            _slew_elapsed = max(1e-4, now - self._last_slew_t)
+            self._last_slew_t = now
+            alpha = 1.0 - math.exp(-_slew_elapsed / max(1e-4, self._anim_slew_tau))
+            self._anim_frame_dt += alpha * (target_dt - self._anim_frame_dt)
+
+            while new_count > 0 and (now - self._last_anim_t) >= self._anim_frame_dt:
+                ring_idx = ring_len - new_count
+                if 0 <= ring_idx < ring_len:
+                    cache.build_and_push(ring, ring_idx, self.panel_w, self.panel_h)
+                    self._record_history_snap()
+                    drained_any = True
+                self._last_ring_cursor += 1
+                new_count -= 1
+                self._last_anim_t += self._anim_frame_dt
         else:
-            history_frame = self._history_frame_at_offset(self._scrub_offset)
-            if history_frame is not None:
-                self._apply_frame_to_display(history_frame)
+            self._last_slew_t = now
+
+        if self._scrub_offset == 0:
+            if drained_any and cache is not None:
+                clen = cache.length()
+                if clen > 0:
+                    self._apply_composite_to_display(clen - 1)
+        else:
+            self._apply_composite_at_offset(self._scrub_offset)
 
         # Sidebar: btn_panel + scrub_dial every pump (cheap); weight snap is count-driven.
         self._cache_map_rgb  = self._render_btn_panel()
@@ -1906,7 +1919,8 @@ class _TransformerStatusOpenGLViewer:
                                         pass
                                 self._scrub_offset = 0
                                 self._weight_snapshot_deque.clear()
-                                self._played_frames_deque.clear()
+                                if self._composite_cache is not None:
+                                    self._composite_cache.clear()
                                 self._loss_count_at_snap_deque.clear()
                                 self._sidebar_dirty = True
                                 self._present(force=True)
@@ -2118,11 +2132,7 @@ class _TransformerStatusOpenGLViewer:
             self._sidebar_dirty = True
 
     def _on_sr_response(self, msg: dict) -> None:
-        """Handle a response to one of our queries from the SaveRestoreNode.
-
-        Loss data is no longer pulled over IPC -- it's read directly from
-        the C store.  Only non-loss responses are handled here.
-        """
+        """Handle a response to one of our queries from the SaveRestoreNode."""
         t = msg.get("type", "")
 
         if t == "resp_channel_list":
@@ -2132,16 +2142,15 @@ class _TransformerStatusOpenGLViewer:
             ck = msg.get("channel_key", "")
             result = msg.get("result")
             if result is not None:
-                images = result.get("images")
-                if images is not None and isinstance(images, (list, np.ndarray)):
-                    frame = {
-                        "images": images if isinstance(images, list) else [images],
-                        "caption": result.get("caption", ck),
-                        "titles": result.get("titles", [ck]),
-                        "rows": result.get("rows", [[]]),
-                        "losses": {},
-                    }
-                    self.enqueue_frame(frame)
+                caption = result.get("caption", ck)
+                titles = result.get("titles")
+                rows = result.get("rows")
+                if caption:
+                    self._ring_text_caption = str(caption)
+                if titles:
+                    self._ring_text_titles = [str(x) for x in titles]
+                if rows:
+                    self._ring_text_rows = [list(r) for r in rows]
 
         elif t == "resp_weight_map":
             wmap = msg.get("map")
@@ -2162,9 +2171,10 @@ class _TransformerStatusOpenGLViewer:
             self._sr_cache_total = int(msg.get("total", 0))
 
     def _sr_poll_data(self) -> None:
-        """Periodically request fresh non-loss data from the SaveRestoreNode.
+        """Periodically request fresh data from the SaveRestoreNode.
 
-        Loss data is not polled -- the viewer reads directly from the C store.
+        Loss history is pulled incrementally per-channel using cursors so
+        the graph can display data that was recorded in the training process.
         """
         now = time.time()
         if now - self._sr_last_poll_t < self._sr_poll_interval:
@@ -2525,10 +2535,26 @@ class _TransformerStatusOpenGLViewer:
             return out
 
     def enqueue_frame(self, frame_dict: dict):
-        """Thread-safe: push a fully-rendered frame dict into the display buffer.
-        Blocks when the buffer is full, back-pressuring the preview worker and
-        (through the work queue) the training loop.  Never drops frames."""
-        self._frame_buffer.put(frame_dict)
+        """Receive a frame dict — push images to scrub ring if present, store text."""
+        images = frame_dict.get("images")
+        if (images is not None and isinstance(images, list) and len(images) >= 3
+                and self._scrub_ring is not None):
+            target_rgb = np.asarray(images[0], dtype=np.uint8)
+            input_rgb = np.asarray(images[1], dtype=np.uint8)
+            output_rgb = np.asarray(images[2], dtype=np.uint8)
+            h, w = target_rgb.shape[0], target_rgb.shape[1]
+            flags = SCRUB_FLAG_HAS_IMAGE | SCRUB_FLAG_HAS_TARGET | SCRUB_FLAG_HAS_OUTPUT
+            self._scrub_ring.push(
+                step=0, round_id=0, ts=time.time(), loss=0.0,
+                channel_key="preview", flags=flags,
+                image_w=w, image_h=h,
+                training_image=input_rgb,
+                output_image=output_rgb,
+                target_data=target_rgb,
+            )
+        self._ring_text_caption = str(frame_dict.get("caption", ""))
+        self._ring_text_titles = [str(x) for x in frame_dict.get("titles", self._panel_titles)]
+        self._ring_text_rows = [list(r) for r in frame_dict.get("rows", self._panel_rows)]
 
     def update(
         self,
@@ -2549,18 +2575,33 @@ class _TransformerStatusOpenGLViewer:
         if self._stop_requested or (not self._ready):
             return
 
-        # Store losses in the frame so the graph advances in sync with each popped image
-        clean_rgb = self._resize_rgb_to_panel(_tensor_to_rgb_u8_image(clean_img))
-        in_rgb = self._resize_rgb_to_panel(_tensor_to_rgb_u8_image(input_img))
-        out_rgb = self._resize_rgb_to_panel(_tensor_to_rgb_u8_image(output_img))
+        ring = self._scrub_ring
+        if ring is None:
+            return
+
+        target_rgb = _tensor_to_rgb_u8_image(clean_img)
+        input_rgb = _tensor_to_rgb_u8_image(input_img)
+        output_rgb = _tensor_to_rgb_u8_image(output_img)
+        h, w = target_rgb.shape[0], target_rgb.shape[1]
+
+        flags = SCRUB_FLAG_HAS_IMAGE | SCRUB_FLAG_HAS_TARGET | SCRUB_FLAG_HAS_OUTPUT
+        ring.push(
+            step=0,
+            round_id=0,
+            ts=time.time(),
+            loss=0.0,
+            channel_key="viewer",
+            flags=flags,
+            image_w=w,
+            image_h=h,
+            training_image=input_rgb,
+            output_image=output_rgb,
+            target_data=target_rgb,
+        )
         titles, rows = self._normalize_panel_text(panel_titles=panel_titles, panel_rows=panel_rows)
-        self._frame_buffer.put({
-            "images": [clean_rgb, in_rgb, out_rgb],
-            "caption": str(caption),
-            "titles": titles,
-            "rows": rows,
-            "losses": dict(frame_losses) if frame_losses is not None else {},
-        })
+        self._ring_text_caption = str(caption)
+        self._ring_text_titles = titles
+        self._ring_text_rows = rows
 
     def close(self):
         if self._ready:
@@ -2779,16 +2820,11 @@ class ViewerIPCServer:
             # Loss values are owned exclusively by the SaveRestoreNode.
             # The GUI obtains them via pull-model queries; ignore direct pushes.
             pass
-        elif t == "frame":
-            frame = msg["frame"]
-            # Resize images to panel size if needed
-            for i, img in enumerate(frame.get("images", [])):
-                if (
-                    img is not None
-                    and (img.shape[0] != v.panel_h or img.shape[1] != v.panel_w)
-                ):
-                    frame["images"][i] = v._resize_rgb_to_panel(img)
-            v.enqueue_frame(frame)
+        elif t == "frame_signal":
+            # Image data is in the shared-memory scrub ring; just store text metadata.
+            v._ring_text_caption = str(msg.get("caption", ""))
+            v._ring_text_titles = [str(x) for x in msg.get("titles", ["target", "input", "output"])]
+            v._ring_text_rows = [list(r) for r in msg.get("rows", [[], [], []])]
         elif t == "checkpoint_saved":
             v.notify_pipeline_checkpoint_saved()
         elif t == "checkpoint_at_walltime":
@@ -2805,7 +2841,6 @@ class ViewerIPCServer:
             v._sidebar_dirty = True
         elif t == "weight_snapshot":
             v._weight_snapshot_deque.append(msg.get("weight_rgb"))
-            v._played_frames_deque.append(msg.get("played_frame"))
             v._loss_count_at_snap_deque.append(msg.get("loss_counts"))
         elif t == "exit":
             print("[viewer-ipc] training process exited cleanly", flush=True)
@@ -2847,13 +2882,6 @@ class ViewerIPCServer:
 
     def query_channel_list(self) -> None:
         self.send_query({"type": "query_channel_list"})
-
-    def query_loss_history(self, channel_key: str, from_step: int = 0) -> None:
-        self.send_query({
-            "type": "query_loss_history",
-            "channel_key": str(channel_key),
-            "from_step": int(from_step),
-        })
 
     def query_latest_result(self, channel_key: str) -> None:
         self.send_query({
@@ -2973,6 +3001,14 @@ class ViewerIPCProxy:
             print(f"[viewer-ipc] connection failed: {e}", flush=True)
             self.enabled = False
 
+        # Cross-process scrub ring handle (same shared memory as the GUI).
+        self._scrub_ring: Optional[NodusScrubRing] = None
+        if self.enabled:
+            try:
+                self._scrub_ring = NodusScrubRing.get_global()
+            except Exception as e:
+                print(f"[viewer-ipc] scrub ring init failed: {e}", flush=True)
+
     # -- internal helpers --------------------------------------------------
 
     def _send(self, msg: dict) -> None:
@@ -3088,7 +3124,30 @@ class ViewerIPCProxy:
         pass
 
     def enqueue_frame(self, frame_dict: dict):
-        self._send({"type": "frame", "frame": frame_dict})
+        """Push images to scrub ring if present, send text metadata via IPC."""
+        images = frame_dict.get("images")
+        ring = self._scrub_ring
+        if (images is not None and isinstance(images, list) and len(images) >= 3
+                and ring is not None):
+            target_rgb = np.asarray(images[0], dtype=np.uint8)
+            input_rgb = np.asarray(images[1], dtype=np.uint8)
+            output_rgb = np.asarray(images[2], dtype=np.uint8)
+            h, w = target_rgb.shape[0], target_rgb.shape[1]
+            flags = SCRUB_FLAG_HAS_IMAGE | SCRUB_FLAG_HAS_TARGET | SCRUB_FLAG_HAS_OUTPUT
+            ring.push(
+                step=0, round_id=0, ts=time.time(), loss=0.0,
+                channel_key="preview", flags=flags,
+                image_w=w, image_h=h,
+                training_image=input_rgb,
+                output_image=output_rgb,
+                target_data=target_rgb,
+            )
+        self._send({
+            "type": "frame_signal",
+            "caption": str(frame_dict.get("caption", "")),
+            "titles": list(frame_dict.get("titles", ["target", "input", "output"])),
+            "rows": [list(r) for r in frame_dict.get("rows", [[], [], []])],
+        })
 
     def update(
         self,
@@ -3100,17 +3159,37 @@ class ViewerIPCProxy:
         panel_rows=None,
         frame_losses=None,
     ):
-        clean_rgb = _tensor_to_rgb_u8_image(clean_img)
-        in_rgb = _tensor_to_rgb_u8_image(input_img)
-        out_rgb = _tensor_to_rgb_u8_image(output_img)
-        frame = {
-            "images": [clean_rgb, in_rgb, out_rgb],
+        ring = self._scrub_ring
+        if ring is None:
+            return
+
+        target_rgb = _tensor_to_rgb_u8_image(clean_img)
+        input_rgb = _tensor_to_rgb_u8_image(input_img)
+        output_rgb = _tensor_to_rgb_u8_image(output_img)
+        h, w = target_rgb.shape[0], target_rgb.shape[1]
+
+        flags = SCRUB_FLAG_HAS_IMAGE | SCRUB_FLAG_HAS_TARGET | SCRUB_FLAG_HAS_OUTPUT
+        ring.push(
+            step=0,
+            round_id=0,
+            ts=time.time(),
+            loss=0.0,
+            channel_key="viewer",
+            flags=flags,
+            image_w=w,
+            image_h=h,
+            training_image=input_rgb,
+            output_image=output_rgb,
+            target_data=target_rgb,
+        )
+        titles = list(panel_titles) if panel_titles else ["target", "input", "output"]
+        rows = [list(r) for r in panel_rows] if panel_rows else [[], [], []]
+        self._send({
+            "type": "frame_signal",
             "caption": str(caption),
-            "titles": list(panel_titles) if panel_titles else ["target", "input", "output"],
-            "rows": [list(r) for r in panel_rows] if panel_rows else [[], [], []],
-            "losses": dict(frame_losses) if frame_losses else {},
-        }
-        self._send({"type": "frame", "frame": frame})
+            "titles": titles,
+            "rows": rows,
+        })
 
     def notify_pipeline_checkpoint_saved(self) -> None:
         self._send({"type": "checkpoint_saved"})

@@ -44,25 +44,3 @@ def test_build_classifier_preview_frames_formats_masks_and_scores():
     assert frame["images"][0].shape == (2, 2, 4)
     assert frame["images"][1].shape == (2, 2, 3)
     assert frame["images"][2].shape == (2, 2, 4)
-
-
-def test_viewer_history_helpers_track_full_frames():
-    viewer = _TransformerStatusOpenGLViewer(enabled=False, image_hw=(16, 16), scale=1)
-    frame = {
-        "images": [
-            np.zeros((16, 16, 4), dtype=np.uint8),
-            np.zeros((16, 16, 3), dtype=np.uint8),
-            np.zeros((16, 16, 4), dtype=np.uint8),
-        ],
-        "caption": "history-frame",
-        "titles": ["a", "b", "c"],
-        "rows": [["r1"], ["r2"], ["r3"]],
-    }
-
-    viewer._record_history_frame(frame)
-
-    assert viewer._history_snap_count() == 1
-    history_frame = viewer._history_frame_at_offset(1)
-    assert history_frame is not None
-    assert history_frame["caption"] == "history-frame"
-    assert history_frame["titles"] == ["a", "b", "c"]

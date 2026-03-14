@@ -102,6 +102,9 @@ def _setup_signatures(lib: ctypes.CDLL) -> None:
     lib.nodus_loss_store_destroy.argtypes = [c_store_p]
     lib.nodus_loss_store_destroy.restype  = None
 
+    lib.nodus_loss_store_get_global.argtypes = []
+    lib.nodus_loss_store_get_global.restype  = c_store_p
+
     lib.nodus_loss_store_record.argtypes  = [
         c_store_p, c_char_p, ctypes.c_float, ctypes.c_float,
         ctypes.c_int32, ctypes.c_double,
@@ -205,6 +208,141 @@ def _setup_signatures(lib: ctypes.CDLL) -> None:
     ]
     lib.nodus_loss_store_render_all_lines.restype = ctypes.c_int32
 
+    # -- scrub ring --
+    c_ring_p = ctypes.c_void_p
+    c_uint8_p = ctypes.POINTER(ctypes.c_uint8)
+
+    lib.nodus_scrub_ring_get_global.argtypes = []
+    lib.nodus_scrub_ring_get_global.restype  = c_ring_p
+
+    lib.nodus_scrub_ring_create.argtypes = []
+    lib.nodus_scrub_ring_create.restype  = c_ring_p
+
+    lib.nodus_scrub_ring_destroy.argtypes = [c_ring_p]
+    lib.nodus_scrub_ring_destroy.restype  = None
+
+    lib.nodus_scrub_ring_push.argtypes = [
+        c_ring_p,
+        ctypes.c_int32, ctypes.c_int32, ctypes.c_double,  # step, round_id, ts
+        ctypes.c_float, ctypes.c_char_p, ctypes.c_uint32, # loss, key, flags
+        ctypes.c_uint32, ctypes.c_uint32,                 # image_w, image_h
+        c_uint8_p, ctypes.c_uint32,                        # training_image, len
+        c_uint8_p, ctypes.c_uint32,                        # output_image, len
+        c_uint8_p, ctypes.c_uint32,                        # target_data, len
+        c_uint8_p, c_uint8_p, c_uint8_p,                   # thumb0..2
+    ]
+    lib.nodus_scrub_ring_push.restype = ctypes.c_int32
+
+    lib.nodus_scrub_ring_clear.argtypes = [c_ring_p]
+    lib.nodus_scrub_ring_clear.restype  = None
+
+    lib.nodus_scrub_ring_length.argtypes = [c_ring_p]
+    lib.nodus_scrub_ring_length.restype  = ctypes.c_int32
+
+    lib.nodus_scrub_ring_capacity.argtypes = [c_ring_p]
+    lib.nodus_scrub_ring_capacity.restype  = ctypes.c_int32
+
+    lib.nodus_scrub_ring_write_cursor.argtypes = [c_ring_p]
+    lib.nodus_scrub_ring_write_cursor.restype  = ctypes.c_int32
+
+    lib.nodus_scrub_ring_get_meta.argtypes = [
+        c_ring_p, ctypes.c_int32,
+        ctypes.POINTER(ctypes.c_int32),   # out_step
+        ctypes.POINTER(ctypes.c_int32),   # out_round_id
+        ctypes.POINTER(ctypes.c_double),  # out_ts
+        ctypes.POINTER(ctypes.c_float),   # out_loss
+        ctypes.c_char_p, ctypes.c_int,    # out_channel_key, buflen
+        ctypes.POINTER(ctypes.c_uint32),  # out_flags
+        ctypes.POINTER(ctypes.c_uint32),  # out_image_w
+        ctypes.POINTER(ctypes.c_uint32),  # out_image_h
+        ctypes.POINTER(ctypes.c_uint32),  # out_target_len
+        ctypes.POINTER(ctypes.c_uint32),  # out_output_w
+        ctypes.POINTER(ctypes.c_uint32),  # out_output_h
+    ]
+    lib.nodus_scrub_ring_get_meta.restype = ctypes.c_int
+
+    lib.nodus_scrub_ring_copy_training_image.argtypes = [
+        c_ring_p, ctypes.c_int32, c_uint8_p, ctypes.c_uint32,
+    ]
+    lib.nodus_scrub_ring_copy_training_image.restype = ctypes.c_int32
+
+    lib.nodus_scrub_ring_copy_target.argtypes = [
+        c_ring_p, ctypes.c_int32, c_uint8_p, ctypes.c_uint32,
+    ]
+    lib.nodus_scrub_ring_copy_target.restype = ctypes.c_int32
+
+    lib.nodus_scrub_ring_copy_output_image.argtypes = [
+        c_ring_p, ctypes.c_int32, c_uint8_p, ctypes.c_uint32,
+    ]
+    lib.nodus_scrub_ring_copy_output_image.restype = ctypes.c_int32
+
+    lib.nodus_scrub_ring_copy_thumbnail.argtypes = [
+        c_ring_p, ctypes.c_int32, ctypes.c_int, c_uint8_p, ctypes.c_uint32,
+    ]
+    lib.nodus_scrub_ring_copy_thumbnail.restype = ctypes.c_int32
+
+    lib.nodus_scrub_ring_reduce_output.argtypes = [
+        c_ring_p, ctypes.c_int32, ctypes.c_uint32, ctypes.c_uint32,
+    ]
+    lib.nodus_scrub_ring_reduce_output.restype = ctypes.c_int
+
+    lib.nodus_scrub_ring_reduce_training.argtypes = [
+        c_ring_p, ctypes.c_int32, ctypes.c_uint32, ctypes.c_uint32,
+    ]
+    lib.nodus_scrub_ring_reduce_training.restype = ctypes.c_int
+
+    lib.nodus_scrub_ring_lock.argtypes = [c_ring_p]
+    lib.nodus_scrub_ring_lock.restype  = None
+
+    lib.nodus_scrub_ring_unlock.argtypes = [c_ring_p]
+    lib.nodus_scrub_ring_unlock.restype  = None
+
+    # -- Composite cache signatures ----------------------------------------
+
+    c_cache_p = ctypes.c_void_p
+    c_frame_p = ctypes.c_void_p
+
+    lib.nodus_composite_build_and_push.argtypes = [
+        c_ring_p, ctypes.c_int32,            # ring, ring_index
+        ctypes.c_uint32, ctypes.c_uint32,    # panel_w, panel_h
+        c_cache_p,                            # cache
+    ]
+    lib.nodus_composite_build_and_push.restype = ctypes.c_int32
+
+    lib.nodus_composite_cache_create.argtypes = [ctypes.c_int32]
+    lib.nodus_composite_cache_create.restype  = c_cache_p
+
+    lib.nodus_composite_cache_destroy.argtypes = [c_cache_p]
+    lib.nodus_composite_cache_destroy.restype  = None
+
+    lib.nodus_composite_cache_clear.argtypes = [c_cache_p]
+    lib.nodus_composite_cache_clear.restype  = None
+
+    lib.nodus_composite_cache_length.argtypes = [c_cache_p]
+    lib.nodus_composite_cache_length.restype  = ctypes.c_int32
+
+    lib.nodus_composite_cache_capacity.argtypes = [c_cache_p]
+    lib.nodus_composite_cache_capacity.restype  = ctypes.c_int32
+
+    lib.nodus_composite_cache_get_meta.argtypes = [
+        c_cache_p, ctypes.c_int32,
+        ctypes.POINTER(ctypes.c_int32),   # out_step
+        ctypes.POINTER(ctypes.c_int32),   # out_round_id
+        ctypes.POINTER(ctypes.c_double),  # out_ts
+        ctypes.POINTER(ctypes.c_float),   # out_loss
+        ctypes.POINTER(ctypes.c_uint32),  # out_flags
+        ctypes.POINTER(ctypes.c_uint32),  # out_panel_w
+        ctypes.POINTER(ctypes.c_uint32),  # out_panel_h
+        ctypes.POINTER(ctypes.c_int32),   # out_source_ring_cursor
+    ]
+    lib.nodus_composite_cache_get_meta.restype = ctypes.c_int
+
+    lib.nodus_composite_cache_copy_panel.argtypes = [
+        c_cache_p, ctypes.c_int32, ctypes.c_int,
+        c_uint8_p, ctypes.c_uint32,
+    ]
+    lib.nodus_composite_cache_copy_panel.restype = ctypes.c_int32
+
 
 # -- Python dataclass for query results --
 
@@ -232,20 +370,39 @@ class NodusLossStore:
     """
 
     def __init__(self, max_channels: int = 64,
-                 max_records: int = 100_000):
+                 max_records: int = 100_000,
+                 _raw_handle: ctypes.c_void_p | None = None):
         lib = _get_lib()
         self._lib = lib
-        self._handle = lib.nodus_loss_store_create(
-            int(max_channels), int(max_records))
-        if not self._handle:
-            raise MemoryError("nodus_loss_store_create returned NULL")
+        self._owns = _raw_handle is None
+        if _raw_handle is not None:
+            self._handle = _raw_handle
+        else:
+            self._handle = lib.nodus_loss_store_create(
+                int(max_channels), int(max_records))
+            if not self._handle:
+                raise MemoryError("nodus_loss_store_create returned NULL")
+
+    @classmethod
+    def get_global(cls) -> "NodusLossStore":
+        """Return the process-global singleton backed by OS shared memory.
+
+        Every process that loads the DLL and calls this receives the SAME
+        physical memory.  The returned wrapper does NOT own the handle --
+        ``close()`` is a no-op.
+        """
+        lib = _get_lib()
+        handle = lib.nodus_loss_store_get_global()
+        if not handle:
+            raise MemoryError("nodus_loss_store_get_global returned NULL")
+        return cls(_raw_handle=handle)
 
     # -- lifecycle --
 
     def close(self) -> None:
-        if self._handle:
+        if self._handle and self._owns:
             self._lib.nodus_loss_store_destroy(self._handle)
-            self._handle = None
+        self._handle = None
 
     def __del__(self):
         self.close()
@@ -681,3 +838,466 @@ class _StoreLockCtx:
 
     def __exit__(self, *exc):
         self._store.unlock()
+
+
+# ======================================================================
+#  Scrub Ring -- cross-process training-image & frame cache
+# ======================================================================
+
+# Mirror the C constants.
+SCRUB_IMAGE_W      = 256
+SCRUB_IMAGE_H      = 256
+SCRUB_IMAGE_C      = 4
+SCRUB_IMAGE_BYTES  = SCRUB_IMAGE_W * SCRUB_IMAGE_H * SCRUB_IMAGE_C
+SCRUB_TARGET_BYTES = SCRUB_IMAGE_BYTES
+SCRUB_THUMB_W      = 64
+SCRUB_THUMB_H      = 64
+SCRUB_THUMB_C      = 3
+SCRUB_THUMB_BYTES  = SCRUB_THUMB_W * SCRUB_THUMB_H * SCRUB_THUMB_C
+SCRUB_NUM_THUMBS   = 3
+SCRUB_RING_CAPACITY = 1536
+SCRUB_BLUE_ZONE     = 512
+
+SCRUB_FLAG_HAS_IMAGE    = 0x01
+SCRUB_FLAG_HAS_TARGET   = 0x02
+SCRUB_FLAG_HAS_THUMBS   = 0x04
+SCRUB_FLAG_HAS_GRADIENT = 0x08
+SCRUB_FLAG_CHECKPOINT   = 0x10
+SCRUB_FLAG_HAS_OUTPUT   = 0x20
+SCRUB_FLAG_REDUCED      = 0x40
+
+
+@dataclass(slots=True)
+class ScrubMeta:
+    step: int = 0
+    round_id: int = 0
+    ts: float = 0.0
+    loss: float = 0.0
+    channel_key: str = ""
+    flags: int = 0
+    image_w: int = 0
+    image_h: int = 0
+    target_len: int = 0
+    output_w: int = 0
+    output_h: int = 0
+
+
+class NodusScrubRing:
+    """Python wrapper around the native scrub ring shared memory."""
+
+    def __init__(self, _raw_handle: ctypes.c_void_p | None = None):
+        lib = _get_lib()
+        self._lib = lib
+        self._owns = _raw_handle is None
+        if _raw_handle is not None:
+            self._handle = _raw_handle
+        else:
+            self._handle = lib.nodus_scrub_ring_create()
+            if not self._handle:
+                raise MemoryError("nodus_scrub_ring_create returned NULL")
+
+    @classmethod
+    def get_global(cls) -> "NodusScrubRing":
+        lib = _get_lib()
+        handle = lib.nodus_scrub_ring_get_global()
+        if not handle:
+            raise MemoryError("nodus_scrub_ring_get_global returned NULL")
+        return cls(_raw_handle=handle)
+
+    def close(self) -> None:
+        if self._handle and self._owns:
+            self._lib.nodus_scrub_ring_destroy(self._handle)
+        self._handle = None
+
+    def __del__(self):
+        self.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+
+    # -- write --
+
+    def push(
+        self,
+        step: int,
+        round_id: int,
+        ts: float,
+        loss: float,
+        channel_key: str,
+        flags: int = 0,
+        image_w: int = 0,
+        image_h: int = 0,
+        training_image: "numpy.ndarray | None" = None,
+        output_image: "numpy.ndarray | None" = None,
+        target_data: "numpy.ndarray | None" = None,
+        thumb0: "numpy.ndarray | None" = None,
+        thumb1: "numpy.ndarray | None" = None,
+        thumb2: "numpy.ndarray | None" = None,
+    ) -> int:
+        import numpy as np
+
+        key_b = channel_key.encode("utf-8") if isinstance(channel_key, str) else channel_key
+
+        img_ptr = None
+        img_len = 0
+        if training_image is not None:
+            img = np.ascontiguousarray(training_image, dtype=np.uint8)
+            img_ptr = img.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8))
+            img_len = img.nbytes
+
+        out_ptr = None
+        out_len = 0
+        if output_image is not None:
+            oimg = np.ascontiguousarray(output_image, dtype=np.uint8)
+            out_ptr = oimg.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8))
+            out_len = oimg.nbytes
+
+        tgt_ptr = None
+        tgt_len = 0
+        if target_data is not None:
+            tgt = np.ascontiguousarray(target_data, dtype=np.uint8)
+            tgt_ptr = tgt.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8))
+            tgt_len = tgt.nbytes
+
+        t0_ptr = t1_ptr = t2_ptr = None
+        if thumb0 is not None:
+            t0 = np.ascontiguousarray(thumb0, dtype=np.uint8)
+            t0_ptr = t0.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8))
+        if thumb1 is not None:
+            t1 = np.ascontiguousarray(thumb1, dtype=np.uint8)
+            t1_ptr = t1.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8))
+        if thumb2 is not None:
+            t2 = np.ascontiguousarray(thumb2, dtype=np.uint8)
+            t2_ptr = t2.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8))
+
+        return int(self._lib.nodus_scrub_ring_push(
+            self._handle,
+            ctypes.c_int32(step),
+            ctypes.c_int32(round_id),
+            ctypes.c_double(ts),
+            ctypes.c_float(loss),
+            key_b,
+            ctypes.c_uint32(flags),
+            ctypes.c_uint32(image_w),
+            ctypes.c_uint32(image_h),
+            img_ptr, ctypes.c_uint32(img_len),
+            out_ptr, ctypes.c_uint32(out_len),
+            tgt_ptr, ctypes.c_uint32(tgt_len),
+            t0_ptr, t1_ptr, t2_ptr,
+        ))
+
+    def clear(self) -> None:
+        self._lib.nodus_scrub_ring_clear(self._handle)
+
+    # -- read --
+
+    def length(self) -> int:
+        return int(self._lib.nodus_scrub_ring_length(self._handle))
+
+    def capacity(self) -> int:
+        return int(self._lib.nodus_scrub_ring_capacity(self._handle))
+
+    def write_cursor(self) -> int:
+        return int(self._lib.nodus_scrub_ring_write_cursor(self._handle))
+
+    def get_meta(self, index: int) -> Optional[ScrubMeta]:
+        step = ctypes.c_int32()
+        round_id = ctypes.c_int32()
+        ts = ctypes.c_double()
+        loss = ctypes.c_float()
+        key_buf = ctypes.create_string_buffer(64)
+        flags = ctypes.c_uint32()
+        image_w = ctypes.c_uint32()
+        image_h = ctypes.c_uint32()
+        target_len = ctypes.c_uint32()
+        output_w = ctypes.c_uint32()
+        output_h = ctypes.c_uint32()
+
+        rc = self._lib.nodus_scrub_ring_get_meta(
+            self._handle, ctypes.c_int32(index),
+            ctypes.byref(step), ctypes.byref(round_id), ctypes.byref(ts),
+            ctypes.byref(loss), key_buf, 64,
+            ctypes.byref(flags),
+            ctypes.byref(image_w), ctypes.byref(image_h),
+            ctypes.byref(target_len),
+            ctypes.byref(output_w), ctypes.byref(output_h),
+        )
+        if rc != 0:
+            return None
+        return ScrubMeta(
+            step=step.value,
+            round_id=round_id.value,
+            ts=ts.value,
+            loss=loss.value,
+            channel_key=key_buf.value.decode("utf-8", errors="replace"),
+            flags=flags.value,
+            image_w=image_w.value,
+            image_h=image_h.value,
+            target_len=target_len.value,
+            output_w=output_w.value,
+            output_h=output_h.value,
+        )
+
+    def copy_training_image(self, index: int) -> "Optional[numpy.ndarray]":
+        import numpy as np
+        buf = (ctypes.c_uint8 * SCRUB_IMAGE_BYTES)()
+        n = self._lib.nodus_scrub_ring_copy_training_image(
+            self._handle, ctypes.c_int32(index), buf,
+            ctypes.c_uint32(SCRUB_IMAGE_BYTES))
+        if n <= 0:
+            return None
+        return np.ctypeslib.as_array(buf)[:n].copy()
+
+    def copy_training_image_shaped(self, index: int) -> "Optional[numpy.ndarray]":
+        """Return training image as (H, W, C) uint8 array, or None."""
+        import numpy as np
+        meta = self.get_meta(index)
+        if meta is None:
+            return None
+        raw = self.copy_training_image(index)
+        if raw is None:
+            return None
+        h, w = meta.image_h, meta.image_w
+        expected = h * w * SCRUB_IMAGE_C
+        if len(raw) < expected:
+            return None
+        return raw[:expected].reshape(h, w, SCRUB_IMAGE_C)
+
+    def copy_target(self, index: int) -> "Optional[numpy.ndarray]":
+        import numpy as np
+        buf = (ctypes.c_uint8 * SCRUB_TARGET_BYTES)()
+        n = self._lib.nodus_scrub_ring_copy_target(
+            self._handle, ctypes.c_int32(index), buf,
+            ctypes.c_uint32(SCRUB_TARGET_BYTES))
+        if n <= 0:
+            return None
+        return np.ctypeslib.as_array(buf)[:n].copy()
+
+    def copy_output_image(self, index: int) -> "Optional[numpy.ndarray]":
+        import numpy as np
+        buf = (ctypes.c_uint8 * SCRUB_IMAGE_BYTES)()
+        n = self._lib.nodus_scrub_ring_copy_output_image(
+            self._handle, ctypes.c_int32(index), buf,
+            ctypes.c_uint32(SCRUB_IMAGE_BYTES))
+        if n <= 0:
+            return None
+        return np.ctypeslib.as_array(buf)[:n].copy()
+
+    def copy_output_image_shaped(self, index: int) -> "Optional[numpy.ndarray]":
+        """Return output image as (H, W, C) uint8 array, or None."""
+        import numpy as np
+        meta = self.get_meta(index)
+        if meta is None or meta.output_w == 0 or meta.output_h == 0:
+            return None
+        raw = self.copy_output_image(index)
+        if raw is None:
+            return None
+        h, w = meta.output_h, meta.output_w
+        expected = h * w * SCRUB_IMAGE_C
+        if len(raw) < expected:
+            return None
+        return raw[:expected].reshape(h, w, SCRUB_IMAGE_C)
+
+    def copy_thumbnail(self, index: int, thumb_idx: int) -> "Optional[numpy.ndarray]":
+        import numpy as np
+        buf = (ctypes.c_uint8 * SCRUB_THUMB_BYTES)()
+        n = self._lib.nodus_scrub_ring_copy_thumbnail(
+            self._handle, ctypes.c_int32(index), thumb_idx,
+            buf, ctypes.c_uint32(SCRUB_THUMB_BYTES))
+        if n <= 0:
+            return None
+        return np.ctypeslib.as_array(buf)[:n].copy().reshape(
+            SCRUB_THUMB_H, SCRUB_THUMB_W, SCRUB_THUMB_C)
+
+    # -- quality reduction (GUI-side cache management) --
+
+    def reduce_output(self, index: int,
+                      target_w: int = 0, target_h: int = 0) -> bool:
+        """Downsample the output image at `index` to target_w x target_h.
+
+        Pass 0,0 to discard entirely.  The reduction is irreversible and
+        happens in-place in shared memory.  Returns True on success.
+        """
+        rc = self._lib.nodus_scrub_ring_reduce_output(
+            self._handle, ctypes.c_int32(index),
+            ctypes.c_uint32(target_w), ctypes.c_uint32(target_h))
+        return rc == 0
+
+    def reduce_training(self, index: int,
+                        target_w: int = 0, target_h: int = 0) -> bool:
+        """Downsample the training image at `index` to target_w x target_h.
+
+        Pass 0,0 to discard entirely.  Returns True on success.
+        """
+        rc = self._lib.nodus_scrub_ring_reduce_training(
+            self._handle, ctypes.c_int32(index),
+            ctypes.c_uint32(target_w), ctypes.c_uint32(target_h))
+        return rc == 0
+
+    # -- locking --
+
+    def lock(self) -> None:
+        self._lib.nodus_scrub_ring_lock(self._handle)
+
+    def unlock(self) -> None:
+        self._lib.nodus_scrub_ring_unlock(self._handle)
+
+    def locked(self):
+        return _RingLockCtx(self)
+
+
+class _RingLockCtx:
+    __slots__ = ("_ring",)
+
+    def __init__(self, ring: NodusScrubRing):
+        self._ring = ring
+
+    def __enter__(self):
+        self._ring.lock()
+        return self._ring
+
+    def __exit__(self, *exc):
+        self._ring.unlock()
+
+
+# ====================================================================
+#  Composite cache constants
+# ====================================================================
+
+COMPOSITE_PANEL_MAX_W = 256
+COMPOSITE_PANEL_MAX_H = 256
+COMPOSITE_PANEL_C = 3
+COMPOSITE_PANEL_MAX_BYTES = COMPOSITE_PANEL_MAX_W * COMPOSITE_PANEL_MAX_H * COMPOSITE_PANEL_C
+COMPOSITE_CACHE_CAPACITY = 512
+
+
+@dataclass(slots=True)
+class CompositeFrameMeta:
+    step: int = 0
+    round_id: int = 0
+    ts: float = 0.0
+    loss: float = 0.0
+    flags: int = 0
+    panel_w: int = 0
+    panel_h: int = 0
+    source_ring_cursor: int = 0
+
+
+class NodusCompositeCache:
+    """GUI-side composite frame cache backed by native C ring.
+
+    The cache holds resized RGB panels built from scrub ring entries.
+    Create one per GUI process; it is *not* shared between processes.
+    """
+
+    def __init__(self, capacity: int = COMPOSITE_CACHE_CAPACITY):
+        lib = _get_lib()
+        self._lib = lib
+        self._handle = lib.nodus_composite_cache_create(ctypes.c_int32(capacity))
+        if not self._handle:
+            raise RuntimeError("nodus_composite_cache_create returned NULL")
+
+    def close(self):
+        if self._handle:
+            self._lib.nodus_composite_cache_destroy(self._handle)
+            self._handle = None
+
+    def __del__(self):
+        self.close()
+
+    # -- build helpers --
+
+    def build_and_push(
+        self,
+        ring: NodusScrubRing,
+        ring_index: int,
+        panel_w: int,
+        panel_h: int,
+    ) -> int:
+        """Build an RGB composite from scrub ring entry and push to cache.
+
+        Returns the cache write cursor, -1 on error.
+        """
+        return int(self._lib.nodus_composite_build_and_push(
+            ring._handle,
+            ctypes.c_int32(ring_index),
+            ctypes.c_uint32(panel_w),
+            ctypes.c_uint32(panel_h),
+            self._handle,
+        ))
+
+    # -- read --
+
+    def length(self) -> int:
+        return int(self._lib.nodus_composite_cache_length(self._handle))
+
+    def capacity(self) -> int:
+        return int(self._lib.nodus_composite_cache_capacity(self._handle))
+
+    def clear(self):
+        self._lib.nodus_composite_cache_clear(self._handle)
+
+    def get_meta(self, index: int) -> Optional[CompositeFrameMeta]:
+        step = ctypes.c_int32()
+        round_id = ctypes.c_int32()
+        ts = ctypes.c_double()
+        loss = ctypes.c_float()
+        flags = ctypes.c_uint32()
+        panel_w = ctypes.c_uint32()
+        panel_h = ctypes.c_uint32()
+        src_cursor = ctypes.c_int32()
+
+        rc = self._lib.nodus_composite_cache_get_meta(
+            self._handle, ctypes.c_int32(index),
+            ctypes.byref(step), ctypes.byref(round_id),
+            ctypes.byref(ts), ctypes.byref(loss),
+            ctypes.byref(flags),
+            ctypes.byref(panel_w), ctypes.byref(panel_h),
+            ctypes.byref(src_cursor),
+        )
+        if rc != 0:
+            return None
+        return CompositeFrameMeta(
+            step=step.value,
+            round_id=round_id.value,
+            ts=ts.value,
+            loss=loss.value,
+            flags=flags.value,
+            panel_w=panel_w.value,
+            panel_h=panel_h.value,
+            source_ring_cursor=src_cursor.value,
+        )
+
+    def copy_panel(self, index: int, panel_idx: int) -> "Optional[numpy.ndarray]":
+        """Copy one RGB panel.  panel_idx: 0=target, 1=input, 2=output.
+
+        Returns (H, W, 3) uint8 numpy array, or None.
+        """
+        import numpy as np
+        buf = (ctypes.c_uint8 * COMPOSITE_PANEL_MAX_BYTES)()
+        n = self._lib.nodus_composite_cache_copy_panel(
+            self._handle, ctypes.c_int32(index), ctypes.c_int(panel_idx),
+            buf, ctypes.c_uint32(COMPOSITE_PANEL_MAX_BYTES))
+        if n <= 0:
+            return None
+        meta = self.get_meta(index)
+        if meta is None:
+            return None
+        h, w = meta.panel_h, meta.panel_w
+        expected = h * w * COMPOSITE_PANEL_C
+        if n < expected:
+            return None
+        return np.ctypeslib.as_array(buf)[:expected].copy().reshape(h, w, COMPOSITE_PANEL_C)
+
+    def copy_all_panels(self, index: int) -> "Optional[list]":
+        """Return [target, input, output] as list of (H,W,3) arrays, or None."""
+        panels = []
+        for pi in range(3):
+            p = self.copy_panel(index, pi)
+            if p is None:
+                return None
+            panels.append(p)
+        return panels

@@ -138,7 +138,8 @@ def build_classifier_preview_frames(
     )
 
     frames: List[Dict[str, Any]] = []
-    for payload in payload_batch:
+    batch_size = len(payload_batch)
+    for sample_idx, payload in enumerate(payload_batch):
         image_like = payload.get("img", None)
         if image_like is None:
             continue
@@ -193,9 +194,9 @@ def build_classifier_preview_frames(
                     _chw_to_u8_hwc(panel_diff),
                     _chw_to_u8_hwc(panel_detected),
                 ],
-                "caption": f"[C] cycle={int(cycle_id)} round={int(round_id)} {step_txt} top={top_txt}",
+                "caption": f"[C] cycle={int(cycle_id)} round={int(round_id)} {step_txt} [{sample_idx+1}/{batch_size}] top={top_txt}",
                 "titles": ["C target +mask", "C mask diff", "C detected +mask"],
-                "step_txt": step_txt,
+                "step_txt": f"{step_txt} [{sample_idx+1}/{batch_size}]",
                 "rows": [
                     target_lines,
                     diff_rows,

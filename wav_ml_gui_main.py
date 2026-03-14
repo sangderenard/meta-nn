@@ -242,7 +242,7 @@ def main():
     from pipeline.nodus_loss_store import NodusLossStore
 
     # Create the native loss store — single authoritative source for all loss data.
-    loss_store = NodusLossStore(max_channels=64, max_records=100_000)
+    loss_store = NodusLossStore.get_global()
 
     viewer = _TransformerStatusOpenGLViewer(
         enabled=True,

@@ -1381,15 +1381,18 @@ def build_pipeline_graph(
     g.add_edge("build_label_embedding", "data_node", label="per_round")
 
     # Pregestation: data_node rebuilds ctx.pregestation_loader when the rebuild period is due.
-    # On non-rebuild rounds the edge is inactive but stage_0 still trains on the cached loader.
+    # The conditional edge fires the rebuild callback only on schedule; the unconditional
+    # per-round edge keeps the path open so stage_0 trains on the cached loader every round.
     g.add_edge("data_node", "stage_0_pregestation",
                condition=_preg_rebuild_cond, label="provides:pregestation_loader",
                condition_id=_CONDITION_ID_PREG_REBUILD,
                on_traverse=_data_node.provide_pregestation)
+    g.add_edge("data_node", "stage_0_pregestation", label="per_round")
     g.add_edge("data_node", "gate_0_pregestation_eval",
                condition=_preg_rebuild_cond, label="provides:pregestation_eval_loader",
                condition_id=_CONDITION_ID_PREG_REBUILD,
                on_traverse=_data_node.provide_pregestation_eval)
+    g.add_edge("data_node", "gate_0_pregestation_eval", label="per_round")
 
     # Gestation: gate condition is embedded in _gest_rebuild_cond (gate must clear AND rebuild due).
     g.add_edge("data_node", "stage_1_gestation",
@@ -1472,8 +1475,12 @@ def build_pipeline_graph(
     # == Housekeeping at end of every round =========================
 
     g.add_edge("gate_wave", "sync_gate_replica", label="end_of_round")
-    g.add_edge("gate_transformer", "sync_gate_replica", label="end_of_round")
-    g.add_edge("gate_berkeley", "sync_gate_replica", label="end_of_round")
+    g.add_edge("gate_transformer", "sync_gate_replica",
+               condition=_always, label="end_of_round",
+               condition_id=_CONDITION_ID_EARLY_GATES)
+    g.add_edge("gate_berkeley", "sync_gate_replica",
+               condition=_always, label="end_of_round",
+               condition_id=_CONDITION_ID_EARLY_GATES)
     g.add_edge("sync_gate_replica", "checkpoint_save", label="end_of_round")
     g.add_edge("checkpoint_save", "viewer_ipc", label="end_of_round")
 

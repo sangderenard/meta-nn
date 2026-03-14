@@ -794,7 +794,7 @@ class SaveRestoreNode(PipelineNode):
 
         # -- Pull-model data stores (GUI queries these) -------------------
         from pipeline.nodus_loss_store import NodusLossStore as _NLS
-        self.loss_store: _NLS = _NLS(max_channels=64, max_records=100_000)
+        self.loss_store: _NLS = _NLS.get_global()
         self.result_store: ResultStore = ResultStore()
 
         # Pending restore request: (round_id, cycle) to restore to.
@@ -1290,10 +1290,14 @@ class SaveRestoreNode(PipelineNode):
     def _resp_latest_result(self, query: Dict[str, Any]) -> Dict[str, Any]:
         ck = str(query.get("channel_key", ""))
         result = self.result_store.latest_serialisable(ck)
+        # Strip binary/image data — images travel via scrub ring, not IPC.
+        if result is not None:
+            result = {k: v for k, v in result.items()
+                      if not isinstance(v, (np.ndarray, bytes, bytearray))}
         return {
             "type": RESP_LATEST_RESULT,
             "channel_key": ck,
-            "result": result,  # None if nothing stored yet
+            "result": result,  # text/scalar metadata only
         }
 
     def _resp_tm_summary(self) -> Dict[str, Any]:
