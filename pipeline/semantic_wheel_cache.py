@@ -22,6 +22,7 @@ from torch.utils.data import Dataset, Sampler
 
 from semantic_dataset_loaders import (
     SemanticDiskRow,
+    _apply_degrade as _canonical_apply_degrade,
     _blend_attention_maps,
     _blend_attention_maps_batch_torch,
     _composite_mask_stack,
@@ -194,12 +195,6 @@ def build_semantic_cache_entry(
     pair_count = min(int(stack_arr.shape[0]), int(idx_arr.size))
     stack_arr = np.asarray(stack_arr[: int(pair_count)], dtype=np.float32)
     idx_arr = np.asarray(idx_arr[: int(pair_count)], dtype=np.int64)
-    if int(pair_count) <= 0 and int(label_arr.size) > 0:
-        stack_arr, idx_arr = build_label_mask_stack(
-            mixed_mask=np.asarray(mixed_mask_arr, dtype=np.float32),
-            label_vec=label_arr,
-            treat_mixed_mask_as_creation=True,
-        )
     if int(stack_arr.shape[0]) > 0:
         mixed_mask_arr = _composite_mask_stack(stack_arr)
     mixed_mask_arr = _normalize_attention_map(np.asarray(mixed_mask_arr, dtype=np.float32), gamma=0.92, blur_kernel=1)
@@ -376,298 +371,16 @@ def _apply_degrade(
     seed: int,
     degrade_config: Optional[Dict[str, Any]] = None,
     processing_device: Optional[Any] = None,
+    apply_vmean_compression: bool = False,
 ) -> Tuple[np.ndarray, Optional[np.ndarray], Dict[str, np.ndarray]]:
-    cfg = dict(degrade_config) if isinstance(degrade_config, dict) else {}
-    cfg_use = {
-        "blur_prob": float(cfg.get("blur_prob", 0.55)),
-        "stride_skew_prob": float(cfg.get("stride_skew_prob", 0.40)),
-        "dropout_prob": float(cfg.get("dropout_prob", 0.25)),
-        "quantization_prob": float(cfg.get("quantization_prob", 0.30)),
-        "noise_prob": float(cfg.get("noise_prob", 0.55)),
-        "noise_std_min": float(cfg.get("noise_std_min", 0.01)),
-        "noise_std_max": float(cfg.get("noise_std_max", 0.08)),
-        "edge_highlight_prob": float(cfg.get("edge_highlight_prob", 0.35)),
-        "edge_highlight_blend_min": float(cfg.get("edge_highlight_blend_min", 0.05)),
-        "edge_highlight_blend_max": float(cfg.get("edge_highlight_blend_max", 0.25)),
-        "edge_highlight_ultra": bool(cfg.get("edge_highlight_ultra", str(os.environ.get("EDGE_HIGHLIGHT_ULTRA", "0")).strip() == "1")),
-        "edge_blur_prob": float(cfg.get("edge_blur_prob", 0.30)),
-        "edge_blur_kernel": int(cfg.get("edge_blur_kernel", 7)),
-        "edge_blur_spread": int(cfg.get("edge_blur_spread", 5)),
-    }
-    rng = np.random.default_rng(int(seed) + (int(idx) * 104729))
-    resolved = _resolve_processing_device(processing_device)
-    if resolved is not None:
-        out_t = torch.as_tensor(x, dtype=torch.float32, device=resolved).clone()
-        mask_out_t = None if mask is None else torch.as_tensor(mask, dtype=torch.float32, device=resolved).clone()
-        c, h, w = int(out_t.shape[0]), int(out_t.shape[1]), int(out_t.shape[2])
-        touch_t = torch.zeros((int(h), int(w)), dtype=torch.float32, device=resolved)
-        term_masks_t: Dict[str, torch.Tensor] = {}
-
-        def _accumulate_touch_t(delta: Any, scale: float = 1.0, gamma: float = 1.0) -> Optional[torch.Tensor]:
-            nonlocal touch_t
-            norm_t = _normalize_attention_map_batch_torch(delta, gamma=float(gamma), blur_kernel=3, device=resolved)
-            if float(torch.amax(norm_t).detach().cpu().item()) <= 1e-8:
-                return None
-            touch_t = touch_t + (float(scale) * norm_t)
-            return norm_t
-
-        def _accumulate_term_mask_t(terms: Sequence[str], delta: Any, scale: float = 1.0, gamma: float = 1.0) -> None:
-            norm_t = _accumulate_touch_t(delta, scale=float(scale), gamma=float(gamma))
-            if norm_t is None or float(torch.amax(norm_t).detach().cpu().item()) <= 1e-8:
-                return
-            for term in normalize_vocab_terms([str(t) for t in list(terms)]):
-                tk = _norm_txt(term)
-                prev_t = term_masks_t.get(tk, torch.zeros((int(h), int(w)), dtype=torch.float32, device=resolved))
-                term_masks_t[tk] = _blend_attention_maps_batch_torch(
-                    [prev_t, norm_t],
-                    weights=[1.0, 1.0],
-                    gamma=0.90,
-                    device=resolved,
-                )
-
-        def _mark_diff_t(prev_x_t: torch.Tensor, next_x_t: torch.Tensor, scale: float = 1.0) -> None:
-            prev_g_t = torch.mean(prev_x_t.to(dtype=torch.float32), dim=0)
-            next_g_t = torch.mean(next_x_t.to(dtype=torch.float32), dim=0)
-            _accumulate_touch_t(torch.abs(next_g_t - prev_g_t), scale=float(scale), gamma=0.95)
-
-        if float(rng.random()) < float(cfg_use["blur_prob"]):
-            prev_t = out_t.clone()
-            k = int(rng.choice(np.asarray([3, 5, 7], dtype=np.int32)))
-            out_t = F.avg_pool2d(out_t[None, ...], kernel_size=int(k), stride=1, padding=int(k // 2))[0]
-            _accumulate_term_mask_t(
-                ["blur damage", "signal"],
-                torch.abs(torch.mean(out_t[:3], dim=0) - torch.mean(prev_t[:3], dim=0)),
-                scale=0.85,
-                gamma=0.95,
-            )
-        if float(rng.random()) < float(cfg_use["stride_skew_prob"]):
-            prev_t = out_t.clone()
-            odd_shift = int(rng.integers(1, 8))
-            out_t[:, 1::2, :] = torch.roll(out_t[:, 1::2, :], shifts=int(odd_shift), dims=2)
-            stripe_t = torch.zeros((int(h), int(w)), dtype=torch.float32, device=resolved)
-            stripe_t[1::2, :] = 1.0
-            _mark_diff_t(prev_t, out_t, scale=0.75)
-            _accumulate_term_mask_t(["stride skew damage", "signal"], stripe_t, scale=0.35, gamma=1.10)
-            if mask_out_t is not None:
-                mask_out_t[1::2, :] = torch.roll(mask_out_t[1::2, :], shifts=int(odd_shift), dims=1)
-        if float(rng.random()) < float(cfg_use["dropout_prob"]):
-            keep = float(rng.uniform(0.78, 0.96))
-            keep_mask_t = torch.as_tensor(
-                (rng.random((int(h), int(w)), dtype=np.float32) < keep).astype(np.float32, copy=False),
-                dtype=torch.float32,
-                device=resolved,
-            )
-            out_t = out_t * keep_mask_t.unsqueeze(0)
-            _accumulate_term_mask_t(["dropout damage", "signal"], 1.0 - keep_mask_t, scale=1.0, gamma=0.90)
-        if float(rng.random()) < float(cfg_use["quantization_prob"]):
-            prev_t = out_t.clone()
-            lv = int(rng.choice(np.asarray([4, 6, 8, 12], dtype=np.int32)))
-            out_t = torch.round(out_t * float(lv - 1)) / float(max(1, lv - 1))
-            _accumulate_term_mask_t(
-                ["quantization damage", "signal"],
-                torch.abs(torch.mean(out_t[:3], dim=0) - torch.mean(prev_t[:3], dim=0)),
-                scale=0.75,
-                gamma=0.95,
-            )
-        if float(rng.random()) < float(cfg_use["noise_prob"]):
-            prev_t = out_t.clone()
-            std = float(rng.uniform(float(cfg_use["noise_std_min"]), float(cfg_use["noise_std_max"])))
-            noise_t = torch.as_tensor(
-                rng.standard_normal((int(c), int(h), int(w)), dtype=np.float32),
-                dtype=torch.float32,
-                device=resolved,
-            )
-            out_t = out_t + (float(std) * noise_t)
-            _accumulate_term_mask_t(
-                ["noise damage", "noise", "mixed noise and signal", "signal"],
-                torch.abs(torch.mean(out_t[:3], dim=0) - torch.mean(prev_t[:3], dim=0)),
-                scale=0.90,
-                gamma=0.90,
-            )
-        if float(rng.random()) < float(cfg_use["edge_highlight_prob"]):
-            gray_t = torch.mean(out_t[:3], dim=0).to(dtype=torch.float32)
-            if bool(cfg_use["edge_highlight_ultra"]):
-                edge_map_t = torch.as_tensor(_canny_edge_map(gray_t.detach().cpu().numpy()), dtype=torch.float32, device=resolved)
-            else:
-                edge_map_t = _sobel_edge_map_torch(gray_t)
-            blend = float(rng.uniform(
-                float(cfg_use["edge_highlight_blend_min"]),
-                float(cfg_use["edge_highlight_blend_max"]),
-            ))
-            out_t = out_t + (float(blend) * edge_map_t.unsqueeze(0))
-            _accumulate_term_mask_t(
-                ["edge highlight", "edge", "signal"],
-                edge_map_t,
-                scale=0.85,
-                gamma=0.95,
-            )
-        if float(rng.random()) < float(cfg_use["edge_blur_prob"]):
-            gray_t = torch.mean(out_t[:3], dim=0).to(dtype=torch.float32)
-            edge_mask_t = _sobel_edge_map_torch(gray_t)
-            blur_k = int(cfg_use["edge_blur_kernel"])
-            spread_k = int(cfg_use["edge_blur_spread"])
-            blurred_t = torch.nn.functional.avg_pool2d(out_t.unsqueeze(0), kernel_size=blur_k, stride=1, padding=blur_k // 2)[0]
-            spread_t = torch.nn.functional.avg_pool2d(edge_mask_t[None, None, ...], kernel_size=spread_k, stride=1, padding=spread_k // 2)[0, 0]
-            spread_t = spread_t / spread_t.amax().clamp(min=1e-8)
-            out_t = out_t * (1.0 - spread_t.unsqueeze(0)) + blurred_t * spread_t.unsqueeze(0)
-            _accumulate_term_mask_t(
-                ["edge blur", "edge", "signal"],
-                spread_t,
-                scale=0.85,
-                gamma=0.95,
-            )
-        out_t = torch.clamp(out_t, 0.0, 1.0).to(dtype=torch.float32)
-        if mask_out_t is not None:
-            touch_t = _normalize_attention_map_batch_torch(touch_t, gamma=1.05, blur_kernel=5, device=resolved)
-            if float(torch.amax(touch_t).detach().cpu().item()) > 1e-8:
-                mask_out_t = _blend_attention_maps_batch_torch(
-                    [mask_out_t, touch_t],
-                    weights=[0.55, 1.15],
-                    gamma=0.98,
-                    device=resolved,
-                ).to(dtype=torch.float32)
-            else:
-                mask_out_t = _normalize_attention_map_batch_torch(mask_out_t, gamma=0.95, blur_kernel=3, device=resolved)
-        term_masks = {
-            str(k): np.asarray(
-                _normalize_attention_map_batch_torch(v, gamma=0.90, blur_kernel=1, device=resolved).detach().cpu().numpy(),
-                dtype=np.float32,
-            )
-            for k, v in term_masks_t.items()
-            if float(torch.amax(v).detach().cpu().item()) > 1e-8
-        }
-        return (
-            np.asarray(out_t.detach().cpu().numpy(), dtype=np.float32),
-            None if mask_out_t is None else np.asarray(mask_out_t.detach().cpu().numpy(), dtype=np.float32),
-            term_masks,
-        )
-    out = np.asarray(x, dtype=np.float32).copy()
-    mask_out = None if mask is None else np.asarray(mask, dtype=np.float32).copy()
-    c, h, w = int(out.shape[0]), int(out.shape[1]), int(out.shape[2])
-    touch = np.zeros((int(h), int(w)), dtype=np.float32)
-    term_masks: Dict[str, np.ndarray] = {}
-
-    def _accumulate_touch(delta: Any, scale: float = 1.0, gamma: float = 1.0) -> Optional[np.ndarray]:
-        nonlocal touch
-        norm = _normalize_attention_map(delta, gamma=float(gamma), blur_kernel=3)
-        if float(np.max(norm)) <= 1e-8:
-            return None
-        touch = np.asarray(touch, dtype=np.float32) + (float(scale) * norm)
-        return np.asarray(norm, dtype=np.float32)
-
-    def _accumulate_term_mask(terms: Sequence[str], delta: Any, scale: float = 1.0, gamma: float = 1.0) -> None:
-        norm = _accumulate_touch(delta, scale=float(scale), gamma=float(gamma))
-        if norm is None or float(np.max(norm)) <= 1e-8:
-            return
-        for term in normalize_vocab_terms([str(t) for t in list(terms)]):
-            tk = _norm_txt(term)
-            prev = np.asarray(term_masks.get(tk, np.zeros((int(h), int(w)), dtype=np.float32)), dtype=np.float32)
-            term_masks[tk] = _blend_attention_maps([prev, norm], weights=[1.0, 1.0], gamma=0.90)
-
-    def _mark_diff(prev_x: np.ndarray, next_x: np.ndarray, scale: float = 1.0) -> None:
-        prev_g = np.mean(np.asarray(prev_x, dtype=np.float32), axis=0)
-        next_g = np.mean(np.asarray(next_x, dtype=np.float32), axis=0)
-        _accumulate_touch(np.abs(next_g - prev_g).astype(np.float32, copy=False), scale=float(scale), gamma=0.95)
-
-    if float(rng.random()) < float(cfg_use["blur_prob"]):
-        prev = np.asarray(out, dtype=np.float32).copy()
-        k = int(rng.choice(np.asarray([3, 5, 7], dtype=np.int32)))
-        t = torch.from_numpy(out[None, ...])
-        t = F.avg_pool2d(t, kernel_size=int(k), stride=1, padding=int(k // 2))
-        out = np.asarray(t[0].cpu().numpy(), dtype=np.float32)
-        _accumulate_term_mask(
-            ["blur damage", "signal"],
-            np.abs(np.mean(out[:3], axis=0) - np.mean(prev[:3], axis=0)),
-            scale=0.85,
-            gamma=0.95,
-        )
-    if float(rng.random()) < float(cfg_use["stride_skew_prob"]):
-        prev = np.asarray(out, dtype=np.float32).copy()
-        odd_shift = int(rng.integers(1, 8))
-        out[:, 1::2, :] = np.roll(out[:, 1::2, :], shift=odd_shift, axis=2)
-        stripe = np.zeros((h, w), dtype=np.float32)
-        stripe[1::2, :] = 1.0
-        _mark_diff(prev, out, scale=0.75)
-        _accumulate_term_mask(["stride skew damage", "signal"], stripe, scale=0.35, gamma=1.10)
-        if mask_out is not None:
-            mask_out[1::2, :] = np.roll(mask_out[1::2, :], shift=odd_shift, axis=1)
-    if float(rng.random()) < float(cfg_use["dropout_prob"]):
-        keep = float(rng.uniform(0.78, 0.96))
-        keep_mask = (rng.random((h, w), dtype=np.float32) < keep).astype(np.float32, copy=False)
-        out = out * keep_mask[None, :, :]
-        _accumulate_term_mask(["dropout damage", "signal"], 1.0 - keep_mask, scale=1.0, gamma=0.90)
-    if float(rng.random()) < float(cfg_use["quantization_prob"]):
-        prev = np.asarray(out, dtype=np.float32).copy()
-        lv = int(rng.choice(np.asarray([4, 6, 8, 12], dtype=np.int32)))
-        out = np.round(out * float(lv - 1)) / float(max(1, lv - 1))
-        _accumulate_term_mask(
-            ["quantization damage", "signal"],
-            np.abs(np.mean(out[:3], axis=0) - np.mean(prev[:3], axis=0)),
-            scale=0.75,
-            gamma=0.95,
-        )
-    if float(rng.random()) < float(cfg_use["noise_prob"]):
-        prev = np.asarray(out, dtype=np.float32).copy()
-        std = float(rng.uniform(float(cfg_use["noise_std_min"]), float(cfg_use["noise_std_max"])))
-        out = out + (std * rng.standard_normal((c, h, w), dtype=np.float32)).astype(np.float32, copy=False)
-        _accumulate_term_mask(
-            ["noise damage", "noise", "mixed noise and signal", "signal"],
-            np.abs(np.mean(out[:3], axis=0) - np.mean(prev[:3], axis=0)),
-            scale=0.90,
-            gamma=0.90,
-        )
-    if float(rng.random()) < float(cfg_use["edge_highlight_prob"]):
-        prev = np.asarray(out, dtype=np.float32).copy()
-        gray = np.mean(out[:3], axis=0).astype(np.float32, copy=False)
-        if bool(cfg_use["edge_highlight_ultra"]):
-            edge_map = _canny_edge_map(gray)
-        else:
-            edge_map = _sobel_edge_map(gray)
-        blend = float(rng.uniform(
-            float(cfg_use["edge_highlight_blend_min"]),
-            float(cfg_use["edge_highlight_blend_max"]),
-        ))
-        out = out + (float(blend) * edge_map[None, :, :]).astype(np.float32, copy=False)
-        _accumulate_term_mask(
-            ["edge highlight", "edge", "signal"],
-            edge_map,
-            scale=0.85,
-            gamma=0.95,
-        )
-    if float(rng.random()) < float(cfg_use["edge_blur_prob"]):
-        gray = np.mean(out[:3], axis=0).astype(np.float32, copy=False)
-        edge_mask = _sobel_edge_map(gray)
-        blur_k = int(cfg_use["edge_blur_kernel"])
-        spread_k = int(cfg_use["edge_blur_spread"])
-        out_t = torch.from_numpy(out[None, ...]).to(torch.float32)
-        blurred = torch.nn.functional.avg_pool2d(out_t, kernel_size=blur_k, stride=1, padding=blur_k // 2)[0].numpy().astype(np.float32)
-        em_t = torch.from_numpy(edge_mask[None, None, ...]).to(torch.float32)
-        spread_mask = torch.nn.functional.avg_pool2d(em_t, kernel_size=spread_k, stride=1, padding=spread_k // 2)[0, 0].numpy().astype(np.float32)
-        spread_mask = spread_mask / max(float(np.max(spread_mask)), 1e-8)
-        out = np.clip(out * (1.0 - spread_mask[None]) + blurred * spread_mask[None], 0.0, 1.0).astype(np.float32, copy=False)
-        _accumulate_term_mask(
-            ["edge blur", "edge", "signal"],
-            spread_mask,
-            scale=0.85,
-            gamma=0.95,
-        )
-    out = np.clip(out, 0.0, 1.0).astype(np.float32, copy=False)
-    if mask_out is not None:
-        touch = _normalize_attention_map(touch, gamma=1.05, blur_kernel=5)
-        if float(np.max(touch)) > 1e-8:
-            mask_out = _blend_attention_maps(
-                [np.asarray(mask_out, dtype=np.float32), np.asarray(touch, dtype=np.float32)],
-                weights=[0.55, 1.15],
-                gamma=0.98,
-            ).astype(np.float32, copy=False)
-        else:
-            mask_out = _normalize_attention_map(mask_out, gamma=0.95, blur_kernel=3)
-    term_masks = {
-        str(k): _normalize_attention_map(v, gamma=0.90, blur_kernel=1)
-        for k, v in term_masks.items()
-        if float(np.max(v)) > 1e-8
-    }
-    return out, mask_out, term_masks
+    """Delegates to the canonical _apply_degrade in semantic_dataset_loaders."""
+    return _canonical_apply_degrade(
+        x,
+        seed=int(seed),
+        idx=int(idx),
+        mask=mask,
+        degrade_config=degrade_config,
+    )
 
 
 def _build_clean_entry(
@@ -739,40 +452,16 @@ def _build_clean_entries_batch(
             (heuristic_stack, heuristic_idx),
             height=size,
             width=size,
-            fallback_creation_mask=creation_mask,
             processing_device=processing_device,
+            strict=True,
         )
-        if int(mask_stack.shape[0]) <= 0 or int(mask_indices.size) <= 0:
-            mask_stack, mask_indices = build_creation_label_mask_stack(
-                label_vec=label_vec,
-                height=size,
-                width=size,
-                creation_mask=np.asarray(creation_mask, dtype=np.float32) if creation_mask is not None else None,
-                processing_device=processing_device,
-            )
         mixed_mask = (
             _composite_mask_stack(mask_stack, processing_device=processing_device)
             if int(mask_stack.shape[0]) > 0
-            else np.asarray(fallback_masks[int(row_idx)], dtype=np.float32)
+            else np.zeros((size, size), dtype=np.float32)
         )
-        _resolved = _resolve_processing_device(processing_device)
-        mixed_mask = (
-            np.asarray(
-                _normalize_attention_map_batch_torch(
-                    np.asarray(mixed_mask, dtype=np.float32),
-                    gamma=0.92,
-                    blur_kernel=5,
-                    device=_resolved,
-                ).detach().cpu().numpy(),
-                dtype=np.float32,
-            )
-            if _resolved is not None
-            else _normalize_attention_map(np.asarray(mixed_mask, dtype=np.float32), gamma=0.92, blur_kernel=5)
-        )
-        # Policy: only deformation steps produce gradient (middle-alpha) masks;
-        # clean entries use binary masks so gradient values trace to deformations.
-        mask_stack = (np.asarray(mask_stack, dtype=np.float32) > 0.5).astype(np.float32, copy=False)
-        mixed_mask = (np.asarray(mixed_mask, dtype=np.float32) > 0.5).astype(np.float32, copy=False)
+        mixed_mask = np.asarray(mixed_mask, dtype=np.float32)
+        mask_stack = np.asarray(mask_stack, dtype=np.float32)
         out.append(
             {
                 "image_u8": np.asarray(image_u8_batch[int(row_idx)], dtype=np.uint8),
@@ -826,18 +515,12 @@ def _build_deformed_entry(
         (distortion_stack, distortion_idx),
         height=size,
         width=size,
-        fallback_creation_mask=(mask_out if mask_out is not None else base_mask),
         processing_device=processing_device,
     )
-    if int(mask_stack.shape[0]) <= 0 or int(mask_indices.size) <= 0:
-        mask_stack, mask_indices = build_label_mask_stack(
-            mixed_mask=(mask_out if mask_out is not None else base_mask),
-            label_vec=label_vec,
-            treat_mixed_mask_as_creation=False,
-            processing_device=processing_device,
-        )
-    mixed_mask = _composite_mask_stack(mask_stack, processing_device=processing_device) if int(mask_stack.shape[0]) > 0 else (
-        np.asarray(mask_out, dtype=np.float32) if mask_out is not None else base_mask
+    mixed_mask = (
+        _composite_mask_stack(mask_stack, processing_device=processing_device)
+        if int(mask_stack.shape[0]) > 0
+        else np.zeros((size, size), dtype=np.float32)
     )
     _resolved = _resolve_processing_device(processing_device)
     mixed_mask = (

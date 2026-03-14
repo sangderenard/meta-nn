@@ -45,7 +45,12 @@ import torch.nn.functional as F
 from pipeline.context import PipelineContext
 from pipeline.graph import PipelineNode
 from pipeline.nodes.base import OneTimeNode
-from semantic_dataset_loaders import _semantic_color_score_maps, detect_semantic_color_terms
+from semantic_dataset_loaders import (
+    _composite_mask_stack,
+    _normalize_attention_map,
+    _semantic_color_score_maps,
+    detect_semantic_color_terms,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -1534,6 +1539,63 @@ def _semantic_terms_with_tonal_tags(
     return _normalize_vocab_terms(list(base) + list(tones))
 
 
+def _semantic_tonal_masks_from_image(
+    image: Any,
+    image_size: int = 128,
+    low_threshold: float = 0.15,
+    high_threshold: float = 0.85,
+) -> Dict[str, np.ndarray]:
+    """Return per-term spatial float32 masks in [0,1] for all tonal qualities
+    detectable from *image*.  Covers every term ``_semantic_tonal_tags_from_image``
+    can emit: color-hue terms via ``_semantic_color_score_maps``, plus luma-
+    derived terms (dark, bright) and temperature terms (warm, cool)."""
+    try:
+        rgb = _image_any_to_rgb_chw01(image, image_size=max(8, int(image_size)))
+    except Exception:
+        return {}
+    arr = np.asarray(rgb, dtype=np.float32)
+    if int(arr.ndim) != 3 or int(arr.shape[0]) < 3:
+        return {}
+    color_maps = _semantic_color_score_maps(arr)
+    masks: Dict[str, np.ndarray] = {str(k): np.asarray(v, dtype=np.float32) for k, v in color_maps.items()}
+    gray_luma = np.clip(np.mean(arr[:3], axis=0), 0.0, 1.0).astype(np.float32, copy=False)
+    lo_t = float(max(1e-6, low_threshold))
+    hi_range = float(max(1e-6, 1.0 - high_threshold))
+    masks["dark"] = np.clip((float(low_threshold) - gray_luma) / lo_t, 0.0, 1.0).astype(np.float32, copy=False)
+    masks["bright"] = np.clip((gray_luma - float(high_threshold)) / hi_range, 0.0, 1.0).astype(np.float32, copy=False)
+    masks["warm"] = np.clip(arr[0] - arr[2], 0.0, 1.0).astype(np.float32, copy=False)
+    masks["cool"] = np.clip(arr[2] - arr[0], 0.0, 1.0).astype(np.float32, copy=False)
+    return masks
+
+
+def _semantic_terms_with_tonal_masks(
+    terms: Sequence[str],
+    image: Any,
+    image_size: int = 128,
+) -> Tuple[List[str], Dict[str, np.ndarray]]:
+    """Like ``_semantic_terms_with_tonal_tags`` but also returns spatial masks.
+
+    Returns ``(enriched_terms, tonal_masks)`` where *tonal_masks* maps each
+    tonal term that was *added* by enrichment (not already in *terms*) to its
+    spatial [0,1] float32 mask.  Terms already covered by element geometry do
+    not appear in *tonal_masks* — only genuinely new observations do, so the
+    caller can inject them as an additional mask-stack part without double-
+    counting element geometry masks.
+    """
+    enriched = _semantic_terms_with_tonal_tags(terms=terms, image=image, image_size=int(image_size))
+    base_set = {re.sub(r"\s+", " ", str(x)).strip().lower() for x in terms}
+    new_terms = [t for t in enriched if str(t).strip().lower() not in base_set]
+    if not new_terms:
+        return enriched, {}
+    all_tonal_masks = _semantic_tonal_masks_from_image(image=image, image_size=int(image_size))
+    tonal_masks: Dict[str, np.ndarray] = {}
+    for term in new_terms:
+        t = str(term).strip().lower()
+        if t in all_tonal_masks:
+            tonal_masks[t] = all_tonal_masks[t]
+    return enriched, tonal_masks
+
+
 def _semantic_enrich_generated_terms_with_noise_spectrum(
     term_key: str,
     terms: Sequence[str],
@@ -2688,13 +2750,14 @@ def _build_pregestation_logic_rows(
                 bg = np.clip(bg + guide[None, :, :], 0.0, 1.0)
                 jitter_x = float(rng.uniform(-0.025, 0.025))
                 jitter_y = float(rng.uniform(-0.025, 0.025))
+                cx_actual = float(cx0 + jitter_x)
+                cy_actual = float(cy0 + jitter_y)
                 # r_temp scales the base radius range: temp=1 → [0.085, 0.115].
                 _r_lo = float(0.085 * r_temp)
                 _r_hi = float(0.115 * r_temp)
                 radius = float(rng.uniform(_r_lo, _r_hi))
                 edge = float(rng.uniform(0.014, 0.024))
-                disk = _soft_disk(cx=float(cx0 + jitter_x), cy=float(cy0 + jitter_y),
-                                  radius=radius, edge=edge)
+                disk = _soft_disk(cx=cx_actual, cy=cy_actual, radius=radius, edge=edge)
                 disk_3d = disk[None, :, :]
 
                 if _include_depth and len(_depth_labels) >= 2:
@@ -2726,12 +2789,36 @@ def _build_pregestation_logic_rows(
                 # dataloader at training time.
 
                 bg_terms = ["dark", "signal", "shape"]
-                circle_terms = list(dir_labels) + [str(color), "object", "signal", "shape"] + extra_terms
                 bg_mask = np.ones((size, size), dtype=np.float32)
                 disk_mask = disk.astype(np.float32, copy=False)
 
+                # Heuristic: detect if actual circle position is diagonal
+                _diag_detect_thresh = 0.15
+                _hdet_active_dirs = list(dir_labels)
+                if abs(cx_actual - 0.5) > _diag_detect_thresh and abs(cy_actual - 0.5) > _diag_detect_thresh:
+                    _h_dir = "right" if cx_actual > 0.5 else "left"
+                    _v_dir = "down" if cy_actual > 0.5 else "up"
+                    for _dd in [_h_dir, _v_dir]:
+                        if _dd not in _hdet_active_dirs:
+                            _hdet_active_dirs.append(_dd)
+
+                # Center labels: based on actual placement
+                _center_thresh = 0.20
+                _h_centered = abs(cx_actual - 0.5) < _center_thresh
+                _v_centered = abs(cy_actual - 0.5) < _center_thresh
+                _circle_center_terms: List[str] = []
+                if _h_centered:
+                    _circle_center_terms.append("horizontal center")
+                if _v_centered:
+                    _circle_center_terms.append("vertical center")
+                if _h_centered and _v_centered:
+                    _circle_center_terms.append("center")
+
+                circle_terms = _hdet_active_dirs + [str(color), "object", "signal", "shape"] + extra_terms + _circle_center_terms
+
                 if _include_depth and len(_depth_labels) >= 2:
-                    cross_terms = ["gray", "shape", "signal"]
+                    # Cross is always at (0.5, 0.5) — always gets all center labels
+                    cross_terms = ["gray", "shape", "signal", "horizontal center", "vertical center", "center"]
                     cross_mask = _cross_alpha.astype(np.float32, copy=False)
                     elem_masks = [bg_mask, disk_mask, cross_mask]
                     elem_term_lists = [bg_terms, circle_terms, cross_terms]
@@ -2788,48 +2875,6 @@ _PREGESTATION_OBSERVED_COLOR_TERMS: Tuple[str, ...] = (
     "magenta", "brown", "black", "white", "gray", "edge",
 )
 
-
-def _normalize_attention_map(mask: Any, gamma: float = 1.0, blur_kernel: int = 0) -> np.ndarray:
-    arr = np.asarray(mask, dtype=np.float32)
-    if int(arr.ndim) != 2 or int(arr.size) <= 0:
-        return np.zeros_like(np.asarray(arr, dtype=np.float32), dtype=np.float32)
-    arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32, copy=False)
-    arr = np.maximum(arr, 0.0).astype(np.float32, copy=False)
-    vmax = float(np.max(arr)) if int(arr.size) > 0 else 0.0
-    if vmax > 1e-8:
-        arr = (arr / float(vmax)).astype(np.float32, copy=False)
-    else:
-        return np.zeros_like(arr, dtype=np.float32)
-    vmean = float(np.mean(arr)) if int(arr.size) > 0 else 0.0
-    if vmean > 1e-8:
-        arr = np.clip(arr / float(max(vmean * 2.0, 1.0)), 0.0, 1.0).astype(np.float32, copy=False)
-    gm = max(0.35, float(gamma))
-    if abs(gm - 1.0) > 1e-6:
-        arr = np.power(np.clip(arr, 0.0, 1.0), gm).astype(np.float32, copy=False)
-    kk = int(blur_kernel)
-    if kk >= 3:
-        kk = int(kk) | 1
-        arr = np.asarray(
-            F.avg_pool2d(
-                torch.from_numpy(arr[None, None, ...]),
-                kernel_size=int(kk),
-                stride=1,
-                padding=int(kk // 2),
-            )[0, 0].cpu().numpy(),
-            dtype=np.float32,
-        )
-        vmax = float(np.max(arr)) if int(arr.size) > 0 else 0.0
-        if vmax > 1e-8:
-            arr = (arr / float(vmax)).astype(np.float32, copy=False)
-    return np.clip(arr, 0.0, 1.0).astype(np.float32, copy=False)
-
-
-def _composite_mask_stack(stack: Any) -> np.ndarray:
-    arr = np.asarray(stack, dtype=np.float32)
-    if int(arr.ndim) != 3 or int(arr.shape[0]) <= 0:
-        return np.zeros((0, 0) if int(arr.ndim) < 2 else (int(arr.shape[-2]), int(arr.shape[-1])), dtype=np.float32)
-    composite = np.sum(arr, axis=0).astype(np.float32, copy=False)
-    return _normalize_attention_map(composite, gamma=1.0, blur_kernel=0)
 
 
 def _enrich_pregestation_stack_with_observed_color_masks(

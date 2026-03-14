@@ -473,7 +473,7 @@ def _normalize_mask_array(mask: Any, height: int, width: int) -> np.ndarray:
     return np.clip(arr, 0.0, 1.0).astype(np.float32, copy=False)
 
 
-def _normalize_attention_map(mask: Any, gamma: float = 1.0, blur_kernel: int = 0) -> np.ndarray:
+def _normalize_attention_map(mask: Any, gamma: float = 1.0, blur_kernel: int = 0, apply_vmean_compression: bool = False, apply_binarize: bool = False) -> np.ndarray:
     arr = np.asarray(mask, dtype=np.float32)
     if int(arr.ndim) != 2 or int(arr.size) <= 0:
         return np.zeros_like(np.asarray(arr, dtype=np.float32), dtype=np.float32)
@@ -484,9 +484,12 @@ def _normalize_attention_map(mask: Any, gamma: float = 1.0, blur_kernel: int = 0
         arr = (arr / float(vmax)).astype(np.float32, copy=False)
     else:
         return np.zeros_like(arr, dtype=np.float32)
-    vmean = float(np.mean(arr)) if int(arr.size) > 0 else 0.0
-    if vmean > 1e-8:
-        arr = np.clip(arr / float(max(vmean * 2.0, 1.0)), 0.0, 1.0).astype(np.float32, copy=False)
+    if bool(apply_vmean_compression):
+        vmean = float(np.mean(arr)) if int(arr.size) > 0 else 0.0
+        if vmean > 1e-8:
+            arr = np.clip(arr / float(max(vmean * 2.0, 1.0)), 0.0, 1.0).astype(np.float32, copy=False)
+    if bool(apply_binarize):
+        return (arr > 0.5).astype(np.float32, copy=False)
     gm = max(0.35, float(gamma))
     if abs(gm - 1.0) > 1e-6:
         arr = np.power(np.clip(arr, 0.0, 1.0), gm).astype(np.float32, copy=False)
@@ -503,7 +506,7 @@ def _normalize_attention_map(mask: Any, gamma: float = 1.0, blur_kernel: int = 0
     return np.clip(arr, 0.0, 1.0).astype(np.float32, copy=False)
 
 
-def _blend_attention_maps(maps: Sequence[Any], weights: Optional[Sequence[float]] = None, gamma: float = 1.0) -> np.ndarray:
+def _blend_attention_maps(maps: Sequence[Any], weights: Optional[Sequence[float]] = None, gamma: float = 1.0, apply_vmean_compression: bool = False, apply_binarize: bool = False) -> np.ndarray:
     valid: List[np.ndarray] = []
     valid_weights: List[float] = []
     for i, m in enumerate(maps):
@@ -513,7 +516,7 @@ def _blend_attention_maps(maps: Sequence[Any], weights: Optional[Sequence[float]
         w = 1.0 if weights is None or i >= int(len(weights)) else float(weights[i])
         if w <= 0.0:
             continue
-        norm = _normalize_attention_map(arr, gamma=1.0, blur_kernel=0)
+        norm = _normalize_attention_map(arr, gamma=1.0, blur_kernel=0, apply_vmean_compression=bool(apply_vmean_compression))
         if float(np.max(norm)) <= 1e-8:
             continue
         valid.append(norm)
@@ -530,46 +533,55 @@ def _blend_attention_maps(maps: Sequence[Any], weights: Optional[Sequence[float]
         wsum += float(w)
     if wsum > 1e-8:
         acc = acc / float(wsum)
-    return _normalize_attention_map(acc, gamma=float(gamma), blur_kernel=5)
+    return _normalize_attention_map(acc, gamma=float(gamma), blur_kernel=5, apply_vmean_compression=bool(apply_vmean_compression), apply_binarize=bool(apply_binarize))
 
 
 def _composite_mask_stack(stack: Any, processing_device: Optional[Any] = None) -> np.ndarray:
-    """Additive-sum all per-label masks, then normalize to [0, 1].
+    """Additive-sum all per-label masks, then normalize to [0, 1] by vmax only.
 
-    Every mask in the stack contributes proportionally to the sum, so
-    pixels covered by more labels receive higher values (density semantics).
-    This is the single canonical path for collapsing a label stack into a
-    composite mask — all training callers must go through here.
+    Individual masks must already be in [0, 1] (via _normalize_stack_row /
+    _normalize_stack_row_batch).  The sum is divided by its maximum so that
+    pixels covered by the most labels reach 1.0; no vmean/gamma distortion is
+    applied here.  Attention-style normalization belongs on the final
+    mixed_mask_u8 stored in the cache entry, not on the raw stack composite.
     """
     arr = np.asarray(stack, dtype=np.float32)
     if int(arr.ndim) != 3 or int(arr.shape[0]) <= 0:
         return np.zeros((0, 0) if int(arr.ndim) < 2 else (int(arr.shape[-2]), int(arr.shape[-1])), dtype=np.float32)
-    resolved = _resolve_processing_device(processing_device)
-    if resolved is None:
-        composite = np.sum(arr, axis=0).astype(np.float32, copy=False)
-        return _normalize_attention_map(composite, gamma=1.0, blur_kernel=0)
-    composite_t = torch.sum(torch.as_tensor(arr, dtype=torch.float32, device=resolved), dim=0)
-    return np.asarray(
-        _normalize_attention_map_batch_torch(composite_t, gamma=1.0, blur_kernel=0, device=resolved).detach().cpu().numpy(),
-        dtype=np.float32,
-    )
+    composite = np.sum(arr, axis=0).astype(np.float32, copy=False)
+    vmax = float(np.max(composite))
+    if vmax > 1e-8:
+        composite = np.clip(composite / vmax, 0.0, 1.0).astype(np.float32, copy=False)
+    else:
+        composite = np.zeros_like(composite, dtype=np.float32)
+    return composite
 
 
 def _positive_label_indices(label_vec: Any) -> np.ndarray:
     return np.where(np.asarray(label_vec, dtype=np.float32).reshape(-1) >= 0.5)[0].astype(np.int64)
 
 
-def _normalize_stack_row(mask: Any, *, height: int, width: int, processing_device: Optional[Any] = None) -> np.ndarray:
+def _normalize_stack_row(
+    mask: Any,
+    *,
+    height: int,
+    width: int,
+    processing_device: Optional[Any] = None,
+    apply_attention_normalization: bool = False,
+) -> np.ndarray:
     clamped = _normalize_mask_array(mask, height=int(height), width=int(width))
+    if not bool(apply_attention_normalization):
+        return clamped
     resolved = _resolve_processing_device(processing_device)
     if resolved is None:
         return _normalize_attention_map(
             clamped,
             gamma=1.0,
             blur_kernel=0,
+            apply_vmean_compression=True,
         )
     return np.asarray(
-        _normalize_attention_map_batch_torch(clamped, gamma=1.0, blur_kernel=0, device=resolved).detach().cpu().numpy(),
+        _normalize_attention_map_batch_torch(clamped, gamma=1.0, blur_kernel=0, device=resolved, apply_vmean_compression=True).detach().cpu().numpy(),
         dtype=np.float32,
     )
 
@@ -605,18 +617,24 @@ def _normalize_stack_row_batch(
     height: int,
     width: int,
     processing_device: Optional[Any] = None,
+    apply_attention_normalization: bool = False,
 ) -> np.ndarray:
     """Batch version of _normalize_stack_row for [N, H, W] arrays.
 
-    Returns [N, H, W] — each slice is resize-normalised then attention-normalised.
-    Replaces per-element _normalize_stack_row calls inside tight loops.
+    Returns [N, H, W] — each slice is resize-scaled to [0, 1].  Attention
+    normalization (vmean/gamma) is intentionally NOT applied per-slice; it
+    belongs on the final composite, not on individual masks before summing.
+    Pass apply_attention_normalization=True to re-enable the per-slice
+    attention path (e.g. for visualization).
     """
     clamped = _normalize_mask_array_batch(stack, height=int(height), width=int(width))
+    if not bool(apply_attention_normalization):
+        return clamped
     resolved = _resolve_processing_device(processing_device)
     if resolved is None:
-        return _normalize_attention_map_batch(clamped, gamma=1.0, blur_kernel=0)
+        return _normalize_attention_map_batch(clamped, gamma=1.0, blur_kernel=0, apply_vmean_compression=True)
     return np.asarray(
-        _normalize_attention_map_batch_torch(clamped, gamma=1.0, blur_kernel=0, device=resolved).detach().cpu().numpy(),
+        _normalize_attention_map_batch_torch(clamped, gamma=1.0, blur_kernel=0, device=resolved, apply_vmean_compression=True).detach().cpu().numpy(),
         dtype=np.float32,
     )
 
@@ -713,6 +731,7 @@ def combine_label_mask_stacks(
     width: int = 0,
     fallback_creation_mask: Optional[Any] = None,
     processing_device: Optional[Any] = None,
+    strict: bool = False,
 ) -> Tuple[np.ndarray, np.ndarray]:
     positive_idx = _positive_label_indices(label_vec)
     if int(positive_idx.size) <= 0:
@@ -757,17 +776,11 @@ def combine_label_mask_stacks(
             covered.add(cls_idx)
 
     missing = [int(ci) for ci in positive_idx.tolist() if int(ci) not in covered]
-    if missing and fallback_creation_mask is not None and int(height) > 0 and int(width) > 0:
-        base_mask = _normalize_stack_row(
-            fallback_creation_mask,
-            height=int(height),
-            width=int(width),
-            processing_device=processing_device,
+    if missing and bool(strict):
+        raise ValueError(
+            f"combine_label_mask_stacks: {len(missing)} positive label(s) have no spatial mask. "
+            f"Missing label indices: {missing[:8]}{'…' if len(missing) > 8 else ''}"
         )
-        for cls_idx in missing:
-            rows.append(np.asarray(base_mask, dtype=np.float32))
-            indices.append(int(cls_idx))
-
     if len(rows) <= 0:
         return np.zeros((0, int(max(0, height)), int(max(0, width))), dtype=np.float32), np.zeros((0,), dtype=np.int64)
     return np.stack(rows, axis=0).astype(np.float32, copy=False), np.asarray(indices, dtype=np.int64)
@@ -844,7 +857,7 @@ def elem_stacks_to_label_stacks(
     covered: set[int] = set()
     n_elems = min(int(stack.shape[0]), int(len(elem_term_lists)))
     if n_elems > 0:
-        # Batch-normalise all element masks at once instead of per-element
+        # Batch-scale all element masks to [0, 1] at once (no attention normalization).
         batch_norm = _normalize_stack_row_batch(stack[:n_elems], height=int(h), width=int(w))
         for ei in range(n_elems):
             mask_e = batch_norm[ei]
@@ -910,13 +923,7 @@ def build_label_mask_stack(
         )
         if int(out_stack.shape[0]) > 0 and int(out_idx.size) > 0:
             return out_stack, out_idx
-    if int(positive_idx.size) <= 0 or int(h) <= 0 or int(w) <= 0:
-        return np.zeros((0, int(mixed.shape[0]), int(mixed.shape[1])), dtype=np.float32), np.zeros((0,), dtype=np.int64)
-    if (not bool(treat_mixed_mask_as_creation)) or float(np.max(mixed)) <= 1e-8:
-        return np.zeros((0, int(mixed.shape[0]), int(mixed.shape[1])), dtype=np.float32), np.zeros((0,), dtype=np.int64)
-    base_mask = mixed
-    stack = np.repeat(base_mask[None, :, :], int(positive_idx.size), axis=0).astype(np.float32, copy=False)
-    return stack, np.asarray(positive_idx, dtype=np.int64)
+    return np.zeros((0, int(mixed.shape[0]), int(mixed.shape[1])), dtype=np.float32), np.zeros((0,), dtype=np.int64)
 
 
 def build_term_mask_stack_from_image(
@@ -975,30 +982,19 @@ def assemble_semantic_mask_layers(
     y = np.asarray(label_vec, dtype=np.float32).reshape(-1).copy()
 
     parts: List[Tuple[Any, Any]] = []
-    # Policy: only deformation steps produce gradient masks; binarize originals.
     for raw_stack, raw_idx in (list(original_parts) if original_parts is not None else []):
-        if raw_stack is not None:
-            _s = np.asarray(raw_stack, dtype=np.float32)
-            if _s.ndim >= 2 and _s.size > 0:
-                raw_stack = (_s > 0.5).astype(np.float32, copy=False)
         parts.append((raw_stack, raw_idx))
 
     has_original_parts = any(
         raw_stack is not None and raw_idx is not None and int(np.asarray(raw_idx).size) > 0
         for raw_stack, raw_idx in parts
     )
-    if original_mixed_mask is None or float(np.max(np.asarray(original_mixed_mask, dtype=np.float32))) <= 1e-8:
-        if not bool(has_original_parts):
-            original_mixed_mask = _single_label_whole_image_mask(y, height=int(h), width=int(w))
-
-    if original_mixed_mask is not None:
+    if original_mixed_mask is not None and float(np.max(np.asarray(original_mixed_mask, dtype=np.float32))) > 1e-8:
         original_stack, original_idx = build_label_mask_stack(
             mixed_mask=np.asarray(original_mixed_mask, dtype=np.float32),
             label_vec=y,
-            treat_mixed_mask_as_creation=True,
         )
         if int(original_stack.shape[0]) > 0 and int(original_idx.size) > 0:
-            original_stack = (original_stack > 0.5).astype(np.float32, copy=False)
             parts.append((original_stack, original_idx))
 
     if isinstance(deformation_term_masks, dict) and deformation_term_masks and isinstance(term_to_idx, dict):
@@ -1050,7 +1046,6 @@ def assemble_semantic_mask_layers(
         np.zeros((0,), dtype=np.int64),
     )
     if int(detected_stack.shape[0]) > 0 and int(detected_idx.size) > 0:
-        detected_stack = (detected_stack > 0.5).astype(np.float32, copy=False)
         parts.append((detected_stack, detected_idx))
 
     final_stack, final_idx = combine_label_mask_stacks(
@@ -1183,6 +1178,8 @@ def _normalize_attention_map_batch_torch(
     gamma: float = 1.0,
     blur_kernel: int = 0,
     device: Optional[Any] = None,
+    apply_vmean_compression: bool = False,
+    apply_binarize: bool = False,
 ) -> torch.Tensor:
     resolved = _resolve_processing_device(device) or torch.device("cpu")
     arr = mask if torch.is_tensor(mask) else torch.as_tensor(mask, dtype=torch.float32, device=resolved)
@@ -1200,9 +1197,13 @@ def _normalize_attention_map_batch_torch(
     vmax = torch.amax(arr, dim=(1, 2), keepdim=True)
     valid = vmax > 1e-8
     arr = torch.where(valid, arr / torch.where(valid, vmax, torch.ones_like(vmax)), torch.zeros_like(arr))
-    vmean = torch.mean(arr, dim=(1, 2), keepdim=True)
-    denom = torch.clamp(vmean * 2.0, min=1.0)
-    arr = torch.where(vmean > 1e-8, torch.clamp(arr / denom, 0.0, 1.0), arr)
+    if bool(apply_vmean_compression):
+        vmean = torch.mean(arr, dim=(1, 2), keepdim=True)
+        denom = torch.clamp(vmean * 2.0, min=1.0)
+        arr = torch.where(vmean > 1e-8, torch.clamp(arr / denom, 0.0, 1.0), arr)
+    if bool(apply_binarize):
+        arr = (arr > 0.5).to(dtype=torch.float32)
+        return arr[0] if bool(squeeze) else arr
     gm = max(0.35, float(gamma))
     if abs(gm - 1.0) > 1e-6:
         arr = torch.pow(torch.clamp(arr, 0.0, 1.0), gm)
@@ -1223,6 +1224,8 @@ def _blend_attention_maps_batch_torch(
     weights: Optional[Sequence[float]] = None,
     gamma: float = 1.0,
     device: Optional[Any] = None,
+    apply_vmean_compression: bool = False,
+    apply_binarize: bool = False,
 ) -> torch.Tensor:
     resolved = _resolve_processing_device(device) or torch.device("cpu")
     valid: List[torch.Tensor] = []
@@ -1240,7 +1243,7 @@ def _blend_attention_maps_batch_torch(
         w = 1.0 if weights is None or i >= int(len(weights)) else float(weights[i])
         if w <= 0.0:
             continue
-        norm = _normalize_attention_map_batch_torch(arr, gamma=1.0, blur_kernel=0, device=resolved)
+        norm = _normalize_attention_map_batch_torch(arr, gamma=1.0, blur_kernel=0, device=resolved, apply_vmean_compression=bool(apply_vmean_compression))
         if float(torch.amax(norm).detach().cpu().item()) <= 1e-8:
             continue
         valid.append(norm)
@@ -1255,7 +1258,7 @@ def _blend_attention_maps_batch_torch(
     wsum = float(torch.sum(torch.as_tensor(valid_weights, dtype=torch.float32)).item())
     if wsum > 1e-8:
         acc = acc / float(wsum)
-    return _normalize_attention_map_batch_torch(acc, gamma=float(gamma), blur_kernel=5, device=resolved)
+    return _normalize_attention_map_batch_torch(acc, gamma=float(gamma), blur_kernel=5, device=resolved, apply_vmean_compression=bool(apply_vmean_compression), apply_binarize=bool(apply_binarize))
 
 
 def _semantic_color_score_maps_batch_torch(
@@ -1362,7 +1365,7 @@ def _avg_pool2d_batch(batch_hw: np.ndarray, kernel_size: int) -> np.ndarray:
     return np.asarray(pooled[:, 0].cpu().numpy(), dtype=np.float32)
 
 
-def _normalize_attention_map_batch(mask: Any, gamma: float = 1.0, blur_kernel: int = 0) -> np.ndarray:
+def _normalize_attention_map_batch(mask: Any, gamma: float = 1.0, blur_kernel: int = 0, apply_vmean_compression: bool = False, apply_binarize: bool = False) -> np.ndarray:
     arr = np.asarray(mask, dtype=np.float32)
     squeeze = False
     if int(arr.ndim) == 2:
@@ -1376,8 +1379,12 @@ def _normalize_attention_map_batch(mask: Any, gamma: float = 1.0, blur_kernel: i
     vmax = np.max(arr, axis=(1, 2), keepdims=True) if int(arr.size) > 0 else np.zeros((int(arr.shape[0]), 1, 1), dtype=np.float32)
     valid = vmax > 1e-8
     arr = np.where(valid, arr / np.where(valid, vmax, 1.0), 0.0).astype(np.float32, copy=False)
-    vmean = np.mean(arr, axis=(1, 2), keepdims=True) if int(arr.size) > 0 else np.zeros((int(arr.shape[0]), 1, 1), dtype=np.float32)
-    arr = np.where(vmean > 1e-8, np.clip(arr / np.maximum(vmean * 2.0, 1.0), 0.0, 1.0), arr).astype(np.float32, copy=False)
+    if bool(apply_vmean_compression):
+        vmean = np.mean(arr, axis=(1, 2), keepdims=True) if int(arr.size) > 0 else np.zeros((int(arr.shape[0]), 1, 1), dtype=np.float32)
+        arr = np.where(vmean > 1e-8, np.clip(arr / np.maximum(vmean * 2.0, 1.0), 0.0, 1.0), arr).astype(np.float32, copy=False)
+    if bool(apply_binarize):
+        arr = (arr > 0.5).astype(np.float32, copy=False)
+        return np.asarray(arr[0], dtype=np.float32) if bool(squeeze) else arr
     gm = max(0.35, float(gamma))
     if abs(gm - 1.0) > 1e-6:
         arr = np.power(np.clip(arr, 0.0, 1.0), gm).astype(np.float32, copy=False)
@@ -1392,7 +1399,7 @@ def _normalize_attention_map_batch(mask: Any, gamma: float = 1.0, blur_kernel: i
     return np.asarray(arr[0], dtype=np.float32) if bool(squeeze) else arr
 
 
-def _blend_attention_maps_batch(maps: Sequence[Any], weights: Optional[Sequence[float]] = None, gamma: float = 1.0) -> np.ndarray:
+def _blend_attention_maps_batch(maps: Sequence[Any], weights: Optional[Sequence[float]] = None, gamma: float = 1.0, apply_vmean_compression: bool = False, apply_binarize: bool = False) -> np.ndarray:
     valid: List[np.ndarray] = []
     valid_weights: List[float] = []
     ref_shape: Optional[Tuple[int, int, int]] = None
@@ -1407,7 +1414,7 @@ def _blend_attention_maps_batch(maps: Sequence[Any], weights: Optional[Sequence[
         w = 1.0 if weights is None or i >= int(len(weights)) else float(weights[i])
         if w <= 0.0:
             continue
-        norm = _normalize_attention_map_batch(arr, gamma=1.0, blur_kernel=0)
+        norm = _normalize_attention_map_batch(arr, gamma=1.0, blur_kernel=0, apply_vmean_compression=bool(apply_vmean_compression))
         if float(np.max(norm)) <= 1e-8:
             continue
         valid.append(np.asarray(norm, dtype=np.float32))
@@ -1422,7 +1429,7 @@ def _blend_attention_maps_batch(maps: Sequence[Any], weights: Optional[Sequence[
     wsum = float(np.sum(np.asarray(valid_weights, dtype=np.float32)))
     if wsum > 1e-8:
         acc = acc / float(wsum)
-    return _normalize_attention_map_batch(acc, gamma=float(gamma), blur_kernel=5)
+    return _normalize_attention_map_batch(acc, gamma=float(gamma), blur_kernel=5, apply_vmean_compression=bool(apply_vmean_compression), apply_binarize=bool(apply_binarize))
 
 
 def _semantic_color_score_maps(chw: np.ndarray) -> Dict[str, np.ndarray]:
@@ -1851,6 +1858,222 @@ def _unit_interval_axis(length: int) -> np.ndarray:
     return np.linspace(0.0, 1.0, num=int(n), dtype=np.float32)
 
 
+def _apply_degrade(
+    x: np.ndarray,
+    *,
+    seed: int,
+    idx: int = 0,
+    mask: Optional[np.ndarray] = None,
+    degrade_config: Optional[Dict[str, Any]] = None,
+) -> Tuple[np.ndarray, Optional[np.ndarray], Dict[str, np.ndarray]]:
+    """Canonical image degradation pipeline — ONE place for all degrade logic.
+
+    Applies probabilistic degradations to a CHW float32 image in [0, 1].
+
+    Returns (degraded_image, mask_out, term_masks):
+      - degraded_image: CHW float32 in [0, 1]
+      - mask_out: spatial mask with spatial transforms propagated (None if not given)
+      - term_masks: Dict[str, ndarray] of per-term raw accumulated pixel-delta masks.
+
+    Masks in term_masks are RAW accumulated deltas — NO internal normalization.
+    Callers normalize via _normalize_attention_map / _normalize_attention_map_batch.
+
+    Term labeling is honest to what each operation does — "signal" is never added by degrade:
+      Spatial transforms label only their own name (shift / horizontal flip / vertical flip).
+      Damage labels only the damage type (blur damage, stride skew damage, etc.).
+      Noise labels: noise damage, noise, mixed noise and signal (source always has signal).
+      Color tinting labels the color; also bright if white, dark if black.
+      Edge operations label the operation name and edge.
+    The source image's signal labels come from its own construction, not from degrade.
+    Excluded by design: texture synthesis, any internal normalization.
+    """
+    import os as _os
+    cfg_raw = dict(degrade_config) if isinstance(degrade_config, dict) else {}
+    cfg = {
+        # Spatial transforms — applied independently; not always desired
+        "shift_prob":               float(cfg_raw.get("shift_prob", 0.35)),
+        "hflip_prob":               float(cfg_raw.get("hflip_prob", 0.40)),
+        "vflip_prob":               float(cfg_raw.get("vflip_prob", 0.15)),
+        # Damage — rarer, each type distinct
+        "blur_prob":                float(cfg_raw.get("blur_prob", 0.35)),
+        "stride_skew_prob":         float(cfg_raw.get("stride_skew_prob", 0.20)),
+        "dropout_prob":             float(cfg_raw.get("dropout_prob", 0.20)),
+        "quantization_prob":        float(cfg_raw.get("quantization_prob", 0.22)),
+        "noise_prob":               float(cfg_raw.get("noise_prob", 0.45)),
+        "noise_std_min":            float(cfg_raw.get("noise_std_min", 0.01)),
+        "noise_std_max":            float(cfg_raw.get("noise_std_max", 0.08)),
+        # Semantic modifications
+        "color_prob":               float(cfg_raw.get("color_prob", 0.32)),
+        "edge_highlight_prob":      float(cfg_raw.get("edge_highlight_prob", 0.28)),
+        "edge_highlight_blend_min": float(cfg_raw.get("edge_highlight_blend_min", 0.05)),
+        "edge_highlight_blend_max": float(cfg_raw.get("edge_highlight_blend_max", 0.25)),
+        "edge_highlight_ultra":     bool(cfg_raw.get("edge_highlight_ultra",
+                                         str(_os.environ.get("EDGE_HIGHLIGHT_ULTRA", "0")).strip() == "1")),
+        "edge_blur_prob":           float(cfg_raw.get("edge_blur_prob", 0.22)),
+        "edge_blur_kernel":         int(cfg_raw.get("edge_blur_kernel", 7)),
+        "edge_blur_spread":         int(cfg_raw.get("edge_blur_spread", 5)),
+    }
+    rng = np.random.default_rng(int(seed) + (int(idx) * 104729))
+    arr = np.asarray(x, dtype=np.float32)
+    if int(arr.ndim) == 3 and int(arr.shape[0]) == 3:
+        out = np.asarray(arr, dtype=np.float32, order="C")
+    elif int(arr.ndim) == 3 and int(arr.shape[2]) == 3:
+        out = np.transpose(arr, (2, 0, 1)).astype(np.float32, copy=False)
+    elif int(arr.ndim) == 2:
+        out = np.repeat(arr[None, :, :], 3, axis=0).astype(np.float32, copy=False)
+    else:
+        out = np.asarray(arr, dtype=np.float32, order="C")
+    out = np.clip(out, 0.0, 1.0).astype(np.float32, copy=False)
+    c, h, w = int(out.shape[0]), int(out.shape[1]), int(out.shape[2])
+    mask_out = None if mask is None else np.asarray(mask, dtype=np.float32).copy()
+    term_masks: Dict[str, np.ndarray] = {}
+
+    def _accum(terms: Sequence[str], delta: np.ndarray) -> None:
+        d = np.asarray(delta, dtype=np.float32)
+        if int(d.ndim) == 3:
+            d = np.mean(d, axis=0)
+        d = np.maximum(d, 0.0)
+        if float(np.max(d)) <= 1e-8:
+            return
+        for t in normalize_vocab_terms([str(s) for s in terms]):
+            tk = _norm_txt(t)
+            prev = term_masks.get(tk)
+            if prev is None:
+                term_masks[tk] = d.copy()
+            else:
+                term_masks[tk] = np.asarray(prev, dtype=np.float32) + d
+
+    # Shift (roll)
+    if float(rng.random()) < float(cfg["shift_prob"]):
+        shift_x = int(rng.integers(-max(1, w // 14), max(1, w // 14) + 1))
+        shift_y = int(rng.integers(-max(1, h // 14), max(1, h // 14) + 1))
+        if shift_x != 0 or shift_y != 0:
+            prev = out.copy()
+            if shift_x != 0:
+                out = np.roll(out, shift=shift_x, axis=2)
+                if mask_out is not None:
+                    mask_out = np.roll(mask_out, shift=shift_x, axis=1)
+            if shift_y != 0:
+                out = np.roll(out, shift=shift_y, axis=1)
+                if mask_out is not None:
+                    mask_out = np.roll(mask_out, shift=shift_y, axis=0)
+            _accum(["shift"], np.abs(np.mean(out, axis=0) - np.mean(prev, axis=0)))
+
+    # Horizontal flip
+    if float(rng.random()) < float(cfg["hflip_prob"]):
+        prev = out.copy()
+        out = np.flip(out, axis=2).copy()
+        if mask_out is not None:
+            mask_out = np.flip(mask_out, axis=1).copy()
+        _accum(["horizontal flip"], np.abs(np.mean(out, axis=0) - np.mean(prev, axis=0)))
+
+    # Vertical flip
+    if float(rng.random()) < float(cfg["vflip_prob"]):
+        prev = out.copy()
+        out = np.flip(out, axis=1).copy()
+        if mask_out is not None:
+            mask_out = np.flip(mask_out, axis=0).copy()
+        _accum(["vertical flip"], np.abs(np.mean(out, axis=0) - np.mean(prev, axis=0)))
+
+    # Blur damage
+    if float(rng.random()) < float(cfg["blur_prob"]):
+        prev = out.copy()
+        k = int(rng.choice(np.asarray([3, 5, 7], dtype=np.int32)))
+        t = torch.from_numpy(out[None, ...])
+        t = F.avg_pool2d(t, kernel_size=int(k), stride=1, padding=int(k // 2))
+        out = np.asarray(t[0].cpu().numpy(), dtype=np.float32)
+        _accum(["blur damage"], np.abs(np.mean(out, axis=0) - np.mean(prev, axis=0)))
+
+    # Stride-skew damage
+    if float(rng.random()) < float(cfg["stride_skew_prob"]):
+        odd_shift = int(rng.integers(1, 8))
+        out[:, 1::2, :] = np.roll(out[:, 1::2, :], shift=odd_shift, axis=2)
+        if mask_out is not None:
+            mask_out[1::2, :] = np.roll(mask_out[1::2, :], shift=odd_shift, axis=1)
+        stripe = np.zeros((h, w), dtype=np.float32)
+        stripe[1::2, :] = 1.0
+        _accum(["stride skew damage"], stripe)
+
+    # Dropout damage
+    if float(rng.random()) < float(cfg["dropout_prob"]):
+        keep = float(rng.uniform(0.78, 0.96))
+        keep_mask = (rng.random((h, w), dtype=np.float32) < keep).astype(np.float32, copy=False)
+        out = out * keep_mask[None, :, :]
+        _accum(["dropout damage"], 1.0 - keep_mask)
+
+    # Quantization damage
+    if float(rng.random()) < float(cfg["quantization_prob"]):
+        prev = out.copy()
+        lv = int(rng.choice(np.asarray([4, 6, 8, 12], dtype=np.int32)))
+        out = np.round(out * float(lv - 1)) / float(max(1, lv - 1))
+        _accum(["quantization damage"], np.abs(np.mean(out, axis=0) - np.mean(prev, axis=0)))
+
+    # Noise — auto-includes "noise" + "mixed noise and signal" since noise on a signal is always mixed
+    if float(rng.random()) < float(cfg["noise_prob"]):
+        prev = out.copy()
+        std = float(rng.uniform(float(cfg["noise_std_min"]), float(cfg["noise_std_max"])))
+        noise_arr = (std * rng.standard_normal((c, h, w), dtype=np.float32)).astype(np.float32, copy=False)
+        out = np.clip(out + noise_arr, 0.0, 1.0)
+        _accum(["noise damage", "noise", "mixed noise and signal"],
+               np.abs(np.mean(out, axis=0) - np.mean(prev, axis=0)))
+
+    # Color tinting
+    if int(c) >= 3 and float(rng.random()) < float(cfg["color_prob"]):
+        prev = out.copy()
+        _COLOR_PROFILES = {
+            "red":     np.asarray([1.00, 0.18, 0.18], dtype=np.float32),
+            "green":   np.asarray([0.18, 1.00, 0.18], dtype=np.float32),
+            "blue":    np.asarray([0.18, 0.18, 1.00], dtype=np.float32),
+            "yellow":  np.asarray([1.00, 1.00, 0.20], dtype=np.float32),
+            "cyan":    np.asarray([0.18, 1.00, 1.00], dtype=np.float32),
+            "magenta": np.asarray([1.00, 0.18, 1.00], dtype=np.float32),
+            "brown":   np.asarray([0.72, 0.44, 0.22], dtype=np.float32),
+            "white":   np.asarray([1.00, 1.00, 1.00], dtype=np.float32),
+            "black":   np.asarray([0.08, 0.08, 0.08], dtype=np.float32),
+            "gray":    np.asarray([0.55, 0.55, 0.55], dtype=np.float32),
+        }
+        color_key = str(rng.choice(np.asarray(list(_COLOR_PROFILES.keys()), dtype=object))).strip().lower()
+        profile = _COLOR_PROFILES.get(color_key, np.asarray([1.0, 1.0, 1.0], dtype=np.float32))[:, None, None]
+        luma = np.mean(out[:3], axis=0, keepdims=True)
+        tinted = np.clip(profile * np.clip(0.25 + (0.90 * luma), 0.0, 1.0), 0.0, 1.0).astype(np.float32, copy=False)
+        alpha = float(rng.uniform(0.24, 0.58))
+        out = np.clip(((1.0 - alpha) * out) + (alpha * tinted), 0.0, 1.0)
+        tint_terms = [color_key]
+        if color_key == "white":
+            tint_terms.append("bright")
+        elif color_key == "black":
+            tint_terms.append("dark")
+        _accum(tint_terms, np.abs(np.mean(out, axis=0) - np.mean(prev, axis=0)))
+
+    # Edge highlight
+    if float(rng.random()) < float(cfg["edge_highlight_prob"]):
+        from pipeline.semantic_wheel_cache import _canny_edge_map, _sobel_edge_map
+        prev = out.copy()
+        gray = np.mean(out[:3], axis=0).astype(np.float32, copy=False)
+        edge_map = _canny_edge_map(gray) if bool(cfg["edge_highlight_ultra"]) else _sobel_edge_map(gray)
+        blend = float(rng.uniform(float(cfg["edge_highlight_blend_min"]), float(cfg["edge_highlight_blend_max"])))
+        out = np.clip(out + (float(blend) * edge_map[None, :, :]), 0.0, 1.0)
+        _accum(["edge highlight", "edge"], edge_map)
+
+    # Edge blur
+    if float(rng.random()) < float(cfg["edge_blur_prob"]):
+        from pipeline.semantic_wheel_cache import _sobel_edge_map
+        gray = np.mean(out[:3], axis=0).astype(np.float32, copy=False)
+        edge_mask = _sobel_edge_map(gray)
+        blur_k = int(cfg["edge_blur_kernel"])
+        spread_k = int(cfg["edge_blur_spread"])
+        out_t = torch.from_numpy(out[None, ...]).to(torch.float32)
+        blurred = F.avg_pool2d(out_t, kernel_size=blur_k, stride=1, padding=blur_k // 2)[0].numpy().astype(np.float32)
+        em_t = torch.from_numpy(edge_mask[None, None, ...]).to(torch.float32)
+        spread_mask = F.avg_pool2d(em_t, kernel_size=spread_k, stride=1, padding=spread_k // 2)[0, 0].numpy().astype(np.float32)
+        spread_mask = spread_mask / max(float(np.max(spread_mask)), 1e-8)
+        out = np.clip(out * (1.0 - spread_mask[None]) + blurred * spread_mask[None], 0.0, 1.0).astype(np.float32, copy=False)
+        _accum(["edge blur", "edge"], spread_mask)
+
+    out = np.clip(out, 0.0, 1.0).astype(np.float32, copy=False)
+    return out, mask_out, term_masks
+
+
 def augment_bootstrap_chw01(
     img: np.ndarray,
     seed: int,
@@ -1858,221 +2081,29 @@ def augment_bootstrap_chw01(
     return_touch_mask: bool = False,
     return_term_masks: bool = False,
 ) -> Any:
-    arr = np.asarray(img, dtype=np.float32)
-    if int(arr.ndim) == 3 and int(arr.shape[0]) == 3:
-        x = np.asarray(arr, dtype=np.float32, order="C")
-    elif int(arr.ndim) == 3 and int(arr.shape[2]) == 3:
-        x = np.transpose(arr, (2, 0, 1)).astype(np.float32, copy=False)
-    elif int(arr.ndim) == 2:
-        x = np.repeat(arr[None, :, :], 3, axis=0).astype(np.float32, copy=False)
+    """Bootstrap image augmentation — delegates to canonical _apply_degrade."""
+    out, _, raw_term_masks = _apply_degrade(np.asarray(img, dtype=np.float32), seed=int(seed))
+    if not bool(return_terms) and not bool(return_touch_mask) and not bool(return_term_masks):
+        return out
+    terms = list(raw_term_masks.keys())
+    if not bool(return_touch_mask) and not bool(return_term_masks):
+        return out, terms
+    all_vals = [np.asarray(v, dtype=np.float32) for v in raw_term_masks.values() if float(np.max(v)) > 1e-8]
+    if len(all_vals) > 0:
+        touch_sum = np.sum(np.stack(all_vals, axis=0), axis=0).astype(np.float32, copy=False)
+        vmax = float(np.max(touch_sum))
+        touched = np.clip(touch_sum / vmax, 0.0, 1.0).astype(np.float32, copy=False) if vmax > 1e-8 else touch_sum
     else:
-        raise RuntimeError(f"Unsupported bootstrap row shape for augmentation: {tuple(arr.shape)}")
-    x = np.clip(x, 0.0, 1.0).astype(np.float32, copy=False)
-    c, h, w = int(x.shape[0]), int(x.shape[1]), int(x.shape[2])
-    rng = np.random.default_rng(int(seed))
-    applied_terms: List[str] = []
-    touched = np.zeros((int(h), int(w)), dtype=np.float32)
-    term_masks: Dict[str, np.ndarray] = {}
-
-    def _accumulate_touch(delta: Any, scale: float = 1.0, gamma: float = 1.0):
-        nonlocal touched
-        norm = _normalize_attention_map(delta, gamma=float(gamma), blur_kernel=3)
-        if float(np.max(norm)) <= 1e-8:
-            return
-        touched = np.asarray(touched, dtype=np.float32) + (float(scale) * norm)
-        return np.asarray(norm, dtype=np.float32)
-
-    def _accumulate_term_mask(terms: Sequence[str], delta: Any, scale: float = 1.0, gamma: float = 1.0):
-        norm = _accumulate_touch(delta, scale=float(scale), gamma=float(gamma))
-        if norm is None or float(np.max(norm)) <= 1e-8:
-            return
-        for term in normalize_vocab_terms([str(t) for t in list(terms)]):
-            tk = _norm_txt(term)
-            prev_mask = np.asarray(term_masks.get(tk, np.zeros((int(h), int(w)), dtype=np.float32)), dtype=np.float32)
-            term_masks[tk] = _blend_attention_maps([prev_mask, norm], weights=[1.0, 1.0], gamma=0.90)
-
-    def _mark_diff(prev_x: np.ndarray, next_x: np.ndarray, scale: float = 1.0):
-        prev_g = np.mean(np.asarray(prev_x, dtype=np.float32), axis=0)
-        next_g = np.mean(np.asarray(next_x, dtype=np.float32), axis=0)
-        diff = np.abs(next_g - prev_g).astype(np.float32, copy=False)
-        return _accumulate_touch(diff, scale=float(scale), gamma=0.95)
-
-    prev = np.asarray(x, dtype=np.float32).copy()
-    shift_x = int(rng.integers(-max(1, w // 14), max(1, w // 14) + 1))
-    shift_y = int(rng.integers(-max(1, h // 14), max(1, h // 14) + 1))
-    if shift_x != 0:
-        x = np.roll(x, shift=shift_x, axis=2)
-    if shift_y != 0:
-        x = np.roll(x, shift=shift_y, axis=1)
-    if shift_x != 0 or shift_y != 0:
-        _mark_diff(prev, x, scale=0.7)
-    prev = np.asarray(x, dtype=np.float32).copy()
-    if float(rng.random()) < 0.45:
-        x = np.flip(x, axis=2).copy()
-        _mark_diff(prev, x, scale=0.4)
-        prev = np.asarray(x, dtype=np.float32).copy()
-    if float(rng.random()) < 0.15:
-        x = np.flip(x, axis=1).copy()
-        _mark_diff(prev, x, scale=0.4)
-        prev = np.asarray(x, dtype=np.float32).copy()
-
-    if float(rng.random()) < 0.55:
-        k = int(rng.choice(np.asarray([3, 5, 7], dtype=np.int32)))
-        t = torch.from_numpy(np.asarray(x, dtype=np.float32)[None, ...])
-        t = F.avg_pool2d(t, kernel_size=int(k), stride=1, padding=int(k // 2))
-        x_blur = np.asarray(t[0].cpu().numpy(), dtype=np.float32)
-        _accumulate_term_mask(["blur damage", "signal"], np.abs(np.mean(x_blur[:3], axis=0) - np.mean(prev[:3], axis=0)), scale=0.8, gamma=0.95)
-        x = x_blur
-        applied_terms.extend(normalize_vocab_terms(["blur damage", "signal"]))
-        prev = np.asarray(x, dtype=np.float32).copy()
-    if float(rng.random()) < 0.45:
-        odd_shift = int(rng.integers(1, 8))
-        x[:, 1::2, :] = np.roll(x[:, 1::2, :], shift=odd_shift, axis=2)
-        stripe = np.zeros((h, w), dtype=np.float32)
-        stripe[1::2, :] = 1.0
-        _accumulate_term_mask(["stride skew damage", "signal"], stripe, scale=0.7, gamma=1.15)
-        applied_terms.extend(normalize_vocab_terms(["stride skew damage", "signal"]))
-        prev = np.asarray(x, dtype=np.float32).copy()
-    if float(rng.random()) < 0.35:
-        keep = float(rng.uniform(0.76, 0.96))
-        keep_mask = (rng.random((h, w), dtype=np.float32) < keep).astype(np.float32, copy=False)
-        x = x * keep_mask[None, :, :]
-        _accumulate_term_mask(["dropout damage", "signal"], 1.0 - keep_mask, scale=1.0, gamma=0.90)
-        applied_terms.extend(normalize_vocab_terms(["dropout damage", "signal"]))
-        prev = np.asarray(x, dtype=np.float32).copy()
-    if float(rng.random()) < 0.40:
-        lv = int(rng.choice(np.asarray([4, 6, 8, 12], dtype=np.int32)))
-        x_quant = np.round(x * float(lv - 1)) / float(max(1, lv - 1))
-        _accumulate_term_mask(["quantization damage", "signal"], np.abs(np.mean(x_quant[:3], axis=0) - np.mean(prev[:3], axis=0)), scale=0.7, gamma=0.95)
-        x = x_quant
-        applied_terms.extend(normalize_vocab_terms(["quantization damage", "signal"]))
-        prev = np.asarray(x, dtype=np.float32).copy()
-
-    x01 = _unit_interval_axis(int(w))[None, :]
-    y01 = _unit_interval_axis(int(h))[:, None]
-    fx = float(rng.uniform(1.2, 8.5))
-    fy = float(rng.uniform(1.0, 7.5))
-    ph = float(rng.uniform(0.0, 2.0 * np.pi))
-    phase = np.empty((int(h), int(w)), dtype=np.float32)
-    np.multiply(y01, np.float32(fy), out=phase)
-    phase += np.float32(fx) * x01
-    phase *= np.float32(2.0 * np.pi)
-    phase += np.float32(ph)
-    np.sin(phase, out=phase)
-    phase *= np.float32(0.5)
-    phase += np.float32(0.5)
-    sig = phase
-    noi = rng.random((h, w), dtype=np.float32)
-    if float(rng.random()) < 0.5:
-        mix_a = float(rng.uniform(0.18, 0.62))
-        mix = np.clip((mix_a * sig) + ((1.0 - mix_a) * noi), 0.0, 1.0).astype(np.float32, copy=False)
-    else:
-        bits = int(rng.integers(2, 7))
-        s_u16 = np.round(np.clip(sig, 0.0, 1.0) * 65535.0).astype(np.uint16, copy=False)
-        n_u16 = np.round(np.clip(noi, 0.0, 1.0) * 65535.0).astype(np.uint16, copy=False)
-        payload = ((n_u16 >> int(16 - bits)) & np.uint16((1 << bits) - 1)).astype(np.uint16, copy=False)
-        keep_mask = np.uint16(0xFFFF ^ ((1 << bits) - 1))
-        mix = np.clip(((s_u16 & keep_mask) | payload).astype(np.float32) / 65535.0, 0.0, 1.0).astype(np.float32, copy=False)
-    blend = float(rng.uniform(0.08, 0.28))
-    x_mix = np.clip(((1.0 - blend) * x) + (blend * mix[None, :, :]), 0.0, 1.0)
-    signal_support = np.ones((int(h), int(w)), dtype=np.float32)
-    noise_support = np.ones((int(h), int(w)), dtype=np.float32)
-    _accumulate_term_mask(["signal"], signal_support, scale=1.0, gamma=1.0)
-    _accumulate_term_mask(["noise", "mixed noise and signal"], noise_support, scale=1.0, gamma=1.0)
-    _accumulate_touch(np.abs(np.mean(x_mix[:3], axis=0) - np.mean(prev[:3], axis=0)), scale=0.6, gamma=0.95)
-    x = x_mix
-    applied_terms.extend(["mixed noise and signal", "noise", "signal"])
-    prev = np.asarray(x, dtype=np.float32).copy()
-
-    if float(rng.random()) < 0.65:
-        std = float(rng.uniform(0.01, 0.08))
-        noise_delta = (std * rng.standard_normal((c, h, w), dtype=np.float32)).astype(np.float32, copy=False)
-        x_noise = np.clip(x + noise_delta, 0.0, 1.0)
-        _accumulate_term_mask(["noise damage", "noise", "mixed noise and signal", "signal"], np.mean(np.abs(noise_delta), axis=0), scale=0.9, gamma=0.90)
-        x = x_noise
-        applied_terms.extend(normalize_vocab_terms(["noise damage", "noise", "mixed noise and signal", "signal"]))
-
-    prev = np.asarray(x, dtype=np.float32).copy()
-    if int(c) >= 3 and float(rng.random()) < 0.45:
-        color_profiles = {
-            "red": np.asarray([1.00, 0.18, 0.18], dtype=np.float32),
-            "green": np.asarray([0.18, 1.00, 0.18], dtype=np.float32),
-            "blue": np.asarray([0.18, 0.18, 1.00], dtype=np.float32),
-            "yellow": np.asarray([1.00, 1.00, 0.20], dtype=np.float32),
-            "cyan": np.asarray([0.18, 1.00, 1.00], dtype=np.float32),
-            "magenta": np.asarray([1.00, 0.18, 1.00], dtype=np.float32),
-            "brown": np.asarray([0.72, 0.44, 0.22], dtype=np.float32),
-            "white": np.asarray([1.00, 1.00, 1.00], dtype=np.float32),
-            "black": np.asarray([0.08, 0.08, 0.08], dtype=np.float32),
-            "gray": np.asarray([0.55, 0.55, 0.55], dtype=np.float32),
-        }
-        color_key = str(rng.choice(np.asarray(list(color_profiles.keys()), dtype=object))).strip().lower()
-        profile = color_profiles.get(color_key, np.asarray([1.0, 1.0, 1.0], dtype=np.float32))[:, None, None]
-        luma = np.mean(np.asarray(x[:3], dtype=np.float32), axis=0, keepdims=True)
-        tinted = np.clip(profile * np.clip(0.25 + (0.90 * luma), 0.0, 1.0), 0.0, 1.0).astype(np.float32, copy=False)
-        alpha = float(rng.uniform(0.24, 0.58))
-        x_tinted = np.clip(((1.0 - alpha) * x) + (alpha * tinted), 0.0, 1.0)
-        _accumulate_term_mask([str(color_key)], np.abs(np.mean(x_tinted[:3], axis=0) - np.mean(prev[:3], axis=0)), scale=0.85, gamma=0.90)
-        x = x_tinted
-        applied_terms.extend(normalize_vocab_terms([str(color_key)]))
-        if str(color_key) == "white":
-            applied_terms.extend(normalize_vocab_terms(["bright"]))
-        elif str(color_key) == "black":
-            applied_terms.extend(normalize_vocab_terms(["dark"]))
-
-    prev = np.asarray(x, dtype=np.float32).copy()
-    if float(rng.random()) < 0.32:
-        gx = np.zeros((h, w), dtype=np.float32)
-        gy = np.zeros((h, w), dtype=np.float32)
-        gray = np.mean(np.asarray(x[:3], dtype=np.float32), axis=0)
-        gx[:, 1:-1] = gray[:, 2:] - gray[:, :-2]
-        gy[1:-1, :] = gray[2:, :] - gray[:-2, :]
-        edge = np.sqrt((gx * gx) + (gy * gy)).astype(np.float32, copy=False)
-        if float(np.max(edge)) > 1e-8:
-            edge = edge / float(np.max(edge))
-        edge_rgb = np.repeat(edge[None, :, :], c, axis=0).astype(np.float32, copy=False)
-        alpha = float(rng.uniform(0.20, 0.46))
-        x_edge = np.clip(((1.0 - alpha) * x) + (alpha * edge_rgb), 0.0, 1.0)
-        _accumulate_term_mask(["edge", "shape", "rough"], edge, scale=0.80, gamma=0.90)
-        x = x_edge
-        applied_terms.extend(normalize_vocab_terms(["edge", "shape", "rough"]))
-
-    prev = np.asarray(x, dtype=np.float32).copy()
-    if float(rng.random()) < 0.36:
-        fx_t = float(rng.uniform(4.0, 16.0))
-        fy_t = float(rng.uniform(4.0, 16.0))
-        ph_t = float(rng.uniform(0.0, 2.0 * np.pi))
-        tex = 0.5 + (0.25 * np.sin((2.0 * np.pi * ((fx_t * x01) + (0.35 * fy_t * y01))) + ph_t))
-        tex += 0.25 * np.sin((2.0 * np.pi * ((0.45 * fx_t * x01) - (fy_t * y01))) + (ph_t * 0.7))
-        tex = np.clip(tex, 0.0, 1.0).astype(np.float32, copy=False)
-        tex_rgb = np.repeat(tex[None, :, :], c, axis=0).astype(np.float32, copy=False)
-        alpha = float(rng.uniform(0.18, 0.42))
-        x_tex = np.clip(x * (0.78 + (0.55 * tex_rgb)) + (alpha * tex_rgb), 0.0, 1.0)
-        tex_terms = ["texture", "pattern"]
-        if float(np.std(tex)) >= 0.18:
-            tex_terms.append("rough")
-        else:
-            tex_terms.append("smooth")
-        _accumulate_term_mask(tex_terms, tex, scale=0.70, gamma=0.90)
-        x = x_tex
-        applied_terms.extend(normalize_vocab_terms(["texture", "pattern"]))
-        if float(np.std(tex)) >= 0.18:
-            applied_terms.extend(normalize_vocab_terms(["rough"]))
-        else:
-            applied_terms.extend(normalize_vocab_terms(["smooth"]))
-
-    x_out = np.asarray(x, dtype=np.float32)
-    touched = _normalize_attention_map(touched, gamma=1.05, blur_kernel=5)
+        touched = np.zeros((int(out.shape[1]), int(out.shape[2])), dtype=np.float32)
     if bool(return_terms) and bool(return_touch_mask) and bool(return_term_masks):
-        term_masks = {str(k): _normalize_attention_map(v, gamma=0.85, blur_kernel=1) for k, v in term_masks.items() if float(np.max(v)) > 1e-8}
-        return x_out, normalize_vocab_terms(applied_terms), touched, term_masks
+        return out, terms, touched, raw_term_masks
     if bool(return_terms) and bool(return_touch_mask):
-        return x_out, normalize_vocab_terms(applied_terms), touched
+        return out, terms, touched
     if bool(return_terms):
-        return x_out, normalize_vocab_terms(applied_terms)
+        return out, terms
     if bool(return_touch_mask):
-        return x_out, touched
-    return x_out
+        return out, touched
+    return out
 
 
 def _cache_encode_image_u8(img: np.ndarray) -> np.ndarray:
@@ -3004,141 +3035,13 @@ class DiskSemanticRowsDataset(Dataset):
     def _apply_degrade(self, x: np.ndarray, mask: Optional[np.ndarray], idx: int) -> Tuple[np.ndarray, Optional[np.ndarray], Dict[str, np.ndarray]]:
         if not bool(self.degrade):
             return x, mask, {}
-        rng = np.random.default_rng(int(self.degrade_seed) + (int(idx) * 104729))
-        out = np.asarray(x, dtype=np.float32).copy()
-        mask_out = None if mask is None else np.asarray(mask, dtype=np.float32).copy()
-        c, h, w = int(out.shape[0]), int(out.shape[1]), int(out.shape[2])
-        touch = np.zeros((int(h), int(w)), dtype=np.float32)
-        term_masks: Dict[str, np.ndarray] = {}
-
-        def _accumulate_touch(delta: Any, scale: float = 1.0, gamma: float = 1.0):
-            nonlocal touch
-            norm = _normalize_attention_map(delta, gamma=float(gamma), blur_kernel=3)
-            if float(np.max(norm)) <= 1e-8:
-                return
-            touch = np.asarray(touch, dtype=np.float32) + (float(scale) * norm)
-            return np.asarray(norm, dtype=np.float32)
-
-        def _accumulate_term_mask(terms: Sequence[str], delta: Any, scale: float = 1.0, gamma: float = 1.0):
-            norm = _accumulate_touch(delta, scale=float(scale), gamma=float(gamma))
-            if norm is None or float(np.max(norm)) <= 1e-8:
-                return
-            for term in normalize_vocab_terms([str(t) for t in list(terms)]):
-                tk = _norm_txt(term)
-                prev = np.asarray(term_masks.get(tk, np.zeros((int(h), int(w)), dtype=np.float32)), dtype=np.float32)
-                term_masks[tk] = _blend_attention_maps([prev, norm], weights=[1.0, 1.0], gamma=0.90)
-
-        def _mark_diff(prev_x: np.ndarray, next_x: np.ndarray, scale: float = 1.0):
-            prev_g = np.mean(np.asarray(prev_x, dtype=np.float32), axis=0)
-            next_g = np.mean(np.asarray(next_x, dtype=np.float32), axis=0)
-            _accumulate_touch(np.abs(next_g - prev_g).astype(np.float32, copy=False), scale=float(scale), gamma=0.95)
-
-        if float(rng.random()) < float(self.degrade_config["blur_prob"]):
-            prev = np.asarray(out, dtype=np.float32).copy()
-            k = int(rng.choice(np.asarray([3, 5, 7], dtype=np.int32)))
-            t = torch.from_numpy(out[None, ...])
-            t = F.avg_pool2d(t, kernel_size=int(k), stride=1, padding=int(k // 2))
-            out = np.asarray(t[0].cpu().numpy(), dtype=np.float32)
-            _accumulate_term_mask(
-                ["blur damage", "signal"],
-                np.abs(np.mean(out[:3], axis=0) - np.mean(prev[:3], axis=0)),
-                scale=0.85,
-                gamma=0.95,
-            )
-        if float(rng.random()) < float(self.degrade_config["stride_skew_prob"]):
-            prev = np.asarray(out, dtype=np.float32).copy()
-            odd_shift = int(rng.integers(1, 8))
-            out[:, 1::2, :] = np.roll(out[:, 1::2, :], shift=odd_shift, axis=2)
-            stripe = np.zeros((h, w), dtype=np.float32)
-            stripe[1::2, :] = 1.0
-            _mark_diff(prev, out, scale=0.75)
-            _accumulate_term_mask(["stride skew damage", "signal"], stripe, scale=0.35, gamma=1.10)
-            if mask_out is not None:
-                mask_out[1::2, :] = np.roll(mask_out[1::2, :], shift=odd_shift, axis=1)
-        if float(rng.random()) < float(self.degrade_config["dropout_prob"]):
-            keep = float(rng.uniform(0.78, 0.96))
-            keep_mask = (rng.random((h, w), dtype=np.float32) < keep).astype(np.float32, copy=False)
-            out = out * keep_mask[None, :, :]
-            _accumulate_term_mask(["dropout damage", "signal"], 1.0 - keep_mask, scale=1.0, gamma=0.90)
-        if float(rng.random()) < float(self.degrade_config["quantization_prob"]):
-            prev = np.asarray(out, dtype=np.float32).copy()
-            lv = int(rng.choice(np.asarray([4, 6, 8, 12], dtype=np.int32)))
-            out = np.round(out * float(lv - 1)) / float(max(1, lv - 1))
-            _accumulate_term_mask(
-                ["quantization damage", "signal"],
-                np.abs(np.mean(out[:3], axis=0) - np.mean(prev[:3], axis=0)),
-                scale=0.75,
-                gamma=0.95,
-            )
-        if float(rng.random()) < float(self.degrade_config["noise_prob"]):
-            prev = np.asarray(out, dtype=np.float32).copy()
-            std = float(rng.uniform(float(self.degrade_config["noise_std_min"]), float(self.degrade_config["noise_std_max"])))
-            out = out + (std * rng.standard_normal((c, h, w), dtype=np.float32)).astype(np.float32, copy=False)
-            _accumulate_term_mask(
-                ["noise damage", "noise", "mixed noise and signal", "signal"],
-                np.abs(np.mean(out[:3], axis=0) - np.mean(prev[:3], axis=0)),
-                scale=0.90,
-                gamma=0.90,
-            )
-        if float(rng.random()) < float(self.degrade_config["edge_highlight_prob"]):
-            prev = np.asarray(out, dtype=np.float32).copy()
-            gray = np.mean(out[:3], axis=0).astype(np.float32, copy=False)
-            if bool(self.degrade_config["edge_highlight_ultra"]):
-                from pipeline.semantic_wheel_cache import _canny_edge_map
-                edge_map = _canny_edge_map(gray)
-            else:
-                from pipeline.semantic_wheel_cache import _sobel_edge_map
-                edge_map = _sobel_edge_map(gray)
-            blend = float(rng.uniform(
-                float(self.degrade_config["edge_highlight_blend_min"]),
-                float(self.degrade_config["edge_highlight_blend_max"]),
-            ))
-            out = out + (float(blend) * edge_map[None, :, :]).astype(np.float32, copy=False)
-            _accumulate_term_mask(
-                ["edge highlight", "edge", "signal"],
-                edge_map,
-                scale=0.85,
-                gamma=0.95,
-            )
-        if float(rng.random()) < float(self.degrade_config["edge_blur_prob"]):
-            gray = np.mean(out[:3], axis=0).astype(np.float32, copy=False)
-            sx = np.array([[1, 0, -1], [2, 0, -2], [1, 0, -1]], dtype=np.float32)
-            gt = torch.from_numpy(gray[None, None, ...]).to(torch.float32)
-            gx = F.conv2d(gt, torch.from_numpy(sx[None, None, ...]), padding=1)
-            gy = F.conv2d(gt, torch.from_numpy(sx.T[None, None, ...]), padding=1)
-            edge_mask = (torch.sqrt(gx ** 2 + gy ** 2)[0, 0]).numpy().astype(np.float32)
-            edge_mask = edge_mask / max(float(np.max(edge_mask)), 1e-8)
-            blur_k = int(self.degrade_config["edge_blur_kernel"])
-            spread_k = int(self.degrade_config["edge_blur_spread"])
-            out_t = torch.from_numpy(out[None, ...]).to(torch.float32)
-            blurred = F.avg_pool2d(out_t, kernel_size=blur_k, stride=1, padding=blur_k // 2)[0].numpy().astype(np.float32)
-            em_t = torch.from_numpy(edge_mask[None, None, ...]).to(torch.float32)
-            spread_mask = F.avg_pool2d(em_t, kernel_size=spread_k, stride=1, padding=spread_k // 2)[0, 0].numpy().astype(np.float32)
-            spread_mask = spread_mask / max(float(np.max(spread_mask)), 1e-8)
-            out = np.clip(out * (1.0 - spread_mask[None]) + blurred * spread_mask[None], 0.0, 1.0).astype(np.float32, copy=False)
-            _accumulate_term_mask(
-                ["edge blur", "edge", "signal"],
-                spread_mask,
-                scale=0.85,
-                gamma=0.95,
-            )
-        out = np.clip(out, 0.0, 1.0).astype(np.float32, copy=False)
-        if mask_out is not None:
-            touch = _normalize_attention_map(touch, gamma=1.05, blur_kernel=5)
-            if float(np.max(touch)) > 1e-8:
-                mask_out = _blend_attention_maps(
-                    [np.asarray(mask_out, dtype=np.float32), np.asarray(touch, dtype=np.float32)],
-                    weights=[0.55, 1.15],
-                    gamma=0.98,
-                ).astype(np.float32, copy=False)
-            else:
-                mask_out = _normalize_attention_map(mask_out, gamma=0.95, blur_kernel=3)
-        term_masks = {
-            str(k): _normalize_attention_map(v, gamma=0.90, blur_kernel=1)
-            for k, v in term_masks.items()
-            if float(np.max(v)) > 1e-8
-        }
-        return out, mask_out, term_masks
+        return _apply_degrade(
+            x,
+            seed=int(self.degrade_seed),
+            idx=int(idx),
+            mask=mask,
+            degrade_config=self.degrade_config,
+        )
 
     def __getitem__(self, index: int):
         row = self.rows[int(index)]

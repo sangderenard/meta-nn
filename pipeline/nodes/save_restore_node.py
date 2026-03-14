@@ -950,6 +950,9 @@ class SaveRestoreNode(PipelineNode):
                     out_dir / f"{name}.pt",
                 )
 
+        # 3b. Save greyscale weight thumbnail for GUI scrub preview
+        self._save_weight_thumbnail(out_dir, _models, ctx.round_id, ctx.cycle)
+
         # 4. Save seed bank
         if self.seed_bank is not None:
             self.seed_bank.save_bank(out_dir / "seed_bank.pt")
@@ -960,9 +963,10 @@ class SaveRestoreNode(PipelineNode):
             self.training_cache.clear_before_checkpoint()
 
         # 6. Notify viewer (lightweight notification only — GUI pulls details)
+        thumb_path = out_dir / f"weight_thumb_r{ctx.round_id:06d}_c{ctx.cycle:04d}.png"
         viewer = ctx.viewer_proxy
         if viewer is not None:
-            notification = self.make_checkpoint_notification(ctx.round_id, ctx.cycle)
+            notification = self.make_checkpoint_notification(ctx.round_id, ctx.cycle, thumb_path=thumb_path)
             send_fn = getattr(viewer, "_send", None)
             if callable(send_fn):
                 try:
@@ -979,6 +983,58 @@ class SaveRestoreNode(PipelineNode):
                     pass
 
         _log(f"[checkpoint] saved round={ctx.round_id} cycle={ctx.cycle}")
+
+    def _save_weight_thumbnail(
+        self,
+        out_dir: Path,
+        models: Dict[str, Any],
+        round_id: int,
+        cycle: int,
+    ) -> None:
+        """Render a greyscale weight thumbnail and save as .png next to checkpoint.
+
+        All model parameters are concatenated into a single flat vector,
+        reshaped into a square, normalised to [0, 255], and saved as a
+        single-channel greyscale PNG.  The file is named
+        ``weight_thumb_r{round}_c{cycle}.png``.
+        """
+        try:
+            parts: list = []
+            for name in sorted(models.keys()):
+                model = models[name]
+                if model is None:
+                    continue
+                for p in model.parameters():
+                    parts.append(p.detach().cpu().float().reshape(-1))
+            if not parts:
+                return
+            flat = torch.cat(parts)
+            n = len(flat)
+            if n == 0:
+                return
+            sq = int(math.ceil(math.sqrt(n)))
+            padded = torch.zeros(sq * sq)
+            padded[:n] = flat
+            grid = padded.reshape(sq, sq)
+            # Normalise to [0, 255] by mapping the full value range
+            gmin = grid.min().item()
+            gmax = grid.max().item()
+            span = gmax - gmin
+            if span < 1e-12:
+                normed = torch.zeros_like(grid)
+            else:
+                normed = (grid - gmin) / span
+            # Downsample to a manageable thumbnail size (max 256×256)
+            thumb_size = min(256, sq)
+            grey_np = (normed * 255.0).clamp(0, 255).to(torch.uint8).numpy()
+            from PIL import Image
+            img = Image.fromarray(grey_np, mode="L")
+            if sq > thumb_size:
+                img = img.resize((thumb_size, thumb_size), Image.LANCZOS)
+            thumb_path = out_dir / f"weight_thumb_r{round_id:06d}_c{cycle:04d}.png"
+            img.save(str(thumb_path))
+        except Exception as exc:
+            _log(f"[checkpoint] weight thumbnail failed: {exc}")
 
     def _execute_restore(self, ctx: PipelineContext) -> None:
         """Restore to a checkpoint and replay training material."""
@@ -1279,10 +1335,13 @@ class SaveRestoreNode(PipelineNode):
             "channel_key": str(channel_key),
         }
 
-    def make_checkpoint_notification(self, round_id: int, cycle: int) -> Dict[str, Any]:
-        return {
+    def make_checkpoint_notification(self, round_id: int, cycle: int, *, thumb_path=None) -> Dict[str, Any]:
+        d = {
             "type": NOTIFY_CHECKPOINT,
             "round_id": int(round_id),
             "cycle": int(cycle),
             "loss_summary": self.loss_accumulator.summary(),
         }
+        if thumb_path is not None:
+            d["thumb_path"] = str(thumb_path)
+        return d

@@ -669,6 +669,7 @@ class DataNode(PipelineNode):
         from pipeline.nodes.vocab_node import (
             _build_pregestation_logic_rows,
             _semantic_terms_with_tonal_tags,
+            _semantic_terms_with_tonal_masks,
         )
 
         target_dim = max(1, int(len(ctx.class_names)))
@@ -702,6 +703,7 @@ class DataNode(PipelineNode):
             all_elem_term_lists: list = []
             all_targets: list = []
             all_term_rows: list = []
+            all_tonal_masks: list = []  # List[Dict[str, np.ndarray]] — tonal masks per row
             for mode in tqdm(_mode_seq, desc="[pregestation] generating modes", unit="mode", leave=False, dynamic_ncols=True):
                 imgs, masks, mask_stacks, elem_term_lists, term_rows, _info = _build_pregestation_logic_rows(
                     image_size=self.preg_cfg.image_size,
@@ -718,16 +720,17 @@ class DataNode(PipelineNode):
                 all_elem_term_lists.extend(elem_term_lists)
                 for row_idx, term_row in enumerate(term_rows):
                     img_ref = imgs[int(row_idx)] if int(row_idx) < int(len(imgs)) else None
-                    enriched_terms = (
-                        _semantic_terms_with_tonal_tags(
+                    if img_ref is not None:
+                        enriched_terms, tonal_masks_dict = _semantic_terms_with_tonal_masks(
                             terms=term_row,
                             image=img_ref,
                             image_size=int(self.preg_cfg.image_size),
                         )
-                        if img_ref is not None
-                        else list(term_row)
-                    )
+                    else:
+                        enriched_terms = list(term_row)
+                        tonal_masks_dict = {}
                     all_term_rows.append(list(enriched_terms))
+                    all_tonal_masks.append(tonal_masks_dict)
                     y = np.zeros((target_dim,), dtype=np.float32)
                     for term in enriched_terms:
                         idx = ctx.semantic_term_to_idx.get(str(term).strip().lower(), -1)
@@ -758,24 +761,38 @@ class DataNode(PipelineNode):
                 else:
                     explicit_stack = np.zeros((0, int(base_mask_np.shape[0]), int(base_mask_np.shape[1])), dtype=np.float32)
                     explicit_idx = np.zeros((0,), dtype=np.int64)
-                fallback_stack, fallback_idx = build_label_mask_stack(
-                    mixed_mask=base_mask_np,
-                    label_vec=all_targets[i],
-                    treat_mixed_mask_as_creation=True,
-                )
+                # Build tonal mask stack from heuristic detections — each term the
+                # tonal enrichment added carries its own spatial evidence mask.
+                _tonal_dict = all_tonal_masks[i] if i < len(all_tonal_masks) else {}
+                _tonal_slices: list = []
+                _tonal_idxs: list = []
+                for _tterm, _tmask in _tonal_dict.items():
+                    _tidx = int(ctx.semantic_term_to_idx.get(str(_tterm).strip().lower(), -1))
+                    if _tidx < 0:
+                        continue
+                    _tmask_np = np.asarray(_tmask, dtype=np.float32)
+                    if int(_tmask_np.ndim) == 2 and int(_tmask_np.size) > 0:
+                        _tonal_slices.append(_tmask_np)
+                        _tonal_idxs.append(_tidx)
+                if _tonal_slices:
+                    tonal_stack = np.stack(_tonal_slices, axis=0)
+                    tonal_idx = np.asarray(_tonal_idxs, dtype=np.int64)
+                else:
+                    tonal_stack = np.zeros((0, int(base_mask_np.shape[0]), int(base_mask_np.shape[1])), dtype=np.float32)
+                    tonal_idx = np.zeros((0,), dtype=np.int64)
                 merged_stack, merged_idx = combine_label_mask_stacks(
                     all_targets[i],
                     (explicit_stack, explicit_idx),
-                    (fallback_stack, fallback_idx),
+                    (tonal_stack, tonal_idx),
                     height=int(base_mask_np.shape[0]),
                     width=int(base_mask_np.shape[1]),
-                    fallback_creation_mask=base_mask_np,
+                    strict=True,
                 )
                 if i < len(all_masks):
                     all_masks[i] = (
                         _composite_mask_stack(merged_stack)
                         if int(np.asarray(merged_stack).size) > 0
-                        else base_mask_np
+                        else np.zeros((int(base_mask_np.shape[0]), int(base_mask_np.shape[1])), dtype=np.float32)
                     )
                 all_label_stacks.append(np.asarray(merged_stack, dtype=np.float32))
                 all_label_indices.append(np.asarray(merged_idx, dtype=np.int64))
@@ -948,25 +965,18 @@ class DataNode(PipelineNode):
                 for i in tqdm(range(_n_gest), desc="[gestation] combining mask stacks", unit="img", leave=False, dynamic_ncols=True):
                     y = np.asarray(targets[int(i)], dtype=np.float32).reshape(-1)
                     base_mask = np.asarray(_base_masks[i], dtype=np.float32)
-                    fallback_stack, fallback_idx = build_label_mask_stack(
-                        mixed_mask=base_mask,
-                        label_vec=y,
-                        treat_mixed_mask_as_creation=True,
-                        processing_device=_processing_device,
-                    )
                     merged_stack, merged_idx = combine_label_mask_stacks(
                         y,
                         (np.asarray(_heuristic_stacks[i], dtype=np.float32), np.asarray(_heuristic_indices[i], dtype=np.int64)),
-                        (fallback_stack, fallback_idx),
                         height=int(base_mask.shape[0]),
                         width=int(base_mask.shape[1]),
-                        fallback_creation_mask=base_mask,
                         processing_device=_processing_device,
+                        strict=True,
                     )
                     mixed_mask = (
                         _composite_mask_stack(merged_stack, processing_device=_processing_device)
                         if int(np.asarray(merged_stack).size) > 0
-                        else base_mask
+                        else np.zeros((int(base_mask.shape[0]), int(base_mask.shape[1])), dtype=np.float32)
                     )
                     terms_rows.append(_all_terms[i])
                     masks.append(np.asarray(mixed_mask, dtype=np.float32))

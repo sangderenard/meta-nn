@@ -403,6 +403,9 @@ class _TransformerStatusOpenGLViewer:
         self._on_restore_state: Optional[Callable] = None
         # Bounding box (x0,y0,x1,y1) in window coords for the restore button.
         self._restore_btn_window_rect: Optional[Tuple[int, int, int, int]] = None
+        # Prev/Next checkpoint navigation button rects (window coords).
+        self._prev_ckpt_btn_rect: Optional[Tuple[int, int, int, int]] = None
+        self._next_ckpt_btn_rect: Optional[Tuple[int, int, int, int]] = None
         # Sparse weight-state snapshots: a small fixed count spread evenly across
         # the full visual cache so there are a couple of real restore points to
         # scrub to without copying enormous state_dicts constantly.
@@ -418,6 +421,12 @@ class _TransformerStatusOpenGLViewer:
         # Loss-count positions recorded at each disk save, for graph markers.
         # Unbounded list: accumulates all markers including pre-existing ones loaded at startup.
         self._disk_save_loss_counts: list = []
+        # Checkpoint thumbnail registry — ordered list of discovered checkpoint
+        # entries beyond the in-memory cache.  Each entry is a dict with keys:
+        #   round_id, cycle, thumb_path (Path or None), loss_counts ({sid:int})
+        # Populated by register_checkpoint_thumbnail() and set_checkpoint_backup_dir().
+        # Sorted oldest→newest (index 0 = oldest checkpoint).
+        self._checkpoint_thumbs: List[Dict[str, Any]] = []
         # Background thread for weight image + state_dict snapshot.
         # Main thread fires it and checks for completion; never blocks.
         self._weight_snap_thread: Optional[threading.Thread] = None
@@ -445,6 +454,11 @@ class _TransformerStatusOpenGLViewer:
         # Cache browse data from SaveRestoreNode.
         self._sr_cache_entries: List[Dict[str, Any]] = []
         self._sr_cache_total: int = 0
+        # Per-channel loss visibility (True = visible). Missing key → visible.
+        self._loss_channel_visible: Dict[int, bool] = {}
+        # Legend hit-boxes for channel toggle clicks: list of (sid, x0, y0, x1, y1)
+        # in *graph-local* pixel coords. Translated to window coords at click time.
+        self._legend_hit_boxes: List[Tuple[int, int, int, int, int]] = []
 
         # Left sidebar: button panel (top) + scrub dial (bottom).
         # Right sidebar: weight map spans from top_bar to window bottom (covers graph row).
@@ -823,6 +837,179 @@ class _TransformerStatusOpenGLViewer:
         except Exception:
             return out
 
+    # ── Checkpoint navigation helpers ──────────────────────────────────────────
+
+    def _scrub_offset_for_checkpoint(self, direction: int) -> Optional[int]:
+        """Find the scrub offset for the next (direction=+1) or previous (-1) checkpoint.
+
+        Checkpoint markers in ``_disk_save_loss_counts`` record per-sid loss-count
+        at each disk save.  The ``_loss_count_at_snap_deque`` records the same per
+        sidebar tick.  We find the tick whose loss-count is closest to a checkpoint
+        marker, then translate that tick index to a scrub offset.
+
+        Returns ``None`` if there is no checkpoint to jump to in that direction.
+        """
+        markers = self._disk_save_loss_counts
+        if not markers:
+            return None
+        snap_list = list(self._loss_count_at_snap_deque)
+        slen = len(snap_list)
+        if slen == 0:
+            return None
+
+        # Identify a reference sid (the one with the most data).
+        ref_sid = max(
+            self._loss_graph_data.keys(),
+            key=lambda s: len(self._loss_graph_data[s]),
+            default=None,
+        )
+        if ref_sid is None:
+            return None
+
+        # Current position in loss-count space.
+        cur_off = int(self._scrub_offset)
+        if cur_off > 0 and cur_off <= slen:
+            cur_idx = slen - cur_off
+            cur_loss_n = int(snap_list[cur_idx].get(ref_sid, 0))
+        else:
+            # Live position = total length
+            cur_loss_n = len(self._loss_graph_data.get(ref_sid, []))
+
+        # Collect unique checkpoint loss-counts and sort them.
+        ckpt_positions: List[int] = []
+        for m in markers:
+            v = m.get(ref_sid)
+            if v is not None:
+                ckpt_positions.append(int(v))
+        if not ckpt_positions:
+            return None
+        ckpt_positions = sorted(set(ckpt_positions))
+
+        # Find target checkpoint loss-count.
+        target_n: Optional[int] = None
+        if direction < 0:  # previous (earlier in time = smaller loss count)
+            for cn in reversed(ckpt_positions):
+                if cn < cur_loss_n - 1:
+                    target_n = cn
+                    break
+        else:  # next (later in time = larger loss count)
+            for cn in ckpt_positions:
+                if cn > cur_loss_n + 1:
+                    target_n = cn
+                    break
+
+        if target_n is None:
+            return None
+
+        # Find the snap index whose loss-count for ref_sid is closest to target_n.
+        best_idx = 0
+        best_dist = abs(int(snap_list[0].get(ref_sid, 0)) - target_n)
+        for i, sc in enumerate(snap_list):
+            d = abs(int(sc.get(ref_sid, 0)) - target_n)
+            if d < best_dist:
+                best_dist = d
+                best_idx = i
+        # Scrub offset: slen - idx  (offset 1 = newest; slen = oldest).
+        return max(1, slen - best_idx)
+
+    # ── Checkpoint thumbnail registry ──────────────────────────────────────────
+
+    def register_checkpoint_thumbnail(
+        self,
+        round_id: int,
+        cycle: int,
+        thumb_path: Optional["Path"] = None,
+        loss_counts: Optional[Dict[int, int]] = None,
+    ) -> None:
+        """Register a checkpoint entry for extended scrub navigation.
+
+        Called at checkpoint-save time (via notify) and at startup when
+        discovering existing checkpoints on disk.  Entries are kept sorted
+        oldest→newest by (round_id, cycle).
+        """
+        entry: Dict[str, Any] = {
+            "round_id": int(round_id),
+            "cycle": int(cycle),
+            "thumb_path": thumb_path,
+            "loss_counts": loss_counts or {},
+        }
+        # Insert in sorted order
+        idx = len(self._checkpoint_thumbs)
+        for i, e in enumerate(self._checkpoint_thumbs):
+            if (e["round_id"], e["cycle"]) > (round_id, cycle):
+                idx = i
+                break
+            if e["round_id"] == round_id and e["cycle"] == cycle:
+                # Update existing entry
+                self._checkpoint_thumbs[i] = entry
+                return
+        self._checkpoint_thumbs.insert(idx, entry)
+
+    def _load_checkpoint_thumbnail(self, ckpt_idx: int) -> Optional[np.ndarray]:
+        """Load a checkpoint thumbnail image and scale to the weight-map panel size.
+
+        Returns an (H, W, 3) uint8 RGB array suitable for the right sidebar,
+        or None if no thumbnail is available.
+        """
+        if ckpt_idx < 0 or ckpt_idx >= len(self._checkpoint_thumbs):
+            return None
+        entry = self._checkpoint_thumbs[ckpt_idx]
+        thumb_path = entry.get("thumb_path")
+        if thumb_path is None or not Path(thumb_path).exists():
+            return self._render_checkpoint_placeholder(entry)
+        try:
+            from PIL import Image
+            img = Image.open(str(thumb_path)).convert("L")
+            # Target size: weight_map panel dimensions
+            H = 2 * self.panel_h + self.graph_h
+            W = self.panel_w
+            img = img.resize((W, W), Image.LANCZOS)  # square, then pad/crop to H
+            grey = np.asarray(img, dtype=np.uint8)
+            # Convert greyscale to RGB (all channels equal)
+            rgb = np.zeros((H, W, 3), dtype=np.uint8)
+            rgb[:, :] = (14, 16, 20)  # dark background
+            # Centre the square thumbnail vertically
+            y0 = max(0, (H - W) // 2)
+            paste_h = min(W, H - y0)
+            rgb[y0:y0 + paste_h, :, 0] = grey[:paste_h]
+            rgb[y0:y0 + paste_h, :, 1] = grey[:paste_h]
+            rgb[y0:y0 + paste_h, :, 2] = grey[:paste_h]
+            # Add label overlay
+            try:
+                from PIL import Image as _PILImg, ImageDraw, ImageFont
+                overlay = _PILImg.fromarray(rgb)
+                draw = ImageDraw.Draw(overlay)
+                font = ImageFont.load_default()
+                r = entry.get("round_id", "?")
+                c = entry.get("cycle", "?")
+                draw.text((4, 4), f"CKPT r{r} c{c}", fill=(200, 170, 40), font=font)
+                draw.text((4, H - 14), "weight snapshot", fill=(120, 120, 140), font=font)
+                rgb = np.asarray(overlay, dtype=np.uint8)
+            except Exception:
+                pass
+            return rgb
+        except Exception:
+            return self._render_checkpoint_placeholder(entry)
+
+    def _render_checkpoint_placeholder(self, entry: Dict[str, Any]) -> np.ndarray:
+        """Render a placeholder when no thumbnail file exists."""
+        H = 2 * self.panel_h + self.graph_h
+        W = self.panel_w
+        rgb = np.full((H, W, 3), (14, 16, 20), dtype=np.uint8)
+        try:
+            from PIL import Image, ImageDraw, ImageFont
+            im = Image.fromarray(rgb)
+            draw = ImageDraw.Draw(im)
+            font = ImageFont.load_default()
+            r = entry.get("round_id", "?")
+            c = entry.get("cycle", "?")
+            draw.text((4, 4), f"CKPT r{r} c{c}", fill=(200, 170, 40), font=font)
+            draw.text((4, 20), "no thumbnail", fill=(80, 80, 100), font=font)
+            rgb = np.asarray(im, dtype=np.uint8)
+        except Exception:
+            pass
+        return rgb
+
     # ── Sidebar public API ─────────────────────────────────────────────────────
 
     def set_queue_refs(self, work_queue: Any) -> None:
@@ -830,11 +1017,42 @@ class _TransformerStatusOpenGLViewer:
         self._preview_work_queue_ref = work_queue
 
     def _history_snap_count(self) -> int:
+        """Total scrub positions: in-memory cache + on-disk checkpoint thumbnails."""
+        cache_len = max(
+            len(self._weight_snapshot_deque),
+            len(self._played_frames_deque),
+            len(self._loss_count_at_snap_deque),
+        )
+        return cache_len + len(self._checkpoint_thumbs)
+
+    def _cache_snap_count(self) -> int:
+        """In-memory cache positions only (without checkpoint thumbnails)."""
         return max(
             len(self._weight_snapshot_deque),
             len(self._played_frames_deque),
             len(self._loss_count_at_snap_deque),
         )
+
+    def _scrub_in_checkpoint_zone(self) -> bool:
+        """True when the current scrub offset is beyond in-memory cache."""
+        return self._scrub_offset > self._cache_snap_count()
+
+    def _checkpoint_index_from_offset(self, offset: int) -> Optional[int]:
+        """Map a scrub offset in the checkpoint zone to a _checkpoint_thumbs index.
+
+        Checkpoint zone offsets start at cache_len + 1.
+        Returns index into _checkpoint_thumbs (newest first) or None.
+        """
+        cache_len = self._cache_snap_count()
+        if offset <= cache_len:
+            return None
+        # ckpt_offset 1 = most-recent checkpoint, N = oldest
+        ckpt_offset = offset - cache_len
+        n = len(self._checkpoint_thumbs)
+        if n == 0 or ckpt_offset > n:
+            return None
+        # _checkpoint_thumbs is sorted oldest→newest, so index for newest-first:
+        return n - ckpt_offset
 
     def _clone_history_frame(self, frame: Optional[dict]) -> Optional[dict]:
         if not isinstance(frame, dict):
@@ -867,6 +1085,9 @@ class _TransformerStatusOpenGLViewer:
         )
 
     def _history_frame_at_offset(self, offset: int) -> Optional[dict]:
+        # If in checkpoint zone, no preview frame is available.
+        if self._scrub_in_checkpoint_zone() and offset > self._cache_snap_count():
+            return None
         history = list(self._played_frames_deque)
         hlen = len(history)
         if hlen <= 0:
@@ -876,6 +1097,10 @@ class _TransformerStatusOpenGLViewer:
         return history[idx]
 
     def _history_weight_map_at_offset(self, offset: int) -> Optional[np.ndarray]:
+        # Check checkpoint zone first
+        ckpt_idx = self._checkpoint_index_from_offset(offset)
+        if ckpt_idx is not None:
+            return self._load_checkpoint_thumbnail(ckpt_idx)
         snaps = list(self._weight_snapshot_deque)
         slen = len(snaps)
         if slen <= 0:
@@ -1123,7 +1348,21 @@ class _TransformerStatusOpenGLViewer:
             y_info = btn_y1 + 6
             total = self._history_snap_count()
             can_restore = callable(self._on_restore_state)
-            if scrubbing:
+            in_ckpt_zone = self._scrub_in_checkpoint_zone()
+            if scrubbing and in_ckpt_zone:
+                ckpt_idx = self._checkpoint_index_from_offset(self._scrub_offset)
+                if ckpt_idx is not None and ckpt_idx < len(self._checkpoint_thumbs):
+                    ent = self._checkpoint_thumbs[ckpt_idx]
+                    draw.text((4, y_info), f"ckpt r{ent['round_id']} c{ent['cycle']}",
+                              fill=(200, 170, 40), font=font)
+                else:
+                    draw.text((4, y_info), f"checkpoint zone ({self._scrub_offset}/{total})",
+                              fill=(200, 170, 40), font=font)
+                draw.text((4, y_info + 12), "wheel \u2191\u2193 to navigate",
+                          fill=(140, 120, 80), font=font)
+                draw.text((4, y_info + 24), "showing weight thumbnail",
+                          fill=(140, 120, 80), font=font)
+            elif scrubbing:
                 draw.text((4, y_info),      f"scrub: -{self._scrub_offset} / {total}",
                           fill=(180, 160, 220), font=font)
                 draw.text((4, y_info + 12), "wheel \u2191\u2193 to navigate",
@@ -1135,8 +1374,47 @@ class _TransformerStatusOpenGLViewer:
                           fill=(80, 100, 80), font=font)
                 draw.text((4, y_info + 12), "wheel \u2191\u2193 to scrub back",
                           fill=(60, 70, 60), font=font)
-            # Loss display below scrub status
-            y_loss = y_info + 40
+
+            # ── Prev / Next checkpoint buttons ────────────────────────────
+            has_ckpts = len(self._disk_save_loss_counts) > 0
+            nav_y0 = y_info + 40
+            nav_h = 18
+            half_w = (W - 24) // 2
+            # PREV button
+            p_x0, p_y0 = 8, nav_y0
+            p_x1, p_y1 = 8 + half_w, nav_y0 + nav_h
+            p_fill    = (50, 40, 80) if has_ckpts else (30, 32, 38)
+            p_outline = (120, 100, 170) if has_ckpts else (50, 54, 62)
+            p_text    = (180, 160, 220) if has_ckpts else (70, 74, 84)
+            draw.rectangle([(p_x0, p_y0), (p_x1, p_y1)], fill=p_fill, outline=p_outline)
+            plbl = "\u25c0 PREV"
+            draw.text((p_x0 + 4, p_y0 + 3), plbl, fill=p_text, font=font)
+            self._prev_ckpt_btn_rect = (
+                p_x0, p_y0 + self.top_bar_h,
+                p_x1, p_y1 + self.top_bar_h,
+            )
+            # NEXT button
+            n_x0, n_y0 = W - 8 - half_w, nav_y0
+            n_x1, n_y1 = W - 8, nav_y0 + nav_h
+            n_fill    = (50, 40, 80) if has_ckpts else (30, 32, 38)
+            n_outline = (120, 100, 170) if has_ckpts else (50, 54, 62)
+            n_text    = (180, 160, 220) if has_ckpts else (70, 74, 84)
+            draw.rectangle([(n_x0, n_y0), (n_x1, n_y1)], fill=n_fill, outline=n_outline)
+            nlbl = "NEXT \u25b6"
+            draw.text((n_x1 - len(nlbl) * 6 - 4, n_y0 + 3), nlbl, fill=n_text, font=font)
+            self._next_ckpt_btn_rect = (
+                n_x0, n_y0 + self.top_bar_h,
+                n_x1, n_y1 + self.top_bar_h,
+            )
+            # Checkpoint count label between buttons
+            n_ckpts = len(self._disk_save_loss_counts)
+            if n_ckpts > 0:
+                ck_lbl = f"{n_ckpts} ckpt{'s' if n_ckpts != 1 else ''}"
+                draw.text(((W - len(ck_lbl) * 6) // 2, nav_y0 + nav_h + 2),
+                          ck_lbl, fill=(130, 120, 160), font=font)
+
+            # Loss display below checkpoint nav
+            y_loss = nav_y0 + nav_h + 16
             if self._loss_display_rows:
                 draw.line([(4, y_loss - 4), (W - 4, y_loss - 4)], fill=(50, 56, 68), width=1)
                 for lr in self._loss_display_rows:
@@ -1174,18 +1452,31 @@ class _TransformerStatusOpenGLViewer:
         total = max(1, self._history_snap_count())
         offset = int(self._scrub_offset)
         fill_frac = float(offset) / float(total)
-        color = (170, 80, 220) if offset > 0 else (60, 80, 110)
+        in_ckpt_zone = self._scrub_in_checkpoint_zone()
+        color = (200, 170, 40) if in_ckpt_zone else (170, 80, 220) if offset > 0 else (60, 80, 110)
         dial = self._render_knob("scrub", fill_frac=fill_frac, color=color)
         try:
             from PIL import Image, ImageDraw, ImageFont
             im = Image.fromarray(dial)
             draw = ImageDraw.Draw(im)
             font = ImageFont.load_default()
-            txt = f"-{offset}" if offset > 0 else "live"
-            draw.text(
-                (self.panel_w // 2 - len(txt) * 3, self.panel_h // 2 - 4),
-                txt, fill=(220, 210, 240), font=font,
-            )
+            if in_ckpt_zone:
+                ckpt_idx = self._checkpoint_index_from_offset(offset)
+                if ckpt_idx is not None and ckpt_idx < len(self._checkpoint_thumbs):
+                    entry = self._checkpoint_thumbs[ckpt_idx]
+                    txt = f"ckpt r{entry['round_id']}"
+                else:
+                    txt = "ckpt"
+                draw.text(
+                    (self.panel_w // 2 - len(txt) * 3, self.panel_h // 2 - 4),
+                    txt, fill=(200, 170, 40), font=font,
+                )
+            else:
+                txt = f"-{offset}" if offset > 0 else "live"
+                draw.text(
+                    (self.panel_w // 2 - len(txt) * 3, self.panel_h // 2 - 4),
+                    txt, fill=(220, 210, 240), font=font,
+                )
             dial = np.asarray(im, dtype=np.uint8)
         except Exception:
             pass
@@ -1622,6 +1913,41 @@ class _TransformerStatusOpenGLViewer:
                                 self._sidebar_dirty = True
                                 self._present(force=True)
                                 continue
+                        # Prev checkpoint button.
+                        if self._prev_ckpt_btn_rect is not None:
+                            bx0, by0, bx1, by1 = self._prev_ckpt_btn_rect
+                            if bx0 <= xi <= bx1 and by0 <= yi <= by1:
+                                new_off = self._scrub_offset_for_checkpoint(-1)
+                                if new_off is not None:
+                                    self._scrub_offset = new_off
+                                    self._sidebar_dirty = True
+                                    self._graph_dirty = True
+                                    self._present(force=True)
+                                continue
+                        # Next checkpoint button.
+                        if self._next_ckpt_btn_rect is not None:
+                            bx0, by0, bx1, by1 = self._next_ckpt_btn_rect
+                            if bx0 <= xi <= bx1 and by0 <= yi <= by1:
+                                new_off = self._scrub_offset_for_checkpoint(+1)
+                                if new_off is not None:
+                                    self._scrub_offset = new_off
+                                    self._sidebar_dirty = True
+                                    self._graph_dirty = True
+                                    self._present(force=True)
+                                continue
+                        # Legend channel-toggle clicks (graph area).
+                        graph_y0 = int(self.top_bar_h + 2 * self.panel_h)
+                        if self._legend_hit_boxes and graph_y0 <= yi < graph_y0 + self.graph_h:
+                            gx = xi
+                            gy = yi - graph_y0
+                            for sid, lx0, ly0, lx1, ly1 in self._legend_hit_boxes:
+                                if lx0 <= gx <= lx1 and ly0 <= gy <= ly1:
+                                    cur = self._loss_channel_visible.get(sid, True)
+                                    self._loss_channel_visible[sid] = not cur
+                                    self._graph_dirty = True
+                                    self._present(force=True)
+                                    break
+                            continue
                         # Top-bar toggle controls.
                         if self._handle_click(xi, yi):
                             self._present(force=True)
@@ -1682,6 +2008,9 @@ class _TransformerStatusOpenGLViewer:
         ``.pt`` files.  The directory's mtime (or the most-recently-modified .pt
         inside it) is used as the wall-clock timestamp.  A gold marker is placed
         on the loss graph at that time via ``notify_checkpoint_at_walltime``.
+
+        Also discovers ``weight_thumb_r*_c*.png`` thumbnails so the extended
+        scrub wheel can show checkpoint weight snapshots.
         """
         p = Path(path)
         if not p.is_dir():
@@ -1696,6 +2025,14 @@ class _TransformerStatusOpenGLViewer:
             # Use the newest .pt mtime in the sub-dir as the checkpoint time.
             t = max(f.stat().st_mtime for f in pts)
             _times.append(t)
+            # Discover weight thumbnails and register for extended scrub.
+            import re as _re
+            for thumb in sub.glob("weight_thumb_r*_c*.png"):
+                m = _re.search(r"weight_thumb_r(\d+)_c(\d+)\.png$", thumb.name)
+                if m:
+                    rid = int(m.group(1))
+                    cid = int(m.group(2))
+                    self.register_checkpoint_thumbnail(rid, cid, thumb_path=str(thumb))
         for t in _times:
             self.notify_checkpoint_at_walltime(t)
 
@@ -1763,6 +2100,12 @@ class _TransformerStatusOpenGLViewer:
         elif t == "notify_checkpoint":
             # Checkpoint marker — record it for the gold marker on the graph.
             self.notify_pipeline_checkpoint_saved()
+            # Register for extended scrub navigation
+            r = int(msg.get("round_id", 0))
+            c = int(msg.get("cycle", 0))
+            tp = msg.get("thumb_path")
+            loss_counts = {sid: len(dq) for sid, dq in self._loss_graph_data.items()}
+            self.register_checkpoint_thumbnail(r, c, thumb_path=tp, loss_counts=loss_counts)
         elif t == "notify_weight_map":
             # Weight map updated — request fresh image on next poll.
             self._sidebar_dirty = True
@@ -1932,7 +2275,9 @@ class _TransformerStatusOpenGLViewer:
 
         # Compute global Y range from visible finite values only
         all_finite: List[float] = []
-        for dq in self._loss_graph_data.values():
+        for sid, dq in self._loss_graph_data.items():
+            if not self._loss_channel_visible.get(sid, True):
+                continue
             n_dq = len(dq)
             i_start = int(_sf * n_dq)
             all_finite.extend(v for v in list(dq)[i_start:] if math.isfinite(v) and v >= 0.0)
@@ -2004,6 +2349,8 @@ class _TransformerStatusOpenGLViewer:
 
         # Plot each series (trimmed to the visible window)
         for sid in sorted(self._loss_graph_data.keys()):
+            if not self._loss_channel_visible.get(sid, True):
+                continue
             dq = self._loss_graph_data[sid]
             if len(dq) == 0:
                 continue
@@ -2094,9 +2441,10 @@ class _TransformerStatusOpenGLViewer:
         except Exception:
             pass
 
-        # Legend (horizontal, top of graph)
+        # Legend (horizontal, top of graph) — clickable channel toggles
         lx = mx0
         _legend_sids = sorted(self._loss_graph_data.keys())
+        _legend_boxes: List[Tuple[int, int, int, int, int]] = []
         # Build reverse map: sid → channel_key for dynamic (100+) channels
         _sid_to_ck: Dict[int, str] = {}
         if hasattr(self, "_sr_sid_map"):
@@ -2104,16 +2452,26 @@ class _TransformerStatusOpenGLViewer:
         for _leg_idx, sid in enumerate(_legend_sids):
             if len(self._loss_graph_data[sid]) == 0:
                 continue
+            vis = self._loss_channel_visible.get(sid, True)
             color = _LOSS_STAGE_COLORS_LEGACY.get(sid, _channel_color(_leg_idx, len(_legend_sids)))
             name = _LOSS_STAGE_NAMES.get(sid, _sid_to_ck.get(sid, f"ch{sid}"))
             dq = self._loss_graph_data[sid]
             last_v = next((v for v in reversed(dq) if math.isfinite(v)), float("nan"))
             label = f"{name}={last_v:.4f}" if math.isfinite(last_v) else name
-            draw.rectangle([(lx, 2), (lx + 7, 9)], fill=color)
-            draw.text((lx + 10, 1), label, fill=color, font=font)
-            lx += max(56, len(label) * 6 + 18)
+            # Dim hidden channels
+            if vis:
+                draw.rectangle([(lx, 2), (lx + 7, 9)], fill=color)
+                draw.text((lx + 10, 1), label, fill=color, font=font)
+            else:
+                dim = tuple(max(30, c // 3) for c in color)
+                draw.rectangle([(lx, 2), (lx + 7, 9)], fill=dim, outline=(60, 60, 60))
+                draw.text((lx + 10, 1), label, fill=dim, font=font)
+            entry_w = max(56, len(label) * 6 + 18)
+            _legend_boxes.append((sid, lx, 0, lx + entry_w, 12))
+            lx += entry_w
             if lx > W - 60:
                 break
+        self._legend_hit_boxes = _legend_boxes
 
         im.paste(loss_im, (0, 0))
 

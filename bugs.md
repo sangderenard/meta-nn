@@ -39,10 +39,10 @@ If evals aren't on their own thread they need the GPU management system; if they
 History graph values need user-adjustable scaling and range.
 
 ### Checkpoints selectable in GUI
-Add next/prev buttons near the scrub wheel for checkpoint navigation.
+~~Add next/prev buttons near the scrub wheel for checkpoint navigation.~~ **DONE** — PREV/NEXT buttons in `_render_btn_panel`, jump scrub offset to nearest checkpoint marker. Click detection in `_poll_events`.
 
 ### Graph display rework
-Current graph rendering on GUI needs redesign.
+Current graph rendering on GUI needs redesign. Per-channel visibility toggles added — click legend entries to show/hide individual loss channels. Hidden channels are dimmed in the legend and excluded from Y-axis scaling.
 
 ### Diagnostic weight image panel
 Figure out the right panel layout to show a diagnostic image of weights as they change over time. Consider whether shipping to the GUI GPU makes sense (different devices?). Showing last checkpoint weights is a reasonable fallback.
