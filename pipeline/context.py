@@ -455,3 +455,46 @@ class PipelineContext:
         ck = _channel_key_for_metric(stage, key)
         if ck is not None:
             self.publish_loss(ck, value_f)
+
+    # ------------------------------------------------------------------
+    # Runtime controls (Pause / Preview / Scrub Editor)
+    # ------------------------------------------------------------------
+
+    def paused(self) -> bool:
+        """True when the GUI has requested a pause (graph should spin-wait)."""
+        proxy = self.viewer_proxy
+        if proxy is None:
+            return False
+        fn = getattr(proxy, "paused", None)
+        if not callable(fn):
+            return False
+        try:
+            return bool(fn())
+        except Exception:
+            return False
+
+    def preview_enabled(self) -> bool:
+        """True when preview image generation is allowed."""
+        proxy = self.viewer_proxy
+        if proxy is None:
+            return True
+        fn = getattr(proxy, "preview_enabled", None)
+        if not callable(fn):
+            return True
+        try:
+            return bool(fn())
+        except Exception:
+            return True
+
+    def scrub_editor_enabled(self) -> bool:
+        """True when the scrub editor (history retention / checkpointing) is on."""
+        proxy = self.viewer_proxy
+        if proxy is None:
+            return True
+        fn = getattr(proxy, "scrub_editor_enabled", None)
+        if not callable(fn):
+            return True
+        try:
+            return bool(fn())
+        except Exception:
+            return True

@@ -398,8 +398,8 @@ class TrainingGraphPlan:
         for edge in self.edges:
             if not edge.enabled:
                 continue
-            if edge.layer == "cycle" or edge.cycle_control:
-                continue  # cycle edges are intentional back-edges; skip DAG check
+            if edge.layer in ("cycle", "runtime_control") or edge.cycle_control:
+                continue  # cycle/runtime-control edges are intentional back-edges; skip DAG check
             in_degree[edge.target_node_id] += 1
             children[edge.source_node_id].append(edge.target_node_id)
 
@@ -450,7 +450,7 @@ class TrainingGraphPlan:
         #    a fallback bypass of a gated sibling. --
         source_edges: Dict[str, List["GraphEdgeRecord"]] = defaultdict(list)
         for edge in self.edges:
-            if edge.enabled and edge.layer != "cycle":
+            if edge.enabled and edge.layer not in ("cycle", "runtime_control"):
                 source_edges[edge.source_node_id].append(edge)
         for src, edges in source_edges.items():
             unconditioned = [e for e in edges if not e.condition_id]
@@ -733,6 +733,8 @@ class RunControlPayload:
     selected_cycle_ids: List[int] = field(default_factory=list)
     selected_node_ids: List[str] = field(default_factory=list)
     gate_override: bool = False
+    preview_enabled: bool = True
+    scrub_editor_enabled: bool = True
     metadata: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
@@ -741,6 +743,8 @@ class RunControlPayload:
             "selected_cycle_ids": [int(x) for x in self.selected_cycle_ids],
             "selected_node_ids": [str(x) for x in self.selected_node_ids],
             "gate_override": bool(self.gate_override),
+            "preview_enabled": bool(self.preview_enabled),
+            "scrub_editor_enabled": bool(self.scrub_editor_enabled),
             "metadata": _jsonable(self.metadata),
         }
 
@@ -751,6 +755,8 @@ class RunControlPayload:
             selected_cycle_ids=[int(x) for x in data.get("selected_cycle_ids", [])],
             selected_node_ids=[str(x) for x in data.get("selected_node_ids", [])],
             gate_override=bool(data.get("gate_override", False)),
+            preview_enabled=bool(data.get("preview_enabled", True)),
+            scrub_editor_enabled=bool(data.get("scrub_editor_enabled", True)),
             metadata=dict(data.get("metadata", {})),
         )
 

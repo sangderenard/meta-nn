@@ -8,6 +8,7 @@ whose preconditions are unmet (gate nodes, conditional stages, etc.).
 from __future__ import annotations
 
 import inspect
+import time
 from abc import ABC, abstractmethod
 from collections import deque
 from dataclasses import dataclass, field
@@ -377,6 +378,8 @@ class PipelineGraph:
         global_in_degree: Dict[str, int] = {nid: 0 for nid in self._nodes}
 
         for edge in self._edges:
+            if str(getattr(edge, "layer", "execution") or "execution") not in ("execution", ""):
+                continue
             successors[edge.source_id].append(edge.target_id)
             global_in_degree[edge.target_id] += 1
 
@@ -401,6 +404,8 @@ class PipelineGraph:
 
         in_degree: Dict[str, int] = {nid: 0 for nid in reachable}
         for edge in self._edges:
+            if str(getattr(edge, "layer", "execution") or "execution") not in ("execution", ""):
+                continue
             if edge.source_id in reachable and edge.target_id in reachable:
                 in_degree[edge.target_id] += 1
 
@@ -517,6 +522,7 @@ class PipelineGraph:
         current_step_id = entry_step_id
         visit_count = 0
         while current_step_id:
+            _wait_while_paused(ctx)
             visit_count += 1
             if max_visits > 0 and visit_count > max_visits:
                 limit_entry = {
@@ -760,6 +766,7 @@ class PipelineGraph:
         step_specs = dict(program_steps or {})
 
         for step_index, node_id in enumerate(sequence, start=1):
+            _wait_while_paused(ctx)
             node = self._nodes.get(node_id)
             step_spec = dict(step_specs.get(node_id, {}) or {})
             program_step_id = str(step_spec.get("step_id", "") or "")
@@ -1006,6 +1013,48 @@ class PipelineGraph:
 
 def _log(msg: str) -> None:
     print(msg, flush=True)
+
+
+def _wait_while_paused(ctx: "PipelineContext") -> None:
+    """Spin-wait while the GUI has the graph paused.
+
+    The context's ``paused()`` predicate proxies through the viewer proxy
+    to the GUI toggle.  While paused we sleep briefly to avoid burning
+    CPU, and re-drain IPC so the GUI can un-pause or stop.
+    """
+    paused_fn = getattr(ctx, "paused", None)
+    if not callable(paused_fn):
+        return
+    stop_fn = getattr(ctx, "stop_requested", None)
+    logged = False
+    while True:
+        try:
+            if not paused_fn():
+                if logged:
+                    _log("[graph] resumed")
+                return
+        except Exception:
+            return
+        if not logged:
+            _log("[graph] paused — waiting for resume")
+            logged = True
+        # Pump IPC so the user can un-pause or stop
+        proxy = getattr(ctx, "viewer_proxy", None)
+        if proxy is not None:
+            pump = getattr(proxy, "pump", None)
+            if callable(pump):
+                try:
+                    pump()
+                except Exception:
+                    pass
+        # Honour stop even while paused
+        if callable(stop_fn):
+            try:
+                if stop_fn():
+                    return
+            except Exception:
+                pass
+        time.sleep(0.1)
 
 
 def _execute_with_residence(node: PipelineNode, ctx: "PipelineContext") -> None:

@@ -2195,6 +2195,8 @@ def _edge_style(layer_id: str, edge: Dict[str, Any]) -> Dict[str, str]:
         return {"stroke": "#8B5CF6", "width": "2px", "opacity": "0.85", "dasharray": "4 2"}
     if str(metadata.get("style_role", "") or "") == "cycle":
         return {"stroke": "#9333EA", "width": "3px", "opacity": "0.90", "dasharray": "10 4"}
+    if str(metadata.get("style_role", "") or "") == "runtime_control":
+        return {"stroke": "#F59E0B", "width": "2px", "opacity": "0.80", "dasharray": "3 2"}
     if layer_id in {"training_mechanics", "training_contracts"}:
         role = str(metadata.get("style_role", "") or "").strip().lower()
         if role == "consume":

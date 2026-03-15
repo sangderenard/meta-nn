@@ -159,7 +159,7 @@ def test_plan_export(graph, node_count):
     _assert(len(decision_steps) > 0, "execution program includes decision steps")
     data_node = next((node for node in plan.nodes if node.node_id == "data_node"), None)
     _assert(data_node is not None, "plan includes data_node record")
-    _assert(data_node.object_type == "object", "data_node object_type exported")
+    _assert(data_node.object_type == "data_hub", "data_node object_type exported")
     _assert(bool(data_node.faculty), "data_node faculty exported")
     _assert(bool(data_node.archetype), "data_node archetype exported")
     gate0_node = next((node for node in plan.nodes if node.node_id == "gate_0_pregestation_eval"), None)
@@ -207,13 +207,19 @@ def test_rebuild_from_plan(plan: TrainingGraphPlan, node_count: int, edge_count:
     rebuilt_graph = build_training_graph_from_plan(plan)
     rebuilt_node_count = len(rebuilt_graph.nodes)
     rebuilt_edge_count = len(rebuilt_graph.edges)
+    # Rebuild only materializes execution-layer edges; count those from the plan.
+    exec_edge_count = sum(
+        1 for e in (plan.edges or [])
+        if bool(getattr(e, "enabled", True))
+        and str(getattr(e, "layer", "execution") or "execution") == "execution"
+    )
     _assert(
         rebuilt_node_count == node_count,
         f"rebuilt graph has {rebuilt_node_count} nodes (expected {node_count})",
     )
     _assert(
-        rebuilt_edge_count == edge_count,
-        f"rebuilt graph has {rebuilt_edge_count} edges (expected {edge_count})",
+        rebuilt_edge_count == exec_edge_count,
+        f"rebuilt graph has {rebuilt_edge_count} edges (expected {exec_edge_count})",
     )
     rebuilt_sequence = rebuilt_graph.build_sequence()
     _assert(

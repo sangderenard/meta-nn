@@ -913,6 +913,10 @@ class SaveRestoreNode(PipelineNode):
             self._execute_restore(ctx)
             return
 
+        # Scrub editor off → skip all checkpoint storage
+        if not ctx.scrub_editor_enabled():
+            return
+
         # Normal save path
         self._execute_save(ctx)
 

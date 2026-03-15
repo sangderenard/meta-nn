@@ -547,6 +547,8 @@ def _apply_execution_layer_metadata(graph: PipelineGraph) -> None:
         return
 
     for edge in raw_edges:
+        if str(getattr(edge, "layer", "execution") or "execution") not in ("execution", ""):
+            continue
         edge.layer = "execution"
         edge.metadata = dict(getattr(edge, "metadata", {}) or {})
         edge.metadata.setdefault("execution_layer", True)
@@ -739,6 +741,9 @@ def build_training_graph_plan(args, output_dir: Path, *, graph: Optional[Pipelin
         "capabilities": [
             "plan_apply",    # worker applies graph swaps between cycles
             "run_control",   # worker honours stop/resume/gate_override
+            "pause",         # worker honours pause/play toggle
+            "preview_toggle",  # worker honours preview on/off
+            "scrub_editor_toggle",  # worker honours scrub editor on/off
         ],
     }
     metadata = {
@@ -880,7 +885,7 @@ def _condition_for_plan_edge(condition_id: str, *, condition_blobs: dict | None 
             return evaluate_condition_expr(_e, ctx)
         return _blob_expr_condition
 
-    predicate_name = str(blob.get("callable_ref", "") or "").rsplit(".", 1)[-1].strip()
+    predicate_name = str(blob.get("callable_ref", "") or blob.get("callable", "") or "").rsplit(".", 1)[-1].strip()
     if predicate_name:
         def _plan_condition(ctx, _name=predicate_name):
             fn = getattr(ctx, _name, None)
@@ -1035,6 +1040,7 @@ def build_training_graph_from_plan(plan) -> PipelineGraph:
             condition=_condition_for_plan_edge(
                 str(getattr(edge_record, "condition_id", "") or ""),
                 condition_blobs=condition_blobs,
+                condition_expr=str(getattr(edge_record, "condition_expr", "") or ""),
             ),
             label=_plan_edge_label(edge_record),
             condition_id=str(getattr(edge_record, "condition_id", "") or ""),
@@ -1507,6 +1513,13 @@ def build_pipeline_graph(
     g.add_edge("sync_gate_replica", "checkpoint_save", label="end_of_round")
     g.add_edge("checkpoint_save", "viewer_ipc", label="end_of_round")
 
+    # Runtime control edges — viewer_ipc broadcasts pause/preview/scrub
+    # state back into nodes that honour those toggles.
+    g.add_edge("viewer_ipc", "checkpoint_save",
+               label="scrub_editor",
+               layer="runtime_control",
+               metadata={"style_role": "runtime_control"})
+
     _apply_execution_layer_metadata(g)
     return g
 
@@ -1799,6 +1812,10 @@ def run(args, output_dir: Path, initial_plan=None) -> None:
             break
         cycle_idx = ctx.cycle
         round_idx = ctx.round_id
+
+        # Honour GUI pause toggle — spin-wait until un-paused.
+        from pipeline.graph import _wait_while_paused
+        _wait_while_paused(ctx)
 
         if ctx.stop_requested():
             save_on_stop = ctx.shutdown_save()

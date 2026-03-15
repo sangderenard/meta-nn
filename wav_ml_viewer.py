@@ -347,6 +347,9 @@ class _TransformerStatusOpenGLViewer:
 
         self._cycle_selected: List[bool] = []
         self._gate_override = False
+        self._paused = False
+        self._preview_enabled = True
+        self._scrub_editor_enabled = True
         self._control_boxes: List[Tuple[str, int, Tuple[int, int, int, int]]] = []
         self._graph_worker_hello: Dict[str, Any] = {}
         self._graph_plan_snapshot: Optional[Dict[str, Any]] = None
@@ -806,9 +809,70 @@ class _TransformerStatusOpenGLViewer:
 
             active = self.selected_cycle_ids()
             active_txt = ",".join(str(i) for i in active) if len(active) > 0 else "none"
+
+            # -- Runtime control toggles (second row, below cycle checkboxes) --
+            toggle_y = self.top_bar_h - 28
+            tx = 6
+
+            # Pause/Play toggle
+            pause_on = bool(self._paused)
+            pause_box = (tx, toggle_y, tx + 11, toggle_y + 11)
+            pause_fill = (180, 140, 40) if pause_on else (36, 40, 44)
+            draw.rectangle([pause_box[0], pause_box[1], pause_box[2], pause_box[3]],
+                           outline=(186, 194, 204), fill=pause_fill)
+            if pause_on:
+                draw.rectangle([(pause_box[0] + 3, pause_box[1] + 2), (pause_box[0] + 4, pause_box[1] + 9)], fill=(236, 244, 248))
+                draw.rectangle([(pause_box[0] + 6, pause_box[1] + 2), (pause_box[0] + 7, pause_box[1] + 9)], fill=(236, 244, 248))
+            else:
+                draw.polygon([(pause_box[0] + 3, pause_box[1] + 2), (pause_box[0] + 3, pause_box[1] + 9), (pause_box[0] + 9, pause_box[1] + 5)], fill=(80, 200, 80))
+            pause_label = "PAUSED" if pause_on else "PLAY"
+            draw.text((tx + 15, toggle_y - 1), pause_label, fill=(230, 220, 140) if pause_on else (140, 200, 140), font=font)
+            self._control_boxes.append(("pause", -1, pause_box))
+            tx += 15 + len(pause_label) * 7 + 8
+
+            # Preview On/Off toggle
+            preview_on = bool(self._preview_enabled)
+            preview_box = (tx, toggle_y, tx + 11, toggle_y + 11)
+            preview_fill = (52, 120, 66) if preview_on else (120, 36, 36)
+            draw.rectangle([preview_box[0], preview_box[1], preview_box[2], preview_box[3]],
+                           outline=(186, 194, 204), fill=preview_fill)
+            if preview_on:
+                draw.line([(preview_box[0] + 2, preview_box[1] + 6), (preview_box[0] + 5, preview_box[1] + 9)], fill=(236, 244, 248), width=1)
+                draw.line([(preview_box[0] + 5, preview_box[1] + 9), (preview_box[0] + 9, preview_box[1] + 2)], fill=(236, 244, 248), width=1)
+            preview_label = "Preview"
+            draw.text((tx + 15, toggle_y - 1), preview_label,
+                      fill=(140, 200, 140) if preview_on else (200, 120, 120), font=font)
+            self._control_boxes.append(("preview", -1, preview_box))
+            tx += 15 + len(preview_label) * 7 + 8
+
+            # Scrub Editor On/Off toggle
+            scrub_on = bool(self._scrub_editor_enabled)
+            scrub_available = bool(self._preview_enabled)
+            scrub_box = (tx, toggle_y, tx + 11, toggle_y + 11)
+            if not scrub_available:
+                scrub_fill = (60, 60, 60)
+            elif scrub_on:
+                scrub_fill = (52, 120, 66)
+            else:
+                scrub_fill = (120, 36, 36)
+            draw.rectangle([scrub_box[0], scrub_box[1], scrub_box[2], scrub_box[3]],
+                           outline=(100, 100, 100) if not scrub_available else (186, 194, 204),
+                           fill=scrub_fill)
+            if scrub_on and scrub_available:
+                draw.line([(scrub_box[0] + 2, scrub_box[1] + 6), (scrub_box[0] + 5, scrub_box[1] + 9)], fill=(236, 244, 248), width=1)
+                draw.line([(scrub_box[0] + 5, scrub_box[1] + 9), (scrub_box[0] + 9, scrub_box[1] + 2)], fill=(236, 244, 248), width=1)
+            scrub_label = "Scrub Editor"
+            draw.text((tx + 15, toggle_y - 1), scrub_label,
+                      fill=(80, 80, 80) if not scrub_available else ((140, 200, 140) if scrub_on else (200, 120, 120)),
+                      font=font)
+            self._control_boxes.append(("scrub_editor", -1, scrub_box))
+
             draw.text(
                 (6, self.top_bar_h - 14),
-                f"cycles={active_txt} gate_override={1 if self._gate_override else 0}",
+                f"cycles={active_txt} gate_override={1 if self._gate_override else 0}"
+                f" preview={'on' if self._preview_enabled else 'off'}"
+                f" scrub={'on' if self._scrub_editor_enabled else 'off'}"
+                f"{' PAUSED' if self._paused else ''}",
                 fill=(180, 188, 198),
                 font=font,
             )
@@ -1855,6 +1919,25 @@ class _TransformerStatusOpenGLViewer:
                     self._gate_override = not bool(self._gate_override)
                     self._top_bar_dirty = True
                     return True
+                elif kind == "pause":
+                    self._paused = not bool(self._paused)
+                    self._top_bar_dirty = True
+                    return True
+                elif kind == "preview":
+                    self._preview_enabled = not bool(self._preview_enabled)
+                    # Turning preview off auto-disables scrub editor
+                    if not self._preview_enabled:
+                        self._scrub_editor_enabled = False
+                    self._top_bar_dirty = True
+                    return True
+                elif kind == "scrub_editor":
+                    # Scrub editor requires preview to be on
+                    if not self._preview_enabled:
+                        pass  # can't enable scrub editor without preview
+                    else:
+                        self._scrub_editor_enabled = not bool(self._scrub_editor_enabled)
+                    self._top_bar_dirty = True
+                    return True
                 elif kind == "stop_save":
                     self._shutdown_save = True
                     self._top_bar_dirty = True
@@ -1882,6 +1965,8 @@ class _TransformerStatusOpenGLViewer:
                     return
                 # Mouse-wheel: scrub weight / preview history.
                 if event.type == self._pygame.MOUSEWHEEL:
+                    if not self._scrub_editor_enabled:
+                        continue
                     delta = int(getattr(event, "y", 0))
                     _snap_len = self._history_snap_count()
                     if _snap_len > 0:
@@ -2760,17 +2845,26 @@ class ViewerIPCServer:
                 self._viewer.stop_requested()
                 or self._viewer.shutdown_save() is not None
             )
+            is_paused = bool(self._viewer._paused)
+            is_preview = bool(self._viewer._preview_enabled)
+            is_scrub_editor = bool(self._viewer._scrub_editor_enabled)
             status = {
                 "type": "status",
                 "stop_requested": is_stopping,
+                "paused": is_paused,
                 "gate_override": self._viewer.gate_override_enabled(),
+                "preview_enabled": is_preview,
+                "scrub_editor_enabled": is_scrub_editor,
                 "cycle_selected": list(self._viewer._cycle_selected),
             }
             conn.send(status)
+            cmd = "stop" if bool(status["stop_requested"]) else ("pause" if is_paused else "resume")
             run_control = RunControlPayload(
-                command="stop" if bool(status["stop_requested"]) else "resume",
+                command=cmd,
                 selected_cycle_ids=self._viewer.selected_cycle_ids(),
                 gate_override=bool(status["gate_override"]),
+                preview_enabled=is_preview,
+                scrub_editor_enabled=is_scrub_editor,
                 metadata={
                     "source": "viewer_ipc_status_loop",
                     "save": self._viewer.shutdown_save(),
@@ -2936,6 +3030,9 @@ class ViewerIPCProxy:
         self._stop_flag = False
         self._shutdown_save: Optional[bool] = None
         self._gate_override = False
+        self._paused = False
+        self._preview_enabled = True
+        self._scrub_editor_enabled = True
         self._cycle_selected: List[bool] = [True] * max(0, cycle_slots)
         self._last_run_control = RunControlPayload(
             command="resume",
@@ -3035,7 +3132,10 @@ class ViewerIPCProxy:
                     if envelope.message_type == MESSAGE_TYPE_RUN_CONTROL:
                         self._last_run_control = payload
                         self._stop_flag = str(payload.command).lower() == "stop"
+                        self._paused = str(payload.command).lower() == "pause"
                         self._gate_override = bool(payload.gate_override)
+                        self._preview_enabled = bool(getattr(payload, "preview_enabled", True))
+                        self._scrub_editor_enabled = bool(getattr(payload, "scrub_editor_enabled", True))
                         # Extract save preference from metadata
                         meta = getattr(payload, "metadata", {}) or {}
                         if self._stop_flag and "save" in meta:
@@ -3056,13 +3156,18 @@ class ViewerIPCProxy:
                 if t == "status":
                     self._stop_flag = msg.get("stop_requested", False)
                     self._gate_override = msg.get("gate_override", False)
+                    self._paused = msg.get("paused", False)
+                    self._preview_enabled = msg.get("preview_enabled", True)
+                    self._scrub_editor_enabled = msg.get("scrub_editor_enabled", True)
                     cs = msg.get("cycle_selected")
                     if cs is not None:
                         self._cycle_selected = list(cs)
                     self._last_run_control = RunControlPayload(
-                        command="stop" if bool(self._stop_flag) else "resume",
+                        command="stop" if bool(self._stop_flag) else ("pause" if bool(self._paused) else "resume"),
                         selected_cycle_ids=self.selected_cycle_ids(),
                         gate_override=bool(self._gate_override),
+                        preview_enabled=bool(self._preview_enabled),
+                        scrub_editor_enabled=bool(self._scrub_editor_enabled),
                         metadata={"source": "legacy_status"},
                     )
                 elif t == "restore":
@@ -3125,6 +3230,8 @@ class ViewerIPCProxy:
 
     def enqueue_frame(self, frame_dict: dict):
         """Push images to scrub ring if present, send text metadata via IPC."""
+        if not self.preview_enabled():
+            return
         images = frame_dict.get("images")
         ring = self._scrub_ring
         if (images is not None and isinstance(images, list) and len(images) >= 3
@@ -3228,6 +3335,18 @@ class ViewerIPCProxy:
 
     def gate_override_enabled(self) -> bool:
         return self._gate_override
+
+    def paused(self) -> bool:
+        self._drain_status()
+        return self._paused
+
+    def preview_enabled(self) -> bool:
+        self._drain_status()
+        return self._preview_enabled
+
+    def scrub_editor_enabled(self) -> bool:
+        self._drain_status()
+        return self._scrub_editor_enabled
 
     def selected_cycle_ids(self) -> List[int]:
         return [int(i + 1) for i, v in enumerate(self._cycle_selected) if bool(v)]

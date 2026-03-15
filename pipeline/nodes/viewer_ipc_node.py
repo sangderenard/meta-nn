@@ -161,3 +161,17 @@ class ViewerIPCNode(PipelineNode):
         send = getattr(proxy, "send_notification", None)
         if callable(send):
             send(sr.make_checkpoint_notification(round_id, cycle))
+
+    # -- Runtime control accessors (edge faculty) -------------------------
+
+    def paused(self) -> bool:
+        fn = getattr(self._viewer_proxy, "paused", None)
+        return bool(fn()) if callable(fn) else False
+
+    def preview_enabled(self) -> bool:
+        fn = getattr(self._viewer_proxy, "preview_enabled", None)
+        return bool(fn()) if callable(fn) else True
+
+    def scrub_editor_enabled(self) -> bool:
+        fn = getattr(self._viewer_proxy, "scrub_editor_enabled", None)
+        return bool(fn()) if callable(fn) else True

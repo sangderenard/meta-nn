@@ -218,6 +218,10 @@ def make_classifier_step_preview_callback(ctx: Any, node_id: str):
         return None
 
     def _callback(payload_batch: Sequence[Dict[str, Any]]) -> None:
+        # Skip all preview work when preview is disabled at runtime.
+        preview_check = getattr(ctx, "preview_enabled", None)
+        if callable(preview_check) and not preview_check():
+            return
         class_names = list(getattr(ctx, "class_names", []) or [])
         eff_loss, frames = build_classifier_preview_frames(
             payload_batch,
