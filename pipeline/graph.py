@@ -1057,6 +1057,44 @@ def _wait_while_paused(ctx: "PipelineContext") -> None:
         time.sleep(0.1)
 
 
+def _publish_active_weight_map(node: PipelineNode, ctx: "PipelineContext") -> None:
+    model_names = list(getattr(node, "gpu_models", []) or [])
+    if not model_names:
+        return
+    save_restore = getattr(ctx, "save_restore_node", None)
+    if save_restore is None:
+        return
+
+    primary_name = ""
+    primary_model = None
+    for model_name in model_names:
+        candidate = getattr(ctx, str(model_name), None)
+        if candidate is not None and hasattr(candidate, "named_parameters"):
+            primary_name = str(model_name)
+            primary_model = candidate
+            break
+    if not primary_name or primary_model is None:
+        return
+
+    notification = None
+    update_fn = getattr(save_restore, "update_runtime_weight_map", None)
+    if callable(update_fn):
+        try:
+            notification = update_fn(primary_name, primary_model)
+        except Exception:
+            notification = None
+
+    viewer = getattr(ctx, "viewer_proxy", None)
+    if notification is None or viewer is None:
+        return
+    send = getattr(viewer, "send_notification", None)
+    if callable(send):
+        try:
+            send(notification)
+        except Exception:
+            pass
+
+
 def _execute_with_residence(node: PipelineNode, ctx: "PipelineContext") -> None:
     """Execute *node* with GPU residence management when available.
 
@@ -1068,6 +1106,7 @@ def _execute_with_residence(node: PipelineNode, ctx: "PipelineContext") -> None:
     model_names = node.gpu_models
     if mgr is None or not getattr(mgr, "enabled", False) or not model_names:
         node.execute(ctx)
+        _publish_active_weight_map(node, ctx)
         return
 
     device = ctx.device or __import__("torch").device("cpu")
@@ -1084,6 +1123,7 @@ def _execute_with_residence(node: PipelineNode, ctx: "PipelineContext") -> None:
     mgr.require_many(models, device)
     try:
         node.execute(ctx)
+        _publish_active_weight_map(node, ctx)
     finally:
         mgr.release_many([name for _, name in models])
 

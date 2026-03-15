@@ -43,7 +43,14 @@ import torch.nn as nn
 
 from pipeline.context import PipelineContext
 from pipeline.graph import PipelineNode
+from pipeline.nodus_loss_store import SCRUB_NUM_THUMBS, SCRUB_THUMB_H, SCRUB_THUMB_W
 from pipeline.nodes.base import _save_pipeline_checkpoint
+from pipeline.weight_map import (
+    annotate_weight_map,
+    render_weight_image,
+    snapshot_model_parameter_state,
+    snapshot_parameter_state_from_state_dict,
+)
 
 
 def _log(msg: str) -> None:
@@ -81,6 +88,57 @@ NOTIFY_NEW_LOSS = "notify_new_loss"
 NOTIFY_NEW_RESULT = "notify_new_result"
 NOTIFY_CHECKPOINT = "notify_checkpoint"
 NOTIFY_WEIGHT_MAP = "notify_weight_map"
+
+
+# Weight thumbnails are rendered as compact active-model diagnostics for the
+# viewer right panel, so they use a fixed square footprint by default.
+_WEIGHT_THUMB_SIDE = max(8, int(os.getenv("WEIGHT_THUMB_SIDE", "256")))
+_WEIGHT_THUMB_PNG_COMPRESS_LEVEL = max(
+    0, min(9, int(os.getenv("WEIGHT_THUMB_PNG_COMPRESS_LEVEL", "0")))
+)
+_WEIGHT_LIVE_TILE_STACK_H = SCRUB_THUMB_H * SCRUB_NUM_THUMBS
+
+
+def _resize_rgb_nearest(rgb: np.ndarray, size_hw: Tuple[int, int]) -> np.ndarray:
+    out_h = max(1, int(size_hw[0]))
+    out_w = max(1, int(size_hw[1]))
+    try:
+        from PIL import Image
+
+        img = Image.fromarray(np.asarray(rgb, dtype=np.uint8), mode="RGB")
+        return np.asarray(img.resize((out_w, out_h), Image.NEAREST), dtype=np.uint8)
+    except Exception:
+        src = np.asarray(rgb, dtype=np.uint8)
+        y_idx = np.floor(np.linspace(0, max(0, src.shape[0] - 1), out_h)).astype(np.int64)
+        x_idx = np.floor(np.linspace(0, max(0, src.shape[1] - 1), out_w)).astype(np.int64)
+        return src[y_idx][:, x_idx]
+
+
+def _weight_thumb_tiles_from_rgb(rgb: np.ndarray) -> Tuple[np.ndarray, ...]:
+    src = np.ascontiguousarray(np.asarray(rgb, dtype=np.uint8))
+    if src.ndim != 3 or src.shape[2] != 3:
+        raise ValueError("weight thumb source must be an RGB image")
+
+    scale = min(
+        float(SCRUB_THUMB_W) / float(max(1, src.shape[1])),
+        float(_WEIGHT_LIVE_TILE_STACK_H) / float(max(1, src.shape[0])),
+    )
+    scaled_w = max(1, int(round(float(src.shape[1]) * scale)))
+    scaled_h = max(1, int(round(float(src.shape[0]) * scale)))
+    scaled = _resize_rgb_nearest(src, (scaled_h, scaled_w))
+
+    canvas = np.full(
+        (_WEIGHT_LIVE_TILE_STACK_H, SCRUB_THUMB_W, 3),
+        (14, 16, 20),
+        dtype=np.uint8,
+    )
+    y0 = max(0, (_WEIGHT_LIVE_TILE_STACK_H - scaled_h) // 2)
+    x0 = max(0, (SCRUB_THUMB_W - scaled_w) // 2)
+    canvas[y0 : y0 + scaled_h, x0 : x0 + scaled_w] = scaled
+    return tuple(
+        np.ascontiguousarray(canvas[idx * SCRUB_THUMB_H : (idx + 1) * SCRUB_THUMB_H].copy())
+        for idx in range(SCRUB_NUM_THUMBS)
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -649,28 +707,31 @@ class WeightTracker:
     thread.
     """
 
-    def __init__(self, image_hw: Tuple[int, int] = (128, 128)) -> None:
+    def __init__(self, image_hw: Tuple[int, int] = (256, 256)) -> None:
         self._lock = threading.Lock()
         self._image_h, self._image_w = max(8, int(image_hw[0])), max(8, int(image_hw[1]))
-        # Per-model storage: model_name → {base: flat_tensor, latest: flat_tensor}
-        self._models: Dict[str, Dict[str, torch.Tensor]] = {}
+        # Per-model storage: model_name → {parameter_keys, base, latest, live_tiles}
+        self._models: Dict[str, Dict[str, Any]] = {}
         self._active_model: Optional[str] = None
 
     def register_base(self, model_name: str, model: nn.Module) -> None:
         """Capture base (initial) weights for a model.  Called once at init."""
-        flat = self._flatten_params(model)
+        parameter_keys, base_state = snapshot_model_parameter_state(model)
         with self._lock:
             entry = self._models.setdefault(model_name, {})
-            entry["base"] = flat
+            entry["parameter_keys"] = list(parameter_keys)
+            entry["base"] = dict(base_state)
             if self._active_model is None:
                 self._active_model = model_name
 
     def capture(self, model_name: str, model: nn.Module) -> None:
         """Capture the current weight state (detached, CPU)."""
-        flat = self._flatten_params(model)
+        parameter_keys, latest_state = snapshot_model_parameter_state(model)
         with self._lock:
             entry = self._models.setdefault(model_name, {})
-            entry["latest"] = flat
+            if parameter_keys:
+                entry["parameter_keys"] = list(parameter_keys)
+            entry["latest"] = dict(latest_state)
 
     def set_active(self, model_name: str) -> None:
         with self._lock:
@@ -680,49 +741,77 @@ class WeightTracker:
         with self._lock:
             return list(self._models.keys())
 
-    def render_weight_map_rgb(self, model_name: Optional[str] = None) -> Optional[np.ndarray]:
-        """Render an (H, W, 3) uint8 RGB image of |current − base| for the named model.
+    def active_model(self) -> Optional[str]:
+        with self._lock:
+            return self._active_model
 
-        Returns None if base or latest is not yet captured.
-        The delta magnitude is normalised to [0,255] and mapped to a heat
-        palette (blue → red → yellow).
-        """
+    def base_state(self, model_name: str) -> Optional[Dict[str, torch.Tensor]]:
+        with self._lock:
+            entry = self._models.get(str(model_name), {})
+            base = entry.get("base")
+            return dict(base) if isinstance(base, dict) else None
+
+    def refresh_live_tiles(self, model_name: Optional[str] = None) -> Optional[Tuple[np.ndarray, ...]]:
         with self._lock:
             name = model_name or self._active_model
             if name is None or name not in self._models:
                 return None
             entry = self._models[name]
+            parameter_keys = list(entry.get("parameter_keys", []) or [])
             base = entry.get("base")
             latest = entry.get("latest")
-        if base is None or latest is None:
+        if not isinstance(latest, dict):
             return None
-        n = min(len(base), len(latest))
-        if n == 0:
+        rgb, _meta = render_weight_image(
+            latest,
+            parameter_keys=parameter_keys,
+            reference_state=base if isinstance(base, dict) else None,
+            target_width=SCRUB_THUMB_W,
+            target_height=SCRUB_THUMB_H,
+        )
+        tiles = _weight_thumb_tiles_from_rgb(rgb)
+        with self._lock:
+            entry = self._models.setdefault(str(name), {})
+            entry["live_tiles"] = tuple(np.ascontiguousarray(tile.copy()) for tile in tiles)
+        return tiles
+
+    def live_thumb_tiles(self, model_name: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            name = model_name or self._active_model
+            if name is None or name not in self._models:
+                return None
+            tiles = self._models[name].get("live_tiles")
+            if not isinstance(tiles, tuple) or len(tiles) != SCRUB_NUM_THUMBS:
+                return None
+            return {
+                "model": str(name),
+                "tiles": tuple(np.ascontiguousarray(np.asarray(tile, dtype=np.uint8)).copy() for tile in tiles),
+            }
+
+    def render_weight_map_rgb(self, model_name: Optional[str] = None) -> Optional[np.ndarray]:
+        """Render an architectural-tall active-model map for the named model."""
+        with self._lock:
+            name = model_name or self._active_model
+            if name is None or name not in self._models:
+                return None
+            entry = self._models[name]
+            parameter_keys = list(entry.get("parameter_keys", []) or [])
+            base = entry.get("base")
+            latest = entry.get("latest")
+        if not isinstance(latest, dict):
             return None
-        delta = (latest[:n] - base[:n]).abs()
-        # Normalise to [0, 1]
-        dmax = delta.max().item()
-        if dmax < 1e-12:
-            normed = torch.zeros(n)
-        else:
-            normed = delta / dmax
-        # Reshape to (H, W) by padding/truncating and wrapping
-        total_px = self._image_h * self._image_w
-        if n < total_px:
-            padded = torch.zeros(total_px)
-            padded[:n] = normed
-        else:
-            padded = normed[:total_px]
-        grid = padded.reshape(self._image_h, self._image_w).numpy()
-        # Heat palette: 0 → dark blue, 0.5 → red, 1.0 → yellow
-        rgb = np.zeros((self._image_h, self._image_w, 3), dtype=np.uint8)
-        r = np.clip(grid * 2.0, 0.0, 1.0)
-        g = np.clip(grid * 2.0 - 1.0, 0.0, 1.0)
-        b = np.clip(1.0 - grid * 2.0, 0.0, 1.0)
-        rgb[:, :, 0] = (r * 255).astype(np.uint8)
-        rgb[:, :, 1] = (g * 255).astype(np.uint8)
-        rgb[:, :, 2] = (b * 255).astype(np.uint8)
-        return rgb
+        rgb, meta = render_weight_image(
+            latest,
+            parameter_keys=parameter_keys,
+            reference_state=base if isinstance(base, dict) else None,
+            target_width=self._image_w,
+            target_height=self._image_h,
+        )
+        return annotate_weight_map(
+            rgb,
+            title=str(name),
+            subtitle="",
+        )
 
     def render_serialisable(self, model_name: Optional[str] = None) -> Optional[Dict[str, Any]]:
         """Return the weight map as a serialisable dict for IPC transfer."""
@@ -735,16 +824,6 @@ class WeightTracker:
             "width": rgb.shape[1],
             "rgb": rgb.tolist(),
         }
-
-    @staticmethod
-    def _flatten_params(model: nn.Module) -> torch.Tensor:
-        """Flatten all model parameters into a single detached CPU tensor."""
-        parts = []
-        for p in model.parameters():
-            parts.append(p.detach().cpu().float().reshape(-1))
-        if not parts:
-            return torch.zeros(0)
-        return torch.cat(parts)
 
 
 # ---------------------------------------------------------------------------
@@ -961,6 +1040,7 @@ class SaveRestoreNode(PipelineNode):
             "wave": ctx.gate_wave.passed,
         }
         if ctx.metrics_history:
+            payload["metrics_history"] = list(ctx.metrics_history)
             payload["orchestration_history"] = list(ctx.metrics_history)
         # Lora state
         if ctx.lora_slot_snapshots:
@@ -975,9 +1055,45 @@ class SaveRestoreNode(PipelineNode):
             "discriminator": ctx.discriminator,
             "wave_classifier": ctx.wave_classifier,
         }
+        _optimizers = {
+            "classifier": ctx.classifier_optimizer,
+            "transformer": ctx.transformer_optimizer,
+            "generator": ctx.generator_optimizer,
+            "discriminator": ctx.discriminator_optimizer,
+            "wave_classifier": ctx.wave_classifier_optimizer,
+        }
+        _lr_controllers = {
+            "classifier": ctx.classifier_lr_controller,
+            "transformer": ctx.transformer_lr_controller,
+        }
+        _grad_scalers = {
+            "classifier": ctx.classifier_grad_scaler,
+            "transformer": ctx.transformer_grad_scaler,
+            "generator": ctx.generator_grad_scaler,
+            "discriminator": ctx.discriminator_grad_scaler,
+            "wave_classifier": ctx.wave_classifier_grad_scaler,
+        }
         for name, model in _models.items():
             if model is not None:
                 payload[f"{name}_state"] = model.state_dict()
+        for name, optimizer in _optimizers.items():
+            if optimizer is not None:
+                try:
+                    payload[f"{name}_optimizer_state"] = optimizer.state_dict()
+                except Exception:
+                    pass
+        for name, controller in _lr_controllers.items():
+            if controller is not None and hasattr(controller, "state_dict"):
+                try:
+                    payload[f"{name}_lr_controller_state"] = controller.state_dict()
+                except Exception:
+                    pass
+        for name, scaler in _grad_scalers.items():
+            if scaler is not None and hasattr(scaler, "state_dict"):
+                try:
+                    payload[f"{name}_grad_scaler_state"] = scaler.state_dict()
+                except Exception:
+                    pass
         if snapshot_lora is not None:
             payload["classifier_lora"] = snapshot_lora
 
@@ -995,8 +1111,14 @@ class SaveRestoreNode(PipelineNode):
                     out_dir / f"{name}.pt",
                 )
 
-        # 3b. Save greyscale weight thumbnail for GUI scrub preview
-        self._save_weight_thumbnail(out_dir, _models, ctx.round_id, ctx.cycle)
+        # 3b. Save the active-model node thumbnail that matches the saved checkpoint payload.
+        thumb_info = self._save_weight_thumbnail(
+            out_dir,
+            _models,
+            payload=payload,
+            round_id=ctx.round_id,
+            cycle=ctx.cycle,
+        )
 
         # 4. Save seed bank
         if self.seed_bank is not None:
@@ -1008,10 +1130,15 @@ class SaveRestoreNode(PipelineNode):
             self.training_cache.clear_before_checkpoint()
 
         # 6. Notify viewer (lightweight notification only — GUI pulls details)
-        thumb_path = out_dir / f"weight_thumb_r{ctx.round_id:06d}_c{ctx.cycle:04d}.png"
         viewer = ctx.viewer_proxy
         if viewer is not None:
-            notification = self.make_checkpoint_notification(ctx.round_id, ctx.cycle, thumb_path=thumb_path)
+            notification = self.make_checkpoint_notification(
+                ctx.round_id,
+                ctx.cycle,
+                thumb_path=(thumb_info or {}).get("path"),
+                thumb_model=(thumb_info or {}).get("model"),
+                checkpoint_path=(out_dir / "pipeline_checkpoint.pt"),
+            )
             send_fn = getattr(viewer, "_send", None)
             if callable(send_fn):
                 try:
@@ -1033,53 +1160,126 @@ class SaveRestoreNode(PipelineNode):
         self,
         out_dir: Path,
         models: Dict[str, Any],
+        *,
+        payload: Dict[str, Any],
         round_id: int,
         cycle: int,
-    ) -> None:
-        """Render a greyscale weight thumbnail and save as .png next to checkpoint.
-
-        All model parameters are concatenated into a single flat vector,
-        reshaped into a square, normalised to [0, 255], and saved as a
-        single-channel greyscale PNG.  The file is named
-        ``weight_thumb_r{round}_c{cycle}.png``.
-        """
+    ) -> Optional[Dict[str, Any]]:
+        """Render and save a 256px active-model architectural thumbnail for the viewer."""
         try:
-            parts: list = []
-            for name in sorted(models.keys()):
-                model = models[name]
-                if model is None:
-                    continue
-                for p in model.parameters():
-                    parts.append(p.detach().cpu().float().reshape(-1))
-            if not parts:
-                return
-            flat = torch.cat(parts)
-            n = len(flat)
-            if n == 0:
-                return
-            sq = int(math.ceil(math.sqrt(n)))
-            padded = torch.zeros(sq * sq)
-            padded[:n] = flat
-            grid = padded.reshape(sq, sq)
-            # Normalise to [0, 255] by mapping the full value range
-            gmin = grid.min().item()
-            gmax = grid.max().item()
-            span = gmax - gmin
-            if span < 1e-12:
-                normed = torch.zeros_like(grid)
-            else:
-                normed = (grid - gmin) / span
-            # Downsample to a manageable thumbnail size (max 256×256)
-            thumb_size = min(256, sq)
-            grey_np = (normed * 255.0).clamp(0, 255).to(torch.uint8).numpy()
+            active_name = self.weight_tracker.active_model()
+            if not active_name or models.get(active_name) is None:
+                for name, model in models.items():
+                    if model is not None:
+                        active_name = str(name)
+                        break
+            if not active_name:
+                return None
+
+            active_model = models.get(active_name)
+            if active_model is None:
+                return None
+
+            state_key = f"{active_name}_state"
+            state_blob = payload.get(state_key)
+            if not isinstance(state_blob, dict):
+                state_blob = active_model.state_dict()
+
+            parameter_keys, saved_state = snapshot_parameter_state_from_state_dict(
+                state_blob,
+                [name for name, _ in active_model.named_parameters()],
+            )
+            if not saved_state:
+                return None
+
+            rgb, meta = render_weight_image(
+                saved_state,
+                parameter_keys=parameter_keys,
+                reference_state=self.weight_tracker.base_state(active_name),
+                target_width=_WEIGHT_THUMB_SIDE,
+                target_height=_WEIGHT_THUMB_SIDE,
+            )
+            rgb = annotate_weight_map(
+                rgb,
+                title=f"{active_name} r{int(round_id)}",
+                subtitle="",
+            )
+
             from PIL import Image
-            img = Image.fromarray(grey_np, mode="L")
-            if sq > thumb_size:
-                img = img.resize((thumb_size, thumb_size), Image.LANCZOS)
+
+            img = Image.fromarray(rgb, mode="RGB")
             thumb_path = out_dir / f"weight_thumb_r{round_id:06d}_c{cycle:04d}.png"
-            img.save(str(thumb_path))
+            img.save(
+                str(thumb_path),
+                format="PNG",
+                compress_level=_WEIGHT_THUMB_PNG_COMPRESS_LEVEL,
+            )
+            sidecar_path = thumb_path.with_suffix(".json")
+            sidecar_path.write_text(
+                json.dumps(
+                    {
+                        "model": str(active_name),
+                        "round_id": int(round_id),
+                        "cycle": int(cycle),
+                        "layer_count": int(meta.get("layer_count", 0)),
+                        "mode": "architectural_tall",
+                        "width": int(img.size[0]),
+                        "height": int(img.size[1]),
+                    },
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+            return {
+                "path": str(thumb_path),
+                "model": str(active_name),
+                "layer_count": int(meta.get("layer_count", 0)),
+            }
         except Exception as exc:
             _log(f"[checkpoint] weight thumbnail failed: {exc}")
+        return None
+
+    def _load_checkpoint_for_restore(
+        self,
+        out_dir: Path,
+        target_round: int,
+        target_cycle: int,
+    ) -> Tuple[Optional[Path], Optional[Dict[str, Any]]]:
+        candidate_paths: List[Path] = []
+        live_ckpt = out_dir / "pipeline_checkpoint.pt"
+        if live_ckpt.exists():
+            candidate_paths.append(live_ckpt)
+
+        backup_root = out_dir / "_weight_backup"
+        if backup_root.is_dir():
+            backup_dirs = sorted(
+                [p for p in backup_root.iterdir() if p.is_dir()],
+                key=lambda p: p.stat().st_mtime,
+                reverse=True,
+            )
+            for backup_dir in backup_dirs:
+                ckpt_path = backup_dir / "pipeline_checkpoint.pt"
+                if ckpt_path.exists():
+                    candidate_paths.append(ckpt_path)
+
+        fallback_path: Optional[Path] = None
+        fallback_ckpt: Optional[Dict[str, Any]] = None
+        for ckpt_path in candidate_paths:
+            try:
+                ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+            except Exception as exc:
+                _log(f"[restore] WARNING: could not load checkpoint candidate {ckpt_path}: {exc}")
+                continue
+            if fallback_path is None and isinstance(ckpt, dict):
+                fallback_path = ckpt_path
+                fallback_ckpt = ckpt
+            if (
+                isinstance(ckpt, dict)
+                and int(ckpt.get("round_id", -1)) == int(target_round)
+                and int(ckpt.get("cycle", -1)) == int(target_cycle)
+            ):
+                return ckpt_path, ckpt
+        return fallback_path, fallback_ckpt
 
     def _execute_restore(self, ctx: PipelineContext) -> None:
         """Restore to a checkpoint and replay training material."""
@@ -1093,16 +1293,30 @@ class SaveRestoreNode(PipelineNode):
         _log(f"[restore] restoring to round={target_round} cycle={target_cycle}")
 
         # 1. Load the checkpoint
-        ckpt_path = out_dir / "pipeline_checkpoint.pt"
-        if not ckpt_path.exists():
+        ckpt_path, ckpt = self._load_checkpoint_for_restore(out_dir, target_round, target_cycle)
+        if ckpt_path is None or ckpt is None:
             _log("[restore] ERROR: no checkpoint file found")
             return
-
+        _log(f"[restore] loading checkpoint payload from: {ckpt_path}")
+        live_ckpt_path = out_dir / "pipeline_checkpoint.pt"
+        # Replay is only meaningful when we loaded the exact live checkpoint AND its
+        # round/cycle matches the target.  A fallback to the wrong checkpoint must NOT
+        # replay: replaying material from round 100 onto a model restored to round 100
+        # (when the user wanted round 5) would silently continue training instead of
+        # rewinding, which is confusing and data-corrupting.
+        _ckpt_round = int(ckpt.get("round_id", -1))
+        _ckpt_cycle = int(ckpt.get("cycle", -1))
+        _is_exact_target = (_ckpt_round == int(target_round) and _ckpt_cycle == int(target_cycle))
         try:
-            ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-        except Exception as exc:
-            _log(f"[restore] ERROR loading checkpoint: {exc}")
-            return
+            replay_allowed = _is_exact_target and (ckpt_path.resolve() == live_ckpt_path.resolve())
+        except Exception:
+            replay_allowed = _is_exact_target and (str(ckpt_path) == str(live_ckpt_path))
+        if not _is_exact_target:
+            _log(
+                f"[restore] WARNING: checkpoint has round={_ckpt_round} cycle={_ckpt_cycle}, "
+                f"target was round={target_round} cycle={target_cycle}; "
+                "restoring best-available fallback, replay disabled"
+            )
 
         # 2. Restore model weights
         _models = {
@@ -1112,6 +1326,24 @@ class SaveRestoreNode(PipelineNode):
             "discriminator": ctx.discriminator,
             "wave_classifier": ctx.wave_classifier,
         }
+        _optimizers = {
+            "classifier": ctx.classifier_optimizer,
+            "transformer": ctx.transformer_optimizer,
+            "generator": ctx.generator_optimizer,
+            "discriminator": ctx.discriminator_optimizer,
+            "wave_classifier": ctx.wave_classifier_optimizer,
+        }
+        _lr_controllers = {
+            "classifier": ctx.classifier_lr_controller,
+            "transformer": ctx.transformer_lr_controller,
+        }
+        _grad_scalers = {
+            "classifier": ctx.classifier_grad_scaler,
+            "transformer": ctx.transformer_grad_scaler,
+            "generator": ctx.generator_grad_scaler,
+            "discriminator": ctx.discriminator_grad_scaler,
+            "wave_classifier": ctx.wave_classifier_grad_scaler,
+        }
         for name, model in _models.items():
             sd_key = f"{name}_state"
             if model is not None and sd_key in ckpt:
@@ -1120,6 +1352,35 @@ class SaveRestoreNode(PipelineNode):
                     _log(f"[restore] loaded {name} weights")
                 except Exception as exc:
                     _log(f"[restore] WARNING: {name} weight load failed: {exc}")
+
+        # 2b. Restore optimizer, LR-controller, and grad-scaler state
+        for name, optimizer in _optimizers.items():
+            state_key = f"{name}_optimizer_state"
+            if optimizer is None or state_key not in ckpt:
+                continue
+            try:
+                optimizer.load_state_dict(ckpt[state_key])
+                _log(f"[restore] loaded {name} optimizer state")
+            except Exception as exc:
+                _log(f"[restore] WARNING: {name} optimizer state load failed: {exc}")
+        for name, controller in _lr_controllers.items():
+            state_key = f"{name}_lr_controller_state"
+            if controller is None or state_key not in ckpt or not hasattr(controller, "load_state_dict"):
+                continue
+            try:
+                controller.load_state_dict(ckpt[state_key])
+                _log(f"[restore] loaded {name} LR-controller state")
+            except Exception as exc:
+                _log(f"[restore] WARNING: {name} LR-controller state load failed: {exc}")
+        for name, scaler in _grad_scalers.items():
+            state_key = f"{name}_grad_scaler_state"
+            if scaler is None or state_key not in ckpt or not hasattr(scaler, "load_state_dict"):
+                continue
+            try:
+                scaler.load_state_dict(ckpt[state_key])
+                _log(f"[restore] loaded {name} grad-scaler state")
+            except Exception as exc:
+                _log(f"[restore] WARNING: {name} grad-scaler state load failed: {exc}")
 
         # 3. Restore seed state
         if self.seed_bank is not None:
@@ -1132,21 +1393,27 @@ class SaveRestoreNode(PipelineNode):
 
         # 4. Replay training material
         if self.training_cache is not None:
-            for ck in self.training_cache.channel_keys():
-                cb = self._replay_callbacks.get(ck)
-                if cb is None:
-                    _log(f"[restore] no replay callback for channel {ck!r}, skipping")
-                    continue
-                batches = self.training_cache.replay_entries(ck)
-                if not batches:
-                    continue
-                _log(f"[restore] replaying {len(batches)} batches on channel {ck!r}")
-                for batch_data in batches:
-                    try:
-                        cb(batch_data)
-                    except Exception as exc:
-                        _log(f"[restore] replay batch error on {ck!r}: {exc}")
-                        break
+            if replay_allowed:
+                for ck in self.training_cache.channel_keys():
+                    cb = self._replay_callbacks.get(ck)
+                    if cb is None:
+                        _log(f"[restore] no replay callback for channel {ck!r}, skipping")
+                        continue
+                    batches = self.training_cache.replay_entries(ck)
+                    if not batches:
+                        continue
+                    _log(f"[restore] replaying {len(batches)} batches on channel {ck!r}")
+                    for batch_data in batches:
+                        try:
+                            cb(batch_data)
+                        except Exception as exc:
+                            _log(f"[restore] replay batch error on {ck!r}: {exc}")
+                            break
+            elif self.training_cache.total_entries() > 0:
+                _log(
+                    "[restore] selected checkpoint came from backup history; "
+                    "skipping live training-material replay cache"
+                )
 
         # 5. Clear cache after replay (we're now at the replayed state)
         if self.training_cache is not None:
@@ -1204,6 +1471,21 @@ class SaveRestoreNode(PipelineNode):
 
     def set_lora_snapshot_fn(self, fn: Callable) -> None:
         self._snapshot_lora_fn = fn
+
+    def update_runtime_weight_map(self, model_name: str, model: Any) -> Optional[Dict[str, Any]]:
+        """Capture the active runtime model so the GUI right panel stays current."""
+        if not model_name or model is None:
+            return None
+        try:
+            self.weight_tracker.set_active(str(model_name))
+            self.weight_tracker.capture(str(model_name), model)
+            self.weight_tracker.refresh_live_tiles(str(model_name))
+        except Exception:
+            return None
+        return self.make_weight_map_notification(model_name)
+
+    def current_weight_thumb_tiles(self, model_name: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        return self.weight_tracker.live_thumb_tiles(model_name)
 
     # -- Pull-model: record data (called by training nodes) ---------------
 
@@ -1339,7 +1621,7 @@ class SaveRestoreNode(PipelineNode):
         return {
             "type": RESP_WEIGHT_MAP,
             "models": self.weight_tracker.model_names(),
-            "active": self.weight_tracker._active_model,
+            "active": self.weight_tracker.active_model(),
             "map": data,
         }
 
@@ -1389,7 +1671,15 @@ class SaveRestoreNode(PipelineNode):
             "channel_key": str(channel_key),
         }
 
-    def make_checkpoint_notification(self, round_id: int, cycle: int, *, thumb_path=None) -> Dict[str, Any]:
+    def make_checkpoint_notification(
+        self,
+        round_id: int,
+        cycle: int,
+        *,
+        thumb_path=None,
+        thumb_model=None,
+        checkpoint_path=None,
+    ) -> Dict[str, Any]:
         d = {
             "type": NOTIFY_CHECKPOINT,
             "round_id": int(round_id),
@@ -1398,4 +1688,14 @@ class SaveRestoreNode(PipelineNode):
         }
         if thumb_path is not None:
             d["thumb_path"] = str(thumb_path)
+        if thumb_model is not None:
+            d["thumb_model"] = str(thumb_model)
+        if checkpoint_path is not None:
+            d["checkpoint_path"] = str(checkpoint_path)
         return d
+
+    def make_weight_map_notification(self, model_name: Optional[str] = None) -> Dict[str, Any]:
+        return {
+            "type": NOTIFY_WEIGHT_MAP,
+            "model": str(model_name or self.weight_tracker.active_model() or ""),
+        }

@@ -58,11 +58,13 @@ Graph topology (sequential stages per round)
 from __future__ import annotations
 
 import json
+import random
 import sys
 import time
 from pathlib import Path
 from typing import Any, Optional
 
+import numpy as np
 import torch
 
 from pipeline.context import PipelineContext
@@ -333,13 +335,19 @@ def _restore_context_from_resume(ctx: PipelineContext) -> None:
         ctx.gate_generator.passed = bool(gate_blob.get("generator", ctx.gate_generator.passed))
         ctx.gate_wave.passed = bool(gate_blob.get("wave", ctx.gate_wave.passed))
 
-    metrics = resume_ckpt.get("metrics_history", resume_summary.get("metrics", []))
+    metrics = resume_ckpt.get(
+        "metrics_history",
+        resume_ckpt.get("orchestration_history", resume_summary.get("metrics", [])),
+    )
     if isinstance(metrics, list):
         ctx.metrics_history = list(metrics)
 
+    resume_dir = ctx.resume_dir if isinstance(ctx.resume_dir, Path) else None
+    if resume_dir is not None:
+        _restore_rng_from_resume_dir(resume_dir)
+
     if ctx.render_config is None and not bool(_arg_value(ctx.args, "force_config_search", default=False)):
         best_cfg_blob = None
-        resume_dir = ctx.resume_dir if isinstance(ctx.resume_dir, Path) else None
         if resume_dir is not None:
             cfg_path = resume_dir / "best_render_config.json"
             if cfg_path.exists():
@@ -355,6 +363,60 @@ def _restore_context_from_resume(ctx: PipelineContext) -> None:
                 ctx.resumed_from_checkpoint = True
             except Exception as exc:
                 _log(f"[orchestrator] WARNING: could not restore render config from resume state: {exc}")
+
+
+def _restore_rng_from_resume_dir(resume_dir: Path) -> None:
+    from pipeline.nodes.base import _torch_load_cpu
+
+    bank_path = Path(resume_dir) / "seed_bank.pt"
+    if not bank_path.exists():
+        return
+    try:
+        bank_blob = _torch_load_cpu(str(bank_path))
+    except Exception as exc:
+        _log(f"[orchestrator] WARNING: could not load resume seed bank {bank_path}: {exc}")
+        return
+    if not isinstance(bank_blob, list) or not bank_blob:
+        return
+    latest = bank_blob[-1]
+    if not isinstance(latest, dict):
+        return
+
+    restored = False
+    try:
+        python_state = latest.get("python_state")
+        if python_state is not None:
+            random.setstate(python_state)
+            restored = True
+    except Exception as exc:
+        _log(f"[orchestrator] WARNING: could not restore Python RNG state: {exc}")
+    try:
+        numpy_state = latest.get("numpy_state")
+        if numpy_state is not None:
+            np.random.set_state(numpy_state)
+            restored = True
+    except Exception as exc:
+        _log(f"[orchestrator] WARNING: could not restore NumPy RNG state: {exc}")
+    try:
+        torch_cpu_state = latest.get("torch_cpu_state")
+        if torch_cpu_state is not None:
+            torch.random.set_rng_state(torch_cpu_state)
+            restored = True
+    except Exception as exc:
+        _log(f"[orchestrator] WARNING: could not restore Torch CPU RNG state: {exc}")
+    cuda_states = latest.get("torch_cuda_states")
+    if isinstance(cuda_states, dict) and torch.cuda.is_available():
+        for dev_idx, state in cuda_states.items():
+            try:
+                torch.cuda.set_rng_state(state, int(dev_idx))
+                restored = True
+            except Exception as exc:
+                _log(f"[orchestrator] WARNING: could not restore Torch CUDA RNG state for device {dev_idx}: {exc}")
+    if restored:
+        _log(
+            "[orchestrator] restored RNG state from seed bank: "
+            f"round={int(latest.get('round_id', 0))} cycle={int(latest.get('cycle', 0))}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -2149,6 +2211,7 @@ def _build_configs_from_args(args) -> dict:
         circle_radius_temperature=float(_g("pregestation_circle_radius_temperature", default=1.0)),
         seed=int(_g("seed", default=42)),
         gpu_preprocess=bool(_g("semantic_gpu_preprocess", default=False)),
+        rebuild_every_n_rounds=int(_g("pregestation_rebuild_every_n_rounds", "pregestation_rebuild_every", default=rounds_per_cycle)),
     )
 
     gestation = GestationDataConfig(
@@ -2162,6 +2225,7 @@ def _build_configs_from_args(args) -> dict:
             )
         ),
         gpu_preprocess=bool(_g("semantic_gpu_preprocess", default=False)),
+        rebuild_every_n_rounds=int(_g("gestation_rebuild_every_n_rounds", "gestation_rebuild_every", default=rounds_per_cycle)),
     )
 
     berkeley_payload = BerkeleyPayloadConfig(
@@ -2195,7 +2259,7 @@ def _build_configs_from_args(args) -> dict:
         refresh_include_clean=bool(_g("berkeley_refresh_include_clean", default=True)),
         gpu_preprocess=bool(_g("semantic_gpu_preprocess", default=False)),
         preload_workers=int(_g("semantic_preload_workers", default=0)),
-        rebuild_every_n_rounds=int(_g("berkeley_refresh_round_every", "berkeley_refresh_every", default=4)),
+        rebuild_every_n_rounds=int(_g("berkeley_refresh_round_every", "berkeley_refresh_every", default=rounds_per_cycle)),
         gate_val_batch_size=int(_g("gate_berkeley_batch_size", default=32)),
         gate_val_num_workers=int(_g("berkeley_refresh_workers", "num_workers", default=0)),
         gate_val_max_val=int(_g("gate_berkeley_max_val", default=0)),

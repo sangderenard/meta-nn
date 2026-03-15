@@ -123,7 +123,9 @@ set "JOINT_TRANS_EPOCHS_PER_ROUND=1"
 set "JOINT_TRANS_STEPS_PER_ROUND=64"
 set "TRANS_EPOCHS_PER_ROUND=5"
 set "TRANS_STEPS_PER_ROUND=256"
-set "BERKELEY_REFRESH_ROUND_EVERY=1"
+REM set "PREGESTATION_REBUILD_EVERY_N_ROUNDS=2"
+REM set "GESTATION_REBUILD_EVERY_N_ROUNDS=2"
+REM set "BERKELEY_REFRESH_ROUND_EVERY=2"
 set "BERKELEY_REFRESH_EPOCHS=1"
 set "BERKELEY_REFRESH_MAX_STEPS=256"
 set "BERKELEY_REFRESH_BATCH_SIZE=0"
@@ -378,6 +380,11 @@ set "BERKELEY_PAYLOAD_CACHE_REBUILD_ARG=--no-berkeley-payload-cache-rebuild"
 if "%BERKELEY_PAYLOAD_CACHE_REBUILD%"=="1" set "BERKELEY_PAYLOAD_CACHE_REBUILD_ARG=--berkeley-payload-cache-rebuild"
 set "GATE_TOTAL_TOKEN_SCHEDULE_ARG=--gate-total-token-schedule-enabled"
 if not "%GATE_TOTAL_TOKEN_SCHEDULE%"=="1" set "GATE_TOTAL_TOKEN_SCHEDULE_ARG=--no-gate-total-token-schedule-enabled"
+
+set "REBUILD_INTERVAL_ARG="
+if defined PREGESTATION_REBUILD_EVERY_N_ROUNDS set "REBUILD_INTERVAL_ARG=%REBUILD_INTERVAL_ARG% --pregestation-rebuild-every-n-rounds %PREGESTATION_REBUILD_EVERY_N_ROUNDS%"
+if defined GESTATION_REBUILD_EVERY_N_ROUNDS set "REBUILD_INTERVAL_ARG=%REBUILD_INTERVAL_ARG% --gestation-rebuild-every-n-rounds %GESTATION_REBUILD_EVERY_N_ROUNDS%"
+if defined BERKELEY_REFRESH_ROUND_EVERY set "REBUILD_INTERVAL_ARG=%REBUILD_INTERVAL_ARG% --berkeley-refresh-round-every %BERKELEY_REFRESH_ROUND_EVERY%"
 
 if not exist "%GRAPH_SCRIPT%" (
   echo Missing graph runner: %GRAPH_SCRIPT%
@@ -689,7 +696,7 @@ set "RUN_EXTRA_ARG=%~2"
   --accept-l1-threshold 0.20 ^
   --library-max-per-round %LIBRARY_MAX_PER_ROUND% ^
   --berkeley-refresh-activation-mult 10.0 ^
-  --berkeley-refresh-round-every %BERKELEY_REFRESH_ROUND_EVERY% ^
+  %REBUILD_INTERVAL_ARG% ^
   --berkeley-refresh-batch-size %BERKELEY_REFRESH_BATCH_SIZE% ^
   --berkeley-refresh-loader-batch-size %BERKELEY_REFRESH_LOADER_BATCH_SIZE% ^
   --berkeley-payload-max-samples %BERKELEY_PAYLOAD_MAX_SAMPLES% ^

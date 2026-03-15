@@ -1,0 +1,433 @@
+{
+  "source": "C:\\dev\\Powershell\\meta-nn\\wav_pipeline_runs\\iterative_rgb256\\classifier.pt",
+  "label": "state_dict",
+  "mode": "architectural_tall",
+  "width": 256,
+  "height": 530,
+  "layer_count": 70,
+  "raw_width": 74,
+  "raw_height": 512,
+  "transposed": false,
+  "layers": [
+    {
+      "name": "<root>",
+      "label": "root",
+      "unit_count": 151,
+      "keys": []
+    },
+    {
+      "name": "features.0",
+      "label": "f0",
+      "unit_count": 96,
+      "keys": []
+    },
+    {
+      "name": "features.1",
+      "label": "f1",
+      "unit_count": 96,
+      "keys": []
+    },
+    {
+      "name": "features.4",
+      "label": "f4",
+      "unit_count": 192,
+      "keys": []
+    },
+    {
+      "name": "features.5",
+      "label": "f5",
+      "unit_count": 192,
+      "keys": []
+    },
+    {
+      "name": "features.8",
+      "label": "f8",
+      "unit_count": 288,
+      "keys": []
+    },
+    {
+      "name": "features.9",
+      "label": "f9",
+      "unit_count": 288,
+      "keys": []
+    },
+    {
+      "name": "features.12",
+      "label": "f12",
+      "unit_count": 384,
+      "keys": []
+    },
+    {
+      "name": "features.13",
+      "label": "f13",
+      "unit_count": 384,
+      "keys": []
+    },
+    {
+      "name": "features.15.conv1",
+      "label": "f15.conv1",
+      "unit_count": 384,
+      "keys": []
+    },
+    {
+      "name": "features.15.bn1",
+      "label": "f15.bn1",
+      "unit_count": 384,
+      "keys": []
+    },
+    {
+      "name": "features.15.conv2",
+      "label": "f15.conv2",
+      "unit_count": 384,
+      "keys": []
+    },
+    {
+      "name": "features.15.bn2",
+      "label": "f15.bn2",
+      "unit_count": 384,
+      "keys": []
+    },
+    {
+      "name": "features.16.conv1",
+      "label": "f16.conv1",
+      "unit_count": 384,
+      "keys": []
+    },
+    {
+      "name": "features.16.bn1",
+      "label": "f16.bn1",
+      "unit_count": 384,
+      "keys": []
+    },
+    {
+      "name": "features.16.conv2",
+      "label": "f16.conv2",
+      "unit_count": 384,
+      "keys": []
+    },
+    {
+      "name": "features.16.bn2",
+      "label": "f16.bn2",
+      "unit_count": 384,
+      "keys": []
+    },
+    {
+      "name": "features.17.conv1",
+      "label": "f17.conv1",
+      "unit_count": 384,
+      "keys": []
+    },
+    {
+      "name": "features.17.bn1",
+      "label": "f17.bn1",
+      "unit_count": 384,
+      "keys": []
+    },
+    {
+      "name": "features.17.conv2",
+      "label": "f17.conv2",
+      "unit_count": 384,
+      "keys": []
+    },
+    {
+      "name": "features.17.bn2",
+      "label": "f17.bn2",
+      "unit_count": 384,
+      "keys": []
+    },
+    {
+      "name": "features.18.conv1",
+      "label": "f18.conv1",
+      "unit_count": 384,
+      "keys": []
+    },
+    {
+      "name": "features.18.bn1",
+      "label": "f18.bn1",
+      "unit_count": 384,
+      "keys": []
+    },
+    {
+      "name": "features.18.conv2",
+      "label": "f18.conv2",
+      "unit_count": 384,
+      "keys": []
+    },
+    {
+      "name": "features.18.bn2",
+      "label": "f18.bn2",
+      "unit_count": 384,
+      "keys": []
+    },
+    {
+      "name": "features.19.conv1",
+      "label": "f19.conv1",
+      "unit_count": 384,
+      "keys": []
+    },
+    {
+      "name": "features.19.bn1",
+      "label": "f19.bn1",
+      "unit_count": 384,
+      "keys": []
+    },
+    {
+      "name": "features.19.conv2",
+      "label": "f19.conv2",
+      "unit_count": 384,
+      "keys": []
+    },
+    {
+      "name": "features.19.bn2",
+      "label": "f19.bn2",
+      "unit_count": 384,
+      "keys": []
+    },
+    {
+      "name": "features.20.conv1",
+      "label": "f20.conv1",
+      "unit_count": 384,
+      "keys": []
+    },
+    {
+      "name": "features.20.bn1",
+      "label": "f20.bn1",
+      "unit_count": 384,
+      "keys": []
+    },
+    {
+      "name": "features.20.conv2",
+      "label": "f20.conv2",
+      "unit_count": 384,
+      "keys": []
+    },
+    {
+      "name": "features.20.bn2",
+      "label": "f20.bn2",
+      "unit_count": 384,
+      "keys": []
+    },
+    {
+      "name": "features.21.conv1",
+      "label": "f21.conv1",
+      "unit_count": 384,
+      "keys": []
+    },
+    {
+      "name": "features.21.bn1",
+      "label": "f21.bn1",
+      "unit_count": 384,
+      "keys": []
+    },
+    {
+      "name": "features.21.conv2",
+      "label": "f21.conv2",
+      "unit_count": 384,
+      "keys": []
+    },
+    {
+      "name": "features.21.bn2",
+      "label": "f21.bn2",
+      "unit_count": 384,
+      "keys": []
+    },
+    {
+      "name": "features.22.conv1",
+      "label": "f22.conv1",
+      "unit_count": 384,
+      "keys": []
+    },
+    {
+      "name": "features.22.bn1",
+      "label": "f22.bn1",
+      "unit_count": 384,
+      "keys": []
+    },
+    {
+      "name": "features.22.conv2",
+      "label": "f22.conv2",
+      "unit_count": 384,
+      "keys": []
+    },
+    {
+      "name": "features.22.bn2",
+      "label": "f22.bn2",
+      "unit_count": 384,
+      "keys": []
+    },
+    {
+      "name": "features.23.conv1",
+      "label": "f23.conv1",
+      "unit_count": 384,
+      "keys": []
+    },
+    {
+      "name": "features.23.bn1",
+      "label": "f23.bn1",
+      "unit_count": 384,
+      "keys": []
+    },
+    {
+      "name": "features.23.conv2",
+      "label": "f23.conv2",
+      "unit_count": 384,
+      "keys": []
+    },
+    {
+      "name": "features.23.bn2",
+      "label": "f23.bn2",
+      "unit_count": 384,
+      "keys": []
+    },
+    {
+      "name": "features.24.conv1",
+      "label": "f24.conv1",
+      "unit_count": 384,
+      "keys": []
+    },
+    {
+      "name": "features.24.bn1",
+      "label": "f24.bn1",
+      "unit_count": 384,
+      "keys": []
+    },
+    {
+      "name": "features.24.conv2",
+      "label": "f24.conv2",
+      "unit_count": 384,
+      "keys": []
+    },
+    {
+      "name": "features.24.bn2",
+      "label": "f24.bn2",
+      "unit_count": 384,
+      "keys": []
+    },
+    {
+      "name": "features.25.conv1",
+      "label": "f25.conv1",
+      "unit_count": 384,
+      "keys": []
+    },
+    {
+      "name": "features.25.bn1",
+      "label": "f25.bn1",
+      "unit_count": 384,
+      "keys": []
+    },
+    {
+      "name": "features.25.conv2",
+      "label": "f25.conv2",
+      "unit_count": 384,
+      "keys": []
+    },
+    {
+      "name": "features.25.bn2",
+      "label": "f25.bn2",
+      "unit_count": 384,
+      "keys": []
+    },
+    {
+      "name": "features.26.conv1",
+      "label": "f26.conv1",
+      "unit_count": 384,
+      "keys": []
+    },
+    {
+      "name": "features.26.bn1",
+      "label": "f26.bn1",
+      "unit_count": 384,
+      "keys": []
+    },
+    {
+      "name": "features.26.conv2",
+      "label": "f26.conv2",
+      "unit_count": 384,
+      "keys": []
+    },
+    {
+      "name": "features.26.bn2",
+      "label": "f26.bn2",
+      "unit_count": 384,
+      "keys": []
+    },
+    {
+      "name": "head.2",
+      "label": "head.2",
+      "unit_count": 151,
+      "keys": []
+    },
+    {
+      "name": "mask_head.0",
+      "label": "mask_head.0",
+      "unit_count": 48,
+      "keys": []
+    },
+    {
+      "name": "mask_head.1",
+      "label": "mask_head.1",
+      "unit_count": 48,
+      "keys": []
+    },
+    {
+      "name": "mask_head.4",
+      "label": "mask_head.4",
+      "unit_count": 48,
+      "keys": []
+    },
+    {
+      "name": "mask_head.5",
+      "label": "mask_head.5",
+      "unit_count": 48,
+      "keys": []
+    },
+    {
+      "name": "mask_head.8",
+      "label": "mask_head.8",
+      "unit_count": 36,
+      "keys": []
+    },
+    {
+      "name": "mask_head.9",
+      "label": "mask_head.9",
+      "unit_count": 36,
+      "keys": []
+    },
+    {
+      "name": "mask_head.12",
+      "label": "mask_head.12",
+      "unit_count": 24,
+      "keys": []
+    },
+    {
+      "name": "mask_head.13",
+      "label": "mask_head.13",
+      "unit_count": 24,
+      "keys": []
+    },
+    {
+      "name": "mask_head.15",
+      "label": "mask_head.15",
+      "unit_count": 1,
+      "keys": []
+    },
+    {
+      "name": "semantic_expand.0",
+      "label": "semantic_expand.0",
+      "unit_count": 1536,
+      "keys": []
+    },
+    {
+      "name": "semantic_expand.2",
+      "label": "semantic_expand.2",
+      "unit_count": 1536,
+      "keys": []
+    },
+    {
+      "name": "embed_proj",
+      "label": "embed_proj",
+      "unit_count": 384,
+      "keys": []
+    }
+  ]
+}

@@ -178,6 +178,28 @@ class BuildWaveClassifierNode(PipelineNode):
         if self.cfg.amp:
             ctx.wave_classifier_grad_scaler = make_grad_scaler(enabled=True)
 
+        resume_ckpt = ctx.resume_pipeline_ckpt if isinstance(ctx.resume_pipeline_ckpt, dict) else None
+        if resume_ckpt is not None:
+            if "wave_classifier_state" in resume_ckpt:
+                try:
+                    model.load_state_dict(resume_ckpt["wave_classifier_state"], strict=False)
+                    _log("[wave-classifier] resumed model state from pipeline checkpoint")
+                except Exception as exc:
+                    _log(f"[wave-classifier] WARNING: could not resume model state: {exc}")
+            if "wave_classifier_optimizer_state" in resume_ckpt:
+                try:
+                    optimizer.load_state_dict(resume_ckpt["wave_classifier_optimizer_state"])
+                    _log("[wave-classifier] resumed optimizer state from pipeline checkpoint")
+                except Exception as exc:
+                    _log(f"[wave-classifier] WARNING: could not resume optimizer state: {exc}")
+            scaler = ctx.wave_classifier_grad_scaler
+            if scaler is not None and "wave_classifier_grad_scaler_state" in resume_ckpt:
+                try:
+                    scaler.load_state_dict(resume_ckpt["wave_classifier_grad_scaler_state"])
+                    _log("[wave-classifier] resumed grad-scaler state from pipeline checkpoint")
+                except Exception as exc:
+                    _log(f"[wave-classifier] WARNING: could not resume grad-scaler state: {exc}")
+
         self._last_n_classes = n_classes
         _log(f"[wave-classifier] built: n_classes={n_classes}")
 

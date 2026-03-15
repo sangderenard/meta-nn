@@ -314,7 +314,7 @@ class PregestationDataConfig:
     # vocab change is wasteful — the disk cache absorbs re-use when the same
     # vocab recurs, but the wheel still needs rebuilding when it changes.
     # 20 rounds is a reasonable balance between freshness and build cost.
-    rebuild_every_n_rounds: int = 20
+    rebuild_every_n_rounds: int = 2
 
 
 # ---------------------------------------------------------------------------
@@ -333,7 +333,7 @@ class GestationDataConfig:
     gpu_preprocess: bool = False
 
     # How many rounds to keep gestation data before rebuilding.
-    rebuild_every_n_rounds: int = 20
+    rebuild_every_n_rounds: int = 2
 
 
 # ---------------------------------------------------------------------------
@@ -401,7 +401,7 @@ class BerkeleyDataConfig:
     preload_workers: int = 0
 
     # How many rounds between full Berkeley refresh loader rebuilds
-    rebuild_every_n_rounds: int = 4
+    rebuild_every_n_rounds: int = 2
 
     # Gate 2 validation loader settings
     gate_val_batch_size: int = 32

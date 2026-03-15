@@ -300,6 +300,34 @@ class BuildTransformerNode(PipelineNode):
         if self.cfg.amp:
             ctx.transformer_grad_scaler = make_grad_scaler(enabled=True)
 
+        resume_ckpt = ctx.resume_pipeline_ckpt if isinstance(ctx.resume_pipeline_ckpt, dict) else None
+        if resume_ckpt is not None:
+            if "transformer_state" in resume_ckpt:
+                try:
+                    model.load_state_dict(resume_ckpt["transformer_state"], strict=False)
+                    _log("[transformer] resumed model state from pipeline checkpoint")
+                except Exception as exc:
+                    _log(f"[transformer] WARNING: could not resume model state: {exc}")
+            if "transformer_optimizer_state" in resume_ckpt:
+                try:
+                    optimizer.load_state_dict(resume_ckpt["transformer_optimizer_state"])
+                    _log("[transformer] resumed optimizer state from pipeline checkpoint")
+                except Exception as exc:
+                    _log(f"[transformer] WARNING: could not resume optimizer state: {exc}")
+            if "transformer_lr_controller_state" in resume_ckpt:
+                try:
+                    lr_ctrl.load_state_dict(resume_ckpt["transformer_lr_controller_state"])
+                    _log("[transformer] resumed LR-controller state from pipeline checkpoint")
+                except Exception as exc:
+                    _log(f"[transformer] WARNING: could not resume LR-controller state: {exc}")
+            scaler = ctx.transformer_grad_scaler
+            if scaler is not None and "transformer_grad_scaler_state" in resume_ckpt:
+                try:
+                    scaler.load_state_dict(resume_ckpt["transformer_grad_scaler_state"])
+                    _log("[transformer] resumed grad-scaler state from pipeline checkpoint")
+                except Exception as exc:
+                    _log(f"[transformer] WARNING: could not resume grad-scaler state: {exc}")
+
         # Checkpoint load
         ckpt_path = self.cfg.transformer_init_ckpt or getattr(ctx.args, "resume_transformer", getattr(ctx.args, "transformer_init", "")) or ""
         if str(ckpt_path).strip():

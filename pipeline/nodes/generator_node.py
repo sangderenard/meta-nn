@@ -212,6 +212,47 @@ class BuildGANNode(PipelineNode):
             ctx.generator_grad_scaler = make_grad_scaler(enabled=True)
             ctx.discriminator_grad_scaler = make_grad_scaler(enabled=True)
 
+        resume_ckpt = ctx.resume_pipeline_ckpt if isinstance(ctx.resume_pipeline_ckpt, dict) else None
+        if resume_ckpt is not None:
+            if "generator_state" in resume_ckpt:
+                try:
+                    generator.load_state_dict(resume_ckpt["generator_state"], strict=False)
+                    _log("[GAN] resumed generator model state from pipeline checkpoint")
+                except Exception as exc:
+                    _log(f"[GAN] WARNING: could not resume generator model state: {exc}")
+            if "discriminator_state" in resume_ckpt:
+                try:
+                    discriminator.load_state_dict(resume_ckpt["discriminator_state"], strict=False)
+                    _log("[GAN] resumed discriminator model state from pipeline checkpoint")
+                except Exception as exc:
+                    _log(f"[GAN] WARNING: could not resume discriminator model state: {exc}")
+            if "generator_optimizer_state" in resume_ckpt:
+                try:
+                    g_optimizer.load_state_dict(resume_ckpt["generator_optimizer_state"])
+                    _log("[GAN] resumed generator optimizer state from pipeline checkpoint")
+                except Exception as exc:
+                    _log(f"[GAN] WARNING: could not resume generator optimizer state: {exc}")
+            if "discriminator_optimizer_state" in resume_ckpt:
+                try:
+                    d_optimizer.load_state_dict(resume_ckpt["discriminator_optimizer_state"])
+                    _log("[GAN] resumed discriminator optimizer state from pipeline checkpoint")
+                except Exception as exc:
+                    _log(f"[GAN] WARNING: could not resume discriminator optimizer state: {exc}")
+            g_scaler = ctx.generator_grad_scaler
+            if g_scaler is not None and "generator_grad_scaler_state" in resume_ckpt:
+                try:
+                    g_scaler.load_state_dict(resume_ckpt["generator_grad_scaler_state"])
+                    _log("[GAN] resumed generator grad-scaler state from pipeline checkpoint")
+                except Exception as exc:
+                    _log(f"[GAN] WARNING: could not resume generator grad-scaler state: {exc}")
+            d_scaler = ctx.discriminator_grad_scaler
+            if d_scaler is not None and "discriminator_grad_scaler_state" in resume_ckpt:
+                try:
+                    d_scaler.load_state_dict(resume_ckpt["discriminator_grad_scaler_state"])
+                    _log("[GAN] resumed discriminator grad-scaler state from pipeline checkpoint")
+                except Exception as exc:
+                    _log(f"[GAN] WARNING: could not resume discriminator grad-scaler state: {exc}")
+
         # Checkpoint load
         g_ckpt = self.cfg.generator_init_ckpt or getattr(ctx.args, "generator_init", "") or ""
         d_ckpt = self.cfg.discriminator_init_ckpt or getattr(ctx.args, "discriminator_init", "") or ""

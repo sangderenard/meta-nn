@@ -1447,7 +1447,9 @@ NODUS_API void nodus_scrub_ring_unlock(NodusScrubRing *ring) {
 /* ================================================================== */
 
 /* Downsample src_w x src_h RGBA (4-byte) → dst_w x dst_h RGB (3-byte).
-   Box-average filter.  src and dst must NOT alias. */
+    Box-average filter with alpha application (RGB is multiplied by A against
+    black) so mask-in-alpha previews remain visible after conversion.
+    src and dst must NOT alias. */
 static void downsample_rgba_to_rgb(
         const uint8_t *src, uint32_t src_w, uint32_t src_h,
         uint8_t *dst, uint32_t dst_w, uint32_t dst_h)
@@ -1461,21 +1463,24 @@ static void downsample_rgba_to_rgb(
             uint32_t sx0 = dx * src_w / dst_w;
             uint32_t sx1 = (dx + 1) * src_w / dst_w;
             if (sx1 <= sx0) sx1 = sx0 + 1;
-            uint32_t acc_r = 0, acc_g = 0, acc_b = 0, count = 0;
+            uint64_t acc_r = 0, acc_g = 0, acc_b = 0;
+            uint32_t count = 0;
             for (uint32_t sy = sy0; sy < sy1 && sy < src_h; sy++) {
                 for (uint32_t sx = sx0; sx < sx1 && sx < src_w; sx++) {
                     uint32_t off = (sy * src_w + sx) * 4;
-                    acc_r += src[off + 0];
-                    acc_g += src[off + 1];
-                    acc_b += src[off + 2];
+                    uint32_t a = (uint32_t)src[off + 3];
+                    acc_r += (uint64_t)src[off + 0] * (uint64_t)a;
+                    acc_g += (uint64_t)src[off + 1] * (uint64_t)a;
+                    acc_b += (uint64_t)src[off + 2] * (uint64_t)a;
                     count++;
                 }
             }
             uint32_t dst_off = (dy * dst_w + dx) * 3;
             if (count > 0) {
-                dst[dst_off + 0] = (uint8_t)(acc_r / count);
-                dst[dst_off + 1] = (uint8_t)(acc_g / count);
-                dst[dst_off + 2] = (uint8_t)(acc_b / count);
+                uint64_t denom = (uint64_t)count * 255ULL;
+                dst[dst_off + 0] = (uint8_t)(acc_r / denom);
+                dst[dst_off + 1] = (uint8_t)(acc_g / denom);
+                dst[dst_off + 2] = (uint8_t)(acc_b / denom);
             }
         }
     }

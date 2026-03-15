@@ -243,6 +243,28 @@ class BuildClassifierNode(PipelineNode):
         if self.cfg.amp:
             ctx.classifier_grad_scaler = make_grad_scaler(enabled=True)
 
+        resume_ckpt = ctx.resume_pipeline_ckpt if isinstance(ctx.resume_pipeline_ckpt, dict) else None
+        if resume_ckpt is not None:
+            if "classifier_state" in resume_ckpt:
+                try:
+                    model.load_state_dict(resume_ckpt["classifier_state"], strict=False)
+                    _log("[classifier] resumed model state from pipeline checkpoint")
+                except Exception as exc:
+                    _log(f"[classifier] WARNING: could not resume model state: {exc}")
+            if "classifier_optimizer_state" in resume_ckpt:
+                try:
+                    optimizer.load_state_dict(resume_ckpt["classifier_optimizer_state"])
+                    _log("[classifier] resumed optimizer state from pipeline checkpoint")
+                except Exception as exc:
+                    _log(f"[classifier] WARNING: could not resume optimizer state: {exc}")
+            scaler = ctx.classifier_grad_scaler
+            if scaler is not None and "classifier_grad_scaler_state" in resume_ckpt:
+                try:
+                    scaler.load_state_dict(resume_ckpt["classifier_grad_scaler_state"])
+                    _log("[classifier] resumed grad-scaler state from pipeline checkpoint")
+                except Exception as exc:
+                    _log(f"[classifier] WARNING: could not resume grad-scaler state: {exc}")
+
         # Load checkpoint if available
         ckpt_path = self.cfg.classifier_init_ckpt or getattr(ctx.args, "classifier_init", "") or ""
         ckpt_scope = self.cfg.classifier_init_scope or "all"
