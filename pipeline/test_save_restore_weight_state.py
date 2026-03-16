@@ -101,3 +101,40 @@ def test_publish_runtime_weight_state_tracks_generation_on_architecture_change()
     assert sr.weight_state_store.calls[0]["architecture_version"] == sr.weight_state_store.calls[1]["architecture_version"]
     assert sr.weight_state_store.calls[2]["architecture_version"] != sr.weight_state_store.calls[1]["architecture_version"]
     assert notification3["generation"] == 2
+
+
+def test_make_checkpoint_notification_includes_all_runtime_weight_models():
+    sr = SaveRestoreNode()
+    generator_meta = SimpleNamespace(
+        publish_seq=21,
+        generation=2,
+        architecture_version=17,
+        round_id=5,
+        cycle=3,
+        step=11,
+        model_name="generator",
+        node_id="stage_g",
+    )
+    discriminator_meta = SimpleNamespace(
+        publish_seq=22,
+        generation=2,
+        architecture_version=19,
+        round_id=5,
+        cycle=3,
+        step=12,
+        model_name="discriminator",
+        node_id="stage_g",
+    )
+    sr._last_weight_state_meta = discriminator_meta
+    sr._weight_model_registry = {
+        ("generator", "stage_g"): generator_meta,
+        ("discriminator", "stage_g"): discriminator_meta,
+    }
+
+    notification = sr.make_checkpoint_notification(round_id=5, cycle=3)
+
+    assert notification["weight_model"] == "discriminator"
+    assert {(entry["model"], entry["publish_seq"]) for entry in notification["weight_models"]} == {
+        ("generator", 21),
+        ("discriminator", 22),
+    }

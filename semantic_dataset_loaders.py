@@ -43,6 +43,8 @@ _SEMANTIC_COLOR_TERMS: Tuple[str, ...] = (
     "gray",
     "edge",
 )
+_INGESTED_ITEM_MASK_TERMS = frozenset(("signal", "object"))
+_DATASET_LABEL_SUFFIX = " dataset"
 
 
 def _directory_size_bytes(path: Path) -> int:
@@ -872,55 +874,177 @@ def elem_stacks_to_label_stacks(
     return np.stack(out_masks, axis=0).astype(np.float32, copy=False), np.asarray(out_idx, dtype=np.int64)
 
 
+def _is_dataset_label_term(term: str) -> bool:
+    return bool(_norm_txt(str(term)).endswith(_DATASET_LABEL_SUFFIX))
+
+
+def _resolve_creation_mask(
+    mixed_mask: Any,
+    *,
+    height: int,
+    width: int,
+    mask_stack_array: Optional[Any] = None,
+    processing_device: Optional[Any] = None,
+) -> np.ndarray:
+    mixed_arr = np.asarray(mixed_mask, dtype=np.float32)
+    if int(mixed_arr.ndim) >= 2 and float(np.max(mixed_arr)) > 1e-8:
+        return _normalize_stack_row(
+            mixed_arr,
+            height=int(height),
+            width=int(width),
+            processing_device=processing_device,
+            apply_attention_normalization=True,
+        )
+    if mask_stack_array is None:
+        return np.zeros((int(max(0, height)), int(max(0, width))), dtype=np.float32)
+    stack_arr = np.asarray(mask_stack_array, dtype=np.float32)
+    if int(stack_arr.ndim) == 2:
+        stack_arr = stack_arr[None, ...]
+    if int(stack_arr.ndim) != 3 or int(stack_arr.shape[0]) <= 0:
+        return np.zeros((int(max(0, height)), int(max(0, width))), dtype=np.float32)
+    if int(height) <= 0 or int(width) <= 0:
+        height = int(stack_arr.shape[-2])
+        width = int(stack_arr.shape[-1])
+    return _normalize_stack_row(
+        _composite_mask_stack(stack_arr, processing_device=processing_device),
+        height=int(height),
+        width=int(width),
+        processing_device=processing_device,
+        apply_attention_normalization=True,
+    )
+
+
+def _build_special_label_mask_stack(
+    label_vec: Any,
+    *,
+    idx_to_term: Optional[Dict[int, str]] = None,
+    height: int,
+    width: int,
+    creation_mask: Optional[Any] = None,
+) -> Tuple[np.ndarray, np.ndarray]:
+    positive_idx = _positive_label_indices(label_vec)
+    if int(positive_idx.size) <= 0 or int(height) <= 0 or int(width) <= 0:
+        return np.zeros((0, int(max(0, height)), int(max(0, width))), dtype=np.float32), np.zeros((0,), dtype=np.int64)
+    if not isinstance(idx_to_term, dict) or not idx_to_term:
+        return np.zeros((0, int(height), int(width)), dtype=np.float32), np.zeros((0,), dtype=np.int64)
+    creation = np.asarray(creation_mask, dtype=np.float32) if creation_mask is not None else np.zeros((int(height), int(width)), dtype=np.float32)
+    creation_ok = int(creation.ndim) == 2 and float(np.max(creation)) > 1e-8
+    full_frame = np.ones((int(height), int(width)), dtype=np.float32)
+    rows: List[np.ndarray] = []
+    indices: List[int] = []
+    for cls_idx in positive_idx.tolist():
+        term_key = _norm_txt(str(idx_to_term.get(int(cls_idx), "")))
+        if not term_key:
+            continue
+        if term_key in _INGESTED_ITEM_MASK_TERMS:
+            if not creation_ok:
+                continue
+            rows.append(creation)
+            indices.append(int(cls_idx))
+            continue
+        if _is_dataset_label_term(term_key):
+            rows.append(full_frame)
+            indices.append(int(cls_idx))
+    if len(rows) <= 0:
+        return np.zeros((0, int(height), int(width)), dtype=np.float32), np.zeros((0,), dtype=np.int64)
+    return np.stack(rows, axis=0).astype(np.float32, copy=False), np.asarray(indices, dtype=np.int64)
+
+
+def _composite_non_dataset_label_stack(
+    mask_stack: Any,
+    mask_indices: Any,
+    *,
+    idx_to_term: Optional[Dict[int, str]] = None,
+    height: int = 0,
+    width: int = 0,
+    fallback_mask: Optional[Any] = None,
+    processing_device: Optional[Any] = None,
+) -> np.ndarray:
+    stack_arr = np.asarray(mask_stack, dtype=np.float32)
+    idx_arr = np.asarray(mask_indices, dtype=np.int64).reshape(-1)
+    if int(stack_arr.ndim) == 2:
+        stack_arr = stack_arr[None, ...]
+    if int(stack_arr.ndim) == 3 and int(stack_arr.shape[0]) > 0:
+        if int(height) <= 0 or int(width) <= 0:
+            height = int(stack_arr.shape[-2])
+            width = int(stack_arr.shape[-1])
+        pair_count = min(int(stack_arr.shape[0]), int(idx_arr.size))
+        keep: List[int] = []
+        for si in range(int(pair_count)):
+            term_name = str(idx_to_term.get(int(idx_arr[int(si)]), "")) if isinstance(idx_to_term, dict) else ""
+            if not _is_dataset_label_term(term_name):
+                keep.append(int(si))
+        if keep:
+            return np.asarray(
+                _composite_mask_stack(stack_arr[np.asarray(keep, dtype=np.int64)], processing_device=processing_device),
+                dtype=np.float32,
+            )
+    if fallback_mask is not None and int(height) > 0 and int(width) > 0:
+        return _normalize_stack_row(
+            fallback_mask,
+            height=int(height),
+            width=int(width),
+            processing_device=processing_device,
+        )
+    return np.zeros((int(max(0, height)), int(max(0, width))), dtype=np.float32)
+
+
 def build_label_mask_stack(
     mixed_mask: Any,
     label_vec: Any,
     mask_stack_array: Optional[Any] = None,
     mask_stack_indices: Optional[Any] = None,
     *,
+    idx_to_term: Optional[Dict[int, str]] = None,
     treat_mixed_mask_as_creation: bool = False,
     processing_device: Optional[Any] = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
     y = np.asarray(label_vec, dtype=np.float32).reshape(-1)
-    positive_idx = np.where(y >= 0.5)[0].astype(np.int64)
     mixed_arr = np.asarray(mixed_mask, dtype=np.float32)
     h = int(mixed_arr.shape[-2]) if int(mixed_arr.ndim) >= 2 else 0
     w = int(mixed_arr.shape[-1]) if int(mixed_arr.ndim) >= 2 else 0
-    if int(h) > 0 and int(w) > 0:
-        mixed_base = _normalize_mask_array(mixed_mask, height=int(h), width=int(w))
-        resolved = _resolve_processing_device(processing_device)
-        mixed = (
-            np.asarray(
-                _normalize_attention_map_batch_torch(
-                    mixed_base,
-                    gamma=0.95,
-                    blur_kernel=3,
-                    device=resolved,
-                ).detach().cpu().numpy(),
-                dtype=np.float32,
-            )
-            if resolved is not None
-            else _normalize_attention_map(
-                mixed_base,
-                gamma=0.95,
-                blur_kernel=3,
-            )
+    if (int(h) <= 0 or int(w) <= 0) and mask_stack_array is not None:
+        stack_ref = np.asarray(mask_stack_array, dtype=np.float32)
+        if int(stack_ref.ndim) == 2:
+            h = int(stack_ref.shape[-2])
+            w = int(stack_ref.shape[-1])
+        elif int(stack_ref.ndim) == 3 and int(stack_ref.shape[0]) > 0:
+            h = int(stack_ref.shape[-2])
+            w = int(stack_ref.shape[-1])
+    creation_mask = (
+        _resolve_creation_mask(
+            mixed_mask,
+            height=int(h),
+            width=int(w),
+            mask_stack_array=mask_stack_array,
+            processing_device=processing_device,
         )
-    else:
-        mixed = np.zeros((0, 0), dtype=np.float32)
+        if bool(treat_mixed_mask_as_creation)
+        else np.zeros((int(max(0, h)), int(max(0, w))), dtype=np.float32)
+    )
+    special_stack, special_idx = _build_special_label_mask_stack(
+        y,
+        idx_to_term=idx_to_term,
+        height=int(h),
+        width=int(w),
+        creation_mask=creation_mask,
+    )
+    parts: List[Tuple[Any, Any]] = []
     if mask_stack_array is not None and mask_stack_indices is not None:
-        fallback_mask = mixed if bool(treat_mixed_mask_as_creation) else None
+        parts.append((mask_stack_array, mask_stack_indices))
+    if int(special_stack.shape[0]) > 0 and int(special_idx.size) > 0:
+        parts.append((special_stack, special_idx))
+    if parts:
         out_stack, out_idx = combine_label_mask_stacks(
             y,
-            (mask_stack_array, mask_stack_indices),
-            height=int(mixed.shape[0]),
-            width=int(mixed.shape[1]),
-            fallback_creation_mask=fallback_mask,
+            *parts,
+            height=int(h),
+            width=int(w),
             processing_device=processing_device,
         )
         if int(out_stack.shape[0]) > 0 and int(out_idx.size) > 0:
             return out_stack, out_idx
-    return np.zeros((0, int(mixed.shape[0]), int(mixed.shape[1])), dtype=np.float32), np.zeros((0,), dtype=np.int64)
+    return np.zeros((0, int(max(0, h)), int(max(0, w))), dtype=np.float32), np.zeros((0,), dtype=np.int64)
 
 
 def build_term_mask_stack_from_image(
@@ -986,10 +1110,29 @@ def assemble_semantic_mask_layers(
         raw_stack is not None and raw_idx is not None and int(np.asarray(raw_idx).size) > 0
         for raw_stack, raw_idx in parts
     )
-    if original_mixed_mask is not None and float(np.max(np.asarray(original_mixed_mask, dtype=np.float32))) > 1e-8:
+    creation_seed_mask = np.asarray(original_mixed_mask, dtype=np.float32) if original_mixed_mask is not None else np.zeros((int(h), int(w)), dtype=np.float32)
+    if float(np.max(np.asarray(creation_seed_mask, dtype=np.float32))) <= 1e-8 and has_original_parts:
+        stacked_parts: List[np.ndarray] = []
+        for raw_stack, _raw_idx in parts:
+            part_arr = np.asarray(raw_stack, dtype=np.float32)
+            if int(part_arr.ndim) == 2:
+                part_arr = part_arr[None, ...]
+            if int(part_arr.ndim) == 3 and int(part_arr.shape[0]) > 0:
+                stacked_parts.append(
+                    _normalize_stack_row_batch(
+                        part_arr,
+                        height=int(h),
+                        width=int(w),
+                    )
+                )
+        if stacked_parts:
+            creation_seed_mask = _composite_mask_stack(np.concatenate(stacked_parts, axis=0))
+    if original_mixed_mask is not None or float(np.max(np.asarray(creation_seed_mask, dtype=np.float32))) > 1e-8:
         original_stack, original_idx = build_label_mask_stack(
-            mixed_mask=np.asarray(original_mixed_mask, dtype=np.float32),
+            mixed_mask=np.asarray(creation_seed_mask, dtype=np.float32),
             label_vec=y,
+            idx_to_term=idx_to_term,
+            treat_mixed_mask_as_creation=True,
         )
         if int(original_stack.shape[0]) > 0 and int(original_idx.size) > 0:
             parts.append((original_stack, original_idx))
@@ -1019,14 +1162,17 @@ def assemble_semantic_mask_layers(
         np.zeros((0, int(h), int(w)), dtype=np.float32),
         np.zeros((0,), dtype=np.int64),
     )
-    detect_mask = (
-        _composite_mask_stack(pre_detect_stack)
-        if int(pre_detect_stack.shape[0]) > 0
-        else (
-            _normalize_stack_row(original_mixed_mask, height=int(h), width=int(w))
-            if original_mixed_mask is not None
-            else None
-        )
+    detect_mask = _composite_non_dataset_label_stack(
+        pre_detect_stack,
+        pre_detect_idx,
+        idx_to_term=idx_to_term,
+        height=int(h),
+        width=int(w),
+        fallback_mask=original_mixed_mask,
+    ) if int(pre_detect_stack.shape[0]) > 0 else (
+        _normalize_stack_row(original_mixed_mask, height=int(h), width=int(w))
+        if original_mixed_mask is not None
+        else None
     )
     y = augment_label_vec_with_detected_color_terms(
         image=chw,
@@ -1055,9 +1201,16 @@ def assemble_semantic_mask_layers(
         np.zeros((0, int(h), int(w)), dtype=np.float32),
         np.zeros((0,), dtype=np.int64),
     )
-    mixed_mask = (
-        _composite_mask_stack(final_stack)
-        if int(final_stack.shape[0]) > 0
+    mixed_mask = _composite_non_dataset_label_stack(
+        final_stack,
+        final_idx,
+        idx_to_term=idx_to_term,
+        height=int(h),
+        width=int(w),
+        fallback_mask=original_mixed_mask,
+    ) if int(final_stack.shape[0]) > 0 else (
+        _normalize_stack_row(original_mixed_mask, height=int(h), width=int(w))
+        if original_mixed_mask is not None
         else np.zeros((int(h), int(w)), dtype=np.float32)
     )
     return y, np.asarray(mixed_mask, dtype=np.float32), np.asarray(final_stack, dtype=np.float32), np.asarray(final_idx, dtype=np.int64)
@@ -1074,9 +1227,10 @@ def semantic_mask_stack_collate(batch: Sequence[Any]) -> Any:
     ms: List[torch.Tensor] = []
     mask_stacks: List[torch.Tensor] = []
     mask_indices: List[torch.Tensor] = []
+    terms_rows: List[List[str]] = []
     for sample in batch:
         if not isinstance(sample, (tuple, list)) or int(len(sample)) < 5:
-            raise RuntimeError("semantic_mask_stack_collate requires 5-tuple samples.")
+            raise RuntimeError("semantic_mask_stack_collate requires 5+-tuple samples.")
         xs.append(sample[0])
         ys.append(sample[1])
         ms.append(sample[2])
@@ -1084,12 +1238,17 @@ def semantic_mask_stack_collate(batch: Sequence[Any]) -> Any:
         idx_t = sample[4] if torch.is_tensor(sample[4]) else torch.as_tensor(sample[4], dtype=torch.long)
         mask_stacks.append(stack_t)
         mask_indices.append(idx_t.to(dtype=torch.long))
+        if int(len(sample)) >= 6 and isinstance(sample[5], (list, tuple)):
+            terms_rows.append(normalize_vocab_terms([str(x) for x in list(sample[5])]))
+        else:
+            terms_rows.append([])
     return {
         "x": torch.stack(xs, dim=0),
         "y": torch.stack(ys, dim=0),
         "mask": torch.stack(ms, dim=0),
         "mask_stacks": mask_stacks,
         "mask_indices": mask_indices,
+        "terms_rows": terms_rows,
     }
 
 
@@ -2771,6 +2930,7 @@ class BootstrapDynamicDataset(Dataset):
                 mask_stack_np, mask_idx_np = build_label_mask_stack(
                     mixed_mask=np.asarray(mask, dtype=np.float32),
                     label_vec=tgt,
+                    idx_to_term=self.idx_to_term,
                     treat_mixed_mask_as_creation=bool(float(np.max(np.asarray(mask, dtype=np.float32))) > 1e-8),
                 )
             else:
@@ -2786,8 +2946,18 @@ class BootstrapDynamicDataset(Dataset):
                     mask_stack_np, mask_idx_np = build_label_mask_stack(
                         mixed_mask=np.asarray(mask, dtype=np.float32),
                         label_vec=tgt,
+                        idx_to_term=self.idx_to_term,
                         treat_mixed_mask_as_creation=bool(float(np.max(np.asarray(mask, dtype=np.float32))) > 1e-8),
                     )
+            if float(np.max(np.asarray(mask, dtype=np.float32))) <= 1e-8 and int(mask_stack_np.shape[0]) > 0 and int(mask_idx_np.size) > 0:
+                mask = _composite_non_dataset_label_stack(
+                    mask_stack_np,
+                    mask_idx_np,
+                    idx_to_term=self.idx_to_term,
+                    height=int(img.shape[1]),
+                    width=int(img.shape[2]),
+                    fallback_mask=mask,
+                )
         else:
             mask_stack_np = np.zeros((0, int(mask.shape[0]), int(mask.shape[1])), dtype=np.float32)
             mask_idx_np = np.zeros((0,), dtype=np.int64)
@@ -2825,6 +2995,7 @@ class BootstrapDynamicDataset(Dataset):
             cached_stack, cached_stack_idx = build_label_mask_stack(
                 mixed_mask=np.asarray(cached_mask, dtype=np.float32),
                 label_vec=tgt,
+                idx_to_term=self.idx_to_term,
                 treat_mixed_mask_as_creation=bool(float(np.max(np.asarray(cached_mask, dtype=np.float32))) > 1e-8),
             )
             self.base_mask_stacks[int(idx)] = np.asarray(cached_stack, dtype=np.float32)
@@ -2833,6 +3004,16 @@ class BootstrapDynamicDataset(Dataset):
         if bool(self.return_mask_stack):
             stack_np = np.asarray(self.base_mask_stacks[int(idx)], dtype=np.float32)
             stack_idx_np = np.asarray(self.base_mask_stack_indices[int(idx)], dtype=np.int64)
+            if float(np.max(mask_np)) <= 1e-8 and int(stack_np.shape[0]) > 0 and int(stack_idx_np.size) > 0:
+                mask_np = _composite_non_dataset_label_stack(
+                    stack_np,
+                    stack_idx_np,
+                    idx_to_term=self.idx_to_term,
+                    height=int(mask_np.shape[0]),
+                    width=int(mask_np.shape[1]),
+                    fallback_mask=mask_np,
+                )
+                self.base_masks[int(idx)] = np.asarray(mask_np, dtype=np.float32)
         else:
             stack_np = np.zeros((0, int(mask_np.shape[0]), int(mask_np.shape[1])), dtype=np.float32)
             stack_idx_np = np.zeros((0,), dtype=np.int64)
@@ -2860,6 +3041,7 @@ class BootstrapDynamicDataset(Dataset):
                     mask_stack_np, mask_idx_np = build_label_mask_stack(
                         mixed_mask=np.asarray(mask, dtype=np.float32),
                         label_vec=tgt,
+                        idx_to_term=self.idx_to_term,
                         treat_mixed_mask_as_creation=bool(float(np.max(np.asarray(mask, dtype=np.float32))) > 1e-8),
                     )
                 return (
@@ -3193,7 +3375,7 @@ def _mask_cache_file_path(cache_root: Path, image_path: Path, terms: Sequence[st
             "mask_mtime": (int(Path(str(mask_path)).stat().st_mtime) if str(mask_path).strip() and Path(str(mask_path)).exists() else 0),
             "terms": list(normalize_vocab_terms([str(x) for x in terms])),
             "layout": layout if isinstance(layout, dict) else None,
-            "cache_version": 3,
+            "cache_version": 4,
         },
         sort_keys=True,
         ensure_ascii=True,

@@ -30,7 +30,7 @@ from semantic_dataset_loaders import (
     collect_semantic_disk_rows,
     infer_semantic_support_masks,
 )
-from wav_ml_models import TinyConvClassifier
+from wav_ml_models import TinyConvClassifier, prime_tiny_classifier_label_bank_for_state_dict
 
 
 def _ok(msg: str) -> None:
@@ -67,6 +67,42 @@ def test_gate_replica_sync_realigns_label_bank() -> None:
     assert torch.allclose(synced.embed_proj.weight, source.embed_proj.weight)
     assert torch.allclose(synced.embed_proj.bias, source.embed_proj.bias)
     _ok("gate replica sync tolerates stale label-bank buffers and lands on the source state")
+
+
+def test_checkpoint_prime_realigns_label_bank_before_load() -> None:
+    print("\n--- test_checkpoint_prime_realigns_label_bank_before_load ---")
+    source = TinyConvClassifier(
+        num_classes=4,
+        base_ch=16,
+        max_ch=64,
+        context_blocks=0,
+    )
+    source.set_label_embedding_bank(
+        torch.randn(4, 13, dtype=torch.float32),
+        temperature=6.0,
+    )
+    target = TinyConvClassifier(
+        num_classes=4,
+        base_ch=16,
+        max_ch=64,
+        context_blocks=0,
+    )
+
+    primed = prime_tiny_classifier_label_bank_for_state_dict(
+        target,
+        source.state_dict(),
+        temperature=6.0,
+    )
+    assert primed is True
+    target.load_state_dict(source.state_dict(), strict=False)
+
+    assert tuple(target.label_embed_bank.shape) == (4, 13), tuple(target.label_embed_bank.shape)
+    assert bool(int(target.label_embed_enabled.item())) is True
+    assert int(target.embed_proj.out_features) == 13
+    assert torch.allclose(target.label_embed_bank, source.label_embed_bank)
+    assert torch.allclose(target.embed_proj.weight, source.embed_proj.weight)
+    assert torch.allclose(target.embed_proj.bias, source.embed_proj.bias)
+    _ok("checkpoint priming reshapes stale classifiers before state_dict restore")
 
 
 def test_collect_semantic_disk_rows_remaps_voc_bits_by_name() -> None:
@@ -277,6 +313,7 @@ def test_term_mask_stacks_torch_path_matches_default() -> None:
 
 if __name__ == "__main__":
     test_gate_replica_sync_realigns_label_bank()
+    test_checkpoint_prime_realigns_label_bank_before_load()
     test_collect_semantic_disk_rows_remaps_voc_bits_by_name()
     test_voc20_terms_enter_only_via_churn()
     test_semantic_candidate_cache_batch_build_preserves_order()

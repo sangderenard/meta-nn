@@ -60,10 +60,15 @@ from pipeline.utils import (
 )
 # Backward-compat alias — internal code now uses _default_class_names
 _default_berkeley_class_names = _default_class_names
-from pipeline.nodes.vocab_node import _normalize_vocab_terms, _semantic_term_index_map
+from pipeline.nodes.vocab_node import (
+    _normalize_vocab_terms,
+    _semantic_term_index_map,
+    register_churn_requirement,
+)
 from semantic_dataset_loaders import (
     BootstrapDynamicDataset,
     DiskSemanticRowsDataset,
+    _composite_non_dataset_label_stack,
     _composite_mask_stack,
     build_label_mask_stack,
     build_loader_from_manifest,
@@ -684,6 +689,7 @@ class DataNode(PipelineNode):
             "samples_per_combo": self.preg_cfg.samples_per_combo,
             "mode_sequence": sorted(_mode_seq),
             "image_size": self.preg_cfg.image_size,
+            "mask_semantics_version": 2,
         })
         _raw_cached = _load_raw_stage_cache(_raw_cache_dir, _raw_cache_key)
         if _raw_cached is not None:
@@ -743,6 +749,7 @@ class DataNode(PipelineNode):
                 return
 
             # ---- Precompute per-label mask stacks from element stacks ----
+            idx_to_term = {int(i): str(name) for i, name in enumerate(ctx.class_names)}
             all_label_stacks: list = []
             all_label_indices: list = []
             for i in tqdm(range(len(all_images)), desc="[pregestation] building mask stacks", unit="img", leave=False, dynamic_ncols=True):
@@ -780,9 +787,19 @@ class DataNode(PipelineNode):
                 else:
                     tonal_stack = np.zeros((0, int(base_mask_np.shape[0]), int(base_mask_np.shape[1])), dtype=np.float32)
                     tonal_idx = np.zeros((0,), dtype=np.int64)
+                creation_mask_np = np.asarray(base_mask_np, dtype=np.float32)
+                if float(np.max(creation_mask_np)) <= 1e-8 and int(np.asarray(explicit_stack).shape[0]) > 0:
+                    creation_mask_np = _composite_mask_stack(np.asarray(explicit_stack, dtype=np.float32))
+                special_stack, special_idx = build_label_mask_stack(
+                    mixed_mask=creation_mask_np,
+                    label_vec=all_targets[i],
+                    idx_to_term=idx_to_term,
+                    treat_mixed_mask_as_creation=True,
+                )
                 merged_stack, merged_idx = combine_label_mask_stacks(
                     all_targets[i],
                     (explicit_stack, explicit_idx),
+                    (special_stack, special_idx),
                     (tonal_stack, tonal_idx),
                     height=int(base_mask_np.shape[0]),
                     width=int(base_mask_np.shape[1]),
@@ -790,9 +807,16 @@ class DataNode(PipelineNode):
                 )
                 if i < len(all_masks):
                     all_masks[i] = (
-                        _composite_mask_stack(merged_stack)
+                        _composite_non_dataset_label_stack(
+                            merged_stack,
+                            merged_idx,
+                            idx_to_term=idx_to_term,
+                            height=int(base_mask_np.shape[0]),
+                            width=int(base_mask_np.shape[1]),
+                            fallback_mask=base_mask_np,
+                        )
                         if int(np.asarray(merged_stack).size) > 0
-                        else np.zeros((int(base_mask_np.shape[0]), int(base_mask_np.shape[1])), dtype=np.float32)
+                        else np.asarray(base_mask_np, dtype=np.float32)
                     )
                 all_label_stacks.append(np.asarray(merged_stack, dtype=np.float32))
                 all_label_indices.append(np.asarray(merged_idx, dtype=np.int64))
@@ -813,6 +837,12 @@ class DataNode(PipelineNode):
         if not all_images:
             _log("[data-node] WARNING: no pregestation images built")
             return
+        _register_churn_terms(
+            ctx,
+            term_rows=all_term_rows,
+            source="pregestation",
+            stage_label="stage0_pregestation",
+        )
 
         with semantic_processing_device(ctx, enabled=bool(self.preg_cfg.gpu_preprocess)) as _processing_device:
             dataset, selected_indices, cache_info = _build_semantic_stage_cache_dataset(
@@ -934,6 +964,7 @@ class DataNode(PipelineNode):
             "samples_per_term": self.gest_cfg.samples_per_term,
             "image_size": self.gest_cfg.image_size,
             "pool_sig": _pool_sig,
+            "mask_semantics_version": 2,
         })
         _raw_cached = _load_raw_stage_cache(_raw_cache_dir, _raw_cache_key)
         if _raw_cached is not None:
@@ -982,18 +1013,33 @@ class DataNode(PipelineNode):
                 for i in tqdm(range(_n_gest), desc="[gestation] combining mask stacks", unit="img", leave=False, dynamic_ncols=True):
                     y = np.asarray(targets[int(i)], dtype=np.float32).reshape(-1)
                     base_mask = np.asarray(_base_masks[i], dtype=np.float32)
+                    special_stack, special_idx = build_label_mask_stack(
+                        mixed_mask=base_mask,
+                        label_vec=y,
+                        idx_to_term=idx_to_term,
+                        treat_mixed_mask_as_creation=True,
+                    )
                     merged_stack, merged_idx = combine_label_mask_stacks(
                         y,
                         (np.asarray(_heuristic_stacks[i], dtype=np.float32), np.asarray(_heuristic_indices[i], dtype=np.int64)),
+                        (special_stack, special_idx),
                         height=int(base_mask.shape[0]),
                         width=int(base_mask.shape[1]),
                         processing_device=_processing_device,
                         strict=True,
                     )
                     mixed_mask = (
-                        _composite_mask_stack(merged_stack, processing_device=_processing_device)
+                        _composite_non_dataset_label_stack(
+                            merged_stack,
+                            merged_idx,
+                            idx_to_term=idx_to_term,
+                            height=int(base_mask.shape[0]),
+                            width=int(base_mask.shape[1]),
+                            fallback_mask=base_mask,
+                            processing_device=_processing_device,
+                        )
                         if int(np.asarray(merged_stack).size) > 0
-                        else np.zeros((int(base_mask.shape[0]), int(base_mask.shape[1])), dtype=np.float32)
+                        else np.asarray(base_mask, dtype=np.float32)
                     )
                     terms_rows.append(_all_terms[i])
                     masks.append(np.asarray(mixed_mask, dtype=np.float32))
@@ -1010,6 +1056,12 @@ class DataNode(PipelineNode):
                     "terms_rows": list(terms_rows),
                 })
                 _pbar.update(1)
+        _register_churn_terms(
+            ctx,
+            term_rows=terms_rows,
+            source="gestation",
+            stage_label="stage1_gestation",
+        )
 
         with semantic_processing_device(ctx, enabled=bool(self.gest_cfg.gpu_preprocess)) as _processing_device:
             dataset, selected_indices, _cache_info = _build_semantic_stage_cache_dataset(
@@ -1148,6 +1200,18 @@ class DataNode(PipelineNode):
         ctx.berkeley_refresh_loader = loader
         ctx.berkeley_gate_val_loader = gate_val_loader
         self._bdata_last_build_round = ctx.total_rounds_completed
+        _register_churn_terms(
+            ctx,
+            term_rows=_dataset_terms_rows(getattr(loader, "dataset", None)),
+            source="berkeley_refresh",
+            stage_label="stage2_berkeley",
+        )
+        _register_churn_terms(
+            ctx,
+            term_rows=_dataset_terms_rows(getattr(gate_val_loader, "dataset", None)),
+            source="berkeley_gate_val",
+            stage_label="gate_berkeley",
+        )
 
         # Possession tracking
         poss = self.possessions["berkeley"]
@@ -1189,6 +1253,12 @@ class DataNode(PipelineNode):
         ctx.payload_bank = out_images
         ctx.payload_masks = out_masks if out_masks else []
         ctx.payload_bank_ready = bool(out_images)
+        _register_churn_terms(
+            ctx,
+            term_rows=_out_terms,
+            source="payload_bank",
+            stage_label="payload_bank",
+        )
 
         # Build payload conditions vector
         if out_images and out_targets and ctx.label_embedding_bank is not None:
@@ -1217,6 +1287,7 @@ class DataNode(PipelineNode):
                 image_size=image_size,
                 seed=seed,
                 source_root=str(self.payload_cfg.payload_bank_dir),
+                return_mask_stack=True,
                 chunk_batch_size=max(1, int(self.payload_cfg.build_batch_size)),
                 wheel_max_bytes=self.bdata_cfg.wheel_max_bytes,
                 wheel_sanity_cap_bytes=self.bdata_cfg.wheel_sanity_cap_bytes,
@@ -1235,6 +1306,12 @@ class DataNode(PipelineNode):
         ctx.payload_validation_dataset = dataset
         ctx.payload_validation_loader = loader
         self._payload_built = True
+        _register_churn_terms(
+            ctx,
+            term_rows=_terms_rows,
+            source="payload_validation",
+            stage_label="payload_validation",
+        )
 
         # Possession tracking
         poss = self.possessions["payload"]
@@ -2006,10 +2083,12 @@ def _build_semantic_stage_cache_dataset(
         )
 
     def _entry_group(base_idx: int, _base_pos: int) -> List[Dict[str, Any]]:
+        term_row = list(_normalize_vocab_terms(terms_rows[int(base_idx)])) if 0 <= int(base_idx) < int(len(terms_rows)) else []
         clean = build_semantic_cache_entry(
             image=images[int(base_idx)],
             label_vec=targets[int(base_idx)],
             image_size=int(image_size),
+            terms=term_row,
             mixed_mask=masks[int(base_idx)],
             mask_stack=mask_stacks[int(base_idx)],
             mask_indices=mask_indices[int(base_idx)],
@@ -2100,6 +2179,70 @@ def _selected_source_counts(rows: Sequence[Any], indices: Sequence[int]) -> Dict
         src = str(getattr(rows[int(row_idx)], "source", "") or "")
         counts[str(src)] = int(counts.get(str(src), 0)) + 1
     return counts
+
+
+def _dataset_terms_rows(dataset: Optional[Dataset], max_rows: int = 0) -> List[List[str]]:
+    if dataset is None:
+        return []
+    limit = int(max_rows) if int(max_rows) > 0 else int(len(dataset))
+    out: List[List[str]] = []
+    reader = getattr(dataset, "read_numpy_entry", None)
+    if callable(reader):
+        for idx in tqdm(range(int(limit)), desc="[data-node] reading dataset terms", unit="row", leave=False, dynamic_ncols=True):
+            try:
+                item = reader(int(idx))
+            except Exception:
+                out.append([])
+                continue
+            terms = item.get("terms", []) if isinstance(item, dict) else []
+            out.append(list(_normalize_vocab_terms(terms if isinstance(terms, (list, tuple)) else [])))
+        return out
+    for idx in range(int(limit)):
+        try:
+            item = dataset[int(idx)]
+        except Exception:
+            out.append([])
+            continue
+        if isinstance(item, (tuple, list)) and int(len(item)) >= 6 and isinstance(item[5], (list, tuple)):
+            out.append(list(_normalize_vocab_terms([str(x) for x in list(item[5])])))
+        else:
+            out.append([])
+    return out
+
+
+def _register_churn_terms(
+    ctx: PipelineContext,
+    *,
+    term_rows: Sequence[Sequence[str]],
+    source: str,
+    stage_label: str,
+) -> Optional[Dict[str, Any]]:
+    normalized_rows = [
+        list(_normalize_vocab_terms([str(x) for x in list(row)]))
+        for row in list(term_rows or [])
+        if isinstance(row, (list, tuple))
+    ]
+    if int(len(normalized_rows)) <= 0:
+        return None
+    required_terms = _normalize_vocab_terms([term for row in normalized_rows for term in row])
+    if int(len(required_terms)) <= 0:
+        return None
+    plan = register_churn_requirement(
+        ctx=ctx,
+        required_terms=required_terms,
+        term_rows=normalized_rows,
+        source=str(source),
+        stage_label=str(stage_label),
+        max_terms_per_slot=int(getattr(ctx, "vocab_lora_max_terms", 0) or len(getattr(ctx, "active_extra_terms", [])) or 0),
+    )
+    extra_count = int(plan.get("required_extra_term_count", 0))
+    if extra_count > 0:
+        _log(
+            f"[data-node] churn requirement source={str(source)} "
+            f"extra_terms={extra_count} slots={int(plan.get('slot_count', 0))} "
+            f"fit={bool(plan.get('current_vocab_fit', False))}"
+        )
+    return plan
 
 
 def _log_semantic_wheel_summary(purpose: str, wheel_info: Dict[str, Any]) -> None:
@@ -3377,11 +3520,15 @@ def _unpack_masked_semantic_batch(batch: Any, context: str) -> Tuple[torch.Tenso
             meta["mask_stacks"] = list(batch.get("mask_stacks") or [])
         if "mask_indices" in batch:
             meta["mask_indices"] = list(batch.get("mask_indices") or [])
+        if "terms_rows" in batch:
+            meta["terms_rows"] = [list(x) for x in list(batch.get("terms_rows") or [])]
     elif isinstance(batch, (tuple, list)) and int(len(batch)) >= 3:
         xb, yb, mb = batch[0], batch[1], batch[2]
         if int(len(batch)) >= 5:
             meta["mask_stacks"] = batch[3]
             meta["mask_indices"] = batch[4]
+        if int(len(batch)) >= 6 and isinstance(batch[5], (list, tuple)):
+            meta["terms_rows"] = [list(x) if isinstance(x, (list, tuple)) else [] for x in list(batch[5])]
     else:
         raise RuntimeError(f"{str(context)} requires (image, target, mask) batches.")
     if not (torch.is_tensor(xb) and torch.is_tensor(yb) and torch.is_tensor(mb)):

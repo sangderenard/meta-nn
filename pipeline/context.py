@@ -62,6 +62,74 @@ def _channel_key_for_metric(stage: str, key: str) -> Optional[str]:
 
 
 # ---------------------------------------------------------------------------
+# Signal store — simple read/write numeric state atoms
+# ---------------------------------------------------------------------------
+
+class SignalStore:
+    """Runtime registry of named numeric signals.
+
+    Each signal holds a single ``float`` value.  Condition expressions
+    access the store through the normal dotted-accessor path on the
+    ``PipelineContext``::
+
+        ctx.signals.gate_pregestation_passed   # → 0.0 or 1.0
+
+    Attribute-style reads are supported so condition_expr can resolve
+    ``signals.xxx`` without special-casing.  Writes go through
+    :meth:`write` (or the ``[]`` operator).
+    """
+
+    __slots__ = ("_values",)
+
+    def __init__(self) -> None:
+        object.__setattr__(self, "_values", {})
+
+    # -- read --
+    def read(self, signal_id: str) -> float:
+        return self._values.get(str(signal_id), 0.0)
+
+    def __getattr__(self, name: str) -> float:
+        if name.startswith("_"):
+            raise AttributeError(name)
+        return self._values.get(name, 0.0)
+
+    def __getitem__(self, key: str) -> float:
+        return self._values.get(str(key), 0.0)
+
+    # -- write --
+    def write(self, signal_id: str, value: float) -> None:
+        self._values[str(signal_id)] = float(value)
+
+    def __setitem__(self, key: str, value: float) -> None:
+        self._values[str(key)] = float(value)
+
+    # -- bulk --
+    def snapshot(self) -> Dict[str, float]:
+        return dict(self._values)
+
+    def load(self, values: Dict[str, float]) -> None:
+        for k, v in values.items():
+            self._values[str(k)] = float(v)
+
+    def init_from_records(self, records: Any) -> None:
+        """Seed initial values from a list of ``SignalRecord``."""
+        for rec in records:
+            sid = str(getattr(rec, "signal_id", ""))
+            if sid:
+                self._values.setdefault(sid, float(getattr(rec, "initial_value", 0.0)))
+
+    def __repr__(self) -> str:
+        pairs = ", ".join(f"{k}={v}" for k, v in sorted(self._values.items()))
+        return f"SignalStore({pairs})"
+
+    def __len__(self) -> int:
+        return len(self._values)
+
+    def __contains__(self, key: str) -> bool:
+        return str(key) in self._values
+
+
+# ---------------------------------------------------------------------------
 # Gate state
 # ---------------------------------------------------------------------------
 
@@ -129,6 +197,16 @@ class PipelineContext:
     non_training_device_preference: str = "auto"
     output_dir: Optional[Path] = None
     raise_on_node_failure: bool = True
+
+    # ---- signals --------------------------------------------------------
+    #  Simple read/write numeric atoms.  Condition expressions and predicate
+    #  graphs reference signals by ID.  Nodes write at runtime.
+    signals: SignalStore = field(default_factory=SignalStore)
+
+    # ---- predicate graphs -----------------------------------------------
+    #  Registry of live PredicateGraph objects keyed by graph_id.
+    #  Populated from the plan at startup; edges look up their graph here.
+    predicate_graphs: Dict[str, Any] = field(default_factory=dict)
 
     # ---- AMP ------------------------------------------------------------
     amp_enabled: bool = False
@@ -250,6 +328,16 @@ class PipelineContext:
     # ---- LoRA adapter state (classifier) --------------------------------
     lora_slot_snapshots: Dict[str, Any] = field(default_factory=dict)
     lora_active_slot: str = ""
+    vocab_lora_library: Dict[str, Any] = field(default_factory=dict)
+    vocab_lora_plan_cache: Dict[str, Any] = field(default_factory=dict)
+    vocab_lora_requirement_history: List[Dict[str, Any]] = field(default_factory=list)
+    vocab_lora_pending_terms: List[str] = field(default_factory=list)
+    vocab_lora_active_signature: str = ""
+    vocab_lora_active_terms: List[str] = field(default_factory=list)
+    vocab_lora_locked_terms: List[str] = field(default_factory=list)
+    vocab_lora_max_terms: int = 0
+    vocab_lora_latest_plan_signature: str = ""
+    vocab_lora_plan_slot_cursor: int = 0
 
     # ---- metrics / history ----------------------------------------------
     metrics_history: List[Dict[str, Any]] = field(default_factory=list)

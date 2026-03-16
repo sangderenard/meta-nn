@@ -62,60 +62,6 @@ def _load_history(viewer, out_dir: Path, loss_store=None) -> None:
 
     loaded = 0
 
-    # ── summary.json (high-level per-round history) ───────────────────────
-    summary_path = out_dir / "summary.json"
-    if summary_path.exists():
-        try:
-            import json
-            data = json.loads(summary_path.read_text(encoding="utf-8"))
-            for row in data.get("berkeley_refresh_history", []):
-                try:
-                    v = float(row.get("loss", float("nan")))
-                    if math.isfinite(v):
-                        _record("berk", v)
-                        loaded += 1
-                except Exception:
-                    pass
-            for row in data.get("generator_history", []):
-                try:
-                    gv = float(row.get("g_loss", float("nan")))
-                    dv = float(row.get("d_loss", float("nan")))
-                    if math.isfinite(gv):
-                        _record("gen", gv)
-                        loaded += 1
-                    if math.isfinite(dv):
-                        _record("disc", dv)
-                        loaded += 1
-                except Exception:
-                    pass
-            for row in data.get("transformer_history", []):
-                try:
-                    v = float(row.get("train_loss", float("nan")))
-                    if math.isfinite(v):
-                        _record("trans", v)
-                        loaded += 1
-                except Exception:
-                    pass
-            for row in data.get("wave_classifier_history", []):
-                try:
-                    v = float(row.get("train_loss", float(row.get("loss", float("nan")))))
-                    if math.isfinite(v):
-                        _record("wcls", v)
-                        loaded += 1
-                except Exception:
-                    pass
-                try:
-                    ev = float(row.get("val_loss", float("nan")))
-                    if math.isfinite(ev):
-                        _record("wcls_eval", ev)
-                        loaded += 1
-                except Exception:
-                    pass
-            if loaded > 0:
-                print(f"[gui] loaded {loaded} values from summary.json", flush=True)
-        except Exception as e:
-            print(f"[gui] could not load summary.json: {e}", flush=True)
-
     # -- training_graph_plan.json (logical graph plan) --------------------
     plan_path = out_dir / DEFAULT_PLAN_FILENAME
     if plan_path.exists():
@@ -150,33 +96,79 @@ def _load_history(viewer, out_dir: Path, loss_store=None) -> None:
         except Exception as e:
             print(f"[gui] could not load {DEFAULT_RUNTIME_SNAPSHOT_FILENAME}: {e}", flush=True)
 
-    # ── loss_log_prev.bin (binary records from previous session) ──────────
-    prev_path = out_dir / "loss_log_prev.bin"
-    try:
-        recs = _LossFileLogger.load(prev_path)
-        for rec in recs:
-            ck = rec["channel_key"].decode("utf-8").rstrip("\x00") if rec["channel_key"] else ""
-            if not ck:
-                ck = f"stage_{int(rec['stage'])}"
-            _record(ck, float(rec["loss"]), ts=float(rec["ts"]))
-        if len(recs) > 0:
-            print(f"[gui] loaded {len(recs)} records from loss_log_prev.bin", flush=True)
-    except Exception as e:
-        print(f"[gui] could not load loss_log_prev.bin: {e}", flush=True)
+    # ── Binary loss logs (have proper timestamps — load these first) ──────
+    bin_loaded = 0
+    for fname in ("loss_log_prev.bin", "loss_log.bin"):
+        fpath = out_dir / fname
+        try:
+            recs = _LossFileLogger.load(fpath)
+            for rec in recs:
+                ck = rec["channel_key"].decode("utf-8").rstrip("\x00") if rec["channel_key"] else ""
+                if not ck:
+                    ck = f"stage_{int(rec['stage'])}"
+                _record(ck, float(rec["loss"]), ts=float(rec["ts"]))
+                bin_loaded += 1
+            if len(recs) > 0:
+                print(f"[gui] loaded {len(recs)} records from {fname}", flush=True)
+        except Exception as e:
+            if fname == "loss_log_prev.bin":
+                print(f"[gui] could not load {fname}: {e}", flush=True)
+    loaded += bin_loaded
 
-    # ── loss_log.bin (current/most recent session, may still be accumulating) ─
-    cur_path = out_dir / "loss_log.bin"
-    try:
-        recs = _LossFileLogger.load(cur_path)
-        for rec in recs:
-            ck = rec["channel_key"].decode("utf-8").rstrip("\x00") if rec["channel_key"] else ""
-            if not ck:
-                ck = f"stage_{int(rec['stage'])}"
-            _record(ck, float(rec["loss"]), ts=float(rec["ts"]))
-        if len(recs) > 0:
-            print(f"[gui] loaded {len(recs)} records from loss_log.bin", flush=True)
-    except Exception:
-        pass  # May not exist yet
+    # ── summary.json fallback (no timestamps — only when binary logs empty) ─
+    if bin_loaded == 0:
+        summary_path = out_dir / "summary.json"
+        if summary_path.exists():
+            try:
+                import json
+                data = json.loads(summary_path.read_text(encoding="utf-8"))
+                for row in data.get("berkeley_refresh_history", []):
+                    try:
+                        v = float(row.get("loss", float("nan")))
+                        if math.isfinite(v):
+                            _record("berk", v)
+                            loaded += 1
+                    except Exception:
+                        pass
+                for row in data.get("generator_history", []):
+                    try:
+                        gv = float(row.get("g_loss", float("nan")))
+                        dv = float(row.get("d_loss", float("nan")))
+                        if math.isfinite(gv):
+                            _record("gen", gv)
+                            loaded += 1
+                        if math.isfinite(dv):
+                            _record("disc", dv)
+                            loaded += 1
+                    except Exception:
+                        pass
+                for row in data.get("transformer_history", []):
+                    try:
+                        v = float(row.get("train_loss", float("nan")))
+                        if math.isfinite(v):
+                            _record("trans", v)
+                            loaded += 1
+                    except Exception:
+                        pass
+                for row in data.get("wave_classifier_history", []):
+                    try:
+                        v = float(row.get("train_loss", float(row.get("loss", float("nan")))))
+                        if math.isfinite(v):
+                            _record("wcls", v)
+                            loaded += 1
+                    except Exception:
+                        pass
+                    try:
+                        ev = float(row.get("val_loss", float("nan")))
+                        if math.isfinite(ev):
+                            _record("wcls_eval", ev)
+                            loaded += 1
+                    except Exception:
+                        pass
+                if loaded > 0:
+                    print(f"[gui] loaded {loaded} values from summary.json (no binary logs)", flush=True)
+            except Exception as e:
+                print(f"[gui] could not load summary.json: {e}", flush=True)
 
     # ── Checkpoint markers from .pt files ─────────────────────────────────
     ckpt_candidates = [

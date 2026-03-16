@@ -260,6 +260,8 @@ class BerkeleyGateNode(GatedNode):
                 channels_last=False,
                 semantic_mask_supervision_mode=str(getattr(ctx.args, "semantic_mask_supervision_mode", "multihot_mix") or "multihot_mix"),
                 semantic_cosine_weight=float(CLASSIFIER_SEMANTIC_COSINE_WEIGHT),
+                active_class_names=list(ctx.class_names),
+                source_class_names=list(ctx.supervised_class_names),
             )
 
         confidence = float(result.get("mean_confidence", 0.0))
@@ -762,7 +764,11 @@ def _evaluate_berkeley_classifier_gate(
     semantic_mask_supervision_mode: str = "multihot_mix",
     preview_sink: Optional[Dict[str, Any]] = None,
     semantic_cosine_weight: float = CLASSIFIER_SEMANTIC_COSINE_WEIGHT,
+    active_class_names: Optional[Sequence[str]] = None,
+    source_class_names: Optional[Sequence[str]] = None,
 ):
+    from pipeline.nodes.classifier_node import _remap_semantic_batch_to_active_vocab
+
     classifier.eval()
     amp_dtype_t = resolve_amp_dtype(amp_dtype) if amp_enabled else torch.float16
     runtime_amp_enabled = bool(amp_enabled and device.type == "cuda")
@@ -790,6 +796,14 @@ def _evaluate_berkeley_classifier_gate(
     for batch in loader:
         batch_idx += 1
         xb, yb, mb, batch_meta = _unpack_masked_semantic_batch(batch, context="berkeley gate evaluation")
+        if isinstance(batch_meta, dict) and int(len(active_class_names or [])) > 0:
+            yb, mb, batch_meta = _remap_semantic_batch_to_active_vocab(
+                yb,
+                mb,
+                batch_meta,
+                active_class_names=list(active_class_names or []),
+                source_class_names=list(source_class_names or []),
+            )
         xb, yb, mb = _expand_semantic_mask_supervision_batch(
             xb=xb,
             yb=yb,

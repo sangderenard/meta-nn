@@ -3185,6 +3185,9 @@ NODUS_API int nodus_weight_image_store_get_meta(
         int32_t *out_h,
         int32_t *out_c,
         int32_t *out_stride_bytes,
+        int32_t *out_mode,
+        int32_t *out_target_w,
+        int32_t *out_target_h,
         uint64_t *out_byte_count,
         uint32_t *out_flags,
         char *out_model_name,
@@ -3218,6 +3221,9 @@ NODUS_API int nodus_weight_image_store_get_meta(
     if (out_h) *out_h = entry->h;
     if (out_c) *out_c = entry->c;
     if (out_stride_bytes) *out_stride_bytes = entry->stride_bytes;
+    if (out_mode) *out_mode = entry->mode;
+    if (out_target_w) *out_target_w = entry->target_w;
+    if (out_target_h) *out_target_h = entry->target_h;
     if (out_byte_count) *out_byte_count = entry->byte_count;
     if (out_flags) *out_flags = entry->flags;
     copy_out_string(entry->model_name, out_model_name, out_model_name_buflen);
@@ -3240,6 +3246,9 @@ NODUS_API int32_t nodus_weight_image_store_copy_image(
     if (nodus_weight_image_store_get_meta(
             store,
             index,
+            NULL,
+            NULL,
+            NULL,
             NULL,
             NULL,
             NULL,

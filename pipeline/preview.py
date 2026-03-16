@@ -229,12 +229,17 @@ def make_classifier_step_preview_callback(ctx: Any, node_id: str):
             cycle_id=int(getattr(ctx, "cycle", 0)),
             round_id=int(getattr(ctx, "round_id", 0)),
         )
-        if callable(publish_progress) and eff_loss is not None and math.isfinite(float(eff_loss)):
-            try:
-                publish_progress(str(node_id), float(eff_loss))
-            except Exception:
-                pass
         for frame in frames:
+            # Publish one loss entry per item so the graph ticks at the same
+            # granularity as the scrub ring (one frame = one graph point).
+            frame_loss = frame.get("loss_scalars", {}).get("batch_loss", None)
+            if frame_loss is None:
+                frame_loss = eff_loss
+            if callable(publish_progress) and frame_loss is not None and math.isfinite(float(frame_loss)):
+                try:
+                    publish_progress(str(node_id), float(frame_loss))
+                except Exception:
+                    pass
             try:
                 enqueue_frame(frame)
             except Exception:

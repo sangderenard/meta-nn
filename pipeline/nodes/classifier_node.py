@@ -36,11 +36,14 @@ Training schedule owned here
 from __future__ import annotations
 
 import copy
+import hashlib
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
+from torch.utils.data import DataLoader
 
 from pipeline.context import PipelineContext
 from pipeline.graph import PipelineNode
@@ -79,6 +82,12 @@ from pipeline.utils import (
     _refresh_cache_is_staging_safe,
     _unwrap_module_for_replica,
 )
+from semantic_dataset_loaders import (
+    _composite_non_dataset_label_stack,
+    build_creation_label_mask_stack,
+    build_label_mask_stack,
+    combine_label_mask_stacks,
+)
 import gc
 import math
 import re
@@ -115,7 +124,7 @@ class ClassifierConfig:
     # ---- LoRA -----------------------------------------------------------
     lora_rank: int = 8
     lora_alpha: float = 16.0
-    lora_enabled: bool = False
+    lora_enabled: bool = True
     lora_churn_slots: int = 4            # number of active LoRA slots per vocab cycle
 
     # ---- optimiser / LR -------------------------------------------------
@@ -162,6 +171,8 @@ class ClassifierConfig:
     # ---- Stage C — LoRA round (per vocab churn group) -------------------
     stageC_steps_per_slot: int = 64
     stageC_lora_rank: int = 8
+    stageC_lora_alpha: float = 16.0
+    stageC_max_terms: int = 50
     stageC_batch_size: int = 16
 
     # ---- Fake-class feedback -------------------------------------------
@@ -210,7 +221,12 @@ class BuildClassifierNode(PipelineNode):
         return not self._built
 
     def execute(self, ctx: PipelineContext) -> None:
-        from wav_ml_models import TinyConvClassifier, maybe_compile_module
+        from wav_ml_models import (
+            TinyConvClassifier,
+            maybe_compile_module,
+            prime_tiny_classifier_label_bank_for_state_dict,
+            restore_tiny_classifier_lora_snapshot,
+        )
 
         n_classes = len(ctx.class_names) if ctx.class_names else 1
         mask_ch = self.cfg.mask_decoder_channels
@@ -248,6 +264,13 @@ class BuildClassifierNode(PipelineNode):
         if resume_ckpt is not None:
             if "classifier_state" in resume_ckpt:
                 try:
+                    if isinstance(resume_ckpt.get("classifier_lora"), dict):
+                        restore_tiny_classifier_lora_snapshot(model, resume_ckpt.get("classifier_lora"))
+                    prime_tiny_classifier_label_bank_for_state_dict(
+                        model,
+                        resume_ckpt["classifier_state"],
+                        temperature=float(self.cfg.label_embedding_temperature),
+                    )
                     model.load_state_dict(resume_ckpt["classifier_state"], strict=False)
                     _log("[classifier] resumed model state from pipeline checkpoint")
                 except Exception as exc:
@@ -359,6 +382,7 @@ class PregestationTrainNode(IRTrainingNode):
         return ctx.pregestation_loader is not None and ctx.classifier is not None
 
     def execute(self, ctx: PipelineContext) -> None:
+        ensure_vocab_lora_active(ctx, self.cfg)
         from pipeline.nodes.base import make_training_progress_callback
         preview_callback = make_classifier_step_preview_callback(ctx, self.node_id)
         weight_update_callback = make_runtime_weight_publish_callback(
@@ -475,6 +499,7 @@ class GestationTrainNode(IRTrainingNode):
         }
 
     def execute(self, ctx: PipelineContext) -> None:
+        ensure_vocab_lora_active(ctx, self.cfg)
         from pipeline.nodes.base import make_training_progress_callback
         preview_callback = make_classifier_step_preview_callback(ctx, self.node_id)
         weight_update_callback = make_runtime_weight_publish_callback(
@@ -590,6 +615,7 @@ class BerkeleyRefreshTrainNode(IRTrainingNode):
         }
 
     def execute(self, ctx: PipelineContext) -> None:
+        ensure_vocab_lora_active(ctx, self.cfg)
         from pipeline.nodes.base import make_training_progress_callback
         preview_callback = make_classifier_step_preview_callback(ctx, self.node_id)
         weight_update_callback = make_runtime_weight_publish_callback(
@@ -623,6 +649,9 @@ class BerkeleyRefreshTrainNode(IRTrainingNode):
             stop_requested=ctx.stop_requested,
             weight_update_callback=weight_update_callback,
             args=ctx.args,
+            remap_targets_from_terms=True,
+            active_class_names=list(ctx.class_names),
+            source_class_names=list(ctx.supervised_class_names),
         )
 
         loss = float(result.get("loss", float("inf")))
@@ -637,12 +666,16 @@ class BerkeleyRefreshTrainNode(IRTrainingNode):
 class LoRARoundNode(IRTrainingNode):
     """Stage C: Per-term LoRA adapter slot training.
 
-    Requires all base gates.  For each active churn-term group a dedicated
-    LoRA slot is activated in the classifier, trained for stageC_steps_per_slot
-    steps on Berkeley payload rows matching those terms, then snapshotted.
+    Requires all base gates.  Sweeps every planned vocab-LoRA slot from the
+    current churn requirement plan in a single execution.  For each slot the
+    slot's vocabulary is activated, the corresponding LoRA adapter is
+    installed/restored, the backbone + adapter are trained together for
+    stageC_steps_per_slot steps on Berkeley payload rows, and the adapter
+    state is snapshotted into the slot library.
 
-    This allows the classifier to specialise per vocabulary subset without
-    catastrophic forgetting of the shared backbone.
+    This turns the system from limited-vocabulary into anything-vocabulary:
+    the backbone is pressured toward zero-hot generalization while each
+    vocab LoRA absorbs term-specific detail.
     """
 
     node_id = "stage_c_lora"
@@ -711,7 +744,7 @@ class LoRARoundNode(IRTrainingNode):
         }
 
     def execute(self, ctx: PipelineContext) -> None:
-        if not self.cfg.lora_enabled:
+        if not self.cfg.lora_enabled or ctx.classifier is None or ctx.berkeley_refresh_loader is None:
             return
 
         from wav_ml_models import (
@@ -721,53 +754,127 @@ class LoRARoundNode(IRTrainingNode):
             restore_tiny_classifier_lora_snapshot,
             set_tiny_classifier_lora_state,
         )
+        from pipeline.nodes.vocab_node import activate_vocab_lora_slot
 
-        # Cycle through churn-group terms with dedicated LoRA slots
-        churn_terms = ctx.active_extra_terms[: self.cfg.lora_churn_slots]
+        # -- Gather all planned slots for the current requirement set ------
+        plan_signature = str(getattr(ctx, "vocab_lora_latest_plan_signature", "") or "").strip()
+        plan = dict(getattr(ctx, "vocab_lora_plan_cache", {}).get(str(plan_signature), {}) or {}) if plan_signature else {}
+        planned_slots = list(plan.get("slots") or [])
+
+        # Fall back: if no multi-slot plan, synthesize a single-slot entry
+        # from whatever churn currently has active.
+        if not planned_slots:
+            active_signature = str(getattr(ctx, "vocab_lora_active_signature", "") or "").strip()
+            if not active_signature:
+                active_signature = hashlib.sha1(
+                    "|".join([str(x) for x in list(getattr(ctx, "active_extra_terms", []))]).encode("utf-8", errors="ignore")
+                ).hexdigest()[:16]
+            fallback_terms = list(
+                getattr(ctx, "vocab_lora_active_terms", [])
+                or getattr(ctx, "active_extra_terms", [])
+            )
+            planned_slots = [
+                {
+                    "signature": str(active_signature),
+                    "slot_name": f"vocab_{active_signature}",
+                    "terms": list(fallback_terms),
+                }
+            ]
+
+        # -- Install LoRA adapters once ------------------------------------
+        install_tiny_classifier_lora(
+            ctx.classifier,
+            rank=int(self.cfg.stageC_lora_rank),
+            alpha=float(self.cfg.stageC_lora_alpha),
+        )
+
         weight_update_callback = make_runtime_weight_publish_callback(
             ctx,
             model_name="classifier",
             model=ctx.classifier,
             node_id=self.node_id,
         )
-        for term in churn_terms:
-            slot_name = _term_to_slot_name(term)
-            ensure_tiny_classifier_lora_slot(
-                ctx.classifier,
-                slot_name=slot_name,
-                rank=self.cfg.stageC_lora_rank,
+
+        # -- Sweep every planned slot --------------------------------------
+        slots_trained = 0
+        for slot_def in planned_slots:
+            slot_signature = str(slot_def.get("signature", "")).strip()
+            slot_name = str(slot_def.get("slot_name", f"vocab_{slot_signature}"))
+            slot_terms = list(slot_def.get("terms") or [])
+            if not slot_signature or not slot_terms:
+                continue
+
+            # Activate this slot's vocabulary in the pipeline context
+            activate_vocab_lora_slot(ctx, slot_def)
+
+            # Prepare LoRA slot
+            ensure_tiny_classifier_lora_slot(ctx.classifier, slot_name=slot_name)
+            existing_snapshot = (
+                getattr(ctx, "lora_slot_snapshots", {}).get(str(slot_signature))
+                or getattr(ctx, "lora_slot_snapshots", {}).get(str(slot_name))
             )
-            install_tiny_classifier_lora(ctx.classifier, slot_name=slot_name)
+            if isinstance(existing_snapshot, dict):
+                restore_tiny_classifier_lora_snapshot(ctx.classifier, existing_snapshot)
 
-            if ctx.berkeley_refresh_loader is not None:
-                _run_classifier_refresh_epochs(
-                    classifier=ctx.classifier,
-                    optimizer=ctx.classifier_optimizer,
-                    loader=ctx.berkeley_refresh_loader,
-                    device=ctx.device,
-                    epochs=1,
-                    max_steps=self.cfg.stageC_steps_per_slot,
-                    amp_enabled=ctx.amp_enabled,
-                    amp_dtype=ctx.amp_dtype,
-                    grad_clip=self.cfg.grad_clip,
-                    grad_accum_steps=self.cfg.grad_accum_steps,
-                    semantic_cosine_weight=self.cfg.semantic_cosine_weight,
-                    grad_scaler=ctx.classifier_grad_scaler,
-                    channels_last=self.cfg.channels_last,
-                    stage_label=f"stageC_lora_{slot_name}",
-                    weight_update_callback=weight_update_callback,
-                    args=ctx.args,
-                )
+            # Backbone + LoRA train together
+            set_tiny_classifier_lora_state(ctx.classifier, slot_name=slot_name, lora_only=False)
+            ctx.lora_active_slot = str(slot_name)
 
-            # Snapshot this slot so it can be restored later
-            ctx.lora_slot_snapshots[slot_name] = tiny_classifier_lora_snapshot(
-                ctx.classifier, slot_name=slot_name
+            _run_classifier_refresh_epochs(
+                classifier=ctx.classifier,
+                optimizer=ctx.classifier_optimizer,
+                loader=ctx.berkeley_refresh_loader,
+                device=ctx.device,
+                epochs=1,
+                max_steps=self.cfg.stageC_steps_per_slot,
+                amp_enabled=ctx.amp_enabled,
+                amp_dtype=ctx.amp_dtype,
+                grad_clip=self.cfg.grad_clip,
+                grad_accum_steps=self.cfg.grad_accum_steps,
+                semantic_cosine_weight=self.cfg.semantic_cosine_weight,
+                grad_scaler=ctx.classifier_grad_scaler,
+                channels_last=self.cfg.channels_last,
+                stage_label=f"stageC_lora_{slot_name}",
+                weight_update_callback=weight_update_callback,
+                args=ctx.args,
+                remap_targets_from_terms=True,
+                active_class_names=list(ctx.class_names),
+                source_class_names=list(ctx.supervised_class_names),
             )
 
-        # Return to base (no active LoRA) after the round
-        set_tiny_classifier_lora_state(ctx.classifier, active_slot="")
-        ctx.lora_active_slot = ""
-        _log(f"[stageC] LoRA round complete for {len(churn_terms)} churn slots")
+            # Snapshot trained slot
+            slot_snapshot = tiny_classifier_lora_snapshot(ctx.classifier, slot_name=slot_name)
+            ctx.lora_slot_snapshots[str(slot_signature)] = dict(slot_snapshot)
+            ctx.lora_slot_snapshots[str(slot_name)] = dict(slot_snapshot)
+
+            library_entry = dict(getattr(ctx, "vocab_lora_library", {}).get(str(slot_signature), {}) or {})
+            library_entry.update(
+                {
+                    "signature": str(slot_signature),
+                    "slot_name": str(slot_name),
+                    "terms": list(slot_terms),
+                    "snapshot_present": True,
+                    "trained_rounds": int(library_entry.get("trained_rounds", 0)) + 1,
+                    "last_trained_round": int(getattr(ctx, "round_id", 0) or 0),
+                }
+            )
+            ctx.vocab_lora_library[str(slot_signature)] = dict(library_entry)
+            slots_trained += 1
+
+            _log(
+                f"[stageC] slot {slots_trained}/{len(planned_slots)} "
+                f"name={slot_name} terms={len(slot_terms)} signature={slot_signature[:12]}"
+            )
+
+        # After sweeping all slots, leave the last trained slot active.
+        # The 50 open vocab slots must never be used without a LoRA in place.
+        # If no slots were trained, re-ensure the current vocab LoRA is active.
+        if slots_trained == 0:
+            ensure_vocab_lora_active(ctx, self.cfg)
+        _log(
+            f"[stageC] LoRA sweep complete: {slots_trained} slot(s) trained, "
+            f"active_slot={ctx.lora_active_slot}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -857,6 +964,7 @@ class FakeClassFeedbackNode(IRTrainingNode):
         )
 
     def execute(self, ctx: PipelineContext) -> None:
+        ensure_vocab_lora_active(ctx, self.cfg)
         weight_update_callback = make_runtime_weight_publish_callback(
             ctx,
             model_name="classifier",
@@ -946,6 +1054,66 @@ def _load_classifier_checkpoint(model: nn.Module, path: str, scope: str = "all")
 
 def _log(msg: str) -> None:
     print(msg, flush=True)
+
+
+def ensure_vocab_lora_active(ctx: PipelineContext, cfg: ClassifierConfig) -> Dict[str, Any]:
+    """Ensure a LoRA adapter is installed and active whenever extra-vocab slots are in use.
+
+    Design invariant: the 50 open/extra vocab slots must NEVER be used
+    without a LoRA in place.  Only when labels are exclusively from
+    the 101 built-in supervised vocabulary may the classifier operate
+    without LoRA.  This helper enforces that invariant.
+    """
+    extra_terms = list(getattr(ctx, "active_extra_terms", []) or [])
+    if not extra_terms:
+        return {"needed": False, "reason": "no_extra_terms"}
+    if ctx.classifier is None:
+        return {"needed": True, "reason": "no_classifier", "installed": False}
+
+    from wav_ml_models import (
+        install_tiny_classifier_lora,
+        ensure_tiny_classifier_lora_slot,
+        set_tiny_classifier_lora_state,
+        tiny_classifier_lora_modules,
+        restore_tiny_classifier_lora_snapshot,
+    )
+
+    # Step 1: ensure LoRA modules are installed on the classifier
+    mods = tiny_classifier_lora_modules(ctx.classifier)
+    if not mods:
+        install_tiny_classifier_lora(
+            ctx.classifier,
+            rank=int(cfg.lora_rank),
+            alpha=float(cfg.lora_alpha),
+        )
+        _log("[lora-guard] installed LoRA adapters (extra vocab active)")
+
+    # Step 2: determine which slot should be active
+    signature = str(getattr(ctx, "vocab_lora_active_signature", "") or "").strip()
+    if not signature:
+        signature = hashlib.sha1(
+            "|".join(str(t) for t in extra_terms).encode("utf-8", errors="ignore")
+        ).hexdigest()[:16]
+        ctx.vocab_lora_active_signature = signature
+
+    slot_name = str(getattr(ctx, "lora_active_slot", "") or "").strip()
+    if not slot_name:
+        slot_name = f"vocab_{signature}"
+
+    # Step 3: ensure the slot exists and restore any snapshot
+    ensure_tiny_classifier_lora_slot(ctx.classifier, slot_name=slot_name)
+    existing_snapshot = (
+        getattr(ctx, "lora_slot_snapshots", {}).get(str(signature))
+        or getattr(ctx, "lora_slot_snapshots", {}).get(str(slot_name))
+    )
+    if isinstance(existing_snapshot, dict):
+        restore_tiny_classifier_lora_snapshot(ctx.classifier, existing_snapshot)
+
+    # Step 4: activate — backbone + LoRA train together
+    set_tiny_classifier_lora_state(ctx.classifier, slot_name=slot_name, lora_only=False)
+    ctx.lora_active_slot = slot_name
+
+    return {"needed": True, "installed": True, "slot_name": slot_name, "signature": signature}
 
 
 # =========================================================================
@@ -1052,6 +1220,145 @@ def _apply_classifier_init(model: TinyConvClassifier, ckpt_path: str, scope: str
     }
 
 
+def _term_key(term: str) -> str:
+    return re.sub(r"\s+", " ", str(term)).strip().lower()
+
+
+def _remap_semantic_batch_to_active_vocab(
+    yb: torch.Tensor,
+    mb: torch.Tensor,
+    batch_meta: Optional[Dict[str, Any]],
+    *,
+    active_class_names: Sequence[str],
+    source_class_names: Optional[Sequence[str]] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, Any]]:
+    meta = dict(batch_meta or {})
+    terms_rows = list(meta.get("terms_rows") or [])
+    if int(len(terms_rows)) != int(yb.shape[0]) or int(len(active_class_names)) <= 0:
+        return yb, mb, meta
+    active_names = [str(x) for x in list(active_class_names)]
+    active_term_to_idx = {_term_key(name): int(i) for i, name in enumerate(active_names) if _term_key(name)}
+    active_idx_to_term = {int(i): str(name) for i, name in enumerate(active_names)}
+    source_names = list(source_class_names or [])
+    if int(len(source_names)) != int(yb.shape[1]):
+        source_names = active_names[: int(yb.shape[1])]
+    source_idx_to_term = {
+        int(i): str(name)
+        for i, name in enumerate(source_names)
+        if _term_key(name)
+    }
+    stack_list = list(meta.get("mask_stacks") or [])
+    index_list = list(meta.get("mask_indices") or [])
+    out_y_rows: List[torch.Tensor] = []
+    out_m_rows: List[torch.Tensor] = []
+    out_stack_rows: List[torch.Tensor] = []
+    out_index_rows: List[torch.Tensor] = []
+
+    for bi in range(int(yb.shape[0])):
+        row_terms = [
+            str(term)
+            for term in list(terms_rows[int(bi)] or [])
+            if _term_key(str(term))
+        ]
+        y_active_np = np.zeros((int(len(active_names)),), dtype=np.float32)
+        for term in row_terms:
+            dst_idx = int(active_term_to_idx.get(_term_key(term), -1))
+            if 0 <= int(dst_idx) < int(y_active_np.size):
+                y_active_np[int(dst_idx)] = 1.0
+        src_positive = torch.nonzero(yb[int(bi)].detach().to(torch.float32) >= 0.5, as_tuple=False).reshape(-1).tolist()
+        for src_idx in src_positive:
+            src_term = str(source_idx_to_term.get(int(src_idx), "") or "")
+            dst_idx = int(active_term_to_idx.get(_term_key(src_term), -1))
+            if 0 <= int(dst_idx) < int(y_active_np.size):
+                y_active_np[int(dst_idx)] = 1.0
+
+        base_mask_np = np.asarray(mb[int(bi)].detach().to(torch.float32).cpu().numpy(), dtype=np.float32)
+        if int(base_mask_np.ndim) == 3 and int(base_mask_np.shape[0]) == 1:
+            base_mask_np = np.asarray(base_mask_np[0], dtype=np.float32)
+        if int(base_mask_np.ndim) != 2:
+            raise RuntimeError(f"Active-vocab remap requires [1,H,W] or [H,W] masks, got {tuple(base_mask_np.shape)}")
+        height = int(base_mask_np.shape[0])
+        width = int(base_mask_np.shape[1])
+
+        mapped_stack_rows: List[np.ndarray] = []
+        mapped_idx_rows: List[int] = []
+        sample_stack = stack_list[int(bi)] if int(bi) < int(len(stack_list)) else None
+        sample_idx = index_list[int(bi)] if int(bi) < int(len(index_list)) else None
+        if sample_stack is not None and sample_idx is not None:
+            stack_np = np.asarray(sample_stack, dtype=np.float32)
+            idx_np = np.asarray(sample_idx, dtype=np.int64).reshape(-1)
+            if int(stack_np.ndim) == 2:
+                stack_np = stack_np[None, ...]
+            pair_count = min(int(stack_np.shape[0]), int(idx_np.size)) if int(stack_np.ndim) == 3 else 0
+            for si in range(int(pair_count)):
+                src_term = str(source_idx_to_term.get(int(idx_np[int(si)]), "") or "")
+                dst_idx = int(active_term_to_idx.get(_term_key(src_term), -1))
+                if dst_idx < 0 or float(y_active_np[int(dst_idx)]) < 0.5:
+                    continue
+                mapped_stack_rows.append(np.asarray(stack_np[int(si)], dtype=np.float32))
+                mapped_idx_rows.append(int(dst_idx))
+        mapped_stack = (
+            np.stack(mapped_stack_rows, axis=0).astype(np.float32, copy=False)
+            if mapped_stack_rows
+            else np.zeros((0, int(height), int(width)), dtype=np.float32)
+        )
+        mapped_idx = np.asarray(mapped_idx_rows, dtype=np.int64)
+
+        special_stack, special_idx = build_label_mask_stack(
+            mixed_mask=base_mask_np,
+            label_vec=y_active_np,
+            idx_to_term=active_idx_to_term,
+            treat_mixed_mask_as_creation=True,
+        )
+        covered = set(np.asarray(mapped_idx, dtype=np.int64).reshape(-1).tolist())
+        covered.update(np.asarray(special_idx, dtype=np.int64).reshape(-1).tolist())
+        missing = [
+            int(idx)
+            for idx in np.where(np.asarray(y_active_np, dtype=np.float32) >= 0.5)[0].astype(np.int64).tolist()
+            if int(idx) not in covered
+        ]
+        if missing:
+            missing_y = np.zeros_like(y_active_np, dtype=np.float32)
+            missing_y[np.asarray(missing, dtype=np.int64)] = 1.0
+            creation_stack, creation_idx = build_creation_label_mask_stack(
+                missing_y,
+                height=int(height),
+                width=int(width),
+                creation_mask=base_mask_np,
+            )
+        else:
+            creation_stack = np.zeros((0, int(height), int(width)), dtype=np.float32)
+            creation_idx = np.zeros((0,), dtype=np.int64)
+        remapped_stack, remapped_idx = combine_label_mask_stacks(
+            y_active_np,
+            (mapped_stack, mapped_idx),
+            (special_stack, special_idx),
+            (creation_stack, creation_idx),
+            height=int(height),
+            width=int(width),
+            strict=True,
+        )
+        mixed_mask_np = _composite_non_dataset_label_stack(
+            remapped_stack,
+            remapped_idx,
+            idx_to_term=active_idx_to_term,
+            height=int(height),
+            width=int(width),
+            fallback_mask=base_mask_np,
+        )
+        out_y_rows.append(torch.from_numpy(np.asarray(y_active_np, dtype=np.float32)))
+        out_m_rows.append(torch.from_numpy(np.asarray(mixed_mask_np, dtype=np.float32)).unsqueeze(0))
+        out_stack_rows.append(torch.from_numpy(np.asarray(remapped_stack, dtype=np.float32)))
+        out_index_rows.append(torch.from_numpy(np.asarray(remapped_idx, dtype=np.int64)))
+
+    meta["terms_rows"] = [list(row) for row in list(terms_rows)]
+    meta["mask_stacks"] = out_stack_rows
+    meta["mask_indices"] = out_index_rows
+    y_out = torch.stack(out_y_rows, dim=0).to(device=yb.device, dtype=torch.float32)
+    m_out = torch.stack(out_m_rows, dim=0).to(device=mb.device, dtype=torch.float32)
+    return y_out, m_out, meta
+
+
 def _run_classifier_refresh_epochs(
     classifier: nn.Module,
     loader: DataLoader,
@@ -1093,6 +1400,9 @@ def _run_classifier_refresh_epochs(
     grad_clip: float = 1.0,
     semantic_soft_target_max: float = 0.0,
     semantic_cosine_weight: float = CLASSIFIER_SEMANTIC_COSINE_WEIGHT,
+    remap_targets_from_terms: bool = False,
+    active_class_names: Optional[Sequence[str]] = None,
+    source_class_names: Optional[Sequence[str]] = None,
 ):
     if epochs <= 0:
         return {"ran": False, "loss": 0.0}
@@ -1204,6 +1514,14 @@ def _run_classifier_refresh_epochs(
                     except StopIteration:
                         loader_iter = iter(loader)
                         xb, yb, mb, batch_meta = _unpack_masked_semantic_batch(next(loader_iter), context="berkeley refresh training")
+                if bool(remap_targets_from_terms) and isinstance(batch_meta, dict):
+                    yb, mb, batch_meta = _remap_semantic_batch_to_active_vocab(
+                        yb,
+                        mb,
+                        batch_meta,
+                        active_class_names=list(active_class_names or []),
+                        source_class_names=list(source_class_names or []),
+                    )
                 if not bool(use_cache):
                     xb, yb, mb = _expand_semantic_mask_supervision_batch(
                         xb=xb,

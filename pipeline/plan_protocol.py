@@ -94,6 +94,215 @@ class NodePosition:
 
 
 @dataclass
+class SignalRecord:
+    """A named numeric signal in the IR — simple read/write state atom.
+
+    Signal objects hold a single float64 value.  Condition expressions and
+    predicate graphs reference signals by ``signal_id``; graph nodes write
+    signal values at runtime.  The IR declares which signals exist and
+    their initial values so the plan is self-describing.
+
+    ``kind`` hints at semantics (no enforcement):
+      * ``toggle``  — binary 0/1 flip (e.g. gate passed)
+      * ``counter`` — monotonically increasing (e.g. rounds completed)
+      * ``gauge``   — arbitrary numeric read (e.g. last loss value)
+      * ``latch``   — set once, never cleared
+    """
+
+    signal_id: str
+    kind: str = "toggle"
+    initial_value: float = 0.0
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "signal_id": str(self.signal_id),
+            "kind": str(self.kind),
+            "initial_value": float(self.initial_value),
+            "metadata": _jsonable(self.metadata),
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "SignalRecord":
+        return cls(
+            signal_id=str(data["signal_id"]),
+            kind=str(data.get("kind", "toggle")),
+            initial_value=float(data.get("initial_value", 0.0)),
+            metadata=dict(data.get("metadata", {})),
+        )
+
+
+# ---------------------------------------------------------------------------
+# Predicate Graph — decision DAGs with output pins
+# ---------------------------------------------------------------------------
+
+@dataclass
+class PredicateNode:
+    """One node inside a predicate graph.
+
+    ``kind="condition"``
+        Reads a signal or evaluates a ``condition_expr`` and branches:
+        ``branches`` maps comparison results to child ``PredicateNode.node_id``
+        values.  At minimum ``"true"`` and ``"false"`` branches must exist.
+
+    ``kind="terminal"``
+        Leaf node — produces an output pin value.  ``output_pin`` names the pin.
+    """
+
+    node_id: str
+    kind: str = "condition"     # "condition" | "terminal"
+
+    # -- condition fields ---
+    signal_id: str = ""         # signal to read (numeric comparison)
+    condition_expr: str = ""    # alternative: full expression
+    operator: str = ">"         # >, >=, <, <=, ==, !=
+    threshold: float = 0.5     # comparison RHS for signal reads
+    branches: Dict[str, str] = field(default_factory=dict)  # result → child node_id
+
+    # -- terminal fields ---
+    output_pin: str = ""        # pin name emitted by this terminal
+
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> Dict[str, Any]:
+        d: Dict[str, Any] = {
+            "node_id": str(self.node_id),
+            "kind": str(self.kind),
+        }
+        if self.kind == "condition":
+            d["signal_id"] = str(self.signal_id)
+            d["condition_expr"] = str(self.condition_expr)
+            d["operator"] = str(self.operator)
+            d["threshold"] = float(self.threshold)
+            d["branches"] = {str(k): str(v) for k, v in self.branches.items()}
+        elif self.kind == "terminal":
+            d["output_pin"] = str(self.output_pin)
+        if self.metadata:
+            d["metadata"] = _jsonable(self.metadata)
+        return d
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "PredicateNode":
+        return cls(
+            node_id=str(data["node_id"]),
+            kind=str(data.get("kind", "condition")),
+            signal_id=str(data.get("signal_id", "")),
+            condition_expr=str(data.get("condition_expr", "")),
+            operator=str(data.get("operator", ">")),
+            threshold=float(data.get("threshold", 0.5)),
+            branches={str(k): str(v) for k, v in dict(data.get("branches", {})).items()},
+            output_pin=str(data.get("output_pin", "")),
+            metadata=dict(data.get("metadata", {})),
+        )
+
+
+@dataclass
+class PredicateGraph:
+    """A self-contained decision DAG with named output pins.
+
+    Evaluation walks from ``entry_node_id`` through condition nodes until
+    reaching a terminal, then returns the terminal's ``output_pin`` name.
+
+    Edges in the execution graph reference a predicate graph by
+    ``predicate_graph_id`` and carry ``pin_effects`` — a mapping from
+    each output pin to the edge behaviour for that outcome::
+
+        pin_effects = {
+            "rebuild":      {"activate": true,  "on_traverse": true},
+            "pass_cached":  {"activate": true,  "on_traverse": false},
+            "hold":         {"activate": false, "on_traverse": false},
+        }
+
+    This separates "should the target node run?" (activate) from
+    "should data be rebuilt?" (on_traverse).
+    """
+
+    graph_id: str
+    entry_node_id: str
+    nodes: List[PredicateNode] = field(default_factory=list)
+    output_pins: List[str] = field(default_factory=list)
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "graph_id": str(self.graph_id),
+            "entry_node_id": str(self.entry_node_id),
+            "nodes": [n.to_dict() for n in self.nodes],
+            "output_pins": [str(p) for p in self.output_pins],
+            "metadata": _jsonable(self.metadata),
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "PredicateGraph":
+        return cls(
+            graph_id=str(data["graph_id"]),
+            entry_node_id=str(data["entry_node_id"]),
+            nodes=[
+                PredicateNode.from_dict(dict(n))
+                for n in data.get("nodes", [])
+                if isinstance(n, dict)
+            ],
+            output_pins=[str(p) for p in data.get("output_pins", [])],
+            metadata=dict(data.get("metadata", {})),
+        )
+
+    def node_map(self) -> Dict[str, PredicateNode]:
+        return {n.node_id: n for n in self.nodes}
+
+    def evaluate(self, signal_reader: "Callable[[str], float]",
+                 expr_evaluator: "Optional[Callable[[str], bool]]" = None) -> str:
+        """Walk the DAG from entry to a terminal, return the output pin name.
+
+        ``signal_reader(signal_id) -> float`` reads a signal value.
+        ``expr_evaluator(expr) -> bool`` evaluates a condition_expr string
+        (falls back to signal-based comparison if not provided).
+
+        Returns the output_pin of the reached terminal, or ``"hold"`` if
+        the walk fails to reach one.
+        """
+        nmap = self.node_map()
+        current = nmap.get(self.entry_node_id)
+        visited: set = set()
+        while current is not None:
+            if current.node_id in visited:
+                break  # cycle guard
+            visited.add(current.node_id)
+
+            if current.kind == "terminal":
+                return str(current.output_pin or "hold")
+
+            # Evaluate condition
+            if current.condition_expr and expr_evaluator is not None:
+                result = bool(expr_evaluator(current.condition_expr))
+            elif current.signal_id:
+                sig_val = float(signal_reader(current.signal_id))
+                op = current.operator
+                thr = current.threshold
+                if op == ">":
+                    result = sig_val > thr
+                elif op == ">=":
+                    result = sig_val >= thr
+                elif op == "<":
+                    result = sig_val < thr
+                elif op == "<=":
+                    result = sig_val <= thr
+                elif op == "==":
+                    result = sig_val == thr
+                elif op == "!=":
+                    result = sig_val != thr
+                else:
+                    result = False
+            else:
+                result = False
+
+            branch_key = "true" if result else "false"
+            next_id = current.branches.get(branch_key, "")
+            current = nmap.get(next_id) if next_id else None
+
+        return "hold"
+
+
+@dataclass
 class ActionRecord:
     """Unified action object — any callable unit in the IR.
 
@@ -276,6 +485,8 @@ class GraphEdgeRecord:
     action_id: str = ""
     cycle_control: Dict[str, Any] = field(default_factory=dict)
     condition_expr: str = ""
+    predicate_graph_id: str = ""    # references PredicateGraph.graph_id
+    pin_effects: Dict[str, Dict[str, Any]] = field(default_factory=dict)  # pin → {activate, on_traverse}
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -285,6 +496,8 @@ class GraphEdgeRecord:
             "target_node_id": str(self.target_node_id),
             "condition_id": str(self.condition_id),
             "condition_expr": str(self.condition_expr),
+            "predicate_graph_id": str(self.predicate_graph_id),
+            "pin_effects": _jsonable(self.pin_effects),
             "layer": str(self.layer),
             "target_function": str(self.target_function),
             "reaction_name": str(self.reaction_name),
@@ -312,6 +525,8 @@ class GraphEdgeRecord:
             action_id=str(data.get("action_id", "")),
             cycle_control=dict(data.get("cycle_control", {})),
             condition_expr=str(data.get("condition_expr", "")),
+            predicate_graph_id=str(data.get("predicate_graph_id", "")),
+            pin_effects=dict(data.get("pin_effects", {})),
         )
 
 
@@ -361,6 +576,8 @@ class TrainingGraphPlan:
     worker_hints: Dict[str, Any] = field(default_factory=dict)
     graph_layers: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     execution_program: Dict[str, Any] = field(default_factory=dict)
+    signals: List[SignalRecord] = field(default_factory=list)
+    predicate_graphs: List[PredicateGraph] = field(default_factory=list)
     layout: GraphLayoutRecord = field(default_factory=GraphLayoutRecord)
     metadata: Dict[str, Any] = field(default_factory=dict)
 
@@ -377,6 +594,15 @@ class TrainingGraphPlan:
         if len(set(edge_ids)) != len(edge_ids):
             raise ValueError("TrainingGraphPlan contains duplicate edge ids.")
 
+        signal_ids = [sig.signal_id for sig in self.signals]
+        if len(set(signal_ids)) != len(signal_ids):
+            raise ValueError("TrainingGraphPlan contains duplicate signal ids.")
+
+        pg_ids = [pg.graph_id for pg in self.predicate_graphs]
+        if len(set(pg_ids)) != len(pg_ids):
+            raise ValueError("TrainingGraphPlan contains duplicate predicate graph ids.")
+        known_pg_ids = set(pg_ids)
+
         known_nodes = set(node_ids)
         for edge in self.edges:
             if edge.source_node_id not in known_nodes:
@@ -386,6 +612,11 @@ class TrainingGraphPlan:
             if edge.target_node_id not in known_nodes:
                 raise ValueError(
                     f"Edge {edge.edge_id!r} references unknown target node {edge.target_node_id!r}."
+                )
+            if edge.predicate_graph_id and edge.predicate_graph_id not in known_pg_ids:
+                warnings.append(
+                    f"Edge {edge.edge_id!r} references unknown predicate graph "
+                    f"{edge.predicate_graph_id!r}."
                 )
         for entry_node_id in self.entry_node_ids:
             if entry_node_id not in known_nodes:
@@ -550,6 +781,8 @@ class TrainingGraphPlan:
             "worker_hints": _jsonable(self.worker_hints),
             "graph_layers": _jsonable(self.graph_layers),
             "execution_program": _jsonable(self.execution_program),
+            "signals": [sig.to_dict() for sig in self.signals],
+            "predicate_graphs": [pg.to_dict() for pg in self.predicate_graphs],
             "layout": self.layout.to_dict(),
             "metadata": _jsonable(self.metadata),
         }
@@ -582,6 +815,16 @@ class TrainingGraphPlan:
             worker_hints=dict(data.get("worker_hints", {})),
             graph_layers=dict(data.get("graph_layers", {})),
             execution_program=dict(data.get("execution_program", {})),
+            signals=[
+                SignalRecord.from_dict(dict(s))
+                for s in data.get("signals", [])
+                if isinstance(s, dict)
+            ],
+            predicate_graphs=[
+                PredicateGraph.from_dict(dict(pg))
+                for pg in data.get("predicate_graphs", [])
+                if isinstance(pg, dict)
+            ],
             layout=GraphLayoutRecord.from_dict(dict(data.get("layout", {}))),
             metadata=dict(data.get("metadata", {})),
         )
@@ -1271,6 +1514,8 @@ def plan_from_pipeline_graph(
     node_metadata: Optional[Dict[str, Dict[str, Any]]] = None,
     graph_layers: Optional[Dict[str, Any]] = None,
     execution_program: Optional[Dict[str, Any]] = None,
+    signals: Optional[List[SignalRecord]] = None,
+    predicate_graphs: Optional[List[PredicateGraph]] = None,
 ) -> TrainingGraphPlan:
     raw_nodes = getattr(graph, "nodes", None)
     raw_nodes = raw_nodes if isinstance(raw_nodes, dict) else getattr(graph, "_nodes", {})
@@ -1404,6 +1649,8 @@ def plan_from_pipeline_graph(
                 enabled=True,
                 metadata=_jsonable(record_meta),
                 condition_expr=_synthesize_edge_condition_expr(condition_id),
+                predicate_graph_id=str(getattr(edge, "predicate_graph_id", "") or ""),
+                pin_effects=dict(getattr(edge, "pin_effects", {}) or {}),
             )
         )
 
@@ -1526,6 +1773,8 @@ def plan_from_pipeline_graph(
         worker_hints=_jsonable(dict(worker_hints or {})),
         graph_layers=serialized_layers,
         execution_program=serialized_execution_program,
+        signals=list(signals or []),
+        predicate_graphs=list(predicate_graphs or []),
         layout=build_layout_from_records(node_records, edge_records),
         metadata=_jsonable(dict(metadata or {})),
     )

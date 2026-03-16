@@ -544,6 +544,9 @@ def _setup_signatures(lib: ctypes.CDLL) -> None:
         ctypes.POINTER(ctypes.c_int32),
         ctypes.POINTER(ctypes.c_int32),
         ctypes.POINTER(ctypes.c_int32),
+        ctypes.POINTER(ctypes.c_int32),
+        ctypes.POINTER(ctypes.c_int32),
+        ctypes.POINTER(ctypes.c_int32),
         ctypes.POINTER(ctypes.c_uint64),
         ctypes.POINTER(ctypes.c_uint32),
         c_char_p,
@@ -1566,6 +1569,9 @@ class WeightImageMeta:
     height: int = 0
     channels: int = 0
     stride_bytes: int = 0
+    mode: int = 0
+    target_width: int = 0
+    target_height: int = 0
     byte_count: int = 0
     flags: int = 0
     model_name: str = ""
@@ -2107,6 +2113,9 @@ class NodusWeightImageStore:
         height = ctypes.c_int32(0)
         channels = ctypes.c_int32(0)
         stride_bytes = ctypes.c_int32(0)
+        mode = ctypes.c_int32(0)
+        target_width = ctypes.c_int32(0)
+        target_height = ctypes.c_int32(0)
         byte_count = ctypes.c_uint64(0)
         flags = ctypes.c_uint32(0)
         model_name = ctypes.create_string_buffer(64)
@@ -2126,6 +2135,9 @@ class NodusWeightImageStore:
             ctypes.byref(height),
             ctypes.byref(channels),
             ctypes.byref(stride_bytes),
+            ctypes.byref(mode),
+            ctypes.byref(target_width),
+            ctypes.byref(target_height),
             ctypes.byref(byte_count),
             ctypes.byref(flags),
             model_name,
@@ -2149,6 +2161,9 @@ class NodusWeightImageStore:
             height=int(height.value),
             channels=int(channels.value),
             stride_bytes=int(stride_bytes.value),
+            mode=int(mode.value),
+            target_width=int(target_width.value),
+            target_height=int(target_height.value),
             byte_count=int(byte_count.value),
             flags=int(flags.value),
             model_name=model_name.value.decode("utf-8", errors="replace"),

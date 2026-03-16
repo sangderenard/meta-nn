@@ -153,7 +153,7 @@ class BuildWaveClassifierNode(PipelineNode):
         return "w" in mode
 
     def execute(self, ctx: PipelineContext) -> None:
-        from wav_ml_models import TinyConvClassifier, maybe_compile_module
+        from wav_ml_models import TinyConvClassifier, maybe_compile_module, prime_tiny_classifier_label_bank_for_state_dict
 
         # Determine label count from WAV records
         n_classes = _count_wave_labels(ctx, self.cfg)
@@ -183,6 +183,10 @@ class BuildWaveClassifierNode(PipelineNode):
         if resume_ckpt is not None:
             if "wave_classifier_state" in resume_ckpt:
                 try:
+                    prime_tiny_classifier_label_bank_for_state_dict(
+                        model,
+                        resume_ckpt["wave_classifier_state"],
+                    )
                     model.load_state_dict(resume_ckpt["wave_classifier_state"], strict=False)
                     _log("[wave-classifier] resumed model state from pipeline checkpoint")
                 except Exception as exc:

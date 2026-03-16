@@ -13,6 +13,7 @@ from pipeline.nodes.vocab_node import (
 )
 from semantic_dataset_loaders import (
     StageDatasetManifest,
+    assemble_semantic_mask_layers,
     build_label_mask_stack,
     build_loader_from_manifest,
     combine_label_mask_stacks,
@@ -78,6 +79,7 @@ def test_pregestation_targets_include_observed_terms() -> None:
         "warm",
         "cool",
     ]
+    idx_to_term = {int(i): str(name) for i, name in enumerate(class_names)}
     term_to_idx = {str(name).strip().lower(): int(i) for i, name in enumerate(class_names)}
     y = np.zeros((len(class_names),), dtype=np.float32)
     for term in enriched_terms:
@@ -93,6 +95,7 @@ def test_pregestation_targets_include_observed_terms() -> None:
     fallback_stack, fallback_idx = build_label_mask_stack(
         mixed_mask=np.asarray(masks[int(chosen)], dtype=np.float32),
         label_vec=y,
+        idx_to_term=idx_to_term,
         treat_mixed_mask_as_creation=True,
     )
     merged_stack, merged_idx = combine_label_mask_stacks(
@@ -103,10 +106,11 @@ def test_pregestation_targets_include_observed_terms() -> None:
         width=int(masks[int(chosen)].shape[1]),
         fallback_creation_mask=np.asarray(masks[int(chosen)], dtype=np.float32),
     )
-    added_idx = int(term_to_idx[added_terms[0]])
-    assert added_idx in set(np.asarray(merged_idx, dtype=np.int64).tolist())
-    assert int(np.asarray(merged_stack).shape[0]) >= int(np.count_nonzero(y >= 0.5))
-    _ok("pregestation mask stacks retain added heuristic target labels")
+    merged_idx_set = set(np.asarray(merged_idx, dtype=np.int64).tolist())
+    assert int(term_to_idx["signal"]) in merged_idx_set
+    assert int(term_to_idx["object"]) in merged_idx_set
+    assert set(np.asarray(fallback_idx, dtype=np.int64).tolist()) == {int(term_to_idx["signal"]), int(term_to_idx["object"])}
+    _ok("pregestation fallback masks retain ingested-item coverage for signal/object")
 
 
 def test_stage_manifest_shuffle_with_ordered_subset() -> None:
@@ -129,6 +133,45 @@ def test_stage_manifest_shuffle_with_ordered_subset() -> None:
     second = next(iter(loader))[0].tolist()
     assert first != second, (first, second)
     _ok("ordered split subsets still shuffle across train iterations")
+
+
+def test_special_label_masks_use_ingested_mask_semantics() -> None:
+    print("\n--- test_special_label_masks_use_ingested_mask_semantics ---")
+    class_names = ["signal", "object", "mnist dataset"]
+    idx_to_term = {int(i): str(name) for i, name in enumerate(class_names)}
+    term_to_idx = {str(name).strip().lower(): int(i) for i, name in enumerate(class_names)}
+    label_vec = np.ones((len(class_names),), dtype=np.float32)
+    mixed_mask = np.zeros((8, 8), dtype=np.float32)
+    mixed_mask[2:6, 1:5] = 1.0
+    special_stack, special_idx = build_label_mask_stack(
+        mixed_mask=mixed_mask,
+        label_vec=label_vec,
+        idx_to_term=idx_to_term,
+        treat_mixed_mask_as_creation=True,
+    )
+    mask_by_idx = {
+        int(special_idx[i]): np.asarray(special_stack[i], dtype=np.float32)
+        for i in range(int(len(special_idx)))
+    }
+    assert set(mask_by_idx.keys()) == {0, 1, 2}, mask_by_idx.keys()
+    assert float(np.max(mask_by_idx[0])) > 0.9
+    assert float(np.mean(mask_by_idx[0])) < 0.9
+    assert float(np.max(mask_by_idx[1])) > 0.9
+    assert float(np.mean(mask_by_idx[1])) < 0.9
+    assert np.allclose(mask_by_idx[2], np.ones_like(mixed_mask))
+    image = np.zeros((1, 8, 8), dtype=np.float32)
+    _, assembled_mask, assembled_stack, assembled_idx = assemble_semantic_mask_layers(
+        image=image,
+        label_vec=label_vec,
+        idx_to_term=idx_to_term,
+        term_to_idx=term_to_idx,
+        original_mixed_mask=mixed_mask,
+    )
+    assert set(np.asarray(assembled_idx, dtype=np.int64).tolist()) >= {0, 1, 2}
+    assert float(np.mean(np.asarray(assembled_mask, dtype=np.float32))) < 0.9
+    assert float(np.max(np.asarray(assembled_mask, dtype=np.float32))) > 0.9
+    assert int(np.asarray(assembled_stack, dtype=np.float32).shape[0]) >= 3
+    _ok("signal/object reuse item mask while dataset labels stay full-frame")
 
 
 def test_stateful_sequential_deck_sampler_continues_partial_pass() -> None:
@@ -187,6 +230,7 @@ def test_chunked_stage_loader_uses_sequential_subset_access() -> None:
 if __name__ == "__main__":
     test_pregestation_targets_include_observed_terms()
     test_stage_manifest_shuffle_with_ordered_subset()
+    test_special_label_masks_use_ingested_mask_semantics()
     test_stateful_sequential_deck_sampler_continues_partial_pass()
     test_chunked_stage_loader_uses_sequential_subset_access()
     print("\nALL TESTS PASSED")

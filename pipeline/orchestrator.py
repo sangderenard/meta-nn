@@ -78,8 +78,11 @@ from pipeline.plan_protocol import (
     DEFAULT_RUNTIME_SNAPSHOT_FILENAME,
     MESSAGE_TYPE_RUNTIME_SNAPSHOT,
     ExecutionEventPayload,
+    PredicateGraph,
+    PredicateNode,
     RuntimeNodeState,
     RuntimeSnapshotPayload,
+    SignalRecord,
     WorkerHelloPayload,
     make_envelope,
     plan_from_pipeline_graph,
@@ -552,6 +555,111 @@ def _build_execution_program(graph: PipelineGraph) -> dict:
     return _materialize_execution_program(graph)
 
 
+# ---------------------------------------------------------------------------
+# Signal & predicate-graph synthesis  (plan-level IR objects)
+# ---------------------------------------------------------------------------
+
+def _build_plan_signals() -> list[SignalRecord]:
+    """Mint signal declarations for the training plan.
+
+    These are IR-level descriptors — not runtime values.  The runtime
+    ``SignalStore`` on ``ctx.signals`` is initialised from these at startup.
+    """
+    return [
+        SignalRecord(signal_id="gate_pregestation.passed", kind="toggle", initial_value=0.0,
+                     metadata={"description": "1.0 when the pregestation gate has cleared"}),
+        SignalRecord(signal_id="gate_gestation.passed", kind="toggle", initial_value=0.0,
+                     metadata={"description": "1.0 when the gestation gate has cleared"}),
+        SignalRecord(signal_id="gate_berkeley.passed", kind="toggle", initial_value=0.0,
+                     metadata={"description": "1.0 when the Berkeley gate has cleared"}),
+        SignalRecord(signal_id="gate_transformer.passed", kind="toggle", initial_value=0.0,
+                     metadata={"description": "1.0 when the transformer gate has cleared"}),
+        SignalRecord(signal_id="gate_override_active", kind="toggle", initial_value=0.0,
+                     metadata={"description": "1.0 when the GUI gate override is active"}),
+    ]
+
+
+def _build_plan_predicate_graphs() -> list[PredicateGraph]:
+    """Build predicate-graph DAGs for data-flow edges.
+
+    Each graph is a serialisable decision tree that evaluates to an
+    output pin.  Edges carry ``pin_effects`` which map each pin to
+    ``{activate, on_traverse}`` booleans.
+    """
+    # --- pg:gate_berkeley_data_flow ---
+    # Controls the data_node → gate_berkeley edge.  Distinguishes three
+    # scenarios: gates not yet passed ("hold"), gates passed but data
+    # still fresh ("pass_cached"), gates passed and data stale ("rebuild").
+    gate_berkeley_data_flow = PredicateGraph(
+        graph_id="pg:gate_berkeley_data_flow",
+        entry_node_id="check_gates",
+        nodes=[
+            PredicateNode(
+                node_id="check_gates",
+                kind="condition",
+                condition_expr="GATE_OVERRIDE OR early_gates_passed",
+                branches={"true": "check_rebuild", "false": "hold"},
+            ),
+            PredicateNode(
+                node_id="check_rebuild",
+                kind="condition",
+                condition_expr=(
+                    "data._bdata_last_build_round < 0 OR "
+                    "(ctx.total_rounds_completed - data._bdata_last_build_round) "
+                    ">= bdata_cfg.rebuild_every_n_rounds"
+                ),
+                branches={"true": "rebuild", "false": "pass_cached"},
+            ),
+            PredicateNode(node_id="hold", kind="terminal", output_pin="hold"),
+            PredicateNode(node_id="pass_cached", kind="terminal", output_pin="pass_cached"),
+            PredicateNode(node_id="rebuild", kind="terminal", output_pin="rebuild"),
+        ],
+        output_pins=["hold", "pass_cached", "rebuild"],
+        metadata={"description": "Data-flow gate for data_node → gate_berkeley"},
+    )
+
+    # --- pg:berkeley_refresh_flow ---
+    # Controls the data_node → stage_2_berkeley edge.  Same three-way
+    # split so stage 2 still trains on cached loaders between refreshes.
+    berkeley_refresh_flow = PredicateGraph(
+        graph_id="pg:berkeley_refresh_flow",
+        entry_node_id="check_gates",
+        nodes=[
+            PredicateNode(
+                node_id="check_gates",
+                kind="condition",
+                condition_expr="GATE_OVERRIDE OR early_gates_passed",
+                branches={"true": "check_rebuild", "false": "hold"},
+            ),
+            PredicateNode(
+                node_id="check_rebuild",
+                kind="condition",
+                condition_expr=(
+                    "data._bdata_last_build_round < 0 OR "
+                    "(ctx.total_rounds_completed - data._bdata_last_build_round) "
+                    ">= bdata_cfg.rebuild_every_n_rounds"
+                ),
+                branches={"true": "rebuild", "false": "pass_cached"},
+            ),
+            PredicateNode(node_id="hold", kind="terminal", output_pin="hold"),
+            PredicateNode(node_id="pass_cached", kind="terminal", output_pin="pass_cached"),
+            PredicateNode(node_id="rebuild", kind="terminal", output_pin="rebuild"),
+        ],
+        output_pins=["hold", "pass_cached", "rebuild"],
+        metadata={"description": "Data-flow gate for data_node → stage_2_berkeley"},
+    )
+
+    return [gate_berkeley_data_flow, berkeley_refresh_flow]
+
+
+# Standard pin_effects map shared by data-flow predicate graphs.
+_DATA_FLOW_PIN_EFFECTS: dict[str, dict[str, bool]] = {
+    "hold":        {"activate": False, "on_traverse": False},
+    "pass_cached": {"activate": True,  "on_traverse": False},
+    "rebuild":     {"activate": True,  "on_traverse": True},
+}
+
+
 def _node_group_id(node_id: str) -> str:
     if node_id in {"wave_pool"}:
         return "bootstrap"
@@ -858,6 +966,8 @@ def build_training_graph_plan(args, output_dir: Path, *, graph: Optional[Pipelin
         node_metadata=_build_plan_node_metadata(graph),
         graph_layers=_build_graph_layers(graph),
         execution_program=_build_execution_program(graph),
+        signals=_build_plan_signals(),
+        predicate_graphs=_build_plan_predicate_graphs(),
     )
 
 
@@ -1546,17 +1656,24 @@ def build_pipeline_graph(
                condition_id=_CONDITION_ID_GEST_REBUILD,
                on_traverse=_data_node.provide_gestation_eval)
 
-    # Berkeley refresh: gate + rebuild period embedded in _berk_refresh_cond.
+    # Berkeley refresh: predicate graph governs activate vs on_traverse so
+    # stage 2 still trains on cached loaders between refresh intervals.
     g.add_edge("data_node", "stage_2_berkeley",
                condition=_berk_refresh_cond, label="provides:berkeley_refresh_loader",
                condition_id=_CONDITION_ID_BERKELEY_REFRESH,
-               on_traverse=_data_node.provide_berkeley_data)
+               on_traverse=_data_node.provide_berkeley_data,
+               predicate_graph_id="pg:berkeley_refresh_flow",
+               pin_effects=_DATA_FLOW_PIN_EFFECTS)
 
-    # Gate 2 eval: data_node provides berkeley loaders + payload validation loader
+    # Gate 2 eval: data_node provides berkeley loaders + payload validation loader.
+    # Predicate graph distinguishes hold / pass_cached / rebuild so we don't
+    # reconstruct data every round under gate override.
     g.add_edge("data_node", "gate_berkeley",
                condition=_early_gates_passed, label="provides:gate_val_loader+payload_val_loader",
                condition_id=_CONDITION_ID_EARLY_GATES,
-               on_traverse=_data_node.provide_gate_data)
+               on_traverse=_data_node.provide_gate_data,
+               predicate_graph_id="pg:gate_berkeley_data_flow",
+               pin_effects=_DATA_FLOW_PIN_EFFECTS)
 
     # GAN training: data_node provides ctx.payload_bank + ctx.payload_conditions (after all gates)
     g.add_edge("data_node", "stage_g_generator",
@@ -1821,6 +1938,14 @@ def run(args, output_dir: Path, initial_plan=None) -> None:
         ctx.graph_plan = build_training_graph_plan(args, output_dir, graph=graph, cfg=cfg)
     ctx.plan_id = str(ctx.graph_plan.plan_id)
     ctx.graph_layers = dict(getattr(ctx.graph_plan, "graph_layers", {}) or {})
+
+    # -- Initialise signals and predicate graphs from the plan IR ----------
+    plan_signals = list(getattr(ctx.graph_plan, "signals", []) or [])
+    if plan_signals:
+        ctx.signals.init_from_records(plan_signals)
+    plan_pgs = list(getattr(ctx.graph_plan, "predicate_graphs", []) or [])
+    ctx.predicate_graphs = {pg.graph_id: pg for pg in plan_pgs}
+
     if ctx.graph_plan_path is not None:
         try:
             ctx.graph_plan.save_json(ctx.graph_plan_path)
@@ -2071,6 +2196,12 @@ def _build_configs_from_args(args) -> dict:
     def _g(*names, default=None):
         return _arg_value(args, *names, default=default)
 
+    rounds_per_cycle = _parse_positive_int(
+        _arg_value(args, "orchestration_rounds", "rounds_per_cycle", default=1),
+        field_name="orchestration_rounds",
+        default=1,
+    )
+
     global_stage_cache_mb = int(_g("semantic_stage_cache_max_mb", default=0))
 
     classifier = ClassifierConfig(
@@ -2111,8 +2242,12 @@ def _build_configs_from_args(args) -> dict:
         stage2_confidence_target=float(_g("gate_berkeley_min_confidence", "berkeley_confidence_target", default=0.55)),
         stage2_f1_target=float(_g("gate_berkeley_min_macro_f1", "berkeley_f1_target", default=0.40)),
         stage2_required_consecutive=int(_g("gate_berkeley_maintain_rounds", "berkeley_gate_consecutive", default=1)),
-        lora_enabled=bool(_g("lora_enabled", default=False)),
-        lora_rank=int(_g("lora_rank", default=8)),
+        lora_enabled=bool(_g("stage_c_lora_enabled", default=False)),
+        lora_rank=int(_g("stage_c_lora_rank", default=8)),
+        lora_alpha=float(_g("stage_c_lora_alpha", default=16.0)),
+        stageC_lora_rank=int(_g("stage_c_lora_rank", default=8)),
+        stageC_lora_alpha=float(_g("stage_c_lora_alpha", default=16.0)),
+        stageC_max_terms=int(_g("stage_c_lora_max_terms", default=50)),
         fake_class_enabled=bool(_g("generator_fake_feedback_enabled", "fake_class_feedback", default=True)),
         fake_class_steps=int(_g("generator_fake_feedback_steps_per_round", "fake_class_steps", default=32)),
         fake_class_batch_size=int(_g("generator_fake_feedback_batch_size", default=16)),

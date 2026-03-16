@@ -483,6 +483,47 @@ class TinyConvClassifier(nn.Module):
         return self.forward_with_aux(x)["logits"]
 
 
+def prime_tiny_classifier_label_bank_for_state_dict(
+    model: nn.Module,
+    state_dict: Dict[str, Any],
+    temperature: Optional[float] = None,
+) -> bool:
+    target = model
+    if not isinstance(target, TinyConvClassifier):
+        wrapped = getattr(model, "_orig_mod", None)
+        if isinstance(wrapped, TinyConvClassifier):
+            target = wrapped
+    if not isinstance(target, TinyConvClassifier):
+        return False
+    if not isinstance(state_dict, dict):
+        return False
+
+    bank = state_dict.get("label_embed_bank")
+    enabled = state_dict.get("label_embed_enabled")
+    if not isinstance(bank, torch.Tensor):
+        return False
+
+    enabled_flag = True
+    if isinstance(enabled, torch.Tensor) and int(enabled.numel()) > 0:
+        enabled_flag = bool(int(enabled.reshape(-1)[0].item()))
+    if (
+        not enabled_flag
+        or int(bank.ndim) != 2
+        or int(bank.shape[0]) <= 0
+        or int(bank.shape[1]) <= 0
+    ):
+        target.disable_label_embedding_bank()
+        return True
+
+    ref_param = next(target.parameters(), None)
+    device = ref_param.device if ref_param is not None else bank.device
+    target.set_label_embedding_bank(
+        bank.detach().to(device=device, dtype=torch.float32),
+        temperature=float(getattr(target, "embed_temperature", 10.0) if temperature is None else temperature),
+    )
+    return True
+
+
 class _LoRALinearSlot(nn.Module):
     def __init__(self, in_features: int, out_features: int, rank: int):
         super().__init__()
@@ -542,11 +583,13 @@ class LoRALinear(nn.Module):
         if not key:
             raise ValueError("LoRA slot name must be non-empty.")
         if key not in self.slots:
-            self.slots[key] = _LoRALinearSlot(
+            slot = _LoRALinearSlot(
                 in_features=int(self.base.in_features),
                 out_features=int(self.base.out_features),
                 rank=int(self.rank),
             )
+            slot = slot.to(device=self.base.weight.device, dtype=self.base.weight.dtype)
+            self.slots[key] = slot
 
     def slot_names(self) -> List[str]:
         return [str(k) for k in self.slots.keys()]
@@ -559,7 +602,7 @@ class LoRALinear(nn.Module):
         for p in self.base.parameters():
             p.requires_grad_(not bool(lora_only))
         for name, slot in self.slots.items():
-            req = bool(lora_only and str(name) == key)
+            req = bool(key) and str(name) == key
             for p in slot.parameters():
                 p.requires_grad_(bool(req))
 
@@ -610,11 +653,13 @@ class LoRAConv2d1x1(nn.Module):
         if not key:
             raise ValueError("LoRA slot name must be non-empty.")
         if key not in self.slots:
-            self.slots[key] = _LoRAConv1x1Slot(
+            slot = _LoRAConv1x1Slot(
                 in_channels=int(self.base.in_channels),
                 out_channels=int(self.base.out_channels),
                 rank=int(self.rank),
             )
+            slot = slot.to(device=self.base.weight.device, dtype=self.base.weight.dtype)
+            self.slots[key] = slot
 
     def slot_names(self) -> List[str]:
         return [str(k) for k in self.slots.keys()]
@@ -627,7 +672,7 @@ class LoRAConv2d1x1(nn.Module):
         for p in self.base.parameters():
             p.requires_grad_(not bool(lora_only))
         for name, slot in self.slots.items():
-            req = bool(lora_only and str(name) == key)
+            req = bool(key) and str(name) == key
             for p in slot.parameters():
                 p.requires_grad_(bool(req))
 
@@ -655,24 +700,29 @@ def install_tiny_classifier_lora(model: TinyConvClassifier, rank: int = 8, alpha
     return model
 
 
-def tiny_classifier_lora_modules(model: TinyConvClassifier) -> List[nn.Module]:
+def tiny_classifier_lora_named_modules(model: TinyConvClassifier) -> List[Tuple[str, nn.Module]]:
     if not isinstance(model, TinyConvClassifier):
         return []
-    out: List[nn.Module] = []
+    out: List[Tuple[str, nn.Module]] = []
     candidates = [
-        model.semantic_expand[0],
-        model.semantic_expand[2],
-        model.embed_proj,
-        model.head[-1],
-        (model.mask_head[-1] if model.mask_head is not None and int(len(model.mask_head)) > 0 else None),
+        ("semantic_expand.0", model.semantic_expand[0]),
+        ("semantic_expand.2", model.semantic_expand[2]),
+        ("embed_proj", model.embed_proj),
+        ("head.-1", model.head[-1]),
+        ("mask_head.-1", (model.mask_head[-1] if model.mask_head is not None and int(len(model.mask_head)) > 0 else None)),
     ]
-    for mod in candidates:
+    for name, mod in candidates:
         if isinstance(mod, (LoRALinear, LoRAConv2d1x1)):
-            out.append(mod)
+            out.append((str(name), mod))
     return out
 
 
-def ensure_tiny_classifier_lora_slot(model: TinyConvClassifier, slot_name: str):
+def tiny_classifier_lora_modules(model: TinyConvClassifier) -> List[nn.Module]:
+    return [mod for _, mod in tiny_classifier_lora_named_modules(model)]
+
+
+def ensure_tiny_classifier_lora_slot(model: TinyConvClassifier, slot_name: str, rank: int = 0):
+    del rank
     key = str(slot_name).strip()
     if not key:
         raise ValueError("LoRA slot name must be non-empty.")
@@ -682,29 +732,40 @@ def ensure_tiny_classifier_lora_slot(model: TinyConvClassifier, slot_name: str):
 
 def set_tiny_classifier_lora_state(model: TinyConvClassifier, slot_name: str = "", lora_only: bool = False):
     key = str(slot_name).strip()
-    if bool(lora_only):
-        if not key:
-            raise ValueError("LoRA-only mode requires a non-empty slot name.")
+    if key:
         ensure_tiny_classifier_lora_slot(model, key)
+    if bool(lora_only) and not key:
+        raise ValueError("LoRA-only mode requires a non-empty slot name.")
     for p in model.parameters():
         p.requires_grad_(not bool(lora_only))
     for mod in tiny_classifier_lora_modules(model):
-        mod.set_active_slot(key if bool(lora_only) else "")
+        mod.set_active_slot(key)
         mod.set_trainable_state(slot_name=key, lora_only=bool(lora_only))
 
 
-def tiny_classifier_lora_snapshot(model: TinyConvClassifier) -> Dict[str, Any]:
+def _clone_lora_slot_state(slot: nn.Module) -> Dict[str, torch.Tensor]:
+    return {
+        str(name): tensor.detach().cpu().clone()
+        for name, tensor in slot.state_dict().items()
+        if torch.is_tensor(tensor)
+    }
+
+
+def tiny_classifier_lora_snapshot(model: TinyConvClassifier, slot_name: str = "") -> Dict[str, Any]:
     if not isinstance(model, TinyConvClassifier):
         return {"installed": False, "slot_names": []}
     mods = tiny_classifier_lora_modules(model)
     if int(len(mods)) <= 0:
         return {"installed": False, "slot_names": []}
     first = mods[0]
+    only_slot = str(slot_name).strip()
     slot_names: List[str] = []
     seen: set = set()
     for mod in mods:
         for slot_name in mod.slot_names():
             key = str(slot_name).strip()
+            if only_slot and str(key) != str(only_slot):
+                continue
             if (not key) or (key in seen):
                 continue
             seen.add(key)
@@ -719,6 +780,16 @@ def tiny_classifier_lora_snapshot(model: TinyConvClassifier) -> Dict[str, Any]:
         lora_only = bool(active_slot) and all((not bool(p.requires_grad)) for p in model.parameters())
     except Exception:
         lora_only = False
+    slot_weights: Dict[str, Dict[str, Dict[str, torch.Tensor]]] = {}
+    for module_name, mod in tiny_classifier_lora_named_modules(model):
+        module_slots: Dict[str, Dict[str, torch.Tensor]] = {}
+        for name, slot in mod.slots.items():
+            key = str(name).strip()
+            if only_slot and str(key) != str(only_slot):
+                continue
+            module_slots[str(key)] = _clone_lora_slot_state(slot)
+        if module_slots:
+            slot_weights[str(module_name)] = module_slots
     return {
         "installed": True,
         "rank": int(getattr(first, "rank", 0)),
@@ -727,6 +798,7 @@ def tiny_classifier_lora_snapshot(model: TinyConvClassifier) -> Dict[str, Any]:
         "active_slot": str(active_slot),
         "lora_only": bool(lora_only),
         "module_count": int(len(mods)),
+        "slot_weights": slot_weights,
     }
 
 
@@ -750,9 +822,28 @@ def restore_tiny_classifier_lora_snapshot(model: TinyConvClassifier, snapshot: O
                 continue
             ensure_tiny_classifier_lora_slot(model, key)
             restored_slots += 1
+    module_map = {str(name): mod for name, mod in tiny_classifier_lora_named_modules(model)}
+    slot_weights = snapshot.get("slot_weights", {})
+    if isinstance(slot_weights, dict):
+        for module_name, module_slots in slot_weights.items():
+            mod = module_map.get(str(module_name))
+            if mod is None or not isinstance(module_slots, dict):
+                continue
+            for slot_name, state in module_slots.items():
+                key = str(slot_name).strip()
+                if not key or not isinstance(state, dict):
+                    continue
+                mod.ensure_slot(key)
+                try:
+                    mod.slots[str(key)].load_state_dict(state, strict=True)
+                except Exception:
+                    try:
+                        mod.slots[str(key)].load_state_dict(state, strict=False)
+                    except Exception:
+                        continue
     active_slot = str(snapshot.get("active_slot", "")).strip()
     lora_only = bool(snapshot.get("lora_only", False)) and bool(active_slot)
-    set_tiny_classifier_lora_state(model, slot_name=active_slot if bool(lora_only) else "", lora_only=bool(lora_only))
+    set_tiny_classifier_lora_state(model, slot_name=active_slot, lora_only=bool(lora_only))
     return {
         "used": True,
         "installed": True,
@@ -1554,6 +1645,7 @@ def train_conditional_generator_discriminator(
     step_preview_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
     stop_requested: Optional[Callable[[], bool]] = None,
     generator_step_callback: Optional[Callable[[int], None]] = None,
+    discriminator_step_callback: Optional[Callable[[int], None]] = None,
     amp: bool = False,
     amp_dtype: str = "float16",
     channels_last: bool = False,
@@ -1664,6 +1756,7 @@ def train_conditional_generator_discriminator(
 
     stop_now = False
     generator_step_count = 0
+    discriminator_step_count = 0
     for epoch in range(1, max(1, int(epochs)) + 1):
         generator.train()
         discriminator.train()
@@ -1767,6 +1860,12 @@ def train_conditional_generator_discriminator(
                     scaler_d.update()
                 else:
                     d_opt.step()
+                discriminator_step_count += 1
+                if discriminator_step_callback is not None:
+                    try:
+                        discriminator_step_callback(int(discriminator_step_count))
+                    except Exception:
+                        pass
                 d_loss_accum += float(d_sub_loss)
             d_loss_step = float(d_loss_accum / float(max(1, disc_steps_per_gen_step)))
 

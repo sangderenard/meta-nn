@@ -50,14 +50,7 @@ from pipeline.nodus_loss_store import (
     WeightStateMeta,
 )
 from pipeline.nodes.base import _save_pipeline_checkpoint
-from pipeline.weight_image_cache import (
-    WEIGHT_IMAGE_FLAG_CHECKPOINT,
-    checkpoint_thumbnail_path,
-    checkpoint_thumbnail_root,
-    crop_weight_image_rgb,
-    plan_weight_image_evictions,
-    save_checkpoint_thumbnail,
-)
+from wav_ml_models import prime_tiny_classifier_label_bank_for_state_dict
 
 
 def _log(msg: str) -> None:
@@ -725,7 +718,6 @@ class SaveRestoreNode(PipelineNode):
         self._last_weight_image_config: Optional[WeightImageConfig] = None
         self._weight_model_generations: Dict[Tuple[str, str], Tuple[int, int]] = {}
         self._weight_model_registry: Dict[Tuple[str, str], WeightStateMeta] = {}
-        self._weight_checkpoint_thumbnail_root: Optional[Path] = None
 
     def initialise(self, ctx: PipelineContext) -> None:
         """Called once by the orchestrator after context is set up."""
@@ -755,14 +747,22 @@ class SaveRestoreNode(PipelineNode):
         # Load historical loss data from binary log files so the pull-model
         # can serve the full history (including previous sessions) from round 0.
         self._load_historical_losses(out_dir)
-        self._weight_checkpoint_thumbnail_root = checkpoint_thumbnail_root(out_dir / "_weight_backup")
-
     def _load_historical_losses(self, out_dir: Path) -> None:
-        """Replay binary loss-log files into the LossAccumulator.
+        """Replay binary loss-log files into the NodusLossStore.
 
         This ensures the pull-model serves complete history to the GUI,
         including data from previous training sessions.
+
+        Skipped when the shared-memory store already contains data (the GUI
+        process loads history first via wav_ml_gui_main._load_history).
         """
+        if self.loss_store.channel_count() > 0:
+            total = sum(
+                self.loss_store.channel_length(ck)
+                for ck in self.loss_store.channel_keys()
+            )
+            _log(f"[save-restore] C store already has {total} records; skipping binary log replay")
+            return
         try:
             from wav_ml_viewer import _LossFileLogger
         except Exception:
@@ -857,6 +857,16 @@ class SaveRestoreNode(PipelineNode):
             "round_id": ctx.round_id,
             "total_rounds_completed": ctx.total_rounds_completed,
             "class_names": ctx.class_names,
+            "vocab_lora_library": dict(getattr(ctx, "vocab_lora_library", {}) or {}),
+            "vocab_lora_plan_cache": dict(getattr(ctx, "vocab_lora_plan_cache", {}) or {}),
+            "vocab_lora_requirement_history": list(getattr(ctx, "vocab_lora_requirement_history", []) or []),
+            "vocab_lora_pending_terms": list(getattr(ctx, "vocab_lora_pending_terms", []) or []),
+            "vocab_lora_active_signature": str(getattr(ctx, "vocab_lora_active_signature", "") or ""),
+            "vocab_lora_active_terms": list(getattr(ctx, "vocab_lora_active_terms", []) or []),
+            "vocab_lora_locked_terms": list(getattr(ctx, "vocab_lora_locked_terms", []) or []),
+            "vocab_lora_max_terms": int(getattr(ctx, "vocab_lora_max_terms", 0) or 0),
+            "vocab_lora_latest_plan_signature": str(getattr(ctx, "vocab_lora_latest_plan_signature", "") or ""),
+            "vocab_lora_plan_slot_cursor": int(getattr(ctx, "vocab_lora_plan_slot_cursor", 0) or 0),
         }
         if ctx.render_config is not None:
             try:
@@ -1046,9 +1056,16 @@ class SaveRestoreNode(PipelineNode):
         for gate in cycle_gates:
             max_iterations = int(getattr(gate, "max_iterations", 0) or 0)
             if max_iterations > 0:
-                gate.iteration = min(int(total_rounds_completed), max_iterations)
+                gate.iteration = int(total_rounds_completed) % max_iterations
             else:
                 gate.iteration = int(total_rounds_completed)
+        # Sync ctx.total_rounds_completed with the primed gate position so that
+        # per-round staleness checks (data rebuild conditions) reset correctly
+        # for each fresh endless run instead of staying stuck at the previous
+        # completed run's total.
+        if cycle_gates:
+            ctx.total_rounds_completed = int(cycle_gates[0].iteration)
+
 
     def _execute_restore(self, ctx: PipelineContext) -> None:
         """Restore to a checkpoint and replay training material."""
@@ -1098,6 +1115,27 @@ class SaveRestoreNode(PipelineNode):
 
         ctx.cycle = max(0, int(ckpt.get("cycle", target_cycle) or target_cycle))
         ctx.round_id = max(0, int(ckpt.get("round_id", target_round) or target_round))
+        if isinstance(ckpt.get("class_names"), (list, tuple)):
+            ctx.class_names = [str(x) for x in list(ckpt.get("class_names") or []) if str(x).strip()]
+            if int(len(getattr(ctx, "supervised_class_names", []))) <= int(len(ctx.class_names)):
+                ctx.active_extra_terms = list(ctx.class_names[int(len(ctx.supervised_class_names)):])
+            ctx.semantic_term_to_idx = {
+                str(name).strip().lower(): int(i)
+                for i, name in enumerate(ctx.class_names)
+                if str(name).strip()
+            }
+        ctx.vocab_lora_library = dict(ckpt.get("vocab_lora_library", {}) or {})
+        ctx.vocab_lora_plan_cache = dict(ckpt.get("vocab_lora_plan_cache", {}) or {})
+        ctx.vocab_lora_requirement_history = list(ckpt.get("vocab_lora_requirement_history", []) or [])
+        ctx.vocab_lora_pending_terms = list(ckpt.get("vocab_lora_pending_terms", []) or [])
+        ctx.vocab_lora_active_signature = str(ckpt.get("vocab_lora_active_signature", "") or "")
+        ctx.vocab_lora_active_terms = list(ckpt.get("vocab_lora_active_terms", []) or [])
+        ctx.vocab_lora_locked_terms = list(ckpt.get("vocab_lora_locked_terms", []) or [])
+        ctx.vocab_lora_max_terms = int(ckpt.get("vocab_lora_max_terms", getattr(ctx, "vocab_lora_max_terms", 0)) or 0)
+        ctx.vocab_lora_latest_plan_signature = str(ckpt.get("vocab_lora_latest_plan_signature", "") or "")
+        ctx.vocab_lora_plan_slot_cursor = int(ckpt.get("vocab_lora_plan_slot_cursor", 0) or 0)
+        ctx.lora_slot_snapshots = dict(ckpt.get("lora_slot_snapshots", {}) or {})
+        ctx.lora_active_slot = str(ckpt.get("lora_active_slot", "") or "")
         try:
             ctx.total_rounds_completed = max(
                 0,
@@ -1136,10 +1174,23 @@ class SaveRestoreNode(PipelineNode):
             sd_key = f"{name}_state"
             if model is not None and sd_key in ckpt:
                 try:
+                    prime_tiny_classifier_label_bank_for_state_dict(model, ckpt[sd_key])
                     model.load_state_dict(ckpt[sd_key], strict=False)
                     _log(f"[restore] loaded {name} weights")
                 except Exception as exc:
                     _log(f"[restore] WARNING: {name} weight load failed: {exc}")
+        if ctx.classifier is not None and isinstance(ckpt.get("classifier_lora"), dict):
+            try:
+                from wav_ml_models import restore_tiny_classifier_lora_snapshot
+
+                info = restore_tiny_classifier_lora_snapshot(ctx.classifier, ckpt.get("classifier_lora"))
+                if bool(info.get("used", False)):
+                    _log(
+                        f"[restore] restored classifier LoRA "
+                        f"slots={int(info.get('slots', 0))} active={str(info.get('active_slot', ''))}"
+                    )
+            except Exception as exc:
+                _log(f"[restore] WARNING: classifier LoRA restore failed: {exc}")
 
         # 2b. Restore optimizer, LR-controller, and grad-scaler state
         for name, optimizer in _optimizers.items():
@@ -1325,101 +1376,6 @@ class SaveRestoreNode(PipelineNode):
         self._weight_model_generations[key] = (int(architecture_version), int(generation))
         return int(generation)
 
-    def _persist_weight_image_thumbnail(
-        self,
-        index: int,
-        *,
-        target_width: int,
-        target_height: int,
-    ) -> Optional[Path]:
-        root = self._weight_checkpoint_thumbnail_root
-        if root is None:
-            return None
-        meta = self.weight_image_store.get_meta(int(index))
-        if meta is None:
-            return None
-        if (int(meta.flags) & int(WEIGHT_IMAGE_FLAG_CHECKPOINT)) == 0:
-            return None
-        rgb = self.weight_image_store.copy_image(int(index))
-        if rgb is None:
-            return None
-        cropped = crop_weight_image_rgb(
-            rgb,
-            target_width=int(target_width),
-            target_height=int(target_height),
-        )
-        path = checkpoint_thumbnail_path(
-            root,
-            round_id=int(meta.round_id),
-            cycle=int(meta.cycle),
-            model_name=str(meta.model_name),
-            generation=int(meta.generation),
-            architecture_version=int(meta.architecture_version),
-        )
-        try:
-            return save_checkpoint_thumbnail(path, cropped)
-        except Exception:
-            return None
-
-    def _persist_weight_image_evictions(
-        self,
-        evict_indices: List[int],
-        *,
-        target_width: int,
-        target_height: int,
-    ) -> None:
-        for index in sorted({int(i) for i in evict_indices}):
-            try:
-                self._persist_weight_image_thumbnail(
-                    int(index),
-                    target_width=int(target_width),
-                    target_height=int(target_height),
-                )
-            except Exception:
-                continue
-
-    def _persist_weight_images_before_config_change(
-        self,
-        *,
-        mode: int,
-        target_width: int,
-        target_height: int,
-    ) -> None:
-        active_cfg = self.weight_image_store.get_active_config()
-        if active_cfg is None:
-            return
-        state_meta = self.weight_state_store.get_meta()
-        if state_meta is None:
-            return
-        if (
-            int(active_cfg.mode) == int(mode)
-            and int(active_cfg.target_width) == int(target_width)
-            and int(active_cfg.target_height) == int(target_height)
-            and int(active_cfg.generation) == int(state_meta.generation)
-            and int(active_cfg.architecture_version) == int(state_meta.architecture_version)
-            and str(active_cfg.model_name) == str(state_meta.model_name)
-            and str(active_cfg.node_id) == str(state_meta.node_id)
-        ):
-            return
-        entries = [
-            self.weight_image_store.get_meta(i)
-            for i in range(max(0, int(self.weight_image_store.length())))
-        ]
-        evict_indices = plan_weight_image_evictions(
-            [entry for entry in entries if entry is not None],
-            max_entries=max(1, int(self.weight_image_store.capacity()) or 1),
-            max_total_bytes=max(
-                0,
-                int(getattr(self.weight_image_store.stats(), "max_total_bytes", 0) or 0),
-            ),
-            clear_all=True,
-        )
-        self._persist_weight_image_evictions(
-            evict_indices,
-            target_width=int(active_cfg.target_width),
-            target_height=int(active_cfg.target_height),
-        )
-
     def configure_runtime_weight_image(
         self,
         *,
@@ -1427,14 +1383,19 @@ class SaveRestoreNode(PipelineNode):
         target_width: int,
         target_height: int,
     ) -> Optional[WeightImageConfig]:
-        self._persist_weight_images_before_config_change(
-            mode=int(mode),
-            target_width=int(target_width),
-            target_height=int(target_height),
-        )
+        state_meta = self._last_weight_state_meta
+        if state_meta is None:
+            try:
+                state_meta = self.weight_state_store.get_meta()
+            except Exception:
+                state_meta = None
+        if state_meta is None:
+            return None
         try:
-            cfg = self.weight_image_store.configure_latest(
+            cfg = self.weight_image_store.measure_for(
                 self.weight_state_store,
+                model_name=str(state_meta.model_name),
+                node_id=str(state_meta.node_id or ""),
                 mode=int(mode),
                 target_width=int(target_width),
                 target_height=int(target_height),
@@ -1688,11 +1649,13 @@ class SaveRestoreNode(PipelineNode):
         *,
         checkpoint_path=None,
     ) -> Dict[str, Any]:
+        weight_models = self.runtime_weight_registry()
         d = {
             "type": NOTIFY_CHECKPOINT,
             "round_id": int(round_id),
             "cycle": int(cycle),
             "loss_summary": self.loss_store.summary(),
+            "weight_models": weight_models,
         }
         meta = self._last_weight_state_meta
         if meta is not None:

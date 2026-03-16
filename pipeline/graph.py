@@ -223,8 +223,35 @@ class PipelineEdge:
     layer: str = "execution"
     reaction: EdgeReactionSpec = field(default_factory=EdgeReactionSpec)
     metadata: Dict[str, Any] = field(default_factory=dict)
+    predicate_graph_id: str = ""
+    pin_effects: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+
+    # ------------------------------------------------------------------
+    # Predicate-graph evaluation helpers
+    # ------------------------------------------------------------------
+
+    def _evaluate_predicate_pin(self, ctx: "PipelineContext") -> Optional[str]:  # noqa: F821
+        """Evaluate this edge's predicate graph (if any) and return the output pin.
+
+        Returns ``None`` when no predicate graph is attached or the graph
+        cannot be found in ``ctx.predicate_graphs``.
+        """
+        if not self.predicate_graph_id:
+            return None
+        pg = ctx.predicate_graphs.get(self.predicate_graph_id)
+        if pg is None:
+            return None
+        from pipeline.condition_expr import evaluate_condition_expr
+        return pg.evaluate(
+            signal_reader=lambda sid: float(ctx.signals.read(sid)),
+            expr_evaluator=lambda expr: evaluate_condition_expr(expr, ctx),
+        )
 
     def is_active(self, ctx: "PipelineContext") -> bool:  # noqa: F821
+        pin = self._evaluate_predicate_pin(ctx)
+        if pin is not None:
+            effects = self.pin_effects.get(pin, {})
+            return bool(effects.get("activate", False))
         if self.condition is None:
             return True
         return bool(self.condition(ctx))
@@ -235,6 +262,11 @@ class PipelineEdge:
     def invoke(self, ctx: "PipelineContext", incoming: Optional[Dict[str, Any]] = None) -> None:  # noqa: F821
         if self.on_traverse is None:
             return
+        pin = self._evaluate_predicate_pin(ctx)
+        if pin is not None:
+            effects = self.pin_effects.get(pin, {})
+            if not effects.get("on_traverse", False):
+                return
         _invoke_edge_callback(
             self.on_traverse,
             ctx,
@@ -292,6 +324,8 @@ class PipelineGraph:
         reaction_defaults: Optional[Dict[str, Any]] = None,
         reaction_metadata: Optional[Dict[str, Any]] = None,
         metadata: Optional[Dict[str, Any]] = None,
+        predicate_graph_id: str = "",
+        pin_effects: Optional[Dict[str, Dict[str, Any]]] = None,
     ) -> "PipelineGraph":
         """Add a directed edge from *source_id* → *target_id*.
 
@@ -351,6 +385,8 @@ class PipelineGraph:
                     metadata=dict(reaction_metadata or {}),
                 ),
                 metadata=dict(metadata or {}),
+                predicate_graph_id=str(predicate_graph_id or ""),
+                pin_effects=dict(pin_effects or {}),
             )
         )
         return self

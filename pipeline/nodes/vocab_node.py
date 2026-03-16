@@ -155,6 +155,8 @@ class InitVocabNode(OneTimeNode):
         ctx.active_extra_terms = list(active_extra)
         ctx.class_names = list(supervised) + list(active_extra)
         ctx.semantic_term_to_idx = _semantic_term_index_map(ctx.class_names)
+        ctx.vocab_lora_locked_terms = list(core)
+        ctx.vocab_lora_max_terms = max(1, int(getattr(ctx.args, "stage_c_lora_max_terms", len(active_extra)) or len(active_extra)))
 
         _log(
             f"[vocab-init] classes={len(ctx.class_names)} "
@@ -197,6 +199,17 @@ class VocabChurnNode(PipelineNode):
         return (ctx.vocab_rotation_cycle % max(1, self.cfg.churn_every_n_cycles)) == 0
 
     def execute(self, ctx: PipelineContext) -> None:
+        selected_slot = select_active_vocab_lora_slot(ctx)
+        if isinstance(selected_slot, dict) and selected_slot:
+            info = activate_vocab_lora_slot(ctx, selected_slot)
+            ctx.vocab_rotation_cycle += 1
+            _log(
+                f"[vocab-churn] cycle={ctx.vocab_rotation_cycle} "
+                f"planned slot={str(info.get('slot_name', ''))} "
+                f"terms={int(len(info.get('terms') or []))} "
+                f"signature={str(info.get('signature', ''))[:12]}"
+            )
+            return
 
         old_terms = list(ctx.active_extra_terms)
         pool_terms = _build_full_term_pool(ctx, self.cfg)
@@ -243,6 +256,8 @@ class VocabChurnNode(PipelineNode):
         ctx.active_extra_terms = list(new_active)
         ctx.class_names = list(ctx.supervised_class_names) + list(new_active)
         ctx.semantic_term_to_idx = _semantic_term_index_map(ctx.class_names)
+        ctx.vocab_lora_active_signature = ""
+        ctx.vocab_lora_active_terms = list(_normalize_vocab_terms(new_active))
         ctx.vocab_rotation_cycle += 1
 
         changed = [t for t in new_active if t not in old_terms]
@@ -728,6 +743,295 @@ def _build_full_term_pool(ctx: PipelineContext, cfg: VocabConfig) -> List[str]:
     removed = set(_removed_semantic_seed_terms() + list(cfg.removed_seed_terms))
     merged = _merge_vocab_terms(base, extra)
     return _normalize_vocab_terms([t for t in merged if t.lower() not in removed])
+
+
+def _vocab_term_key(term: str) -> str:
+    return re.sub(r"\s+", " ", str(term)).strip().lower()
+
+
+def _hash_vocab_term_set(terms: Sequence[str]) -> str:
+    ordered = sorted({_vocab_term_key(str(x)) for x in terms if _vocab_term_key(str(x))})
+    return hashlib.sha1("|".join(ordered).encode("utf-8", errors="ignore")).hexdigest()[:16]
+
+
+def _normalize_term_rows(rows: Optional[Sequence[Sequence[str]]]) -> List[List[str]]:
+    if not isinstance(rows, (list, tuple)):
+        return []
+    out: List[List[str]] = []
+    for row in rows:
+        if isinstance(row, (list, tuple)):
+            out.append(_normalize_vocab_terms([str(x) for x in list(row)]))
+    return out
+
+
+def _partition_terms_by_dependencies(
+    *,
+    variable_terms: Sequence[str],
+    term_rows: Sequence[Sequence[str]],
+    capacity: int,
+) -> List[List[str]]:
+    ordered_terms = _normalize_vocab_terms(variable_terms)
+    if int(len(ordered_terms)) <= 0:
+        return []
+    if int(capacity) <= 0:
+        return [list(ordered_terms)]
+    allowed = {_vocab_term_key(term) for term in ordered_terms}
+    freq: Dict[str, int] = {str(term): 0 for term in ordered_terms}
+    pair_weights: Dict[Tuple[str, str], int] = {}
+    for raw_row in term_rows:
+        row_terms = [
+            _vocab_term_key(term)
+            for term in _normalize_vocab_terms([str(x) for x in list(raw_row)])
+            if _vocab_term_key(term) in allowed
+        ]
+        if int(len(row_terms)) <= 0:
+            continue
+        row_unique = list(dict.fromkeys(row_terms))
+        for term in row_unique:
+            freq[str(term)] = int(freq.get(str(term), 0)) + 1
+        for i in range(int(len(row_unique))):
+            for j in range(int(i + 1), int(len(row_unique))):
+                pair = tuple(sorted((str(row_unique[i]), str(row_unique[j]))))
+                pair_weights[pair] = int(pair_weights.get(pair, 0)) + 1
+    seed_order = sorted(
+        [str(term) for term in ordered_terms],
+        key=lambda term: (-int(freq.get(str(term), 0)), str(term)),
+    )
+    groups: List[List[str]] = []
+    for term in seed_order:
+        best_group_idx = -1
+        best_score = -1
+        for gi, group in enumerate(groups):
+            if int(len(group)) >= int(capacity):
+                continue
+            score = 0
+            for other in group:
+                pair = tuple(sorted((str(term), str(other))))
+                score += int(pair_weights.get(pair, 0))
+            if int(score) > int(best_score):
+                best_score = int(score)
+                best_group_idx = int(gi)
+        if int(best_group_idx) < 0:
+            groups.append([str(term)])
+        else:
+            groups[int(best_group_idx)].append(str(term))
+    return [list(_normalize_vocab_terms(group)) for group in groups if group]
+
+
+def plan_vocab_lora_requirements(
+    *,
+    ctx: PipelineContext,
+    required_terms: Sequence[str],
+    term_rows: Optional[Sequence[Sequence[str]]] = None,
+    source: str = "",
+    stage_label: str = "",
+    max_terms_per_slot: int = 0,
+) -> Dict[str, Any]:
+    normalized_required = _normalize_vocab_terms(required_terms)
+    required_key_set = {_vocab_term_key(term) for term in normalized_required}
+    supervised_terms = _normalize_vocab_terms(getattr(ctx, "supervised_class_names", []))
+    supervised_set = {_vocab_term_key(term) for term in supervised_terms}
+    locked_terms = _normalize_vocab_terms(getattr(ctx, "vocab_lora_locked_terms", []) or getattr(ctx, "core_terms", []))
+    locked_set = {_vocab_term_key(term) for term in locked_terms}
+    current_extra = _normalize_vocab_terms(getattr(ctx, "active_extra_terms", []))
+    current_extra_set = {_vocab_term_key(term) for term in current_extra}
+    required_extra = [
+        str(term)
+        for term in normalized_required
+        if _vocab_term_key(term) not in supervised_set
+    ]
+    required_extra_set = {_vocab_term_key(term) for term in required_extra}
+    current_vocab_fit = bool(required_extra_set.issubset(current_extra_set))
+    max_terms = max(1, int(max_terms_per_slot) if int(max_terms_per_slot) > 0 else int(getattr(ctx, "vocab_lora_max_terms", 0) or len(current_extra) or len(required_extra) or 1))
+    fixed_locked_terms = list(locked_terms[: int(max_terms)])
+    variable_terms = [
+        str(term)
+        for term in required_extra
+        if _vocab_term_key(term) not in locked_set
+    ]
+    variable_capacity = max(0, int(max_terms) - int(len(fixed_locked_terms)))
+    normalized_rows = _normalize_term_rows(term_rows)
+    grouped_terms = _partition_terms_by_dependencies(
+        variable_terms=variable_terms,
+        term_rows=normalized_rows,
+        capacity=max(1, int(variable_capacity) if int(variable_capacity) > 0 else 1),
+    )
+    slot_defs: List[Dict[str, Any]] = []
+    for slot_terms in grouped_terms or [[]]:
+        all_terms = _normalize_vocab_terms(list(fixed_locked_terms) + list(slot_terms))
+        if int(len(all_terms)) <= 0:
+            continue
+        signature = _hash_vocab_term_set(all_terms)
+        slot_defs.append(
+            {
+                "signature": str(signature),
+                "slot_name": f"vocab_{str(signature)}",
+                "terms": list(all_terms),
+                "locked_terms": [str(t) for t in fixed_locked_terms],
+                "variable_terms": list(_normalize_vocab_terms(slot_terms)),
+                "term_count": int(len(all_terms)),
+            }
+        )
+    if int(len(slot_defs)) <= 0 and int(len(required_extra)) > 0:
+        signature = _hash_vocab_term_set(required_extra)
+        slot_defs = [
+            {
+                "signature": str(signature),
+                "slot_name": f"vocab_{str(signature)}",
+                "terms": list(_normalize_vocab_terms(list(fixed_locked_terms) + list(variable_terms))),
+                "locked_terms": [str(t) for t in fixed_locked_terms],
+                "variable_terms": list(_normalize_vocab_terms(variable_terms)),
+                "term_count": int(len(_normalize_vocab_terms(list(fixed_locked_terms) + list(variable_terms)))),
+            }
+        ]
+    plan_signature = _hash_vocab_term_set(required_extra)
+    return {
+        "signature": str(plan_signature),
+        "source": str(source),
+        "stage_label": str(stage_label),
+        "required_terms": list(normalized_required),
+        "required_term_count": int(len(normalized_required)),
+        "required_extra_terms": list(_normalize_vocab_terms(required_extra)),
+        "required_extra_term_count": int(len(_normalize_vocab_terms(required_extra))),
+        "required_builtin_terms": [
+            str(term)
+            for term in normalized_required
+            if _vocab_term_key(term) in supervised_set
+        ],
+        "current_vocab_fit": bool(current_vocab_fit),
+        "needs_split": bool(int(len(slot_defs)) > 1),
+        "slot_capacity": int(max_terms),
+        "variable_capacity": int(variable_capacity),
+        "slots": list(slot_defs),
+        "slot_count": int(len(slot_defs)),
+        "term_rows_observed": int(len(normalized_rows)),
+        "unknown_to_current_vocab": [
+            str(term)
+            for term in _normalize_vocab_terms(required_extra)
+            if _vocab_term_key(term) not in current_extra_set
+        ],
+        "required_key_set": sorted([str(x) for x in required_key_set]),
+    }
+
+
+def register_churn_requirement(
+    *,
+    ctx: PipelineContext,
+    required_terms: Sequence[str],
+    term_rows: Optional[Sequence[Sequence[str]]] = None,
+    source: str = "",
+    stage_label: str = "",
+    max_terms_per_slot: int = 0,
+) -> Dict[str, Any]:
+    plan = plan_vocab_lora_requirements(
+        ctx=ctx,
+        required_terms=required_terms,
+        term_rows=term_rows,
+        source=str(source),
+        stage_label=str(stage_label),
+        max_terms_per_slot=int(max_terms_per_slot),
+    )
+    if int(plan.get("required_extra_term_count", 0)) <= 0:
+        return plan
+    plan_signature = str(plan.get("signature", "")).strip()
+    if plan_signature:
+        ctx.vocab_lora_plan_cache[str(plan_signature)] = dict(plan)
+        if _source_should_drive_vocab_activation(source=str(source), stage_label=str(stage_label)):
+            if str(getattr(ctx, "vocab_lora_latest_plan_signature", "")) != str(plan_signature):
+                ctx.vocab_lora_plan_slot_cursor = 0
+            ctx.vocab_lora_latest_plan_signature = str(plan_signature)
+    for slot in list(plan.get("slots") or []):
+        signature = str(slot.get("signature", "")).strip()
+        if not signature:
+            continue
+        library_entry = dict(ctx.vocab_lora_library.get(str(signature), {}))
+        library_entry.update(
+            {
+                "signature": str(signature),
+                "slot_name": str(slot.get("slot_name", f"vocab_{signature}")),
+                "terms": list(_normalize_vocab_terms(slot.get("terms") or [])),
+                "locked_terms": list(_normalize_vocab_terms(slot.get("locked_terms") or [])),
+                "variable_terms": list(_normalize_vocab_terms(slot.get("variable_terms") or [])),
+                "term_count": int(slot.get("term_count", 0)),
+                "planned": True,
+                "plan_signature": str(plan_signature),
+                "latest_source": str(source),
+                "latest_stage": str(stage_label),
+                "snapshot_present": bool(str(signature) in getattr(ctx, "lora_slot_snapshots", {})),
+                "activation_count": int(library_entry.get("activation_count", 0)),
+                "trained_rounds": int(library_entry.get("trained_rounds", 0)),
+            }
+        )
+        ctx.vocab_lora_library[str(signature)] = library_entry
+    pending_keys = {_vocab_term_key(term) for term in list(getattr(ctx, "vocab_lora_pending_terms", []))}
+    for term in list(plan.get("unknown_to_current_vocab") or []):
+        key = _vocab_term_key(str(term))
+        if not key or key in pending_keys:
+            continue
+        pending_keys.add(str(key))
+        ctx.vocab_lora_pending_terms.append(str(term))
+    ctx.vocab_lora_requirement_history.append(
+        {
+            "signature": str(plan_signature),
+            "source": str(source),
+            "stage_label": str(stage_label),
+            "required_terms": list(plan.get("required_terms") or []),
+            "required_extra_terms": list(plan.get("required_extra_terms") or []),
+            "slot_count": int(plan.get("slot_count", 0)),
+            "needs_split": bool(plan.get("needs_split", False)),
+            "current_vocab_fit": bool(plan.get("current_vocab_fit", False)),
+        }
+    )
+    return plan
+
+
+def _source_should_drive_vocab_activation(source: str, stage_label: str) -> bool:
+    key = " ".join([str(source or "").strip().lower(), str(stage_label or "").strip().lower()]).strip()
+    if not key:
+        return False
+    return any(token in key for token in ("berkeley", "payload", "refresh", "stage2", "stage c", "stagec"))
+
+
+def select_active_vocab_lora_slot(ctx: PipelineContext) -> Optional[Dict[str, Any]]:
+    plan_signature = str(getattr(ctx, "vocab_lora_latest_plan_signature", "") or "").strip()
+    if not plan_signature:
+        return None
+    plan = dict(getattr(ctx, "vocab_lora_plan_cache", {}).get(str(plan_signature), {}) or {})
+    slots = list(plan.get("slots") or [])
+    if int(len(slots)) <= 0:
+        return None
+    cursor = max(0, int(getattr(ctx, "vocab_lora_plan_slot_cursor", 0) or 0))
+    slot = dict(slots[int(cursor % int(len(slots)))])
+    ctx.vocab_lora_plan_slot_cursor = int((cursor + 1) % max(1, int(len(slots))))
+    return slot
+
+
+def activate_vocab_lora_slot(ctx: PipelineContext, slot: Dict[str, Any]) -> Dict[str, Any]:
+    slot_terms = _normalize_vocab_terms(slot.get("terms") or [])
+    total_slots = max(1, int(getattr(ctx, "vocab_lora_max_terms", 0) or len(getattr(ctx, "active_extra_terms", [])) or len(slot_terms) or 1))
+    active_extra = _normalize_active_extra_terms_with_core(
+        active_terms=slot_terms,
+        core_terms=getattr(ctx, "core_terms", []),
+        total_slots=int(total_slots),
+    )
+    ctx.active_extra_terms = list(active_extra)
+    ctx.class_names = list(getattr(ctx, "supervised_class_names", [])) + list(active_extra)
+    ctx.semantic_term_to_idx = _semantic_term_index_map(ctx.class_names)
+    ctx.vocab_lora_active_signature = str(slot.get("signature", "") or "")
+    ctx.vocab_lora_active_terms = list(_normalize_vocab_terms(slot.get("terms") or []))
+    library_entry = dict(ctx.vocab_lora_library.get(str(ctx.vocab_lora_active_signature), {}) or {})
+    if library_entry:
+        library_entry["activation_count"] = int(library_entry.get("activation_count", 0)) + 1
+        library_entry["last_activation_cycle"] = int(getattr(ctx, "vocab_rotation_cycle", 0))
+        library_entry["snapshot_present"] = bool(str(ctx.vocab_lora_active_signature) in getattr(ctx, "lora_slot_snapshots", {}))
+        ctx.vocab_lora_library[str(ctx.vocab_lora_active_signature)] = library_entry
+    return {
+        "signature": str(ctx.vocab_lora_active_signature),
+        "slot_name": str(slot.get("slot_name", f"vocab_{ctx.vocab_lora_active_signature}")),
+        "terms": list(ctx.vocab_lora_active_terms),
+        "class_count": int(len(ctx.class_names)),
+        "extra_count": int(len(ctx.active_extra_terms)),
+    }
 
 
 def _resolve_supervised_class_names(ctx: PipelineContext) -> List[str]:

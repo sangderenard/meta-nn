@@ -442,6 +442,12 @@ class GeneratorTrainNode(IRTrainingNode):
             model=ctx.generator,
             node_id=self.node_id,
         )
+        discriminator_step_callback = make_runtime_weight_publish_callback(
+            ctx,
+            model_name="discriminator",
+            model=ctx.discriminator,
+            node_id=self.node_id,
+        )
 
         # train_conditional_generator_discriminator creates its own optimizers internally
         # and returns (trained_generator, trained_discriminator, list_of_epoch_metric_dicts).
@@ -467,6 +473,7 @@ class GeneratorTrainNode(IRTrainingNode):
             amp_dtype=str(ctx.amp_dtype or "float16"),
             channels_last=False,
             generator_step_callback=generator_step_callback,
+            discriminator_step_callback=discriminator_step_callback,
         )
 
         ctx.generator = trained_g

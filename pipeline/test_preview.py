@@ -151,49 +151,156 @@ def test_viewer_enqueue_frame_does_not_push_weight_tiles():
 
 def test_shared_weight_render_rerenders_on_config_change_and_uses_target_dims():
     class _FakeStateStore:
+        def __init__(self):
+            self._entries = [
+                SimpleNamespace(
+                    publish_seq=7,
+                    model_name="generator",
+                    node_id="stage_g",
+                    generation=1,
+                    architecture_version=11,
+                    round_id=1,
+                    cycle=2,
+                    step=3,
+                ),
+                SimpleNamespace(
+                    publish_seq=8,
+                    model_name="discriminator",
+                    node_id="stage_g",
+                    generation=1,
+                    architecture_version=11,
+                    round_id=1,
+                    cycle=2,
+                    step=4,
+                ),
+            ]
+
         def get_meta(self):
-            return SimpleNamespace(publish_seq=7, model_name="toy")
+            return self._entries[-1]
+
+        def list_meta(self):
+            return list(self._entries)
+
+        def get_meta_for(self, *, model_name, node_id=""):
+            for entry in self._entries:
+                if str(entry.model_name) != str(model_name):
+                    continue
+                if str(entry.node_id) != str(node_id or ""):
+                    continue
+                return entry
+            return None
 
     class _FakeImageStore:
         def __init__(self):
             self.calls = []
             self.limit_calls = []
-            self._cfg = None
             self._image_seq = 0
             self._max_entries = 512
+            self._entries = []
 
-        def get_active_config(self):
-            return self._cfg
+        def _find_entry_index(self, *, model_name, node_id, state_publish_seq):
+            for index, (meta, _rgb) in enumerate(self._entries):
+                if int(meta.state_publish_seq) != int(state_publish_seq):
+                    continue
+                if str(meta.model_name) != str(model_name):
+                    continue
+                if str(meta.node_id) != str(node_id):
+                    continue
+                return index
+            return None
 
         def length(self):
-            return 0
+            return len(self._entries)
 
         def stats(self):
             return SimpleNamespace(max_entries=self._max_entries, max_total_bytes=0)
 
-        def get_meta(self, _index):
-            return None
+        def get_meta(self, index):
+            if index < 0 or index >= len(self._entries):
+                return None
+            return self._entries[int(index)][0]
 
         def set_limits(self, *, max_entries, max_total_bytes):
             self.limit_calls.append((int(max_entries), int(max_total_bytes)))
             return True
 
-        def render_latest(self, _state_store, *, mode, target_width, target_height):
-            self.calls.append((int(mode), int(target_width), int(target_height)))
-            self._image_seq += 1
-            return True
+        def measure_for(self, state_store, *, model_name, node_id="", mode, target_width, target_height):
+            state_meta = state_store.get_meta_for(model_name=str(model_name), node_id=str(node_id or ""))
+            if state_meta is None:
+                return None
+            render_w = int(target_width) + 50
+            render_h = int(target_height) + 40
+            return SimpleNamespace(
+                state_publish_seq=int(state_meta.publish_seq),
+                generation=int(state_meta.generation),
+                architecture_version=int(state_meta.architecture_version),
+                round_id=int(state_meta.round_id),
+                cycle=int(state_meta.cycle),
+                step=int(state_meta.step),
+                mode=int(mode),
+                target_width=int(target_width),
+                target_height=int(target_height),
+                render_width=int(render_w),
+                render_height=int(render_h),
+                render_channels=3,
+                render_stride_bytes=int(render_w * 3),
+                model_name=str(model_name),
+                node_id=str(node_id or ""),
+            )
 
-        def latest_image(self):
+        def render_for(self, state_store, *, model_name, node_id="", mode, target_width, target_height):
+            self.calls.append((str(model_name), int(mode), int(target_width), int(target_height)))
+            state_meta = state_store.get_meta_for(model_name=str(model_name), node_id=str(node_id or ""))
+            if state_meta is None:
+                return False
+            cfg = self.measure_for(
+                state_store,
+                model_name=str(model_name),
+                node_id=str(node_id or ""),
+                mode=int(mode),
+                target_width=int(target_width),
+                target_height=int(target_height),
+            )
+            if cfg is None:
+                return False
+            self._image_seq += 1
+            fill = 64 if str(model_name) == "generator" else 96
+            rgb = np.full((int(cfg.render_height), int(cfg.render_width), 3), fill, dtype=np.uint8)
             meta = SimpleNamespace(
                 image_seq=self._image_seq,
-                state_publish_seq=7,
-                round_id=1,
-                cycle=2,
-                step=3,
-                model_name="toy",
+                state_publish_seq=int(state_meta.publish_seq),
+                generation=int(state_meta.generation),
+                architecture_version=int(state_meta.architecture_version),
+                round_id=int(state_meta.round_id),
+                cycle=int(state_meta.cycle),
+                step=int(state_meta.step),
+                width=int(cfg.render_width),
+                height=int(cfg.render_height),
+                channels=3,
+                stride_bytes=int(cfg.render_stride_bytes),
+                mode=int(mode),
+                target_width=int(target_width),
+                target_height=int(target_height),
+                byte_count=int(cfg.render_stride_bytes) * int(cfg.render_height),
+                flags=0,
+                model_name=str(model_name),
+                node_id=str(node_id or ""),
+                blob_name=f"blob_{self._image_seq}",
             )
-            rgb = np.full((6, 5, 3), 64, dtype=np.uint8)
-            return meta, rgb
+            existing = self._find_entry_index(
+                model_name=str(model_name),
+                node_id=str(node_id or ""),
+                state_publish_seq=int(state_meta.publish_seq),
+            )
+            if existing is not None:
+                self._entries.pop(existing)
+            self._entries.append((meta, rgb))
+            return True
+
+        def copy_image(self, index):
+            if index < 0 or index >= len(self._entries):
+                return None
+            return self._entries[int(index)][1].copy()
 
     viewer = _TransformerStatusOpenGLViewer(enabled=False, image_hw=(8, 8), graph_h=0)
     viewer._ipc_server_ref = SimpleNamespace(has_connection=True)
@@ -201,42 +308,33 @@ def test_shared_weight_render_rerenders_on_config_change_and_uses_target_dims():
     image_store = _FakeImageStore()
     image_store._max_entries = viewer._weight_history_maxlen
     viewer._weight_image_store = image_store
+    viewer.weight_image_spec = lambda: {"mode": 1, "panel_crop_w": 100, "panel_crop_h": 80}
 
-    image_store._cfg = SimpleNamespace(
-        state_publish_seq=7,
-        mode=1,
-        target_width=100,
-        target_height=80,
-        render_width=150,
-        render_height=120,
-        render_channels=3,
-        render_stride_bytes=450,
-    )
     viewer._launch_shared_weight_render()
     viewer._shared_weight_render_thread.join(timeout=2.0)
     viewer._collect_shared_weight_render()
 
-    image_store._cfg = SimpleNamespace(
-        state_publish_seq=7,
-        mode=1,
-        target_width=140,
-        target_height=90,
-        render_width=210,
-        render_height=140,
-        render_channels=3,
-        render_stride_bytes=630,
-    )
+    viewer.weight_image_spec = lambda: {"mode": 1, "panel_crop_w": 140, "panel_crop_h": 90}
     viewer._launch_shared_weight_render()
     viewer._shared_weight_render_thread.join(timeout=2.0)
     viewer._collect_shared_weight_render()
 
-    assert image_store.calls == [(1, 100, 80), (1, 140, 90)]
+    assert image_store.calls == [
+        ("generator", 1, 100, 80),
+        ("discriminator", 1, 100, 80),
+        ("generator", 1, 140, 90),
+        ("discriminator", 1, 140, 90),
+    ]
     assert image_store.limit_calls == [
         (viewer._weight_history_maxlen, 450 * 120 * viewer._weight_history_maxlen),
-        (viewer._weight_history_maxlen, 630 * 140 * viewer._weight_history_maxlen),
+        (viewer._weight_history_maxlen, 570 * 130 * viewer._weight_history_maxlen),
     ]
-    assert len(viewer._weight_snapshot_deque) == 2
-    assert viewer._weight_current_rgb_by_model["toy"].shape == (90, 140, 3)
+    assert len(viewer._weight_snapshot_deques_by_model["generator"]) == 2
+    assert len(viewer._weight_snapshot_deques_by_model["discriminator"]) == 2
+    assert viewer._weight_current_rgb_by_model["generator"].shape == (90, 140, 3)
+    assert viewer._weight_current_rgb_by_model["discriminator"].shape == (90, 140, 3)
+    assert viewer._weight_current_meta_by_model["generator"]["mode"] == 1
+    assert viewer._weight_current_meta_by_model["discriminator"]["target_width"] == 140
 
 
 def test_crop_weight_image_rgb_center_crops_and_pads():
@@ -312,3 +410,35 @@ def test_viewer_tracks_weight_registry_and_active_tab():
 
     assert viewer._resolved_active_weight_model_name() == "discriminator"
     assert viewer._weight_snapshot_deque is viewer._weight_snapshot_deques_by_model["discriminator"]
+
+
+def test_viewer_checkpoint_notification_tracks_all_weight_models():
+    viewer = _TransformerStatusOpenGLViewer(enabled=False, image_hw=(8, 8), graph_h=0)
+
+    viewer.notify_pipeline_checkpoint_saved(
+        round_id=5,
+        cycle=3,
+        weight_models=[
+            {
+                "model": "generator",
+                "node_id": "stage_g",
+                "publish_seq": 21,
+                "generation": 2,
+                "architecture_version": 17,
+            },
+            {
+                "model": "discriminator",
+                "node_id": "stage_g",
+                "publish_seq": 22,
+                "generation": 2,
+                "architecture_version": 19,
+            },
+        ],
+    )
+
+    gen = viewer._checkpoint_weight_records[(5, 3, "generator")]
+    disc = viewer._checkpoint_weight_records[(5, 3, "discriminator")]
+    assert gen["state_publish_seq"] == 21
+    assert disc["state_publish_seq"] == 22
+    assert gen["generation"] == 2
+    assert disc["architecture_version"] == 19

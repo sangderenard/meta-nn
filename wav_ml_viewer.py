@@ -345,6 +345,13 @@ class _TransformerStatusOpenGLViewer:
         self._port_file_path: Optional[str] = None
         self._training_proc: Optional[Any] = None   # subprocess.Popen handle
         self._ipc_server_ref: Optional[Any] = None   # ViewerIPCServer backref
+        # START button safety gates:
+        # - cooldown blocks rapid re-clicks
+        # - launch_pending blocks duplicate starts before IPC connect arrives
+        self._start_cooldown_s: float = 10.0
+        self._start_cooldown_until: float = 0.0
+        self._start_launch_grace_s: float = 30.0
+        self._start_launch_pending_until: float = 0.0
 
         self._last_present_t = 0.0
         # Slew: elapsed time controls how many scrub-ring entries are drained per pump().
@@ -551,7 +558,26 @@ class _TransformerStatusOpenGLViewer:
         srv = self._ipc_server_ref
         if srv is None:
             return False
-        return getattr(srv, "has_connection", False)
+        connected = bool(getattr(srv, "has_connection", False))
+        if connected:
+            # Connected means the launch completed; clear pending gate.
+            self._start_launch_pending_until = 0.0
+        return connected
+
+    def _start_cooldown_remaining(self) -> float:
+        return max(0.0, float(self._start_cooldown_until) - time.monotonic())
+
+    def _is_training_proc_alive(self) -> bool:
+        proc = self._training_proc
+        if proc is None:
+            return False
+        try:
+            return proc.poll() is None
+        except Exception:
+            return False
+
+    def _has_launch_pending(self) -> bool:
+        return time.monotonic() < float(self._start_launch_pending_until)
 
     def shutdown_save(self) -> Optional[bool]:
         return self._shutdown_save
@@ -563,8 +589,32 @@ class _TransformerStatusOpenGLViewer:
         if not script:
             print("[viewer] no launch script configured; cannot start training", flush=True)
             return
+        cooldown_remaining = self._start_cooldown_remaining()
+        if cooldown_remaining > 0.0:
+            print(
+                f"[viewer] START cooldown active ({cooldown_remaining:.1f}s remaining); ignoring START",
+                flush=True,
+            )
+            self._top_bar_dirty = True
+            return
         if self.has_training_connection():
             print("[viewer] training already connected; ignoring START", flush=True)
+            self._start_cooldown_until = time.monotonic() + float(self._start_cooldown_s)
+            self._top_bar_dirty = True
+            return
+        if self._is_training_proc_alive():
+            print("[viewer] training process already running; ignoring START", flush=True)
+            self._start_cooldown_until = time.monotonic() + float(self._start_cooldown_s)
+            self._top_bar_dirty = True
+            return
+        if self._has_launch_pending():
+            pending_left = max(0.0, float(self._start_launch_pending_until) - time.monotonic())
+            print(
+                f"[viewer] previous START still pending ({pending_left:.1f}s until timeout); ignoring START",
+                flush=True,
+            )
+            self._start_cooldown_until = time.monotonic() + float(self._start_cooldown_s)
+            self._top_bar_dirty = True
             return
         # Clear stop state so the next training run starts cleanly
         self._stop_requested = False
@@ -584,8 +634,13 @@ class _TransformerStatusOpenGLViewer:
                     cwd=os.path.dirname(os.path.abspath(script)) or ".",
                 )
             self._training_proc = proc
+            now = time.monotonic()
+            self._start_cooldown_until = now + float(self._start_cooldown_s)
+            self._start_launch_pending_until = now + float(self._start_launch_grace_s)
             print(f"[viewer] launched training process (pid={proc.pid}): {script}", flush=True)
         except Exception as e:
+            # Launch failed immediately; release pending gate so user can retry.
+            self._start_launch_pending_until = 0.0
             print(f"[viewer] failed to launch training: {e}", flush=True)
 
     def _init(self):
@@ -942,15 +997,30 @@ class _TransformerStatusOpenGLViewer:
                 draw.text((save_box[0] + 5, btn_y + 1), label_save, fill=(200, 240, 210), font=font)
                 self._control_boxes.append(("stop_save", -1, save_box))
             elif self._launch_script:
-                label_start = "START"
+                cooldown_remaining = self._start_cooldown_remaining()
+                launch_pending = self._has_launch_pending()
+                proc_alive = self._is_training_proc_alive()
+                can_start = (cooldown_remaining <= 0.0) and (not launch_pending) and (not proc_alive)
+                if launch_pending:
+                    label_start = "STARTING..."
+                elif proc_alive:
+                    label_start = "RUNNING..."
+                elif cooldown_remaining > 0.0:
+                    label_start = f"START {int(math.ceil(cooldown_remaining))}s"
+                else:
+                    label_start = "START"
                 lw_start = len(label_start) * 7 + 10
                 start_box = (bx - lw_start, btn_y, bx, btn_y + btn_h)
+                start_outline = (60, 100, 180) if can_start else (86, 92, 104)
+                start_fill = (36, 64, 130) if can_start else (48, 54, 64)
+                start_text = (200, 220, 250) if can_start else (170, 178, 188)
                 draw.rectangle(
                     [start_box[0], start_box[1], start_box[2], start_box[3]],
-                    outline=(60, 100, 180), fill=(36, 64, 130),
+                    outline=start_outline, fill=start_fill,
                 )
-                draw.text((start_box[0] + 5, btn_y + 1), label_start, fill=(200, 220, 250), font=font)
-                self._control_boxes.append(("start", -1, start_box))
+                draw.text((start_box[0] + 5, btn_y + 1), label_start, fill=start_text, font=font)
+                if can_start:
+                    self._control_boxes.append(("start", -1, start_box))
 
             tx = 8
             row1_y = 22
@@ -1299,10 +1369,30 @@ class _TransformerStatusOpenGLViewer:
         state_store = self._weight_state_store
         if state_store is None:
             return False
-        state_meta = state_store.get_meta()
+        node_id = str(record.get("node_id", "") or "")
+        state_meta = None
+        get_meta_for = getattr(state_store, "get_meta_for", None)
+        if callable(get_meta_for):
+            try:
+                state_meta = get_meta_for(
+                    model_name=str(model_name),
+                    node_id=node_id,
+                )
+            except Exception:
+                state_meta = None
+        if state_meta is None:
+            for candidate in self._weight_state_registry_entries():
+                if self._normalise_weight_model_name(getattr(candidate, "model_name", "")) != self._normalise_weight_model_name(model_name):
+                    continue
+                if str(getattr(candidate, "node_id", "") or "") != node_id:
+                    continue
+                state_meta = candidate
+                break
         if state_meta is None:
             return False
         if self._normalise_weight_model_name(getattr(state_meta, "model_name", "")) != self._normalise_weight_model_name(model_name):
+            return False
+        if node_id and str(getattr(state_meta, "node_id", "") or "") != node_id:
             return False
         if int(record.get("round_id", 0) or 0) > 0 and int(state_meta.round_id) != int(record.get("round_id", 0) or 0):
             return False
@@ -1498,10 +1588,18 @@ class _TransformerStatusOpenGLViewer:
         meta = store.get_meta()
         return [meta] if meta is not None else []
 
-    def _weight_image_present_for_state(self, state_meta: Any) -> bool:
+    def _find_weight_image_store_index_for_state(
+        self,
+        state_meta: Any,
+        *,
+        mode: Optional[int] = None,
+        target_width: Optional[int] = None,
+        target_height: Optional[int] = None,
+        checkpoint_only: bool = False,
+    ) -> Optional[int]:
         store = self._weight_image_store
         if store is None or state_meta is None:
-            return False
+            return None
         target_model = self._normalise_weight_model_name(getattr(state_meta, "model_name", ""))
         target_node = str(getattr(state_meta, "node_id", "") or "")
         target_publish_seq = int(getattr(state_meta, "publish_seq", 0) or 0)
@@ -1515,8 +1613,31 @@ class _TransformerStatusOpenGLViewer:
                 continue
             if str(getattr(image_meta, "node_id", "") or "") != target_node:
                 continue
-            return True
-        return False
+            if checkpoint_only and (int(getattr(image_meta, "flags", 0) or 0) & int(WEIGHT_IMAGE_FLAG_CHECKPOINT)) == 0:
+                continue
+            if mode is not None and int(getattr(image_meta, "mode", 0) or 0) != int(mode):
+                continue
+            if target_width is not None and int(getattr(image_meta, "target_width", 0) or 0) != int(target_width):
+                continue
+            if target_height is not None and int(getattr(image_meta, "target_height", 0) or 0) != int(target_height):
+                continue
+            return int(index)
+        return None
+
+    def _weight_image_present_for_state(
+        self,
+        state_meta: Any,
+        *,
+        mode: int,
+        target_width: int,
+        target_height: int,
+    ) -> bool:
+        return self._find_weight_image_store_index_for_state(
+            state_meta,
+            mode=int(mode),
+            target_width=int(target_width),
+            target_height=int(target_height),
+        ) is not None
 
     def _measure_weight_state_cfg(
         self,
@@ -1860,12 +1981,12 @@ class _TransformerStatusOpenGLViewer:
         mode = int(spec.get("mode", self._weight_image_mode) or self._weight_image_mode)
         target_width = int(spec.get("panel_crop_w", self.panel_w) or self.panel_w)
         target_height = int(spec.get("panel_crop_h", self._weight_map_target_hw()[0]) or self._weight_map_target_hw()[0])
-        active_model = self._resolved_active_weight_model_name()
         registry_entries = list(self._weight_state_registry_entries())
         if not registry_entries:
             return
         for state_meta in registry_entries:
             self._register_weight_model(getattr(state_meta, "model_name", ""))
+        active_model = self._resolved_active_weight_model_name()
         registry_entries.sort(
             key=lambda meta: (
                 0 if self._normalise_weight_model_name(getattr(meta, "model_name", "")) == str(active_model or "") else 1,
@@ -1873,8 +1994,7 @@ class _TransformerStatusOpenGLViewer:
             )
         )
         measured_cfgs: List[WeightImageConfig] = []
-        pending_state_meta = None
-        pending_cfg = None
+        pending_pairs: List[Tuple[Any, Optional[WeightImageConfig]]] = []
         for state_meta in registry_entries:
             cfg = self._measure_weight_state_cfg(
                 state_meta,
@@ -1884,66 +2004,83 @@ class _TransformerStatusOpenGLViewer:
             )
             if cfg is not None:
                 measured_cfgs.append(cfg)
-            if pending_state_meta is None and not self._weight_image_present_for_state(state_meta):
-                pending_state_meta = state_meta
-                pending_cfg = cfg
+            if not self._weight_image_present_for_state(
+                state_meta,
+                mode=int(mode),
+                target_width=int(target_width),
+                target_height=int(target_height),
+            ):
+                pending_pairs.append((state_meta, cfg))
         limit_cfg = None
         if measured_cfgs:
             limit_cfg = max(
                 measured_cfgs,
                 key=lambda cfg: int(getattr(cfg, "render_stride_bytes", 0) or 0) * max(1, int(getattr(cfg, "render_height", 0) or 0)),
             )
-        elif pending_cfg is not None:
-            limit_cfg = pending_cfg
+        elif pending_pairs and pending_pairs[0][1] is not None:
+            limit_cfg = pending_pairs[0][1]
         if limit_cfg is not None:
             self._apply_weight_image_store_limits(limit_cfg)
             self._persist_weight_image_evictions_for_render(limit_cfg)
-        if pending_state_meta is None:
+        if not pending_pairs:
             return
-        render_sig = (
-            int(getattr(pending_state_meta, "publish_seq", 0) or 0),
-            int(mode),
-            int(target_width),
-            int(target_height),
-            self._normalise_weight_model_name(getattr(pending_state_meta, "model_name", "")),
-            str(getattr(pending_state_meta, "node_id", "") or ""),
-        )
         result_box: Dict[str, Any] = {}
 
         def _shared_weight_worker(
             _self=self,
             _state_store=state_store,
             _image_store=image_store,
-            _state_meta=pending_state_meta,
+            _pending_pairs=list(pending_pairs),
             _box=result_box,
         ) -> None:
-            ok = _image_store.render_for(
-                _state_store,
-                model_name=str(getattr(_state_meta, "model_name", "") or ""),
-                node_id=str(getattr(_state_meta, "node_id", "") or ""),
-                mode=int(mode),
-                target_width=int(target_width),
-                target_height=int(target_height),
-            )
-            _box["state_publish_seq"] = int(_state_meta.publish_seq)
-            _box["model_name"] = str(_state_meta.model_name)
-            _box["render_sig"] = render_sig
-            if not ok:
-                _box["ok"] = False
-                return
-            latest = _image_store.latest_image()
-            if latest is None:
-                _box["ok"] = False
-                return
-            image_meta, rgb = latest
-            subtitle = f"r{int(image_meta.round_id)} c{int(image_meta.cycle)} s{int(image_meta.step)}"
-            _box["ok"] = True
-            _box["image_meta"] = image_meta
-            _box["weight_map"] = annotate_weight_map(
-                np.ascontiguousarray(np.asarray(rgb, dtype=np.uint8)),
-                title=str(image_meta.model_name or _state_meta.model_name or ""),
-                subtitle=subtitle,
-            )
+            render_results: List[Dict[str, Any]] = []
+            for _state_meta, _cfg in _pending_pairs:
+                ok = _image_store.render_for(
+                    _state_store,
+                    model_name=str(getattr(_state_meta, "model_name", "") or ""),
+                    node_id=str(getattr(_state_meta, "node_id", "") or ""),
+                    mode=int(mode),
+                    target_width=int(target_width),
+                    target_height=int(target_height),
+                )
+                if not ok:
+                    continue
+                index = _self._find_weight_image_store_index_for_state(
+                    _state_meta,
+                    mode=int(mode),
+                    target_width=int(target_width),
+                    target_height=int(target_height),
+                )
+                if index is None:
+                    continue
+                image_meta = _image_store.get_meta(int(index))
+                rgb = _image_store.copy_image(int(index))
+                if image_meta is None or rgb is None:
+                    continue
+                subtitle = f"r{int(image_meta.round_id)} c{int(image_meta.cycle)} s{int(image_meta.step)}"
+                render_results.append(
+                    {
+                        "state_publish_seq": int(getattr(_state_meta, "publish_seq", 0) or 0),
+                        "model_name": str(getattr(_state_meta, "model_name", "") or ""),
+                        "render_sig": (
+                            int(getattr(_state_meta, "publish_seq", 0) or 0),
+                            int(mode),
+                            int(target_width),
+                            int(target_height),
+                            self._normalise_weight_model_name(getattr(_state_meta, "model_name", "")),
+                            str(getattr(_state_meta, "node_id", "") or ""),
+                        ),
+                        "image_meta": image_meta,
+                        "weight_map": annotate_weight_map(
+                            np.ascontiguousarray(np.asarray(rgb, dtype=np.uint8)),
+                            title=str(getattr(image_meta, "model_name", "") or getattr(_state_meta, "model_name", "") or ""),
+                            subtitle=subtitle,
+                        ),
+                        "measured_cfg": _cfg,
+                    }
+                )
+            _box["ok"] = bool(render_results)
+            _box["render_results"] = render_results
 
         self._shared_weight_render_result = result_box
         self._shared_weight_render_thread = threading.Thread(
@@ -1962,64 +2099,71 @@ class _TransformerStatusOpenGLViewer:
         self._shared_weight_render_result = None
         if not bool(result.get("ok")):
             return
-        image_meta = result.get("image_meta")
-        weight_map = result.get("weight_map")
-        if image_meta is None or weight_map is None:
-            return
-        self._last_weight_state_publish_seq = int(result.get("state_publish_seq", 0) or 0)
-        self._last_weight_image_seq = int(getattr(image_meta, "image_seq", 0) or 0)
-        render_sig = result.get("render_sig")
-        if isinstance(render_sig, tuple):
-            self._last_weight_render_sig = render_sig
-        pending_ckpt = self._pending_checkpoint_weight_marks.pop(
-            int(getattr(image_meta, "state_publish_seq", 0) or 0),
-            None,
-        )
-        if pending_ckpt is not None:
-            self._mark_checkpoint_weight_image(
+        render_results = list(result.get("render_results") or [])
+        if not render_results and result.get("image_meta") is not None and result.get("weight_map") is not None:
+            render_results = [dict(result)]
+        any_rendered = False
+        for item in render_results:
+            image_meta = item.get("image_meta")
+            weight_map = item.get("weight_map")
+            if image_meta is None or weight_map is None:
+                continue
+            self._last_weight_state_publish_seq = int(item.get("state_publish_seq", 0) or 0)
+            self._last_weight_image_seq = int(getattr(image_meta, "image_seq", 0) or 0)
+            render_sig = item.get("render_sig")
+            if isinstance(render_sig, tuple):
+                self._last_weight_render_sig = render_sig
+            pending_ckpt = self._pending_checkpoint_weight_marks.pop(
                 int(getattr(image_meta, "state_publish_seq", 0) or 0),
-                int(pending_ckpt[0]),
-                int(pending_ckpt[1]),
+                None,
             )
-            self._remember_checkpoint_weight_record(
-                round_id=int(pending_ckpt[0]),
-                cycle=int(pending_ckpt[1]),
-                model_name=str(getattr(image_meta, "model_name", "") or result.get("model_name") or ""),
-                generation=int(getattr(image_meta, "generation", 0) or 0),
-                architecture_version=int(getattr(image_meta, "architecture_version", 0) or 0),
-                state_publish_seq=int(getattr(image_meta, "state_publish_seq", 0) or 0),
-                node_id=str(getattr(image_meta, "node_id", "") or ""),
+            if pending_ckpt is not None:
+                self._mark_checkpoint_weight_image(
+                    int(getattr(image_meta, "state_publish_seq", 0) or 0),
+                    int(pending_ckpt[0]),
+                    int(pending_ckpt[1]),
+                )
+                self._remember_checkpoint_weight_record(
+                    round_id=int(pending_ckpt[0]),
+                    cycle=int(pending_ckpt[1]),
+                    model_name=str(getattr(image_meta, "model_name", "") or item.get("model_name") or ""),
+                    generation=int(getattr(image_meta, "generation", 0) or 0),
+                    architecture_version=int(getattr(image_meta, "architecture_version", 0) or 0),
+                    state_publish_seq=int(getattr(image_meta, "state_publish_seq", 0) or 0),
+                    node_id=str(getattr(image_meta, "node_id", "") or ""),
+                )
+            model_name = self._register_weight_model(
+                str(item.get("model_name") or getattr(image_meta, "model_name", "") or "")
             )
-        model_name = self._register_weight_model(
-            str(result.get("model_name") or getattr(image_meta, "model_name", "") or "")
-        )
-        active_cfg = result.get("active_cfg")
-        if active_cfg is not None:
             weight_map = crop_weight_image_rgb(
                 np.ascontiguousarray(np.asarray(weight_map, dtype=np.uint8)),
-                target_width=int(getattr(active_cfg, "target_width", 0) or weight_map.shape[1]),
-                target_height=int(getattr(active_cfg, "target_height", 0) or weight_map.shape[0]),
+                target_width=int(getattr(image_meta, "target_width", 0) or weight_map.shape[1]),
+                target_height=int(getattr(image_meta, "target_height", 0) or weight_map.shape[0]),
             )
-        weight_map = np.ascontiguousarray(np.asarray(weight_map, dtype=np.uint8))
-        if model_name is not None:
-            self._weight_current_rgb_by_model[model_name] = weight_map.copy()
-            self._weight_current_meta_by_model[model_name] = {
-                "model_name": str(model_name),
-                "state_publish_seq": int(getattr(image_meta, "state_publish_seq", 0) or 0),
-                "image_seq": int(getattr(image_meta, "image_seq", 0) or 0),
-                "round_id": int(getattr(image_meta, "round_id", 0) or 0),
-                "cycle": int(getattr(image_meta, "cycle", 0) or 0),
-                "step": int(getattr(image_meta, "step", 0) or 0),
-                "generation": int(getattr(image_meta, "generation", 0) or 0),
-                "architecture_version": int(getattr(image_meta, "architecture_version", 0) or 0),
-                "node_id": str(getattr(image_meta, "node_id", "") or ""),
-            }
-            snaps = self._weight_snapshot_deques_by_model.get(model_name)
-            if snaps is not None:
-                snaps.append(weight_map.copy())
-                if str(self._resolved_active_weight_model_name() or "") == str(model_name):
-                    self._weight_snapshot_deque = snaps
-        self._sidebar_dirty = True
+            if model_name is not None:
+                self._weight_current_rgb_by_model[model_name] = weight_map.copy()
+                self._weight_current_meta_by_model[model_name] = {
+                    "model_name": str(model_name),
+                    "state_publish_seq": int(getattr(image_meta, "state_publish_seq", 0) or 0),
+                    "image_seq": int(getattr(image_meta, "image_seq", 0) or 0),
+                    "round_id": int(getattr(image_meta, "round_id", 0) or 0),
+                    "cycle": int(getattr(image_meta, "cycle", 0) or 0),
+                    "step": int(getattr(image_meta, "step", 0) or 0),
+                    "generation": int(getattr(image_meta, "generation", 0) or 0),
+                    "architecture_version": int(getattr(image_meta, "architecture_version", 0) or 0),
+                    "node_id": str(getattr(image_meta, "node_id", "") or ""),
+                    "mode": int(getattr(image_meta, "mode", 0) or 0),
+                    "target_width": int(getattr(image_meta, "target_width", 0) or 0),
+                    "target_height": int(getattr(image_meta, "target_height", 0) or 0),
+                }
+                snaps = self._weight_snapshot_deques_by_model.get(model_name)
+                if snaps is not None:
+                    snaps.append(weight_map.copy())
+                    if str(self._resolved_active_weight_model_name() or "") == str(model_name):
+                        self._weight_snapshot_deque = snaps
+                any_rendered = True
+        if any_rendered:
+            self._sidebar_dirty = True
 
     def _mark_checkpoint_weight_image(self, state_publish_seq: int, round_id: int, cycle: int) -> None:
         store = self._weight_image_store
@@ -2632,6 +2776,8 @@ class _TransformerStatusOpenGLViewer:
         self._init()
         if not self._ready:
             return
+        if self._start_cooldown_remaining() > 0.0 or self._has_launch_pending():
+            self._top_bar_dirty = True
         self._poll_events()
         self._sr_poll_data()
         self._present(force=False)
@@ -2647,6 +2793,7 @@ class _TransformerStatusOpenGLViewer:
         weight_generation: int = 0,
         weight_architecture_version: int = 0,
         weight_node_id: str = "",
+        weight_models: Optional[Sequence[Dict[str, Any]]] = None,
     ) -> None:
         """Call this immediately after every _save_training_segment_snapshot call.
 
@@ -2654,6 +2801,41 @@ class _TransformerStatusOpenGLViewer:
         vertical marker at the exact loss position where each disk checkpoint
         was written.  Thread-safe: can be called from any thread.
         """
+        model_records: List[Dict[str, Any]] = []
+        for item in list(weight_models or []):
+            if not isinstance(item, dict):
+                continue
+            model_name = self._normalise_weight_model_name(item.get("model"))
+            if not model_name:
+                continue
+            model_records.append(
+                {
+                    "model_name": model_name,
+                    "node_id": str(item.get("node_id", "") or ""),
+                    "state_publish_seq": int(item.get("publish_seq", 0) or 0),
+                    "generation": int(item.get("generation", 0) or 0),
+                    "architecture_version": int(item.get("architecture_version", 0) or 0),
+                    "round_id": int(item.get("round_id", 0) or 0),
+                    "cycle": int(item.get("cycle", 0) or 0),
+                    "step": int(item.get("step", 0) or 0),
+                }
+            )
+        primary_model_name = self._normalise_weight_model_name(weight_model)
+        if not model_records and primary_model_name:
+            model_records.append(
+                {
+                    "model_name": primary_model_name,
+                    "node_id": str(weight_node_id or ""),
+                    "state_publish_seq": int(weight_state_publish_seq),
+                    "generation": int(weight_generation),
+                    "architecture_version": int(weight_architecture_version),
+                    "round_id": int(round_id),
+                    "cycle": int(cycle),
+                    "step": 0,
+                }
+            )
+        if not primary_model_name and model_records:
+            primary_model_name = str(model_records[0].get("model_name", "") or "")
         snapshot = self._loss_channel_lengths()
         self._disk_save_loss_counts.append(snapshot)
         record = {
@@ -2662,21 +2844,34 @@ class _TransformerStatusOpenGLViewer:
             "cycle": int(cycle),
             "checkpoint_path": str(checkpoint_path or ""),
             "state_publish_seq": int(weight_state_publish_seq),
-            "model_name": self._normalise_weight_model_name(weight_model),
+            "model_name": str(primary_model_name),
             "generation": int(weight_generation),
             "architecture_version": int(weight_architecture_version),
             "node_id": str(weight_node_id or ""),
+            "weight_models": [dict(item) for item in model_records],
         }
         self._checkpoint_marker_records.append(record)
-        self._remember_checkpoint_weight_record(
-            round_id=int(round_id),
-            cycle=int(cycle),
-            model_name=weight_model,
-            generation=int(weight_generation),
-            architecture_version=int(weight_architecture_version),
-            state_publish_seq=int(weight_state_publish_seq),
-            node_id=str(weight_node_id or ""),
-        )
+        if model_records:
+            for item in model_records:
+                self._remember_checkpoint_weight_record(
+                    round_id=int(round_id),
+                    cycle=int(cycle),
+                    model_name=str(item.get("model_name", "") or ""),
+                    generation=int(item.get("generation", 0) or 0),
+                    architecture_version=int(item.get("architecture_version", 0) or 0),
+                    state_publish_seq=int(item.get("state_publish_seq", 0) or 0),
+                    node_id=str(item.get("node_id", "") or ""),
+                )
+        else:
+            self._remember_checkpoint_weight_record(
+                round_id=int(round_id),
+                cycle=int(cycle),
+                model_name=weight_model,
+                generation=int(weight_generation),
+                architecture_version=int(weight_architecture_version),
+                state_publish_seq=int(weight_state_publish_seq),
+                node_id=str(weight_node_id or ""),
+            )
         self._graph_dirty = True
 
     def notify_checkpoint_at_walltime(self, wall_ts: float) -> None:
@@ -2824,6 +3019,7 @@ class _TransformerStatusOpenGLViewer:
             r = int(msg.get("round_id", 0))
             c = int(msg.get("cycle", 0))
             checkpoint_path = str(msg.get("checkpoint_path", "") or "").strip()
+            weight_models = [item for item in list(msg.get("weight_models", []) or []) if isinstance(item, dict)]
             if checkpoint_path:
                 try:
                     self._checkpoint_live_dir = Path(checkpoint_path).resolve().parent
@@ -2838,9 +3034,19 @@ class _TransformerStatusOpenGLViewer:
                 weight_generation=int(msg.get("weight_generation", 0) or 0),
                 weight_architecture_version=int(msg.get("weight_architecture_version", 0) or 0),
                 weight_node_id=str(msg.get("weight_node_id", "") or ""),
+                weight_models=weight_models,
             )
-            state_publish_seq = int(msg.get("weight_state_publish_seq", 0) or 0)
-            self._mark_checkpoint_weight_image(state_publish_seq, r, c)
+            if weight_models:
+                for item in weight_models:
+                    model_name = self._register_weight_model(item.get("model"))
+                    if self._active_weight_model_name is None and model_name is not None:
+                        self.set_active_weight_model(model_name)
+                    state_publish_seq = int(item.get("publish_seq", 0) or 0)
+                    if state_publish_seq > 0:
+                        self._mark_checkpoint_weight_image(state_publish_seq, r, c)
+            else:
+                state_publish_seq = int(msg.get("weight_state_publish_seq", 0) or 0)
+                self._mark_checkpoint_weight_image(state_publish_seq, r, c)
         elif t == "notify_weight_state":
             self._sidebar_dirty = True
             for name in list(msg.get("known_models", []) or []):
@@ -3103,8 +3309,15 @@ class _TransformerStatusOpenGLViewer:
                         continue
                     arr = ts_tensor.cpu().numpy()
                     time_arrays[ck] = arr
-                    arr_lo = float(arr[0])
-                    arr_hi = float(arr[-1])
+                    # Skip records with ts<=0 when computing the time range —
+                    # they have no meaningful wall-clock and would anchor the
+                    # axis at epoch 0, compressing all real data to the right.
+                    pos_mask = arr > 0.0
+                    if pos_mask.any():
+                        arr_lo = float(arr[pos_mask][0])
+                        arr_hi = float(arr[pos_mask][-1])
+                    else:
+                        continue
                     time_lo = arr_lo if time_lo is None else min(time_lo, arr_lo)
                     time_hi = arr_hi if time_hi is None else max(time_hi, arr_hi)
                     if ck == ref_sid:

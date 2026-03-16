@@ -161,6 +161,7 @@ def build_semantic_cache_entry(
     image: Any,
     label_vec: Any,
     image_size: int,
+    terms: Optional[Sequence[str]] = None,
     mixed_mask: Optional[Any] = None,
     mask_stack: Optional[Any] = None,
     mask_indices: Optional[Any] = None,
@@ -169,8 +170,9 @@ def build_semantic_cache_entry(
     image_u8 = _fit_image_array_u8(image=image, image_size=size)
     image_f32 = np.clip(np.asarray(image_u8, dtype=np.float32) / 255.0, 0.0, 1.0).astype(np.float32, copy=False)
     label_arr = np.asarray(label_vec, dtype=np.float32).reshape(-1)
+    normalized_terms = list(normalize_vocab_terms([str(x) for x in list(terms or [])]))
     if mixed_mask is None:
-        mixed_mask_arr = infer_semantic_support_mask(image=image_f32, terms=[])
+        mixed_mask_arr = infer_semantic_support_mask(image=image_f32, terms=normalized_terms)
     else:
         mixed_mask_arr = _fit_mask_array(np.asarray(mixed_mask, dtype=np.float32), image_size=size)
     stack_arr = np.asarray(mask_stack) if mask_stack is not None else np.zeros((0, size, size), dtype=np.float32)
@@ -196,6 +198,7 @@ def build_semantic_cache_entry(
         "mixed_mask": np.clip(np.asarray(mixed_mask_arr, dtype=np.float32), 0.0, 1.0),
         "mask_stack": np.asarray(stack_arr, dtype=np.float32),
         "mask_indices": np.asarray(idx_arr, dtype=np.int32).reshape(-1),
+        "terms": list(normalized_terms),
     }
 
 
@@ -462,6 +465,7 @@ def _build_clean_entries_batch(
                 "mixed_mask": np.clip(np.asarray(mixed_mask, dtype=np.float32), 0.0, 1.0),
                 "mask_stack": np.asarray(mask_stack, dtype=np.float32),
                 "mask_indices": np.asarray(mask_indices, dtype=np.int32).reshape(-1),
+                "terms": list(normalize_vocab_terms([str(x) for x in list(row.terms)])),
             }
         )
     return out
@@ -521,6 +525,12 @@ def _build_deformed_entry(
         "mixed_mask": np.clip(np.asarray(mixed_mask, dtype=np.float32), 0.0, 1.0),
         "mask_stack": np.asarray(mask_stack, dtype=np.float32),
         "mask_indices": np.asarray(mask_indices, dtype=np.int32).reshape(-1),
+        "terms": list(
+            normalize_vocab_terms(
+                list(clean_entry.get("terms") or [])
+                + [str(x) for x in list(term_masks.keys())]
+            )
+        ),
     }
 
 
@@ -614,12 +624,27 @@ def _chunk_payload(entries: Sequence[Dict[str, Any]], label_dim: int, image_size
     label_bank_rows: List[np.ndarray] = []
     label_bank_lut: Dict[bytes, int] = {}
     label_refs: List[int] = []
+    terms_bank_rows: List[str] = []
+    terms_bank_lut: Dict[str, int] = {}
+    terms_refs: List[int] = []
     mask_bank_rows: List[np.ndarray] = []
     mask_bank_lut: Dict[bytes, int] = {}
     assoc_offsets: List[int] = [0]
     assoc_mask_ids: List[int] = []
     assoc_label_indices: List[int] = []
     for entry in entries:
+        terms_json = json.dumps(
+            list(normalize_vocab_terms([str(x) for x in list(entry.get("terms") or [])])),
+            ensure_ascii=True,
+            separators=(",", ":"),
+        )
+        term_id = terms_bank_lut.get(str(terms_json), -1)
+        if int(term_id) < 0:
+            term_id = int(len(terms_bank_rows))
+            terms_bank_lut[str(terms_json)] = int(term_id)
+            terms_bank_rows.append(str(terms_json))
+        terms_refs.append(int(term_id))
+
         label_vec = np.asarray(entry["label_vec_u8"], dtype=np.uint8).reshape(-1)
         if int(label_vec.size) != int(label_dim):
             raise RuntimeError(f"semantic wheel label width mismatch: got={int(label_vec.size)} expected={int(label_dim)}")
@@ -651,12 +676,16 @@ def _chunk_payload(entries: Sequence[Dict[str, Any]], label_dim: int, image_size
         assoc_offsets.append(int(len(assoc_mask_ids)))
 
     label_bank = np.stack(label_bank_rows, axis=0).astype(np.uint8, copy=False) if len(label_bank_rows) > 0 else np.zeros((0, int(label_dim)), dtype=np.uint8)
+    max_terms_len = max((len(str(x)) for x in terms_bank_rows), default=1)
+    terms_bank = np.asarray(terms_bank_rows, dtype=f"<U{int(max_terms_len)}") if len(terms_bank_rows) > 0 else np.asarray([], dtype="<U1")
     mask_bank = np.stack(mask_bank_rows, axis=0).astype(np.float16, copy=False) if len(mask_bank_rows) > 0 else np.zeros((0, size, size), dtype=np.float16)
     payload = {
         "images": images,
         "mixed_masks": mixed_masks,
         "label_bank": label_bank,
         "label_refs": np.asarray(label_refs, dtype=np.int32),
+        "terms_bank": terms_bank,
+        "terms_refs": np.asarray(terms_refs, dtype=np.int32),
         "mask_bank": mask_bank,
         "assoc_offsets": np.asarray(assoc_offsets, dtype=np.int64),
         "assoc_mask_ids": np.asarray(assoc_mask_ids, dtype=np.int32),
@@ -768,6 +797,8 @@ class SemanticWheelDataset(Dataset):
         mixed_masks = np.asarray(payload["mixed_masks"], dtype=np.float32)
         label_bank = np.asarray(payload["label_bank"], dtype=np.uint8)
         label_refs = np.asarray(payload["label_refs"], dtype=np.int32).reshape(-1)
+        terms_bank = np.asarray(payload.get("terms_bank", np.asarray([], dtype="<U1")))
+        terms_refs = np.asarray(payload.get("terms_refs", np.zeros((0,), dtype=np.int32)), dtype=np.int32).reshape(-1)
         mask_bank = np.asarray(payload["mask_bank"], dtype=np.float32)
         assoc_offsets = np.asarray(payload["assoc_offsets"], dtype=np.int64).reshape(-1)
         assoc_mask_ids = np.asarray(payload["assoc_mask_ids"], dtype=np.int32).reshape(-1)
@@ -778,6 +809,14 @@ class SemanticWheelDataset(Dataset):
             if 0 <= int(label_ref) < int(label_bank.shape[0])
             else np.zeros((int(self.label_dim),), dtype=np.uint8)
         )
+        term_ref = int(terms_refs[int(row_offset)]) if 0 <= int(row_offset) < int(terms_refs.size) else -1
+        if 0 <= int(term_ref) < int(terms_bank.shape[0]):
+            try:
+                terms = list(normalize_vocab_terms(json.loads(str(terms_bank[int(term_ref)]))))
+            except Exception:
+                terms = []
+        else:
+            terms = []
         a0 = int(assoc_offsets[int(row_offset)]) if int(row_offset) < int(assoc_offsets.size) else 0
         a1 = int(assoc_offsets[int(row_offset) + 1]) if int(row_offset + 1) < int(assoc_offsets.size) else int(a0)
         mask_ids = np.asarray(assoc_mask_ids[int(a0): int(a1)], dtype=np.int32)
@@ -793,6 +832,7 @@ class SemanticWheelDataset(Dataset):
             "mixed_mask": np.asarray(mixed_masks[int(row_offset)], dtype=np.float32),
             "mask_stack": np.asarray(stack_f32, dtype=np.float32),
             "mask_indices": np.asarray(label_indices, dtype=np.int32),
+            "terms": list(terms),
         }
 
     def __getitem__(self, index: int):
@@ -803,7 +843,7 @@ class SemanticWheelDataset(Dataset):
         if bool(self.return_mask_stack):
             stack_t = torch.from_numpy(np.asarray(item["mask_stack"], dtype=np.float32))
             idx_t = torch.from_numpy(np.asarray(item["mask_indices"], dtype=np.int64))
-            return x_t, y_t, mask_t, stack_t, idx_t
+            return x_t, y_t, mask_t, stack_t, idx_t, list(item.get("terms") or [])
         return x_t, y_t, mask_t
 
 
@@ -872,6 +912,7 @@ def ensure_semantic_candidate_cache(
     cache_root.mkdir(parents=True, exist_ok=True)
     purpose_key = _sanitize_component(config.purpose)
     build_config = {
+        "format_version": 2,
         "purpose": str(config.purpose),
         "image_size": int(config.image_size),
         "batch_size": int(config.batch_size),
@@ -1113,7 +1154,7 @@ def ensure_semantic_candidate_cache(
     total_raw_bytes = int(writer_state["total_raw_bytes"])
 
     final_manifest = {
-        "version": 1,
+        "version": 2,
         "signature": str(signature),
         "purpose": str(config.purpose),
         "candidate_signature": str(candidate_sig),
