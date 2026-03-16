@@ -50,6 +50,7 @@ from pipeline.nodus_loss_store import (
     WeightStateMeta,
 )
 from pipeline.nodes.base import _save_pipeline_checkpoint
+from pipeline.weight_map import parameter_plan_from_render_spec, resolve_weight_render_spec
 from wav_ml_models import prime_tiny_classifier_label_bank_for_state_dict
 
 
@@ -947,10 +948,18 @@ class SaveRestoreNode(PipelineNode):
         for name, model in _models.items():
             if model is not None:
                 extra = {}
+                _state_blob = None
                 if name == "classifier" and snapshot_lora is not None:
                     extra["classifier_lora"] = snapshot_lora
+                try:
+                    _state_blob = model.state_dict()
+                    extra["weight_render_spec"] = resolve_weight_render_spec(_state_blob)
+                except Exception:
+                    pass
+                if _state_blob is None:
+                    _state_blob = model.state_dict()
                 torch.save(
-                    {"state_dict": model.state_dict(), **extra},
+                    {"state_dict": _state_blob, **extra},
                     out_dir / f"{name}.pt",
                 )
 
@@ -1424,6 +1433,11 @@ class SaveRestoreNode(PipelineNode):
             return None
         try:
             state_blob = model.state_dict()
+            render_spec = resolve_weight_render_spec(state_blob)
+            parameter_plan = parameter_plan_from_render_spec(
+                state_blob,
+                weight_render_spec=render_spec,
+            )
             architecture_version = _compute_architecture_version(state_blob)
             generation = self._resolve_weight_generation(
                 model_name=str(model_name),
@@ -1439,6 +1453,7 @@ class SaveRestoreNode(PipelineNode):
                 step=int(step),
                 generation=int(generation),
                 architecture_version=int(architecture_version),
+                parameter_plan=parameter_plan,
             )
         except Exception:
             return None

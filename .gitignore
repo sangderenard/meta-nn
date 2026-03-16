@@ -4,3 +4,10 @@ _tmp_graph_smoke/
 __pycache__/
 *.py[cod]
 node_modules/
+native/build-debug/
+native/build-*/
+native/.cmake/
+native/CMakeUserPresets.json
+native/CMakePresets.json
+pipeline_debug/
+.codex_tmp_weight_images/

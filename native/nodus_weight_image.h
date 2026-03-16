@@ -7,7 +7,8 @@
  *
  *   NODUS_WEIGHT_MODE_PARAMETER_GROUPS   square grid, 1 px per node group
  *   NODUS_WEIGHT_MODE_ARCHITECTURAL_TALL layers as vertical columns
- *   NODUS_WEIGHT_MODE_ARCHITECTURAL_WIDE layers as horizontal rows
+ *   NODUS_WEIGHT_MODE_ARCHITECTURAL_WIDE   layers as horizontal rows
+ *   NODUS_WEIGHT_MODE_ARCHITECTURAL_PACKED layers packed to mean box width
  *
  * Built as part of the nodus_loss_store shared library.
  */
@@ -39,6 +40,7 @@ extern "C" {
 #define NODUS_WEIGHT_MODE_PARAMETER_GROUPS    0
 #define NODUS_WEIGHT_MODE_ARCHITECTURAL_TALL  1
 #define NODUS_WEIGHT_MODE_ARCHITECTURAL_WIDE  2
+#define NODUS_WEIGHT_MODE_ARCHITECTURAL_PACKED 3
 
 /* Limits. */
 #define NODUS_WEIGHT_MAX_LAYERS  512

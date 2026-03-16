@@ -395,7 +395,7 @@ class BerkeleyDataConfig:
     cache_device: str = "auto"
     channels_last: bool = False
     wheel_max_bytes: int = 0
-    wheel_sanity_cap_bytes: int = 8 * 1024 * 1024 * 1024
+    wheel_sanity_cap_bytes: int = 30 * 1024 * 1024 * 1024
     wheel_allow_large_override: bool = False
     wheel_expiry_uses: int = 1
     wheel_lookahead_batches: int = 0
@@ -942,6 +942,15 @@ class DataNode(PipelineNode):
 
         from pipeline.nodes.vocab_node import _semantic_terms_with_tonal_tags
         symbol_pool = ctx.symbol_pool or {}
+
+        # ADD THIS: Tell the churn system what the symbol pool ACTUALLY contains
+        _register_churn_terms(
+            ctx,
+            required_terms=list(symbol_pool.keys()), # Register raw keys
+            source="symbol_pool_raw",
+            stage_label="stage1_gestation_requirements",
+        )
+
         images, targets = _flatten_symbol_pool(
             symbol_pool=symbol_pool, class_names=ctx.class_names,
             semantic_term_to_idx=ctx.semantic_term_to_idx,
@@ -2213,7 +2222,8 @@ def _dataset_terms_rows(dataset: Optional[Dataset], max_rows: int = 0) -> List[L
 def _register_churn_terms(
     ctx: PipelineContext,
     *,
-    term_rows: Sequence[Sequence[str]],
+    term_rows: Optional[Sequence[Sequence[str]]] = None,
+    required_terms: Optional[Sequence[str]] = None,
     source: str,
     stage_label: str,
 ) -> Optional[Dict[str, Any]]:
@@ -2222,15 +2232,18 @@ def _register_churn_terms(
         for row in list(term_rows or [])
         if isinstance(row, (list, tuple))
     ]
-    if int(len(normalized_rows)) <= 0:
+    if required_terms is not None:
+        flat_terms = _normalize_vocab_terms([str(t) for t in required_terms])
+    elif int(len(normalized_rows)) > 0:
+        flat_terms = _normalize_vocab_terms([term for row in normalized_rows for term in row])
+    else:
         return None
-    required_terms = _normalize_vocab_terms([term for row in normalized_rows for term in row])
-    if int(len(required_terms)) <= 0:
+    if int(len(flat_terms)) <= 0:
         return None
     plan = register_churn_requirement(
         ctx=ctx,
-        required_terms=required_terms,
-        term_rows=normalized_rows,
+        required_terms=flat_terms,
+        term_rows=normalized_rows if normalized_rows else None,
         source=str(source),
         stage_label=str(stage_label),
         max_terms_per_slot=int(getattr(ctx, "vocab_lora_max_terms", 0) or len(getattr(ctx, "active_extra_terms", [])) or 0),
@@ -2467,7 +2480,7 @@ def _build_berkeley_refresh_loader(
     prefetch_factor: int = 2,
     return_mask_stack: bool = True,
     wheel_max_bytes: int = 0,
-    wheel_sanity_cap_bytes: int = 8 * 1024 * 1024 * 1024,
+    wheel_sanity_cap_bytes: int = 30 * 1024 * 1024 * 1024,
     wheel_allow_large_override: bool = False,
     wheel_expiry_uses: int = 1,
     wheel_lookahead_batches: int = 0,
@@ -2693,7 +2706,7 @@ def _build_berkeley_gate_val_loader(
     prefetch_factor: int = 2,
     return_mask_stack: bool = False,
     wheel_max_bytes: int = 0,
-    wheel_sanity_cap_bytes: int = 8 * 1024 * 1024 * 1024,
+    wheel_sanity_cap_bytes: int = 30 * 1024 * 1024 * 1024,
     wheel_allow_large_override: bool = False,
     wheel_expiry_uses: int = 1,
     wheel_lookahead_batches: int = 0,
@@ -3312,7 +3325,7 @@ def _build_payload_validation_gate_dataset(
     return_mask_stack: bool = False,
     chunk_batch_size: int = 32,
     wheel_max_bytes: int = 0,
-    wheel_sanity_cap_bytes: int = 8 * 1024 * 1024 * 1024,
+    wheel_sanity_cap_bytes: int = 30 * 1024 * 1024 * 1024,
     wheel_allow_large_override: bool = False,
     wheel_expiry_uses: int = 1,
     wheel_lookahead_batches: int = 0,
@@ -3790,7 +3803,7 @@ def _build_berkeley_payload_bank(
     source_root: str = "",
     force_cache_rebuild: bool = False,
     wheel_max_bytes: int = 0,
-    wheel_sanity_cap_bytes: int = 8 * 1024 * 1024 * 1024,
+    wheel_sanity_cap_bytes: int = 30 * 1024 * 1024 * 1024,
     wheel_allow_large_override: bool = False,
     wheel_expiry_uses: int = 1,
     wheel_lookahead_batches: int = 0,

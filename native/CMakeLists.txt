@@ -4,6 +4,9 @@ project(nodus_loss_store C)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 
+# Allow isolated build outputs (e.g. debug builds while release DLL is in use).
+set(NODUS_OUTPUT_DIR "" CACHE PATH "Optional output directory for nodus_loss_store binaries")
+
 # Shared library
 add_library(nodus_loss_store SHARED nodus_loss_store.c nodus_weight_image.c)
 
@@ -23,17 +26,23 @@ if(UNIX)
     )
 endif()
 
-# Output directly into the project's pipeline/ directory so Python can find it
+# Output defaults to pipeline/ for compatibility, but can be overridden.
+if(NODUS_OUTPUT_DIR)
+    set(_NODUS_BIN_DIR "${NODUS_OUTPUT_DIR}")
+else()
+    set(_NODUS_BIN_DIR "${CMAKE_SOURCE_DIR}/../pipeline")
+endif()
+
 set_target_properties(nodus_loss_store PROPERTIES
-    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_SOURCE_DIR}/../pipeline"
-    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_SOURCE_DIR}/../pipeline"
+    LIBRARY_OUTPUT_DIRECTORY "${_NODUS_BIN_DIR}"
+    RUNTIME_OUTPUT_DIRECTORY "${_NODUS_BIN_DIR}"
 )
 
 # Also place into per-config dirs for multi-config generators (VS)
 foreach(cfg DEBUG RELEASE RELWITHDEBINFO MINSIZEREL)
     string(TOUPPER ${cfg} CFG_UPPER)
     set_target_properties(nodus_loss_store PROPERTIES
-        LIBRARY_OUTPUT_DIRECTORY_${CFG_UPPER} "${CMAKE_SOURCE_DIR}/../pipeline"
-        RUNTIME_OUTPUT_DIRECTORY_${CFG_UPPER} "${CMAKE_SOURCE_DIR}/../pipeline"
+        LIBRARY_OUTPUT_DIRECTORY_${CFG_UPPER} "${_NODUS_BIN_DIR}"
+        RUNTIME_OUTPUT_DIRECTORY_${CFG_UPPER} "${_NODUS_BIN_DIR}"
     )
 endforeach()

@@ -185,6 +185,9 @@ CMAKE_STATIC_LINKER_FLAGS_RELWITHDEBINFO:STRING=
 // Studio IDE projects all commands are done without /nologo.
 CMAKE_VERBOSE_MAKEFILE:BOOL=FALSE
 
+//Optional output directory for nodus_loss_store binaries
+NODUS_OUTPUT_DIR:PATH=
+
 //Value Computed by CMake
 nodus_loss_store_BINARY_DIR:STATIC=C:/dev/Powershell/meta-nn/native/build
 

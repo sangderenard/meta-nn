@@ -211,62 +211,12 @@ class VocabChurnNode(PipelineNode):
             )
             return
 
-        old_terms = list(ctx.active_extra_terms)
-        pool_terms = _build_full_term_pool(ctx, self.cfg)
-        try:
-            from berkeley_sbd_pretrain import VOC20_CLASSES as _VOC20_CLASSES
-            pool_terms = _merge_vocab_terms(pool_terms, [str(x) for x in list(_VOC20_CLASSES)])
-        except Exception:
-            pool_terms = _merge_vocab_terms(
-                pool_terms,
-                [
-                    "aeroplane",
-                    "bicycle",
-                    "bird",
-                    "boat",
-                    "bottle",
-                    "bus",
-                    "car",
-                    "cat",
-                    "chair",
-                    "cow",
-                    "dining table",
-                    "dog",
-                    "horse",
-                    "motorbike",
-                    "person",
-                    "potted plant",
-                    "sheep",
-                    "sofa",
-                    "train",
-                    "tv monitor",
-                ],
-            )
-
-        new_active, churn_info = _rotate_active_extra_terms(
-            active_terms=ctx.active_extra_terms,
-            pool_terms=pool_terms,
-            replace_count=self.cfg.churn_n,
-            seed=self.cfg.seed,
-            locked_prefix_count=int(len(ctx.core_terms)),
-            churn_cursor=int(ctx.vocab_rotation_cycle),
-            sweep_cycles=int(max(0, self.cfg.churn_every_n_cycles)),
-        )
-
-        ctx.active_extra_terms = list(new_active)
-        ctx.class_names = list(ctx.supervised_class_names) + list(new_active)
-        ctx.semantic_term_to_idx = _semantic_term_index_map(ctx.class_names)
-        ctx.vocab_lora_active_signature = ""
-        ctx.vocab_lora_active_terms = list(_normalize_vocab_terms(new_active))
+        # No LoRA plan — nothing to rotate.  Churn only manages the LoRA
+        # library; it does not spuriously swap active terms.
         ctx.vocab_rotation_cycle += 1
-
-        changed = [t for t in new_active if t not in old_terms]
         _log(
             f"[vocab-churn] cycle={ctx.vocab_rotation_cycle} "
-            f"{'bulk-fill' if churn_info.get('bulk_fill') else 'rotate'} "
-            f"replaced={int(churn_info.get('replaced', len(changed)))} "
-            f"candidates={int(churn_info.get('candidate_terms', 0))} "
-            f"changed={changed[:8]}{'…' if len(changed) > 8 else ''}"
+            f"no-op (no lora plan)"
         )
 
 
@@ -347,6 +297,18 @@ class BuildFlashcardRowsNode(PipelineNode):
 
     def execute(self, ctx: PipelineContext) -> None:
         import numpy as np
+
+        # Register the raw symbol pool terms with churn BEFORE filtering,
+        # so the LoRA system sees demand for terms not yet in the vocab.
+        from pipeline.nodes.data_nodes import _register_churn_terms
+        symbol_pool = ctx.symbol_pool or {}
+        if symbol_pool:
+            _register_churn_terms(
+                ctx,
+                required_terms=list(symbol_pool.keys()),
+                source="flashcard_symbol_pool",
+                stage_label="flashcard_requirements",
+            )
 
         # _build_reference_flashcard_payload_rows(
         #   class_names, condition_num_classes, supervised_num_classes,

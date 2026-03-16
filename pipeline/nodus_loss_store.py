@@ -13,7 +13,7 @@ import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 # -- Locate the shared library ------------------------------------------
 
@@ -21,6 +21,12 @@ _LIB_NAME = "nodus_loss_store"
 
 def _find_library() -> str:
     """Return the absolute path to the compiled shared library."""
+    env_override = str(os.environ.get("NODUS_LOSS_STORE_LIB", "")).strip()
+    if env_override:
+        p = Path(env_override)
+        if p.exists():
+            return str(p)
+
     # 1. Check next to this file (pipeline/)
     here = Path(__file__).resolve().parent
     if sys.platform == "win32":
@@ -1610,22 +1616,29 @@ def _pack_weight_state_dict(
     state_dict: Dict[str, object],
     *,
     parameter_keys: Optional[List[str]] = None,
+    parameter_plan: Optional[Sequence[Tuple[str, str]]] = None,
 ) -> Tuple[List[bytes], List["numpy.ndarray"], List[int], List[int]]:
     import numpy as np
     import torch
 
-    if parameter_keys is None:
-        keys = [str(k) for k, v in state_dict.items() if torch.is_tensor(v) and torch.is_floating_point(v)]
+    if parameter_plan is not None:
+        keys = [(str(state_key), str(render_key)) for state_key, render_key in parameter_plan]
+    elif parameter_keys is None:
+        keys = [
+            (str(k), str(k))
+            for k, v in state_dict.items()
+            if torch.is_tensor(v) and torch.is_floating_point(v)
+        ]
     else:
-        keys = [str(k) for k in parameter_keys]
+        keys = [(str(k), str(k)) for k in parameter_keys]
 
     packed_names: List[bytes] = []
     packed_arrays: List[np.ndarray] = []
     packed_numel: List[int] = []
     packed_shape0: List[int] = []
 
-    for key in keys:
-        value = state_dict.get(key)
+    for state_key, render_key in keys:
+        value = state_dict.get(state_key)
         if value is None or (not torch.is_tensor(value)) or (not torch.is_floating_point(value)):
             continue
         tensor = value.detach().to(device="cpu", dtype=torch.float32).contiguous()
@@ -1633,7 +1646,7 @@ def _pack_weight_state_dict(
         if int(flat.numel()) <= 0:
             continue
         arr = flat.numpy()
-        packed_names.append(key.encode("utf-8", errors="ignore"))
+        packed_names.append(render_key.encode("utf-8", errors="ignore"))
         packed_arrays.append(arr)
         packed_numel.append(int(arr.size))
         packed_shape0.append(int(tensor.shape[0]) if int(tensor.ndim) > 0 else 1)
@@ -1669,10 +1682,12 @@ class NodusWeightStateStore:
         architecture_version: int = 0,
         publish_seq: int = 0,
         parameter_keys: Optional[List[str]] = None,
+        parameter_plan: Optional[Sequence[Tuple[str, str]]] = None,
     ) -> Optional[WeightStateMeta]:
         packed_names, packed_arrays, packed_numel, packed_shape0 = _pack_weight_state_dict(
             state_dict,
             parameter_keys=parameter_keys,
+            parameter_plan=parameter_plan,
         )
         count = len(packed_arrays)
         if count <= 0:

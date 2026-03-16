@@ -719,7 +719,7 @@ class SemanticWheelConfig:
     deformations_per_clean: int = 0
     include_clean: bool = True
     explicit_max_bytes: int = 0
-    sanity_cap_bytes: int = 8 * 1024 * 1024 * 1024
+    sanity_cap_bytes: int = 30 * 1024 * 1024 * 1024
     allow_large_override: bool = False
     expiry_uses: int = 1
     max_base_rows: int = 0
@@ -1130,16 +1130,14 @@ def ensure_semantic_candidate_cache(
         shutil.rmtree(str(temp_dir), ignore_errors=True)
         raise writer_state["error"]
 
-    if cap_exceeded:
-        # Clean up partial temp and hard-fail
-        shutil.rmtree(str(temp_dir), ignore_errors=True)
+    if cap_exceeded and len(selected_base_rows) > 0:
         actual_mb = float(writer_state["total_raw_bytes"]) / (1024.0 * 1024.0)
         cap_mb = float(effective_limit) / (1024.0 * 1024.0)
-        raise RuntimeError(
-            f"{str(config.purpose)} semantic wheel exceeded byte cap "
-            f"({actual_mb:.1f} MB written, sanity cap {cap_mb:.1f} MB). "
-            f"Wrote {int(len(selected_base_rows))} of {int(len(ordered_candidates))} candidate rows before stopping. "
-            "Increase the wheel cap, reduce image_size/deformations, or enable the large-cache override."
+        tqdm.write(
+            f"[{config.purpose}] wheel reached byte cap "
+            f"({actual_mb:.1f} MB written, cap {cap_mb:.1f} MB). "
+            f"Serving partial wheel with {int(len(selected_base_rows))} of "
+            f"{int(len(ordered_candidates))} candidate rows."
         )
 
     if len(selected_base_rows) <= 0:

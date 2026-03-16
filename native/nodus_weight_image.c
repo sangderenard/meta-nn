@@ -3,8 +3,9 @@
  *
  * Implements all three modes:
  *   parameter_groups    — square grid, 1 px per node group, nearest upscale
- *   architectural_tall  — layers as vertical columns, 1 px per unit
- *   architectural_wide  — transposed: layers as horizontal rows
+ *   architectural_tall   — layers as vertical columns, 1 px per unit
+ *   architectural_wide   — transposed: layers as horizontal rows
+ *   architectural_packed — packed layer boxes using a mean-width cap
  *
  * The colour palette and statistics-to-colour mapping exactly mirror the
  * Python implementation in pipeline/weight_map.py.
@@ -39,6 +40,57 @@ static float maxf(float a, float b) { return a > b ? a : b; }
 
 static int maxi(int a, int b) { return a > b ? a : b; }
 static int mini(int a, int b) { return a < b ? a : b; }
+
+static int round_div_pos(int a, int b) {
+    if (b <= 0) return a;
+    return (a + (b / 2)) / b;
+}
+
+static uint32_t hash_u32(uint32_t x) {
+    x ^= x >> 16;
+    x *= 0x7feb352dU;
+    x ^= x >> 15;
+    x *= 0x846ca68bU;
+    x ^= x >> 16;
+    return x;
+}
+
+static void hsv_to_rgb(float h_deg, float s, float v, uint8_t *r, uint8_t *g, uint8_t *b) {
+    float h = fmodf(h_deg, 360.0f);
+    if (h < 0.0f) h += 360.0f;
+    float c = v * s;
+    float x = c * (1.0f - fabsf(fmodf(h / 60.0f, 2.0f) - 1.0f));
+    float m = v - c;
+    float rr = 0.0f, gg = 0.0f, bb = 0.0f;
+    if (h < 60.0f)      { rr = c; gg = x; bb = 0.0f; }
+    else if (h < 120.0f){ rr = x; gg = c; bb = 0.0f; }
+    else if (h < 180.0f){ rr = 0.0f; gg = c; bb = x; }
+    else if (h < 240.0f){ rr = 0.0f; gg = x; bb = c; }
+    else if (h < 300.0f){ rr = x; gg = 0.0f; bb = c; }
+    else                { rr = c; gg = 0.0f; bb = x; }
+    *r = (uint8_t)clampf((rr + m) * 255.0f, 0.0f, 255.0f);
+    *g = (uint8_t)clampf((gg + m) * 255.0f, 0.0f, 255.0f);
+    *b = (uint8_t)clampf((bb + m) * 255.0f, 0.0f, 255.0f);
+}
+
+static void group_color_from_id(int group_id, uint8_t *r, uint8_t *g, uint8_t *b) {
+    uint32_t hv = hash_u32((uint32_t)(group_id >= 0 ? group_id : -group_id));
+    float t = (float)(hv & 0xFFFFU) / 65535.0f;
+    /* Keep hues away from red; reserve red for megalayers. */
+    float hue = 35.0f + (t * 280.0f);
+    hsv_to_rgb(hue, 0.65f, 0.92f, r, g, b);
+}
+
+static void blend_pixel(uint8_t *rgb, int stride_w, int total_h,
+                        int x, int y, uint8_t r, uint8_t g, uint8_t b, float alpha)
+{
+    if (x < 0 || x >= stride_w || y < 0 || y >= total_h) return;
+    int off = (y * stride_w + x) * 3;
+    float a = clampf(alpha, 0.0f, 1.0f);
+    rgb[off + 0] = (uint8_t)clampf((1.0f - a) * (float)rgb[off + 0] + a * (float)r, 0.0f, 255.0f);
+    rgb[off + 1] = (uint8_t)clampf((1.0f - a) * (float)rgb[off + 1] + a * (float)g, 0.0f, 255.0f);
+    rgb[off + 2] = (uint8_t)clampf((1.0f - a) * (float)rgb[off + 2] + a * (float)b, 0.0f, 255.0f);
+}
 
 /* Robust scale: 95th percentile of absolute values. */
 static float robust_scale(const float *values, int count) {
@@ -149,6 +201,22 @@ static void set_pixel(uint8_t *rgb, int stride_w, int total_h,
     rgb[off + 2] = b;
 }
 
+static void draw_rect_border(
+        uint8_t *rgb, int stride_w, int total_h,
+        int x0, int y0, int x1, int y1,
+        uint8_t r, uint8_t g, uint8_t b)
+{
+    if (x1 < x0 || y1 < y0) return;
+    for (int x = x0; x <= x1; x++) {
+        set_pixel(rgb, stride_w, total_h, x, y0, r, g, b);
+        set_pixel(rgb, stride_w, total_h, x, y1, r, g, b);
+    }
+    for (int y = y0; y <= y1; y++) {
+        set_pixel(rgb, stride_w, total_h, x0, y, r, g, b);
+        set_pixel(rgb, stride_w, total_h, x1, y, r, g, b);
+    }
+}
+
 /* ------------------------------------------------------------------ */
 /*  Nearest-neighbour upscale of raw grid into a larger buffer.       */
 /*  Caller must ensure dst has room for (src_w*sx) * (src_h*sy) * 3.  */
@@ -189,32 +257,167 @@ static int measure_parameter_groups_dims(
     return 0;
 }
 
+/* Shared packed-layout math used by BOTH measure and render. */
+static int compute_packed_layout_from_units(
+        const int32_t *unit_counts,
+        int32_t num_layers,
+        int32_t target_h,
+        int32_t footer_h,
+    int use_nonviolator_max,
+        int *image_display_cols_out,
+        int *data_flat_cols_out,
+        int *is_mega_out,
+        int *out_data_capacity_h90,
+        int *out_data_raw_h,
+        int *out_nonviolating_mean_feature_count)
+{
+    int data_target_h;
+    int data_capacity_h90;
+    int sum_nonviolating_features = 0;
+    int max_nonviolating_features = 1;
+    int count_nonviolating_layers = 0;
+    int nonviolating_mean_feature_count;
+    int data_raw_h;
+
+    if (!unit_counts || num_layers <= 0 || !image_display_cols_out || !data_flat_cols_out || !is_mega_out
+            || !out_data_capacity_h90 || !out_data_raw_h || !out_nonviolating_mean_feature_count) return -1;
+
+    data_target_h = maxi(1, target_h - footer_h);
+    data_capacity_h90 = maxi(1, (int)floorf(0.90f * (float)data_target_h));
+
+    for (int li = 0; li < num_layers; li++) {
+        int feature_count = maxi(1, unit_counts[li]);
+        if (feature_count <= data_capacity_h90) {
+            sum_nonviolating_features += feature_count;
+            if (feature_count > max_nonviolating_features) max_nonviolating_features = feature_count;
+            count_nonviolating_layers += 1;
+        }
+    }
+
+    if (count_nonviolating_layers > 0) {
+        if (use_nonviolator_max) {
+            nonviolating_mean_feature_count = maxi(1, max_nonviolating_features);
+        } else {
+            nonviolating_mean_feature_count = maxi(1, sum_nonviolating_features / count_nonviolating_layers);
+        }
+    } else {
+        nonviolating_mean_feature_count = maxi(1, data_capacity_h90);
+    }
+
+    data_raw_h = data_capacity_h90;
+    for (int li = 0; li < num_layers; li++) {
+        int feature_count = maxi(1, unit_counts[li]);
+        int data_flat_cols = maxi(1, (int)ceilf((float)feature_count / (float)data_capacity_h90));
+        int exceeds_90 = (feature_count > data_capacity_h90) ? 1 : 0;
+        int image_display_cols = exceeds_90
+            ? maxi(1, (int)ceilf((float)feature_count / (float)nonviolating_mean_feature_count))
+            : data_flat_cols;
+        int data_rows_used = maxi(1, (int)ceilf((float)feature_count / (float)image_display_cols));
+
+        if (data_rows_used > data_raw_h) data_raw_h = data_rows_used;
+
+        image_display_cols_out[li] = image_display_cols;
+        data_flat_cols_out[li] = data_flat_cols;
+        is_mega_out[li] = exceeds_90 ? 1 : 0;
+    }
+
+    *out_data_capacity_h90 = data_capacity_h90;
+    *out_data_raw_h = data_raw_h;
+    *out_nonviolating_mean_feature_count = nonviolating_mean_feature_count;
+    return 0;
+}
+
 static int measure_architectural_dims(
         const int32_t *unit_counts,
         int32_t num_layers,
         int32_t target_w,
         int32_t target_h,
         int transpose,
+        int pack_to_mean,
         int32_t *out_w,
         int32_t *out_h)
 {
+    int use_nonviolator_max = 1;
     int footer_h = 18;
     int max_unit_count = 1;
-    int raw_h, raw_w = 0;
+    int raw_h = 1, raw_w = 0;
+    int *cols_per_layer = NULL;
     int ori_w, ori_h;
     int eff_w, eff_h;
     int li;
     if (!unit_counts || num_layers <= 0 || !out_w || !out_h) return -1;
+    cols_per_layer = (int *)calloc((size_t)num_layers, sizeof(int));
+    if (!cols_per_layer) return -1;
     for (li = 0; li < num_layers; li++) {
         if (unit_counts[li] > max_unit_count) max_unit_count = unit_counts[li];
     }
-    raw_h = (max_unit_count % 2 == 1) ? max_unit_count : (max_unit_count + 1);
-    for (li = 0; li < num_layers; li++) {
-        int uc = maxi(1, unit_counts[li]);
-        int cols = maxi(1, (int)ceilf((float)uc / (float)raw_h));
-        raw_w += cols;
+
+    if (pack_to_mean) {
+        int packed_h90 = 1;
+        int packed_raw_h = 1;
+        int packed_nonviolating_mean_features = 1;
+        int *is_mega = NULL;
+        int *seam_cols = NULL;
+
+        is_mega = (int *)calloc((size_t)num_layers, sizeof(int));
+        seam_cols = (int *)calloc((size_t)num_layers + 1u, sizeof(int));
+        if (!is_mega || !seam_cols) {
+            free(is_mega);
+            free(seam_cols);
+            free(cols_per_layer);
+            return -1;
+        }
+
+        if (compute_packed_layout_from_units(
+                unit_counts,
+                num_layers,
+                target_h,
+                footer_h,
+            use_nonviolator_max,
+                cols_per_layer,
+                seam_cols, /* temporary scratch buffer, contents overwritten below */
+                is_mega,
+                &packed_h90,
+                &packed_raw_h,
+                &packed_nonviolating_mean_features) != 0) {
+            free(is_mega);
+            free(seam_cols);
+            free(cols_per_layer);
+            return -1;
+        }
+
+        raw_h = packed_raw_h;
+        raw_w = 0;
+        memset(seam_cols, 0, ((size_t)num_layers + 1u) * sizeof(int));
+        for (li = 0; li < num_layers; li++) {
+            if (is_mega[li]) {
+                is_mega[li] = 1;
+                if (seam_cols[li] < 1) seam_cols[li] = 1;
+                if (seam_cols[li + 1] < 1) seam_cols[li + 1] = 1;
+            }
+        }
+
+        raw_w += seam_cols[0];
+        for (li = 0; li < num_layers; li++) {
+            raw_w += cols_per_layer[li];
+            raw_w += seam_cols[li + 1];
+        }
+
+        free(is_mega);
+        free(seam_cols);
+    } else {
+        raw_h = (max_unit_count % 2 == 1) ? max_unit_count : (max_unit_count + 1);
+        raw_w = 0;
+        for (li = 0; li < num_layers; li++) {
+            int uc = maxi(1, unit_counts[li]);
+            int image_display_cols = maxi(1, (int)ceilf((float)uc / (float)raw_h));
+            cols_per_layer[li] = image_display_cols;
+            raw_w += image_display_cols;
+        }
     }
     raw_w = maxi(1, raw_w);
+    raw_h = maxi(1, raw_h);
+    if ((raw_h % 2) == 0) raw_h += 1;
     if (transpose) {
         ori_w = raw_h;
         ori_h = raw_w;
@@ -226,6 +429,7 @@ static int measure_architectural_dims(
     eff_h = maxi(target_h, ori_h + footer_h);
     *out_w = eff_w;
     *out_h = eff_h;
+    free(cols_per_layer);
     return 0;
 }
 
@@ -324,7 +528,11 @@ static int render_parameter_groups(
 /* Internal layout entry for one layer. */
 typedef struct LayerLayout {
     int unit_count;
-    int cols;       /* columns occupied (tall) or rows (wide) */
+    int image_display_cols;  /* image-space columns occupied in tall mode */
+    int data_box_cols;       /* data-space natural square-box columns */
+    int data_flat_cols;      /* data-space columns needed at H90 floor */
+    int is_mega;    /* packed layer was clamped to mean width */
+    int group_id;   /* branch/group identifier for tinting */
     int x0;        /* raw grid column start */
     int x1;        /* raw grid column end */
     float max_abs_mean;
@@ -336,21 +544,27 @@ static int render_architectural(
         const NodusWeightLayer *layers, int32_t num_layers,
         int32_t target_w, int32_t target_h,
         int transpose,  /* 0 = tall, 1 = wide */
+    int pack_to_mean,
+        const int32_t *group_ids,
         uint8_t *out_rgb, int32_t *out_w, int32_t *out_h)
 {
+    int use_nonviolator_max = 1;
     if (num_layers <= 0 || !layers) return -1;
 
     int footer_h = 18;
 
     /* Find max unit count across all layers. */
     int max_unit_count = 1;
+    int flat_raw_h = 1;
+    int *data_flat_cols_per_layer = NULL;
+    int *image_display_cols_per_layer = NULL;
+    int *packed_is_mega = NULL;
     for (int i = 0; i < num_layers; i++) {
         if (layers[i].unit_count > max_unit_count)
             max_unit_count = layers[i].unit_count;
     }
     /* Force odd for symmetric centering. */
     int raw_h = (max_unit_count % 2 == 1) ? max_unit_count : max_unit_count + 1;
-    int row_capacity = raw_h;
 
     /* Per-layer layout. */
     LayerLayout *ll = (LayerLayout *)malloc((size_t)num_layers * sizeof(LayerLayout));
@@ -360,16 +574,82 @@ static int render_architectural(
     float *tmp_vals = (float *)malloc((size_t)(max_unit_count > 0 ? max_unit_count : 1) * sizeof(float));
     if (!tmp_vals) { free(ll); return -1; }
 
+    if (pack_to_mean) {
+        data_flat_cols_per_layer = (int *)calloc((size_t)num_layers, sizeof(int));
+        image_display_cols_per_layer = (int *)calloc((size_t)num_layers, sizeof(int));
+        packed_is_mega = (int *)calloc((size_t)num_layers, sizeof(int));
+        if (!data_flat_cols_per_layer || !image_display_cols_per_layer || !packed_is_mega) {
+            free(tmp_vals);
+            free(data_flat_cols_per_layer);
+            free(image_display_cols_per_layer);
+            free(packed_is_mega);
+            free(ll);
+            return -1;
+        }
+    }
+
+    if (pack_to_mean) {
+        int packed_h90 = 1;
+        int packed_raw_h = 1;
+        int packed_nonviolating_mean_features = 1;
+        int32_t *unit_counts = (int32_t *)calloc((size_t)num_layers, sizeof(int32_t));
+        if (!unit_counts) {
+            free(tmp_vals);
+            free(data_flat_cols_per_layer);
+            free(image_display_cols_per_layer);
+            free(packed_is_mega);
+            free(ll);
+            return -1;
+        }
+        for (int li = 0; li < num_layers; li++) unit_counts[li] = layers[li].unit_count;
+
+        if (compute_packed_layout_from_units(
+                unit_counts,
+                num_layers,
+                target_h,
+                footer_h,
+            use_nonviolator_max,
+                image_display_cols_per_layer,
+                data_flat_cols_per_layer,
+                packed_is_mega,
+                &packed_h90,
+                &packed_raw_h,
+                &packed_nonviolating_mean_features) != 0) {
+            free(unit_counts);
+            free(tmp_vals);
+            free(data_flat_cols_per_layer);
+            free(image_display_cols_per_layer);
+            free(packed_is_mega);
+            free(ll);
+            return -1;
+        }
+        free(unit_counts);
+        flat_raw_h = packed_h90;
+        raw_h = packed_raw_h;
+    }
+
+    int boundary_gap_cols = (pack_to_mean && !transpose) ? 2 : 0;
+    int *seam_cols = NULL; /* size = num_layers + 1, reserved boundary bands */
     int raw_total_w = 0;
     for (int li = 0; li < num_layers; li++) {
         int uc = maxi(1, layers[li].unit_count);
-        int cols = maxi(1, (int)ceilf((float)uc / (float)row_capacity));
+        int image_display_cols = 0;
+        if (pack_to_mean) {
+            int data_box_cols = maxi(1, (int)ceilf(sqrtf((float)uc)));
+            int data_flat_cols = data_flat_cols_per_layer[li];
+            image_display_cols = image_display_cols_per_layer[li];
+            ll[li].data_box_cols = data_box_cols;
+            ll[li].data_flat_cols = data_flat_cols;
+            ll[li].is_mega = packed_is_mega[li];
+        } else {
+            image_display_cols = maxi(1, (int)ceilf((float)uc / (float)raw_h));
+            ll[li].data_box_cols = image_display_cols;
+            ll[li].data_flat_cols = image_display_cols;
+            ll[li].is_mega = 0;
+        }
         ll[li].unit_count = layers[li].unit_count;
-        ll[li].cols = cols;
-        ll[li].x0 = raw_total_w;
-        ll[li].x1 = raw_total_w + cols;
-        raw_total_w += cols;
-
+        ll[li].image_display_cols = image_display_cols;
+        ll[li].group_id = group_ids ? (int)group_ids[li] : 0;
         /* Compute per-layer normalization. */
         int n = layers[li].unit_count;
         const NodusWeightUnit *units = layers[li].units;
@@ -388,21 +668,84 @@ static int render_architectural(
     }
     free(tmp_vals);
 
+    /* Compute all required boundary bands before any x allocation:
+       - mega layers need left/right seam space for red border
+       - branch/group spans need seam space at span boundaries */
+    if (boundary_gap_cols > 0) {
+        seam_cols = (int *)calloc((size_t)num_layers + 1u, sizeof(int));
+        if (!seam_cols) {
+            free(data_flat_cols_per_layer);
+            free(image_display_cols_per_layer);
+            free(packed_is_mega);
+            free(ll);
+            return -1;
+        }
+
+        for (int li = 0; li < num_layers; li++) {
+            if (ll[li].is_mega) {
+                if (seam_cols[li] < 1) seam_cols[li] = 1;
+                if (seam_cols[li + 1] < 1) seam_cols[li + 1] = 1;
+            }
+        }
+
+        {
+            int group_count_layout = 0;
+            int li = 0;
+            while (li < num_layers) {
+                int gid = ll[li].group_id;
+                int end = li;
+                group_count_layout++;
+                while ((end + 1) < num_layers && ll[end + 1].group_id == gid) end++;
+                li = end + 1;
+            }
+            if (group_count_layout > 1) {
+                li = 0;
+                while (li < num_layers) {
+                    int gid = ll[li].group_id;
+                    int start = li;
+                    int end = li;
+                    while ((end + 1) < num_layers && ll[end + 1].group_id == gid) end++;
+                    if (seam_cols[start] < boundary_gap_cols) seam_cols[start] = boundary_gap_cols;
+                    if (seam_cols[end + 1] < boundary_gap_cols) seam_cols[end + 1] = boundary_gap_cols;
+                    li = end + 1;
+                }
+            }
+        }
+    }
+
+    /* Assign layer x ranges from precomputed seam bands. */
+    raw_total_w = 0;
+    if (seam_cols) raw_total_w += seam_cols[0];
+    for (int li = 0; li < num_layers; li++) {
+        ll[li].x0 = raw_total_w;
+        ll[li].x1 = raw_total_w + ll[li].image_display_cols;
+        raw_total_w += ll[li].image_display_cols;
+        if (seam_cols) raw_total_w += seam_cols[li + 1];
+    }
+
+    raw_h = maxi(1, raw_h);
+    if ((raw_h % 2) == 0) raw_h += 1;
+
     int raw_w = maxi(1, raw_total_w);
 
     /* Build raw grid (1 px per unit). */
     uint8_t *raw = (uint8_t *)malloc((size_t)raw_h * (size_t)raw_w * 3);
-    if (!raw) { free(ll); return -1; }
+    if (!raw) { free(seam_cols); free(data_flat_cols_per_layer); free(image_display_cols_per_layer); free(packed_is_mega); free(ll); return -1; }
     fill_bg(raw, raw_w, raw_h);
 
     for (int li = 0; li < num_layers; li++) {
         int n = layers[li].unit_count;
         const NodusWeightUnit *units = layers[li].units;
+        int row_capacity = raw_h;
+        if (pack_to_mean) {
+            row_capacity = maxi(1, (int)ceilf((float)maxi(1, n) / (float)maxi(1, ll[li].image_display_cols)));
+            row_capacity = mini(raw_h, row_capacity);
+        }
         for (int idx = 0; idx < n; idx++) {
             int col = idx / row_capacity;
             int pos_in_col = idx % row_capacity;
             int units_in_col = mini(row_capacity, maxi(1, n - col * row_capacity));
-            int y_offset = (row_capacity - units_in_col) / 2;
+            int y_offset = (raw_h - units_in_col) / 2;
             int gx = ll[li].x0 + col;
             int gy = y_offset + pos_in_col;
             if (gy >= 0 && gy < raw_h && gx >= 0 && gx < raw_w) {
@@ -424,7 +767,7 @@ static int render_architectural(
         ori_w = raw_h;
         ori_h = raw_w;
         oriented = (uint8_t *)malloc((size_t)ori_w * (size_t)ori_h * 3);
-        if (!oriented) { free(raw); free(ll); return -1; }
+        if (!oriented) { free(raw); free(seam_cols); free(data_flat_cols_per_layer); free(image_display_cols_per_layer); free(packed_is_mega); free(ll); return -1; }
         for (int y = 0; y < raw_h; y++) {
             for (int x = 0; x < raw_w; x++) {
                 int si = (y * raw_w + x) * 3;
@@ -445,9 +788,11 @@ static int render_architectural(
     int eff_w = maxi(target_w, ori_w);
     int eff_h = maxi(target_h, ori_h + footer_h);
     int data_h = eff_h - footer_h;
+    int avail_w = maxi(1, eff_w);
+    int avail_h = maxi(1, data_h);
 
     /* Integer scale: largest factor that fits within target. */
-    int scale = maxi(1, mini(data_h / ori_h, eff_w / ori_w));
+    int scale = maxi(1, mini(avail_h / ori_h, avail_w / ori_w));
     int scaled_w = ori_w * scale;
     int scaled_h = ori_h * scale;
 
@@ -455,7 +800,7 @@ static int render_architectural(
     uint8_t *scaled;
     if (scale > 1) {
         scaled = (uint8_t *)malloc((size_t)scaled_w * (size_t)scaled_h * 3);
-        if (!scaled) { free(oriented); free(ll); return -1; }
+        if (!scaled) { free(oriented); free(seam_cols); free(data_flat_cols_per_layer); free(image_display_cols_per_layer); free(packed_is_mega); free(ll); return -1; }
         nn_upscale(oriented, ori_w, ori_h, scaled, scale, scale);
         free(oriented);
     } else {
@@ -466,8 +811,12 @@ static int render_architectural(
     fill_black(out_rgb, eff_w, eff_h);
 
     /* Centre the scaled grid in the data area. */
-    int y0 = (data_h - scaled_h) / 2;
-    int x0 = (eff_w - scaled_w) / 2;
+    int y0 = (avail_h - scaled_h) / 2;
+    int x0 = (avail_w - scaled_w) / 2;
+    int grid_x0 = x0;
+    int grid_x1 = x0 + scaled_w - 1;
+    int grid_y0 = y0;
+    int grid_y1 = y0 + scaled_h - 1;
     for (int y = 0; y < scaled_h; y++) {
         int dy = y + y0;
         if (dy < 0 || dy >= data_h) continue;
@@ -482,6 +831,137 @@ static int render_architectural(
         }
     }
     free(scaled);
+
+    /* Packed mode overlays: group tints, megalayer red tint, and nested borders.
+       Draw order is intentional: mega borders are inset, group borders are last. */
+    if (pack_to_mean && !transpose) {
+        int *group_start = (int *)calloc((size_t)num_layers, sizeof(int));
+        int *group_end = (int *)calloc((size_t)num_layers, sizeof(int));
+        int *group_gid = (int *)calloc((size_t)num_layers, sizeof(int));
+        int group_count = 0;
+        if (!group_start || !group_end || !group_gid) {
+            free(group_start); free(group_end); free(group_gid);
+            free(seam_cols);
+            free(data_flat_cols_per_layer);
+            free(image_display_cols_per_layer);
+            free(packed_is_mega);
+            free(ll);
+            return -1;
+        }
+
+        /* Build contiguous spans by group id to represent branch partitions. */
+        {
+            int li = 0;
+            while (li < num_layers) {
+                int gid = ll[li].group_id;
+                int start = li;
+                int end = li;
+                while ((end + 1) < num_layers && ll[end + 1].group_id == gid) end++;
+                group_start[group_count] = start;
+                group_end[group_count] = end;
+                group_gid[group_count] = gid;
+                group_count++;
+                li = end + 1;
+            }
+        }
+
+        {
+            int enable_group_overlay = (group_count > 1) ? 1 : 0;
+
+            /* Pass 1: tint whole branch/group spans (only when actual branching exists). */
+            if (enable_group_overlay) {
+                for (int gi = 0; gi < group_count; gi++) {
+                    int li0 = group_start[gi];
+                    int li1 = group_end[gi];
+                    int gx0 = x0 + ll[li0].x0 * scale;
+                    int gx1 = x0 + ll[li1].x1 * scale;
+                    int y_start = grid_y0;
+                    int y_end = grid_y1;
+                    uint8_t gr, gg, gb;
+                    if (gx1 <= gx0) gx1 = gx0 + 1;
+                    gx0 = maxi(0, gx0);
+                    gx1 = mini(eff_w, gx1);
+                    if (gx0 >= gx1) continue;
+
+                    group_color_from_id(group_gid[gi], &gr, &gg, &gb);
+                    for (int y = y_start; y <= y_end; y++) {
+                        for (int x = gx0; x < gx1; x++) {
+                            blend_pixel(out_rgb, eff_w, eff_h, x, y, gr, gg, gb, 0.12f);
+                        }
+                    }
+                }
+            }
+
+            /* Pass 2: mega tint + red border ring using inter-layer boundary bands. */
+            for (int li = 0; li < num_layers; li++) {
+                int lx0 = x0 + ll[li].x0 * scale;
+                int lx1 = x0 + ll[li].x1 * scale;
+                int y_start = grid_y0;
+                int y_end = grid_y1;
+                int left_seam = seam_cols ? seam_cols[li] : 0;
+                int right_seam = seam_cols ? seam_cols[li + 1] : 0;
+                if (!ll[li].is_mega) continue;
+                if (lx1 <= lx0) lx1 = lx0 + 1;
+                lx0 = maxi(0, lx0);
+                lx1 = mini(eff_w, lx1);
+                if (lx0 >= lx1) continue;
+
+                for (int y = y_start; y <= y_end; y++) {
+                    for (int x = lx0; x < lx1; x++) {
+                        blend_pixel(out_rgb, eff_w, eff_h, x, y, 255, 56, 56, 0.16f);
+                    }
+                }
+
+                {
+                    int x_left = maxi(0, lx0 - (left_seam > 0 ? 1 : 0));
+                    int x_right = mini(eff_w - 1, (right_seam > 0) ? lx1 : (lx1 - 1));
+                    int y_top = maxi(0, y_start - 1);
+                    int y_bottom = mini(data_h - 1, y_end + 1);
+                    /* Avoid rendering 1px seam-lines as fake borders for tiny boxes. */
+                    if ((x_right - x_left) >= 2 && (y_bottom - y_top) >= 2) {
+                        draw_rect_border(out_rgb, eff_w, eff_h, x_left, y_top, x_right, y_bottom, 255, 92, 92);
+                    }
+                }
+            }
+
+            /* Pass 3: group borders last; only when branch partitions exist. */
+            if (enable_group_overlay) {
+                for (int gi = 0; gi < group_count; gi++) {
+                    int li0 = group_start[gi];
+                    int li1 = group_end[gi];
+                    int gx0 = x0 + ll[li0].x0 * scale;
+                    int gx1 = x0 + ll[li1].x1 * scale;
+                    int y_start = grid_y0;
+                    int y_end = grid_y1;
+                    int left_seam = seam_cols ? seam_cols[li0] : 0;
+                    int right_seam = seam_cols ? seam_cols[li1 + 1] : 0;
+                    uint8_t gr, gg, gb;
+                    if (gx1 <= gx0) gx1 = gx0 + 1;
+                    gx0 = maxi(0, gx0);
+                    gx1 = mini(eff_w, gx1);
+                    if (gx0 >= gx1) continue;
+
+                    group_color_from_id(group_gid[gi], &gr, &gg, &gb);
+                    draw_rect_border(
+                        out_rgb,
+                        eff_w,
+                        eff_h,
+                        maxi(0, gx0 - (left_seam > 0 ? 1 : 0)),
+                        maxi(0, y_start - 2),
+                        mini(eff_w - 1, (right_seam > 0) ? gx1 : (gx1 - 1)),
+                        mini(data_h - 1, y_end + 1),
+                        (uint8_t)clampf((float)gr * 0.95f, 0.0f, 255.0f),
+                        (uint8_t)clampf((float)gg * 0.95f, 0.0f, 255.0f),
+                        (uint8_t)clampf((float)gb * 0.95f, 0.0f, 255.0f)
+                    );
+                }
+            }
+        }
+
+        free(group_start);
+        free(group_end);
+        free(group_gid);
+    }
 
     /* Footer background: dark bar at the bottom. */
     for (int y = data_h; y < eff_h; y++) {
@@ -514,6 +994,10 @@ static int render_architectural(
     }
 
     free(ll);
+    free(seam_cols);
+    free(data_flat_cols_per_layer);
+    free(image_display_cols_per_layer);
+    free(packed_is_mega);
 
     *out_w = eff_w;
     *out_h = eff_h;
@@ -551,13 +1035,19 @@ NODUS_API int nodus_weight_image_render(
         if (!layers || num_layers <= 0) return -1;
         return render_architectural(layers, num_layers,
                                     target_w, target_h,
-                                    0, out_rgb, out_w, out_h);
+                                    0, 0, NULL, out_rgb, out_w, out_h);
 
     case NODUS_WEIGHT_MODE_ARCHITECTURAL_WIDE:
         if (!layers || num_layers <= 0) return -1;
         return render_architectural(layers, num_layers,
                                     target_w, target_h,
-                                    1, out_rgb, out_w, out_h);
+                                    1, 0, NULL, out_rgb, out_w, out_h);
+
+    case NODUS_WEIGHT_MODE_ARCHITECTURAL_PACKED:
+        if (!layers || num_layers <= 0) return -1;
+        return render_architectural(layers, num_layers,
+                                    target_w, target_h,
+                                    0, 1, NULL, out_rgb, out_w, out_h);
 
     default:
         return -1;
@@ -589,7 +1079,7 @@ NODUS_API int nodus_weight_image_measure(
         unit_counts = (int32_t *)calloc((size_t)num_layers, sizeof(int32_t));
         if (!unit_counts) return -1;
         for (int32_t i = 0; i < num_layers; i++) unit_counts[i] = layers[i].unit_count;
-        rc = measure_architectural_dims(unit_counts, num_layers, target_w, target_h, 0, out_w, out_h);
+        rc = measure_architectural_dims(unit_counts, num_layers, target_w, target_h, 0, 0, out_w, out_h);
         free(unit_counts);
         return rc;
     }
@@ -601,7 +1091,19 @@ NODUS_API int nodus_weight_image_measure(
         unit_counts = (int32_t *)calloc((size_t)num_layers, sizeof(int32_t));
         if (!unit_counts) return -1;
         for (int32_t i = 0; i < num_layers; i++) unit_counts[i] = layers[i].unit_count;
-        rc = measure_architectural_dims(unit_counts, num_layers, target_w, target_h, 1, out_w, out_h);
+        rc = measure_architectural_dims(unit_counts, num_layers, target_w, target_h, 1, 0, out_w, out_h);
+        free(unit_counts);
+        return rc;
+    }
+
+    case NODUS_WEIGHT_MODE_ARCHITECTURAL_PACKED: {
+        int32_t *unit_counts = NULL;
+        int rc;
+        if (!layers || num_layers <= 0) return -1;
+        unit_counts = (int32_t *)calloc((size_t)num_layers, sizeof(int32_t));
+        if (!unit_counts) return -1;
+        for (int32_t i = 0; i < num_layers; i++) unit_counts[i] = layers[i].unit_count;
+        rc = measure_architectural_dims(unit_counts, num_layers, target_w, target_h, 0, 1, out_w, out_h);
         free(unit_counts);
         return rc;
     }
@@ -746,6 +1248,7 @@ NODUS_API int nodus_weight_image_measure_from_state_dict(
         target_w,
         target_h,
         (mode == NODUS_WEIGHT_MODE_ARCHITECTURAL_WIDE) ? 1 : 0,
+        (mode == NODUS_WEIGHT_MODE_ARCHITECTURAL_PACKED) ? 1 : 0,
         out_w,
         out_h
     );
@@ -872,15 +1375,24 @@ NODUS_API int nodus_weight_image_from_state_dict(
     /* ---- ARCHITECTURAL modes: build per-layer per-unit stats ---- */
     NodusWeightLayer *layers = (NodusWeightLayer *)calloc(
         (size_t)num_groups, sizeof(NodusWeightLayer));
+    int32_t *group_ids = (int32_t *)calloc((size_t)num_groups, sizeof(int32_t));
     if (!layers) { free(nodes_acc); return -1; }
+    if (!group_ids) { free(layers); free(nodes_acc); return -1; }
 
     for (int g = 0; g < num_groups; g++) {
+        const char *gname = nodes_acc[g].name;
+        int gid = 0;
+        for (int i = 0; gname[i] != '\0' && gname[i] != '.'; i++) {
+            gid = ((gid * 131) + (unsigned char)gname[i]) & 0x7fffffff;
+        }
+        group_ids[g] = (int32_t)gid;
+
         int uc = nodes_acc[g].unit_count;
         layers[g].unit_count = uc;
         layers[g].units = (NodusWeightUnit *)calloc((size_t)uc, sizeof(NodusWeightUnit));
         if (!layers[g].units) {
             for (int k = 0; k < g; k++) free(layers[k].units);
-            free(layers); free(nodes_acc);
+            free(group_ids); free(layers); free(nodes_acc);
             return -1;
         }
 
@@ -893,7 +1405,7 @@ NODUS_API int nodus_weight_image_from_state_dict(
         if (!u_sum || !u_abs_sum || !u_sq_sum || !u_diff || !u_count) {
             free(u_sum); free(u_abs_sum); free(u_sq_sum); free(u_diff); free(u_count);
             for (int k = 0; k <= g; k++) free(layers[k].units);
-            free(layers); free(nodes_acc);
+            free(group_ids); free(layers); free(nodes_acc);
             return -1;
         }
 
@@ -961,44 +1473,49 @@ NODUS_API int nodus_weight_image_from_state_dict(
     free(nodes_acc);
 
     /* Compute max possible image size so we can heap-allocate. */
-    int max_units = 1;
-    int total_cols = 0;
-    for (int g = 0; g < num_groups; g++) {
-        if (layers[g].unit_count > max_units)
-            max_units = layers[g].unit_count;
-        int uc = maxi(1, layers[g].unit_count);
-        int raw_h_est = (max_units % 2 == 1) ? max_units : max_units + 1;
-        int cols = maxi(1, (int)ceilf((float)uc / (float)raw_h_est));
-        total_cols += cols;
+    int32_t *unit_counts_tmp = (int32_t *)calloc((size_t)num_groups, sizeof(int32_t));
+    int32_t alloc_w = 0;
+    int32_t alloc_h = 0;
+    if (!unit_counts_tmp) {
+        for (int g = 0; g < num_groups; g++) free(layers[g].units);
+        free(group_ids);
+        free(layers);
+        return -1;
     }
-    int footer_h = 18;
-    int raw_h = (max_units % 2 == 1) ? max_units : max_units + 1;
-    int eff_w = maxi(target_w, total_cols);
-    int eff_h = maxi(target_h, raw_h + footer_h);
-    /* For wide mode, transpose dimensions. */
-    if (mode == NODUS_WEIGHT_MODE_ARCHITECTURAL_WIDE) {
-        int tw = maxi(target_w, raw_h);
-        int th = maxi(target_h, total_cols + footer_h);
-        eff_w = maxi(eff_w, tw);
-        eff_h = maxi(eff_h, th);
+    for (int g = 0; g < num_groups; g++) unit_counts_tmp[g] = (int32_t)layers[g].unit_count;
+    if (measure_architectural_dims(
+            unit_counts_tmp,
+            num_groups,
+            target_w,
+            target_h,
+            (mode == NODUS_WEIGHT_MODE_ARCHITECTURAL_WIDE) ? 1 : 0,
+            (mode == NODUS_WEIGHT_MODE_ARCHITECTURAL_PACKED) ? 1 : 0,
+            &alloc_w,
+            &alloc_h) != 0) {
+        free(unit_counts_tmp);
+        for (int g = 0; g < num_groups; g++) free(layers[g].units);
+        free(group_ids);
+        free(layers);
+        return -1;
     }
-    /* Conservative upper bound: scale can only increase dimensions. */
-    int alloc_w = maxi(eff_w, target_w);
-    int alloc_h = maxi(eff_h, target_h);
+    free(unit_counts_tmp);
 
     uint8_t *rgb = (uint8_t *)malloc((size_t)alloc_w * (size_t)alloc_h * 3);
     if (!rgb) {
         for (int g = 0; g < num_groups; g++) free(layers[g].units);
+        free(group_ids);
         free(layers);
         return -1;
     }
 
     int transpose = (mode == NODUS_WEIGHT_MODE_ARCHITECTURAL_WIDE) ? 1 : 0;
+    int pack_to_mean = (mode == NODUS_WEIGHT_MODE_ARCHITECTURAL_PACKED) ? 1 : 0;
     int rc = render_architectural(layers, num_groups,
                                   target_w, target_h,
-                                  transpose, rgb, out_w, out_h);
+                                  transpose, pack_to_mean, group_ids, rgb, out_w, out_h);
 
     for (int g = 0; g < num_groups; g++) free(layers[g].units);
+    free(group_ids);
     free(layers);
 
     if (rc != 0) { free(rgb); return -1; }
