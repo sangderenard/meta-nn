@@ -5,7 +5,7 @@ set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 
 # Shared library
-add_library(nodus_loss_store SHARED nodus_loss_store.c)
+add_library(nodus_loss_store SHARED nodus_loss_store.c nodus_weight_image.c)
 
 target_include_directories(nodus_loss_store PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>

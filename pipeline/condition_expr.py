@@ -589,6 +589,10 @@ def expr_for_condition_id(condition_id: str) -> str:
             "GATE_OVERRIDE OR all_base_gates_passed",
         "gates.wave_stage_ready":
             "(GATE_OVERRIDE AND transformer IS_NOT_NONE) OR wave_stage_ready",
+        "resume.startup_restore_pending":
+            "ctx.startup_restore_pending",
+        "runtime.shutdown_save_pending":
+            "ctx.shutdown_save_pending",
         "data.pregestation_rebuild_due":
             "data._preg_last_build_round < 0 OR "
             "(ctx.total_rounds_completed - data._preg_last_build_round) >= preg_cfg.rebuild_every_n_rounds",

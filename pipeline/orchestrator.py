@@ -320,6 +320,21 @@ def _restore_context_from_resume(ctx: PipelineContext) -> None:
     resume_summary = ctx.resume_summary if isinstance(ctx.resume_summary, dict) else {}
     resume_ckpt = ctx.resume_pipeline_ckpt if isinstance(ctx.resume_pipeline_ckpt, dict) else {}
 
+    if resume_ckpt:
+        try:
+            ctx.startup_restore_round = max(0, int(resume_ckpt.get("round_id", 0) or 0))
+        except Exception:
+            ctx.startup_restore_round = 0
+        try:
+            ctx.startup_restore_cycle = max(0, int(resume_ckpt.get("cycle", 0) or 0))
+        except Exception:
+            ctx.startup_restore_cycle = 0
+        ctx.startup_restore_pending = bool(
+            ctx.startup_restore_round > 0
+            or ctx.startup_restore_cycle > 0
+            or bool(resume_ckpt.get("total_rounds_completed", 0))
+        )
+
     total_rounds = resume_summary.get("total_rounds", resume_ckpt.get("total_rounds_completed", 0))
     try:
         ctx.total_rounds_completed = max(ctx.total_rounds_completed, int(total_rounds))
@@ -428,6 +443,8 @@ _CONDITION_ID_PREGESTATION_GATE = "gates.pregestation_passed"
 _CONDITION_ID_EARLY_GATES = "gates.early_passed"
 _CONDITION_ID_ALL_GATES = "gates.all_base_passed"
 _CONDITION_ID_WAVE_STAGE_READY = "gates.wave_stage_ready"
+_CONDITION_ID_STARTUP_RESTORE_PENDING = "resume.startup_restore_pending"
+_CONDITION_ID_SHUTDOWN_SAVE_PENDING = "runtime.shutdown_save_pending"
 # Data-rebuild schedule conditions (wired to the data-node "provides" edges)
 _CONDITION_ID_PREG_REBUILD = "data.pregestation_rebuild_due"
 _CONDITION_ID_GEST_REBUILD = "data.gestation_rebuild_due"
@@ -471,6 +488,18 @@ def _build_condition_blobs() -> dict:
             "description": "True when the transformer exists and the upstream gates allow the wave classifier stage.",
             "callable": "_wave_stage_ready",
             "condition_expr": expr_for_condition_id(_CONDITION_ID_WAVE_STAGE_READY),
+        },
+        _CONDITION_ID_STARTUP_RESTORE_PENDING: {
+            "label": "Startup restore pending",
+            "description": "True when a resume checkpoint exists and the startup restore has not been consumed yet.",
+            "callable": "_startup_restore_pending",
+            "condition_expr": expr_for_condition_id(_CONDITION_ID_STARTUP_RESTORE_PENDING),
+        },
+        _CONDITION_ID_SHUTDOWN_SAVE_PENDING: {
+            "label": "Shutdown save pending",
+            "description": "True when the GUI requested Stop and Save and the runtime has not flushed the checkpoint yet.",
+            "callable": "_shutdown_save_pending",
+            "condition_expr": expr_for_condition_id(_CONDITION_ID_SHUTDOWN_SAVE_PENDING),
         },
         # Data-rebuild schedule conditions — these gate the "provides" edges from data_node
         # so the callbacks only fire when a cache rebuild is actually due.
@@ -617,6 +646,9 @@ def _apply_execution_layer_metadata(graph: PipelineGraph) -> None:
 
         if edge.on_traverse is not None:
             method_name = getattr(getattr(edge.on_traverse, "__func__", edge.on_traverse), "__name__", "")
+            owner = getattr(edge.on_traverse, "__self__", None)
+            owner_name = type(owner).__name__ if owner is not None else ""
+            is_data_provider = owner_name == "DataNode"
             defaults = {
                 "consumer": str(edge.target_id),
                 "resources": _edge_provided_resources(method_name, edge.label),
@@ -624,12 +656,14 @@ def _apply_execution_layer_metadata(graph: PipelineGraph) -> None:
             if edge.condition_id:
                 defaults["condition_id"] = str(edge.condition_id)
             edge.reaction = EdgeReactionSpec(
-                reaction_name="data.provide",
-                target_function=(f"DataNode.{method_name}" if method_name else "data.provide"),
+                reaction_name=("data.provide" if is_data_provider else "runtime.prepare"),
+                target_function=(
+                    f"{owner_name}.{method_name}" if owner_name and method_name else method_name or "runtime.prepare"
+                ),
                 defaults=defaults,
                 layer="execution",
                 metadata={
-                    "template": "data.provide",
+                    "template": ("data.provide" if is_data_provider else "runtime.prepare"),
                     "source_node_id": str(edge.source_id),
                     "target_node_id": str(edge.target_id),
                 },
@@ -965,6 +999,7 @@ def _resolve_callback_from_ref(
     strict: bool = False,
 ):
     """Resolve a callable_ref to an actual method on a graph node."""
+    owner_ref = str(callable_ref or "").rsplit(".", 1)[0].strip()
     method_name = str(callable_ref or "").rsplit(".", 1)[-1].strip()
     source_id = str(owner_node_id or "").strip()
     if not method_name or not source_id:
@@ -977,6 +1012,15 @@ def _resolve_callback_from_ref(
             raise ValueError(f"Plan edge references unknown callback source node {source_id!r}")
         return None
     callback = getattr(source_node, method_name, None)
+    if callback is None and owner_ref:
+        owner_token = owner_ref.rsplit(".", 1)[-1].strip()
+        for candidate_id, candidate_node in graph.nodes.items():
+            if str(type(candidate_node).__name__) != owner_token:
+                continue
+            candidate_callback = getattr(candidate_node, method_name, None)
+            if candidate_callback is None:
+                continue
+            return candidate_callback
     if callback is None and strict:
         raise ValueError(
             f"Plan edge {edge_id!r} expects callback {callable_ref!r} "
@@ -1009,7 +1053,7 @@ def _resolve_plan_edge_callback(graph: PipelineGraph, edge_record, *, action_map
 
     reaction_name = str(getattr(edge_record, "reaction_name", "") or "").strip()
     target_function = str(getattr(edge_record, "target_function", "") or "").strip()
-    if reaction_name != "data.provide":
+    if reaction_name not in {"data.provide", "runtime.prepare"}:
         return None
     source_id = str(getattr(edge_record, "source_node_id", "") or "").strip()
     return _resolve_callback_from_ref(
@@ -1310,6 +1354,12 @@ def _generator_exists(ctx: PipelineContext) -> bool:
     mode = str(ctx.orchestration_mode or getattr(ctx.args, "orchestration_mode", "")).lower()
     return "g" in mode
 
+def _startup_restore_pending(ctx: PipelineContext) -> bool:
+    return bool(getattr(ctx, "startup_restore_pending", False))
+
+def _shutdown_save_pending(ctx: PipelineContext) -> bool:
+    return bool(getattr(ctx, "shutdown_save_pending", False))
+
 def _make_preg_rebuild_cond(data_node):
     """Return an edge condition that fires when pregestation data is missing or rebuild period has elapsed."""
     def _cond(ctx: PipelineContext) -> bool:
@@ -1443,7 +1493,8 @@ def build_pipeline_graph(
 
     # Housekeeping
     g.add_node(SyncGateReplicaNode(classifier_cfg))
-    g.add_node(SaveRestoreNode(save_every_n_rounds))
+    _save_restore_node = SaveRestoreNode(save_every_n_rounds)
+    g.add_node(_save_restore_node)
     g.add_node(ViewerIPCNode())
 
     # ---------------------------------------------------------------
@@ -1572,7 +1623,12 @@ def build_pipeline_graph(
     g.add_edge("gate_berkeley", "sync_gate_replica",
                condition=_always, label="end_of_round",
                condition_id=_CONDITION_ID_EARLY_GATES)
-    g.add_edge("sync_gate_replica", "checkpoint_save", label="end_of_round")
+    g.add_edge(
+        "sync_gate_replica",
+        "checkpoint_save",
+        label="end_of_round",
+        on_traverse=_save_restore_node.prepare_runtime_checkpoint,
+    )
     g.add_edge("checkpoint_save", "viewer_ipc", label="end_of_round")
 
     # Runtime control edges — viewer_ipc broadcasts pause/preview/scrub
@@ -1864,6 +1920,22 @@ def run(args, output_dir: Path, initial_plan=None) -> None:
     _primary_gate = _cycle_gates[0] if _cycle_gates else None
 
     while True:
+        if ctx.stop_requested():
+            save_on_stop = ctx.shutdown_save()
+            _log(f"[orchestrator] GUI requested stop before next iteration (save={save_on_stop}); stopping run")
+            stop_requested = True
+            if save_on_stop:
+                try:
+                    ctx.shutdown_save_pending = True
+                    statuses = _execute_runtime_pass(graph, ctx, sequence=sequence)
+                    ctx.last_node_statuses = dict(statuses)
+                    _log_statuses("shutdown-save", statuses)
+                except Exception as _ckpt_exc:
+                    _log(f"[orchestrator] WARNING: stop-save checkpoint failed: {_ckpt_exc}")
+                finally:
+                    ctx.shutdown_save_pending = False
+            break
+
         # Ask the CycleGate whether to continue.  When no gate exists
         # (legacy plan without cycle edges), we do zero iterations here
         # because the init pass above already executed the graph once.
@@ -1878,22 +1950,6 @@ def run(args, output_dir: Path, initial_plan=None) -> None:
         # Honour GUI pause toggle — spin-wait until un-paused.
         from pipeline.graph import _wait_while_paused
         _wait_while_paused(ctx)
-
-        if ctx.stop_requested():
-            save_on_stop = ctx.shutdown_save()
-            _log(f"[orchestrator] GUI requested stop before next iteration (save={save_on_stop}); stopping run")
-            stop_requested = True
-            if save_on_stop:
-                # Force a checkpoint save before exiting
-                for node_id, node in graph.nodes.items():
-                    if node_id == "checkpoint_save":
-                        try:
-                            _log("[orchestrator] saving checkpoint before stop...")
-                            node.execute(ctx)
-                        except Exception as _ckpt_exc:
-                            _log(f"[orchestrator] WARNING: stop-save checkpoint failed: {_ckpt_exc}")
-                        break
-            break
 
         # READ POINT A — apply a new plan received from the GUI between cycles
         if ctx.viewer_proxy is not None:

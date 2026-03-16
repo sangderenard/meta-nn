@@ -4,6 +4,9 @@
     <ClCompile Include="C:\dev\Powershell\meta-nn\native\nodus_loss_store.c">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="C:\dev\Powershell\meta-nn\native\nodus_weight_image.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <CustomBuild Include="C:\dev\Powershell\meta-nn\native\CMakeLists.txt" />

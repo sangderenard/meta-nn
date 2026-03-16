@@ -296,6 +296,10 @@ class PipelineContext:
     resume_dir: Optional[Path] = None
     resume_summary: Optional[Dict[str, Any]] = None
     resume_pipeline_ckpt: Optional[Dict[str, Any]] = None
+    startup_restore_pending: bool = False
+    startup_restore_round: int = 0
+    startup_restore_cycle: int = 0
+    shutdown_save_pending: bool = False
     run_tag: str = ""
     semantic_cache_nonce: str = ""
     graph_plan: Optional[Any] = None

@@ -358,6 +358,7 @@ if %errorlevel% neq 0 goto :VCEnd</Command>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="C:\dev\Powershell\meta-nn\native\nodus_loss_store.c" />
+    <ClCompile Include="C:\dev\Powershell\meta-nn\native\nodus_weight_image.c" />
   </ItemGroup>
   <ItemGroup />
   <ItemGroup>

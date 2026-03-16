@@ -878,6 +878,7 @@ class SaveRestoreNode(PipelineNode):
 
         # Pending restore request: (round_id, cycle) to restore to.
         self._pending_restore: Optional[Tuple[int, int]] = None
+        self._force_save_pending: bool = False
         # Replay callbacks: channel_key → callable that accepts a batch dict
         # and performs one training step.  Registered by the orchestrator.
         self._replay_callbacks: Dict[str, Callable[[Dict[str, Any]], None]] = {}
@@ -982,7 +983,7 @@ class SaveRestoreNode(PipelineNode):
 
     def should_run(self, ctx: PipelineContext) -> bool:
         # Always run if a restore is pending
-        if self._pending_restore is not None:
+        if self._pending_restore is not None or self._force_save_pending:
             return True
         return (ctx.round_id % self.save_every_n_rounds) == 0
 
@@ -990,6 +991,13 @@ class SaveRestoreNode(PipelineNode):
         # Handle pending restore first
         if self._pending_restore is not None:
             self._execute_restore(ctx)
+            return
+
+        if self._force_save_pending:
+            try:
+                self._execute_save(ctx)
+            finally:
+                self._force_save_pending = False
             return
 
         # Scrub editor off → skip all checkpoint storage
@@ -1281,12 +1289,53 @@ class SaveRestoreNode(PipelineNode):
                 return ckpt_path, ckpt
         return fallback_path, fallback_ckpt
 
+    def prepare_startup_restore(self, ctx: PipelineContext) -> None:
+        """Arm the startup resume target from context state during graph execution."""
+        if not bool(getattr(ctx, "startup_restore_pending", False)):
+            return
+        target_round = int(getattr(ctx, "startup_restore_round", 0) or 0)
+        target_cycle = int(getattr(ctx, "startup_restore_cycle", 0) or 0)
+        if target_round <= 0:
+            resume_ckpt = ctx.resume_pipeline_ckpt if isinstance(ctx.resume_pipeline_ckpt, dict) else {}
+            target_round = int(resume_ckpt.get("round_id", 0) or 0)
+            target_cycle = int(resume_ckpt.get("cycle", 0) or 0)
+        if target_round <= 0:
+            raise RuntimeError("startup restore is pending but no checkpoint round/cycle is available")
+        self.request_restore(target_round, target_cycle)
+
+    def prepare_shutdown_save(self, ctx: PipelineContext) -> None:
+        """Force a checkpoint save on the next execute() during shutdown."""
+        if not bool(getattr(ctx, "shutdown_save_pending", False)):
+            return
+        self._force_save_pending = True
+
+    def prepare_runtime_checkpoint(self, ctx: PipelineContext) -> None:
+        """Arm restore/save control requests before the checkpoint node runs."""
+        if bool(getattr(ctx, "shutdown_save_pending", False)):
+            self.prepare_shutdown_save(ctx)
+            return
+        if bool(getattr(ctx, "startup_restore_pending", False)):
+            self.prepare_startup_restore(ctx)
+
+    @staticmethod
+    def _prime_cycle_gate_state(ctx: PipelineContext, total_rounds_completed: int) -> None:
+        cycle_gates = list(getattr(ctx, "cycle_gates", None) or [])
+        for gate in cycle_gates:
+            max_iterations = int(getattr(gate, "max_iterations", 0) or 0)
+            if max_iterations > 0:
+                gate.iteration = min(int(total_rounds_completed), max_iterations)
+            else:
+                gate.iteration = int(total_rounds_completed)
+
     def _execute_restore(self, ctx: PipelineContext) -> None:
         """Restore to a checkpoint and replay training material."""
         target_round, target_cycle = self._pending_restore
         self._pending_restore = None
+        startup_restore = bool(getattr(ctx, "startup_restore_pending", False))
         out_dir = ctx.output_dir
         if out_dir is None:
+            if startup_restore:
+                raise RuntimeError("startup restore failed: output_dir is unavailable")
             _log("[restore] ERROR: no output_dir set, cannot restore")
             return
 
@@ -1295,6 +1344,8 @@ class SaveRestoreNode(PipelineNode):
         # 1. Load the checkpoint
         ckpt_path, ckpt = self._load_checkpoint_for_restore(out_dir, target_round, target_cycle)
         if ckpt_path is None or ckpt is None:
+            if startup_restore:
+                raise RuntimeError("startup restore failed: no checkpoint file found")
             _log("[restore] ERROR: no checkpoint file found")
             return
         _log(f"[restore] loading checkpoint payload from: {ckpt_path}")
@@ -1312,11 +1363,25 @@ class SaveRestoreNode(PipelineNode):
         except Exception:
             replay_allowed = _is_exact_target and (str(ckpt_path) == str(live_ckpt_path))
         if not _is_exact_target:
+            if startup_restore:
+                raise RuntimeError(
+                    "startup restore failed: checkpoint round/cycle did not match the requested resume target"
+                )
             _log(
                 f"[restore] WARNING: checkpoint has round={_ckpt_round} cycle={_ckpt_cycle}, "
                 f"target was round={target_round} cycle={target_cycle}; "
                 "restoring best-available fallback, replay disabled"
             )
+
+        ctx.cycle = max(0, int(ckpt.get("cycle", target_cycle) or target_cycle))
+        ctx.round_id = max(0, int(ckpt.get("round_id", target_round) or target_round))
+        try:
+            ctx.total_rounds_completed = max(
+                0,
+                int(ckpt.get("total_rounds_completed", ctx.total_rounds_completed) or ctx.total_rounds_completed),
+            )
+        except Exception:
+            pass
 
         # 2. Restore model weights
         _models = {
@@ -1389,6 +1454,10 @@ class SaveRestoreNode(PipelineNode):
                 seed_snap.restore()
                 _log(f"[restore] RNG state restored to r={target_round} c={target_cycle}")
             else:
+                if startup_restore:
+                    raise RuntimeError(
+                        "startup restore failed: no matching seed snapshot was found for the resume target"
+                    )
                 _log("[restore] WARNING: no seed snapshot found for target, RNG not restored")
 
         # 4. Replay training material
@@ -1418,6 +1487,11 @@ class SaveRestoreNode(PipelineNode):
         # 5. Clear cache after replay (we're now at the replayed state)
         if self.training_cache is not None:
             self.training_cache.clear_before_checkpoint()
+
+        self._prime_cycle_gate_state(ctx, int(getattr(ctx, "total_rounds_completed", 0) or 0))
+        if startup_restore:
+            ctx.startup_restore_pending = False
+            ctx.resume_pipeline_ckpt = None
 
         _log(f"[restore] replay complete, control returned to orchestrator")
 

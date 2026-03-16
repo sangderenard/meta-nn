@@ -225,6 +225,7 @@ def _render_one(
         reference_state=None,
         target_width=image_size,
         target_height=image_size,
+        mode=str(mode),
     )
     subtitle = ""
     if str(mode) == "parameter_groups":

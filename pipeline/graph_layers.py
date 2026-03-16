@@ -1025,6 +1025,7 @@ def build_execution_program(graph: PipelineGraph) -> Dict[str, Any]:
             "label": _execution_node_label(str(node_id), node),
             "kind": type(node).__name__,
             "config_id": _node_config_id(str(node_id)),
+            "faculty": str(getattr(node, "runtime_faculty", "other") or "other"),
             "shape": "process",
             "call_ref": f"{type(node).__name__}.execute",
         }
@@ -1065,6 +1066,7 @@ def build_execution_program_from_plan(plan: TrainingGraphPlan) -> Dict[str, Any]
             "label": _execution_record_label(node),
             "kind": str(getattr(node, "kind", "node") or "node"),
             "config_id": str(getattr(node, "config_id", "") or ""),
+            "faculty": str(getattr(node, "faculty", "other") or "other"),
             "shape": str(metadata.get("shape", "process") or "process"),
             "call_ref": f"{str(getattr(node, 'kind', 'node') or 'node')}.execute",
         }
@@ -1394,7 +1396,7 @@ def _build_execution_program_from_specs(
 
     ordered_steps = sorted(steps, key=lambda step: (float(step.get("display_order", 0)), str(step.get("step_id", ""))))
     entry_step_id = str(ordered_steps[0].get("step_id", "") or "") if ordered_steps else ""
-    return {
+    program = {
         "program_id": "training_execution_program",
         "label": "Training execution program",
         "version": 1,
@@ -1403,6 +1405,224 @@ def _build_execution_program_from_specs(
         "sequence_node_ids": [str(node_id) for node_id in sequence],
         "steps": ordered_steps,
         "transitions": list(transitions),
+    }
+    program = _inject_checkpoint_control_branch(
+        program,
+        node_specs=node_specs,
+        incoming_by_target=incoming_by_target,
+        node_step_ids=node_step_ids,
+        sequence=sequence,
+        condition_blobs=condition_blobs,
+        condition_id="resume.startup_restore_pending",
+        branch_name="startup_restore",
+        halt_label="Startup restore complete",
+        halt_call_ref="scheduler.startup_restore_complete",
+        halt_reason="startup_restore_complete",
+    )
+    return _inject_checkpoint_control_branch(
+        program,
+        node_specs=node_specs,
+        incoming_by_target=incoming_by_target,
+        node_step_ids=node_step_ids,
+        sequence=sequence,
+        condition_blobs=condition_blobs,
+        condition_id="runtime.shutdown_save_pending",
+        branch_name="shutdown_save",
+        halt_label="Shutdown save complete",
+        halt_call_ref="scheduler.shutdown_save_complete",
+        halt_reason="shutdown_save_complete",
+    )
+
+
+def _inject_checkpoint_control_branch(
+    program: Dict[str, Any],
+    *,
+    node_specs: Dict[str, Dict[str, Any]],
+    incoming_by_target: Dict[str, List[Dict[str, Any]]],
+    node_step_ids: Dict[str, str],
+    sequence: List[str],
+    condition_blobs: Optional[Dict[str, Any]] = None,
+    condition_id: str,
+    branch_name: str,
+    halt_label: str,
+    halt_call_ref: str,
+    halt_reason: str,
+) -> Dict[str, Any]:
+    restore_node_id = "checkpoint_save"
+    if restore_node_id not in node_step_ids:
+        return program
+
+    restore_insert_idx = -1
+    prelude_faculties = {"bootstrap", "build", "vocab"}
+    for idx, node_id in enumerate(sequence):
+        faculty = str((node_specs.get(str(node_id), {}) or {}).get("faculty", "other") or "other")
+        if faculty not in prelude_faculties:
+            restore_insert_idx = idx
+            break
+    if restore_insert_idx <= 0 or restore_insert_idx >= len(sequence):
+        return program
+
+    prelude_tail_id = str(sequence[restore_insert_idx - 1])
+    prelude_tail_step_id = str(node_step_ids.get(prelude_tail_id, "") or "")
+    if not prelude_tail_step_id:
+        return program
+
+    transitions = [dict(transition) for transition in list(program.get("transitions", []) or []) if isinstance(transition, dict)]
+    outgoing = [
+        dict(transition)
+        for transition in transitions
+        if str(transition.get("from_step_id", "") or "") == prelude_tail_step_id
+    ]
+    if not outgoing:
+        return program
+    if len(outgoing) != 1:
+        return program
+
+    original_transition = outgoing[0]
+    original_target_step_id = str(original_transition.get("to_step_id", "") or "")
+    if not original_target_step_id:
+        return program
+
+    original_transitions = [
+        transition
+        for transition in transitions
+        if str(transition.get("transition_id", "") or "") != str(original_transition.get("transition_id", "") or "")
+    ]
+    ordered_steps = [dict(step) for step in list(program.get("steps", []) or []) if isinstance(step, dict)]
+    step_map = {
+        str(step.get("step_id", "") or ""): dict(step)
+        for step in ordered_steps
+        if str(step.get("step_id", "") or "").strip()
+    }
+    prelude_step = step_map.get(prelude_tail_step_id)
+    target_step = step_map.get(original_target_step_id)
+    if prelude_step is None or target_step is None:
+        return program
+
+    base_order = float(prelude_step.get("display_order", 0) or 0)
+    target_order = float(target_step.get("display_order", base_order + 10.0) or (base_order + 10.0))
+    if target_order <= base_order:
+        target_order = base_order + 10.0
+
+    incoming = list(incoming_by_target.get(restore_node_id, []) or [])
+    restore_decision_step_id = f"decision_{branch_name}_checkpoint_save"
+    restore_node_step_id = f"step_{branch_name}_checkpoint_save"
+    restore_halt_step_id = f"program_{branch_name}_complete"
+    restore_node_spec = dict(node_specs.get(restore_node_id, {}) or {})
+    restore_step = {
+        "step_id": restore_node_step_id,
+        "display_order": base_order + ((target_order - base_order) * 0.60),
+        "ordinal": float(prelude_step.get("ordinal", 0) or 0) + 0.6,
+        "kind": "node",
+        "node_id": restore_node_id,
+        "label": str(restore_node_spec.get("label", restore_node_id) or restore_node_id),
+        "shape": str(restore_node_spec.get("shape", "process") or "process"),
+        "call_ref": str(restore_node_spec.get("call_ref", "node.execute") or "node.execute"),
+        "config": {
+            "node_id": restore_node_id,
+            "config_id": str(restore_node_spec.get("config_id", "") or ""),
+            "kind": str(restore_node_spec.get("kind", "node") or "node"),
+            str(branch_name): True,
+        },
+        "incoming_edge_ids": [str(edge.get("edge_id", "") or "") for edge in incoming],
+        "guard_condition_ids": [],
+        "frame_keys": _execution_frame_hints(restore_node_id, _program_resources_from_edges(incoming)),
+    }
+    decision_step = {
+        "step_id": restore_decision_step_id,
+        "display_order": base_order + ((target_order - base_order) * 0.30),
+        "ordinal": float(prelude_step.get("ordinal", 0) or 0) + 0.3,
+        "kind": "decision",
+        "node_id": "",
+        "label": _condition_display_label(
+            [condition_id],
+            condition_blobs=condition_blobs,
+            target_label=str(restore_step.get("label", restore_node_id) or restore_node_id),
+        ),
+        "shape": "decision",
+        "call_ref": "scheduler.guard",
+        "config": {
+            "guard_condition_ids": [condition_id],
+            "target_node_id": restore_node_id,
+            str(branch_name): True,
+        },
+        "guard_condition_ids": [condition_id],
+        "frame_keys": list(restore_step.get("frame_keys", []) or []),
+    }
+    halt_step = {
+        "step_id": restore_halt_step_id,
+        "display_order": base_order + ((target_order - base_order) * 0.90),
+        "ordinal": float(prelude_step.get("ordinal", 0) or 0) + 0.9,
+        "kind": "halt",
+        "node_id": "",
+        "label": str(halt_label),
+        "shape": "terminal",
+        "call_ref": str(halt_call_ref),
+        "config": {"reason": str(halt_reason)},
+        "guard_condition_ids": [],
+        "frame_keys": [],
+    }
+
+    max_transition_ordinal = max(
+        [float(transition.get("ordinal", 0) or 0) for transition in original_transitions] + [0.0]
+    )
+    transition_base = max_transition_ordinal + 1.0
+    branch_label = str(branch_name).replace("_", ".")
+    original_transitions.extend(
+        [
+            {
+                "transition_id": f"transition_{branch_name}_pre",
+                "ordinal": transition_base,
+                "from_step_id": prelude_tail_step_id,
+                "to_step_id": restore_decision_step_id,
+                "label": branch_label,
+                "kind": "sequence",
+                "branch": "",
+                "call_ref": "scheduler.advance",
+            },
+            {
+                "transition_id": f"transition_{branch_name}_pass",
+                "ordinal": transition_base + 0.1,
+                "from_step_id": restore_decision_step_id,
+                "to_step_id": restore_node_step_id,
+                "label": f"{branch_label}.1",
+                "kind": "branch",
+                "branch": "pass",
+                "call_ref": "scheduler.guard.pass",
+            },
+            {
+                "transition_id": f"transition_{branch_name}_skip",
+                "ordinal": transition_base + 0.2,
+                "from_step_id": restore_decision_step_id,
+                "to_step_id": original_target_step_id,
+                "label": f"{branch_label}.0",
+                "kind": "branch",
+                "branch": "hold",
+                "call_ref": "scheduler.guard.hold",
+            },
+            {
+                "transition_id": f"transition_{branch_name}_done",
+                "ordinal": transition_base + 0.3,
+                "from_step_id": restore_node_step_id,
+                "to_step_id": restore_halt_step_id,
+                "label": f"{branch_label}.done",
+                "kind": "sequence",
+                "branch": "",
+                "call_ref": f"scheduler.{branch_name}.complete",
+            },
+        ]
+    )
+
+    ordered_steps.extend([decision_step, restore_step, halt_step])
+    ordered_steps.sort(key=lambda step: (float(step.get("display_order", 0) or 0), str(step.get("step_id", ""))))
+    halt_step_ids = list(program.get("halt_step_ids", []) or [])
+    if restore_halt_step_id not in halt_step_ids:
+        halt_step_ids.append(restore_halt_step_id)
+    return {
+        **program,
+        "halt_step_ids": halt_step_ids,
+        "steps": ordered_steps,
+        "transitions": original_transitions,
     }
 
 

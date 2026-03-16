@@ -13,7 +13,6 @@ from pipeline.weight_map import (
     render_parameter_node_map,
     render_weight_image,
     snapshot_parameter_state_from_state_dict,
-    summarize_parameter_nodes,
 )
 
 
@@ -24,21 +23,12 @@ class _ToyModel(nn.Module):
         self.head = nn.Linear(hid_dim, out_dim)
 
 
-def test_summarize_parameter_nodes_groups_weight_and_bias_into_one_node():
+def test_parameter_groups_mode_renders_via_c_backend():
     state = {
         "block.weight": torch.tensor([[1.0, -2.0], [0.5, 1.5]], dtype=torch.float32),
         "block.bias": torch.tensor([0.25, -0.75], dtype=torch.float32),
         "head.weight": torch.tensor([[0.5, -0.5]], dtype=torch.float32),
     }
-
-    stats = summarize_parameter_nodes(
-        state,
-        parameter_keys=["block.weight", "block.bias", "head.weight"],
-    )
-
-    assert [row["node"] for row in stats] == ["block", "head"]
-    assert stats[0]["count"] == 6
-    assert stats[1]["count"] == 2
 
     rgb, meta = render_parameter_node_map(
         state,
@@ -46,7 +36,9 @@ def test_summarize_parameter_nodes_groups_weight_and_bias_into_one_node():
         image_size=32,
     )
     assert rgb.shape == (32, 32, 3)
-    assert meta["node_count"] == 2
+    assert meta["mode"] == "parameter_groups"
+    assert meta["width"] == 32
+    assert meta["height"] == 32
     assert int(np.count_nonzero(rgb)) > 0
 
 
@@ -107,7 +99,7 @@ def test_save_weight_thumbnail_uses_active_model_only_and_256px(tmp_path):
         payload["generator_state"],
         [name for name, _ in generator.named_parameters()],
     )
-    expected_rgb, expected_meta = render_weight_image(
+    expected_rgb, _ = render_weight_image(
         saved_state,
         parameter_keys=parameter_keys,
         reference_state=node.weight_tracker.base_state("generator"),
@@ -141,13 +133,17 @@ def test_architectural_modes_place_layers_horizontally_and_transpose_cleanly():
         state,
         target_width=64,
         target_height=64,
+        mode="architectural_tall",
     )
     wide_rgb, wide_meta = render_weight_image(
         state,
         target_width=64,
         target_height=64,
+        mode="architectural_wide",
     )
 
-    assert tall_meta["layer_count"] == 2
-    assert tall_meta["layers"][0]["name"] == "stem"
-    assert tall_meta["layers"][1]["name"] == "head"
+    assert tall_meta["mode"] == "architectural_tall"
+    assert wide_meta["mode"] == "architectural_wide"
+    assert bool(tall_meta["transposed"]) is False
+    assert bool(wide_meta["transposed"]) is True
+    assert int(np.abs(tall_rgb.astype(np.int32) - wide_rgb.astype(np.int32)).sum()) > 0

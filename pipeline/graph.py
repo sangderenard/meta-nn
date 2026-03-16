@@ -646,6 +646,21 @@ class PipelineGraph:
                 )
                 break
 
+            if step_kind == "halt":
+                program_trace.append(
+                    {
+                        "tick": int(len(program_trace) + 1),
+                        "entry_kind": "step",
+                        "step_id": str(current_step_id),
+                        "kind": "halt",
+                        "label": step_label,
+                        "call_ref": call_ref,
+                        "frame_keys": list(frame_keys),
+                        "status": "halt",
+                    }
+                )
+                break
+
             if step_kind == "node":
                 node_id = str(step.get("node_id", "") or "")
                 step_spec = dict(step)
