@@ -109,6 +109,22 @@ NODUS_API int nodus_weight_image_render(
         int32_t                    *out_w,
         int32_t                    *out_h);
 
+/* Compute the exact rendered image size without rendering pixels.
+ *
+ * Inputs mirror nodus_weight_image_render(), minus the output buffer.
+ * Returns 0 on success, -1 on error.
+ */
+NODUS_API int nodus_weight_image_measure(
+        int                         mode,
+        const NodusWeightLayer     *layers,
+        int32_t                     num_layers,
+        const NodusWeightNodeGroup *nodes,
+        int32_t                     num_nodes,
+        int32_t                     target_w,
+        int32_t                     target_h,
+        int32_t                    *out_w,
+        int32_t                    *out_h);
+
 /* ------------------------------------------------------------------ */
 /*  State-dict intake: dump raw tensors, C does everything            */
 /* ------------------------------------------------------------------ */
@@ -150,6 +166,19 @@ NODUS_API int nodus_weight_image_from_state_dict(
         int32_t             target_w,
         int32_t             target_h,
         uint8_t           **out_rgb,
+        int32_t            *out_w,
+        int32_t            *out_h);
+
+/* State-dict variant of nodus_weight_image_measure(). */
+NODUS_API int nodus_weight_image_measure_from_state_dict(
+        const char *const  *param_names,
+        const float *const *param_data,
+        const int32_t      *param_numel,
+        const int32_t      *param_shape0,
+        int32_t             num_params,
+        int                 mode,
+        int32_t             target_w,
+        int32_t             target_h,
         int32_t            *out_w,
         int32_t            *out_h);
 

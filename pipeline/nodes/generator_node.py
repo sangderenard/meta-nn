@@ -56,6 +56,7 @@ from pipeline.nodes.base import (
     IRStateSpec,
     IRTrainingNode,
     IRTensorPortSpec,
+    make_runtime_weight_publish_callback,
     make_grad_scaler,
 )
 import hashlib
@@ -435,6 +436,12 @@ class GeneratorTrainNode(IRTrainingNode):
 
     def execute(self, ctx: PipelineContext) -> None:
         from wav_ml_models import train_conditional_generator_discriminator
+        generator_step_callback = make_runtime_weight_publish_callback(
+            ctx,
+            model_name="generator",
+            model=ctx.generator,
+            node_id=self.node_id,
+        )
 
         # train_conditional_generator_discriminator creates its own optimizers internally
         # and returns (trained_generator, trained_discriminator, list_of_epoch_metric_dicts).
@@ -459,6 +466,7 @@ class GeneratorTrainNode(IRTrainingNode):
             amp=ctx.amp_enabled,
             amp_dtype=str(ctx.amp_dtype or "float16"),
             channels_last=False,
+            generator_step_callback=generator_step_callback,
         )
 
         ctx.generator = trained_g

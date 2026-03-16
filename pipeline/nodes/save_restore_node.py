@@ -24,37 +24,58 @@ independent history.
 from __future__ import annotations
 
 import gc
+import hashlib
 import json
 import math
-import os
 import random
 import shutil
 import struct
 import threading
 import time
-from collections import OrderedDict, deque
-from dataclasses import dataclass, field
+from collections import deque
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
-import torch.nn as nn
 
 from pipeline.context import PipelineContext
 from pipeline.graph import PipelineNode
-from pipeline.nodus_loss_store import SCRUB_NUM_THUMBS, SCRUB_THUMB_H, SCRUB_THUMB_W
+from pipeline.nodus_loss_store import (
+    NodusLossStore,
+    NodusWeightImageStore,
+    WeightImageConfig,
+    NodusWeightStateStore,
+    WeightStateMeta,
+)
 from pipeline.nodes.base import _save_pipeline_checkpoint
-from pipeline.weight_map import (
-    annotate_weight_map,
-    render_weight_image,
-    snapshot_model_parameter_state,
-    snapshot_parameter_state_from_state_dict,
+from pipeline.weight_image_cache import (
+    WEIGHT_IMAGE_FLAG_CHECKPOINT,
+    checkpoint_thumbnail_path,
+    checkpoint_thumbnail_root,
+    crop_weight_image_rgb,
+    plan_weight_image_evictions,
+    save_checkpoint_thumbnail,
 )
 
 
 def _log(msg: str) -> None:
     print(msg, flush=True)
+
+
+def _compute_architecture_version(state_dict: Dict[str, Any]) -> int:
+    h = hashlib.blake2b(digest_size=8)
+    for key, value in state_dict.items():
+        if not torch.is_tensor(value) or not torch.is_floating_point(value):
+            continue
+        h.update(str(key).encode("utf-8", errors="ignore"))
+        h.update(str(value.dtype).encode("ascii", errors="ignore"))
+        dims = tuple(int(x) for x in value.shape)
+        h.update(struct.pack("<I", len(dims)))
+        for dim in dims:
+            h.update(struct.pack("<q", int(dim)))
+    return int.from_bytes(h.digest(), byteorder="little", signed=False)
 
 
 # ---------------------------------------------------------------------------
@@ -71,8 +92,8 @@ QUERY_LOSS_HISTORY = "query_loss_history"
 QUERY_LATEST_RESULT = "query_latest_result"
 QUERY_TM_SUMMARY = "query_tm_summary"
 QUERY_CHECKPOINT_INFO = "query_checkpoint_info"
-QUERY_WEIGHT_MAP = "query_weight_map"
 QUERY_CACHE_BROWSE = "query_cache_browse"
+QUERY_WEIGHT_REGISTRY = "query_weight_registry"
 
 # Response types (Training → GUI)
 RESP_CHANNEL_LIST = "resp_channel_list"
@@ -80,65 +101,14 @@ RESP_LOSS_HISTORY = "resp_loss_history"
 RESP_LATEST_RESULT = "resp_latest_result"
 RESP_TM_SUMMARY = "resp_tm_summary"
 RESP_CHECKPOINT_INFO = "resp_checkpoint_info"
-RESP_WEIGHT_MAP = "resp_weight_map"
 RESP_CACHE_BROWSE = "resp_cache_browse"
+RESP_WEIGHT_REGISTRY = "resp_weight_registry"
 
 # Notification types (Training → GUI, lightweight)
 NOTIFY_NEW_LOSS = "notify_new_loss"
 NOTIFY_NEW_RESULT = "notify_new_result"
 NOTIFY_CHECKPOINT = "notify_checkpoint"
-NOTIFY_WEIGHT_MAP = "notify_weight_map"
-
-
-# Weight thumbnails are rendered as compact active-model diagnostics for the
-# viewer right panel, so they use a fixed square footprint by default.
-_WEIGHT_THUMB_SIDE = max(8, int(os.getenv("WEIGHT_THUMB_SIDE", "256")))
-_WEIGHT_THUMB_PNG_COMPRESS_LEVEL = max(
-    0, min(9, int(os.getenv("WEIGHT_THUMB_PNG_COMPRESS_LEVEL", "0")))
-)
-_WEIGHT_LIVE_TILE_STACK_H = SCRUB_THUMB_H * SCRUB_NUM_THUMBS
-
-
-def _resize_rgb_nearest(rgb: np.ndarray, size_hw: Tuple[int, int]) -> np.ndarray:
-    out_h = max(1, int(size_hw[0]))
-    out_w = max(1, int(size_hw[1]))
-    try:
-        from PIL import Image
-
-        img = Image.fromarray(np.asarray(rgb, dtype=np.uint8), mode="RGB")
-        return np.asarray(img.resize((out_w, out_h), Image.NEAREST), dtype=np.uint8)
-    except Exception:
-        src = np.asarray(rgb, dtype=np.uint8)
-        y_idx = np.floor(np.linspace(0, max(0, src.shape[0] - 1), out_h)).astype(np.int64)
-        x_idx = np.floor(np.linspace(0, max(0, src.shape[1] - 1), out_w)).astype(np.int64)
-        return src[y_idx][:, x_idx]
-
-
-def _weight_thumb_tiles_from_rgb(rgb: np.ndarray) -> Tuple[np.ndarray, ...]:
-    src = np.ascontiguousarray(np.asarray(rgb, dtype=np.uint8))
-    if src.ndim != 3 or src.shape[2] != 3:
-        raise ValueError("weight thumb source must be an RGB image")
-
-    scale = min(
-        float(SCRUB_THUMB_W) / float(max(1, src.shape[1])),
-        float(_WEIGHT_LIVE_TILE_STACK_H) / float(max(1, src.shape[0])),
-    )
-    scaled_w = max(1, int(round(float(src.shape[1]) * scale)))
-    scaled_h = max(1, int(round(float(src.shape[0]) * scale)))
-    scaled = _resize_rgb_nearest(src, (scaled_h, scaled_w))
-
-    canvas = np.full(
-        (_WEIGHT_LIVE_TILE_STACK_H, SCRUB_THUMB_W, 3),
-        (14, 16, 20),
-        dtype=np.uint8,
-    )
-    y0 = max(0, (_WEIGHT_LIVE_TILE_STACK_H - scaled_h) // 2)
-    x0 = max(0, (SCRUB_THUMB_W - scaled_w) // 2)
-    canvas[y0 : y0 + scaled_h, x0 : x0 + scaled_w] = scaled
-    return tuple(
-        np.ascontiguousarray(canvas[idx * SCRUB_THUMB_H : (idx + 1) * SCRUB_THUMB_H].copy())
-        for idx in range(SCRUB_NUM_THUMBS)
-    )
+NOTIFY_WEIGHT_STATE = "notify_weight_state"
 
 
 # ---------------------------------------------------------------------------
@@ -693,140 +663,6 @@ class ResultStore:
 
 
 # ---------------------------------------------------------------------------
-# Weight Tracker
-# ---------------------------------------------------------------------------
-
-class WeightTracker:
-    """Captures detached model weight snapshots and renders weight-map images.
-
-    Maintains a base tensor (initial weights at load time) and the latest
-    snapshot.  The difference ``|current − base|`` is rendered as an RGB
-    image suitable for the viewer's right-panel weight display.
-
-    Thread-safe: snapshot capture and image rendering can happen from any
-    thread.
-    """
-
-    def __init__(self, image_hw: Tuple[int, int] = (256, 256)) -> None:
-        self._lock = threading.Lock()
-        self._image_h, self._image_w = max(8, int(image_hw[0])), max(8, int(image_hw[1]))
-        # Per-model storage: model_name → {parameter_keys, base, latest, live_tiles}
-        self._models: Dict[str, Dict[str, Any]] = {}
-        self._active_model: Optional[str] = None
-
-    def register_base(self, model_name: str, model: nn.Module) -> None:
-        """Capture base (initial) weights for a model.  Called once at init."""
-        parameter_keys, base_state = snapshot_model_parameter_state(model)
-        with self._lock:
-            entry = self._models.setdefault(model_name, {})
-            entry["parameter_keys"] = list(parameter_keys)
-            entry["base"] = dict(base_state)
-            if self._active_model is None:
-                self._active_model = model_name
-
-    def capture(self, model_name: str, model: nn.Module) -> None:
-        """Capture the current weight state (detached, CPU)."""
-        parameter_keys, latest_state = snapshot_model_parameter_state(model)
-        with self._lock:
-            entry = self._models.setdefault(model_name, {})
-            if parameter_keys:
-                entry["parameter_keys"] = list(parameter_keys)
-            entry["latest"] = dict(latest_state)
-
-    def set_active(self, model_name: str) -> None:
-        with self._lock:
-            self._active_model = model_name
-
-    def model_names(self) -> List[str]:
-        with self._lock:
-            return list(self._models.keys())
-
-    def active_model(self) -> Optional[str]:
-        with self._lock:
-            return self._active_model
-
-    def base_state(self, model_name: str) -> Optional[Dict[str, torch.Tensor]]:
-        with self._lock:
-            entry = self._models.get(str(model_name), {})
-            base = entry.get("base")
-            return dict(base) if isinstance(base, dict) else None
-
-    def refresh_live_tiles(self, model_name: Optional[str] = None) -> Optional[Tuple[np.ndarray, ...]]:
-        with self._lock:
-            name = model_name or self._active_model
-            if name is None or name not in self._models:
-                return None
-            entry = self._models[name]
-            parameter_keys = list(entry.get("parameter_keys", []) or [])
-            base = entry.get("base")
-            latest = entry.get("latest")
-        if not isinstance(latest, dict):
-            return None
-        rgb, _meta = render_weight_image(
-            latest,
-            parameter_keys=parameter_keys,
-            reference_state=base if isinstance(base, dict) else None,
-            target_width=SCRUB_THUMB_W,
-            target_height=SCRUB_THUMB_H,
-        )
-        tiles = _weight_thumb_tiles_from_rgb(rgb)
-        with self._lock:
-            entry = self._models.setdefault(str(name), {})
-            entry["live_tiles"] = tuple(np.ascontiguousarray(tile.copy()) for tile in tiles)
-        return tiles
-
-    def live_thumb_tiles(self, model_name: Optional[str] = None) -> Optional[Dict[str, Any]]:
-        with self._lock:
-            name = model_name or self._active_model
-            if name is None or name not in self._models:
-                return None
-            tiles = self._models[name].get("live_tiles")
-            if not isinstance(tiles, tuple) or len(tiles) != SCRUB_NUM_THUMBS:
-                return None
-            return {
-                "model": str(name),
-                "tiles": tuple(np.ascontiguousarray(np.asarray(tile, dtype=np.uint8)).copy() for tile in tiles),
-            }
-
-    def render_weight_map_rgb(self, model_name: Optional[str] = None) -> Optional[np.ndarray]:
-        """Render an architectural-tall active-model map for the named model."""
-        with self._lock:
-            name = model_name or self._active_model
-            if name is None or name not in self._models:
-                return None
-            entry = self._models[name]
-            parameter_keys = list(entry.get("parameter_keys", []) or [])
-            base = entry.get("base")
-            latest = entry.get("latest")
-        if not isinstance(latest, dict):
-            return None
-        rgb, meta = render_weight_image(
-            latest,
-            parameter_keys=parameter_keys,
-            reference_state=base if isinstance(base, dict) else None,
-            target_width=self._image_w,
-            target_height=self._image_h,
-        )
-        return annotate_weight_map(
-            rgb,
-            title=str(name),
-            subtitle="",
-        )
-
-    def render_serialisable(self, model_name: Optional[str] = None) -> Optional[Dict[str, Any]]:
-        """Return the weight map as a serialisable dict for IPC transfer."""
-        rgb = self.render_weight_map_rgb(model_name)
-        if rgb is None:
-            return None
-        return {
-            "model": model_name or self._active_model,
-            "height": rgb.shape[0],
-            "width": rgb.shape[1],
-            "rgb": rgb.tolist(),
-        }
-
-
-# ---------------------------------------------------------------------------
 # The Node
 # ---------------------------------------------------------------------------
 
@@ -872,8 +708,9 @@ class SaveRestoreNode(PipelineNode):
         self.training_cache: Optional[TrainingMaterialCache] = None
 
         # -- Pull-model data stores (GUI queries these) -------------------
-        from pipeline.nodus_loss_store import NodusLossStore as _NLS
-        self.loss_store: _NLS = _NLS.get_global()
+        self.loss_store: NodusLossStore = NodusLossStore.get_global()
+        self.weight_state_store: NodusWeightStateStore = NodusWeightStateStore.get_global()
+        self.weight_image_store: NodusWeightImageStore = NodusWeightImageStore.get_global()
         self.result_store: ResultStore = ResultStore()
 
         # Pending restore request: (round_id, cycle) to restore to.
@@ -884,9 +721,11 @@ class SaveRestoreNode(PipelineNode):
         self._replay_callbacks: Dict[str, Callable[[Dict[str, Any]], None]] = {}
         # Snapshot of the classifier lora helper (injected)
         self._snapshot_lora_fn: Optional[Callable] = None
-
-        # -- Weight tracking (base tensor + per-checkpoint delta image) ----
-        self.weight_tracker: WeightTracker = WeightTracker()
+        self._last_weight_state_meta: Optional[WeightStateMeta] = None
+        self._last_weight_image_config: Optional[WeightImageConfig] = None
+        self._weight_model_generations: Dict[Tuple[str, str], Tuple[int, int]] = {}
+        self._weight_model_registry: Dict[Tuple[str, str], WeightStateMeta] = {}
+        self._weight_checkpoint_thumbnail_root: Optional[Path] = None
 
     def initialise(self, ctx: PipelineContext) -> None:
         """Called once by the orchestrator after context is set up."""
@@ -916,21 +755,7 @@ class SaveRestoreNode(PipelineNode):
         # Load historical loss data from binary log files so the pull-model
         # can serve the full history (including previous sessions) from round 0.
         self._load_historical_losses(out_dir)
-
-        # Register base weights for weight-tracking delta image
-        _models = {
-            "classifier": ctx.classifier,
-            "transformer": ctx.transformer,
-            "generator": ctx.generator,
-            "discriminator": ctx.discriminator,
-            "wave_classifier": ctx.wave_classifier,
-        }
-        for name, model in _models.items():
-            if model is not None:
-                try:
-                    self.weight_tracker.register_base(name, model)
-                except Exception:
-                    pass
+        self._weight_checkpoint_thumbnail_root = checkpoint_thumbnail_root(out_dir / "_weight_backup")
 
     def _load_historical_losses(self, out_dir: Path) -> None:
         """Replay binary loss-log files into the LossAccumulator.
@@ -978,7 +803,7 @@ class SaveRestoreNode(PipelineNode):
             {"subnode_id": "training_cache", "kind": "state_store", "label": "Training Material Cache", "order": 1},
             {"subnode_id": "loss_store", "kind": "metric_store", "label": "Nodus Loss Store (native)", "order": 2},
             {"subnode_id": "result_store", "kind": "metric_store", "label": "Result Store", "order": 3},
-            {"subnode_id": "weight_tracker", "kind": "diagnostic", "label": "Weight Tracker", "order": 4},
+            {"subnode_id": "weight_state_store", "kind": "state_store", "label": "Weight State Store (native)", "order": 4},
         ]
 
     def should_run(self, ctx: PipelineContext) -> bool:
@@ -1119,15 +944,6 @@ class SaveRestoreNode(PipelineNode):
                     out_dir / f"{name}.pt",
                 )
 
-        # 3b. Save the active-model node thumbnail that matches the saved checkpoint payload.
-        thumb_info = self._save_weight_thumbnail(
-            out_dir,
-            _models,
-            payload=payload,
-            round_id=ctx.round_id,
-            cycle=ctx.cycle,
-        )
-
         # 4. Save seed bank
         if self.seed_bank is not None:
             self.seed_bank.save_bank(out_dir / "seed_bank.pt")
@@ -1137,14 +953,12 @@ class SaveRestoreNode(PipelineNode):
             self.training_cache.save_manifest(out_dir / "tm_manifest.json")
             self.training_cache.clear_before_checkpoint()
 
-        # 6. Notify viewer (lightweight notification only — GUI pulls details)
+        # 6. Notify viewer (lightweight notification only — GUI owns image rendering)
         viewer = ctx.viewer_proxy
         if viewer is not None:
             notification = self.make_checkpoint_notification(
                 ctx.round_id,
                 ctx.cycle,
-                thumb_path=(thumb_info or {}).get("path"),
-                thumb_model=(thumb_info or {}).get("model"),
                 checkpoint_path=(out_dir / "pipeline_checkpoint.pt"),
             )
             send_fn = getattr(viewer, "_send", None)
@@ -1154,98 +968,7 @@ class SaveRestoreNode(PipelineNode):
                 except Exception:
                     pass
 
-        # 7. Capture weight snapshots for delta rendering
-        for name, model in _models.items():
-            if model is not None:
-                try:
-                    self.weight_tracker.capture(name, model)
-                except Exception:
-                    pass
-
         _log(f"[checkpoint] saved round={ctx.round_id} cycle={ctx.cycle}")
-
-    def _save_weight_thumbnail(
-        self,
-        out_dir: Path,
-        models: Dict[str, Any],
-        *,
-        payload: Dict[str, Any],
-        round_id: int,
-        cycle: int,
-    ) -> Optional[Dict[str, Any]]:
-        """Render and save a 256px active-model architectural thumbnail for the viewer."""
-        try:
-            active_name = self.weight_tracker.active_model()
-            if not active_name or models.get(active_name) is None:
-                for name, model in models.items():
-                    if model is not None:
-                        active_name = str(name)
-                        break
-            if not active_name:
-                return None
-
-            active_model = models.get(active_name)
-            if active_model is None:
-                return None
-
-            state_key = f"{active_name}_state"
-            state_blob = payload.get(state_key)
-            if not isinstance(state_blob, dict):
-                state_blob = active_model.state_dict()
-
-            parameter_keys, saved_state = snapshot_parameter_state_from_state_dict(
-                state_blob,
-                [name for name, _ in active_model.named_parameters()],
-            )
-            if not saved_state:
-                return None
-
-            rgb, meta = render_weight_image(
-                saved_state,
-                parameter_keys=parameter_keys,
-                reference_state=self.weight_tracker.base_state(active_name),
-                target_width=_WEIGHT_THUMB_SIDE,
-                target_height=_WEIGHT_THUMB_SIDE,
-            )
-            rgb = annotate_weight_map(
-                rgb,
-                title=f"{active_name} r{int(round_id)}",
-                subtitle="",
-            )
-
-            from PIL import Image
-
-            img = Image.fromarray(rgb, mode="RGB")
-            thumb_path = out_dir / f"weight_thumb_r{round_id:06d}_c{cycle:04d}.png"
-            img.save(
-                str(thumb_path),
-                format="PNG",
-                compress_level=_WEIGHT_THUMB_PNG_COMPRESS_LEVEL,
-            )
-            sidecar_path = thumb_path.with_suffix(".json")
-            sidecar_path.write_text(
-                json.dumps(
-                    {
-                        "model": str(active_name),
-                        "round_id": int(round_id),
-                        "cycle": int(cycle),
-                        "layer_count": int(meta.get("layer_count", 0)),
-                        "mode": "architectural_tall",
-                        "width": int(img.size[0]),
-                        "height": int(img.size[1]),
-                    },
-                    indent=2,
-                ),
-                encoding="utf-8",
-            )
-            return {
-                "path": str(thumb_path),
-                "model": str(active_name),
-                "layer_count": int(meta.get("layer_count", 0)),
-            }
-        except Exception as exc:
-            _log(f"[checkpoint] weight thumbnail failed: {exc}")
-        return None
 
     def _load_checkpoint_for_restore(
         self,
@@ -1546,20 +1269,234 @@ class SaveRestoreNode(PipelineNode):
     def set_lora_snapshot_fn(self, fn: Callable) -> None:
         self._snapshot_lora_fn = fn
 
-    def update_runtime_weight_map(self, model_name: str, model: Any) -> Optional[Dict[str, Any]]:
-        """Capture the active runtime model so the GUI right panel stays current."""
+    def latest_weight_state_meta(self) -> Optional[WeightStateMeta]:
+        meta = self.weight_state_store.get_meta()
+        if meta is not None:
+            self._last_weight_state_meta = meta
+        return meta
+
+    def latest_weight_image_config(self) -> Optional[WeightImageConfig]:
+        cfg = self.weight_image_store.get_active_config()
+        if cfg is not None:
+            self._last_weight_image_config = cfg
+        return cfg
+
+    def runtime_weight_registry(self) -> List[Dict[str, Any]]:
+        entries: List[Dict[str, Any]] = []
+        metas = []
+        list_meta = getattr(self.weight_state_store, "list_meta", None)
+        if callable(list_meta):
+            try:
+                metas = list_meta()
+            except Exception:
+                metas = []
+        if not metas:
+            metas = list(self._weight_model_registry.values())
+        for meta in metas:
+            entries.append(
+                {
+                    "model": str(meta.model_name),
+                    "node_id": str(meta.node_id),
+                    "publish_seq": int(meta.publish_seq),
+                    "generation": int(meta.generation),
+                    "architecture_version": int(meta.architecture_version),
+                    "round_id": int(meta.round_id),
+                    "cycle": int(meta.cycle),
+                    "step": int(meta.step),
+                }
+            )
+        return entries
+
+    def _resolve_weight_generation(
+        self,
+        *,
+        model_name: str,
+        node_id: str,
+        architecture_version: int,
+    ) -> int:
+        key = (str(model_name or ""), str(node_id or ""))
+        prev_arch, prev_generation = self._weight_model_generations.get(key, (0, 0))
+        if int(prev_generation) <= 0:
+            generation = 1
+        elif int(prev_arch) != int(architecture_version):
+            generation = int(prev_generation) + 1
+        else:
+            generation = int(prev_generation)
+        self._weight_model_generations[key] = (int(architecture_version), int(generation))
+        return int(generation)
+
+    def _persist_weight_image_thumbnail(
+        self,
+        index: int,
+        *,
+        target_width: int,
+        target_height: int,
+    ) -> Optional[Path]:
+        root = self._weight_checkpoint_thumbnail_root
+        if root is None:
+            return None
+        meta = self.weight_image_store.get_meta(int(index))
+        if meta is None:
+            return None
+        if (int(meta.flags) & int(WEIGHT_IMAGE_FLAG_CHECKPOINT)) == 0:
+            return None
+        rgb = self.weight_image_store.copy_image(int(index))
+        if rgb is None:
+            return None
+        cropped = crop_weight_image_rgb(
+            rgb,
+            target_width=int(target_width),
+            target_height=int(target_height),
+        )
+        path = checkpoint_thumbnail_path(
+            root,
+            round_id=int(meta.round_id),
+            cycle=int(meta.cycle),
+            model_name=str(meta.model_name),
+            generation=int(meta.generation),
+            architecture_version=int(meta.architecture_version),
+        )
+        try:
+            return save_checkpoint_thumbnail(path, cropped)
+        except Exception:
+            return None
+
+    def _persist_weight_image_evictions(
+        self,
+        evict_indices: List[int],
+        *,
+        target_width: int,
+        target_height: int,
+    ) -> None:
+        for index in sorted({int(i) for i in evict_indices}):
+            try:
+                self._persist_weight_image_thumbnail(
+                    int(index),
+                    target_width=int(target_width),
+                    target_height=int(target_height),
+                )
+            except Exception:
+                continue
+
+    def _persist_weight_images_before_config_change(
+        self,
+        *,
+        mode: int,
+        target_width: int,
+        target_height: int,
+    ) -> None:
+        active_cfg = self.weight_image_store.get_active_config()
+        if active_cfg is None:
+            return
+        state_meta = self.weight_state_store.get_meta()
+        if state_meta is None:
+            return
+        if (
+            int(active_cfg.mode) == int(mode)
+            and int(active_cfg.target_width) == int(target_width)
+            and int(active_cfg.target_height) == int(target_height)
+            and int(active_cfg.generation) == int(state_meta.generation)
+            and int(active_cfg.architecture_version) == int(state_meta.architecture_version)
+            and str(active_cfg.model_name) == str(state_meta.model_name)
+            and str(active_cfg.node_id) == str(state_meta.node_id)
+        ):
+            return
+        entries = [
+            self.weight_image_store.get_meta(i)
+            for i in range(max(0, int(self.weight_image_store.length())))
+        ]
+        evict_indices = plan_weight_image_evictions(
+            [entry for entry in entries if entry is not None],
+            max_entries=max(1, int(self.weight_image_store.capacity()) or 1),
+            max_total_bytes=max(
+                0,
+                int(getattr(self.weight_image_store.stats(), "max_total_bytes", 0) or 0),
+            ),
+            clear_all=True,
+        )
+        self._persist_weight_image_evictions(
+            evict_indices,
+            target_width=int(active_cfg.target_width),
+            target_height=int(active_cfg.target_height),
+        )
+
+    def configure_runtime_weight_image(
+        self,
+        *,
+        mode: int,
+        target_width: int,
+        target_height: int,
+    ) -> Optional[WeightImageConfig]:
+        self._persist_weight_images_before_config_change(
+            mode=int(mode),
+            target_width=int(target_width),
+            target_height=int(target_height),
+        )
+        try:
+            cfg = self.weight_image_store.configure_latest(
+                self.weight_state_store,
+                mode=int(mode),
+                target_width=int(target_width),
+                target_height=int(target_height),
+            )
+        except Exception:
+            return None
+        if cfg is not None:
+            self._last_weight_image_config = cfg
+        return cfg
+
+    def publish_runtime_weight_state(
+        self,
+        model_name: str,
+        model: Any,
+        *,
+        node_id: str = "",
+        round_id: int = 0,
+        cycle: int = 0,
+        step: int = 0,
+        image_mode: Optional[int] = None,
+        image_target_width: Optional[int] = None,
+        image_target_height: Optional[int] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Publish the latest floating-point model state into the shared C store."""
         if not model_name or model is None:
             return None
         try:
-            self.weight_tracker.set_active(str(model_name))
-            self.weight_tracker.capture(str(model_name), model)
-            self.weight_tracker.refresh_live_tiles(str(model_name))
+            state_blob = model.state_dict()
+            architecture_version = _compute_architecture_version(state_blob)
+            generation = self._resolve_weight_generation(
+                model_name=str(model_name),
+                node_id=str(node_id or ""),
+                architecture_version=int(architecture_version),
+            )
+            meta = self.weight_state_store.publish_state_dict(
+                state_blob,
+                model_name=str(model_name),
+                node_id=str(node_id or ""),
+                round_id=int(round_id),
+                cycle=int(cycle),
+                step=int(step),
+                generation=int(generation),
+                architecture_version=int(architecture_version),
+            )
         except Exception:
             return None
-        return self.make_weight_map_notification(model_name)
-
-    def current_weight_thumb_tiles(self, model_name: Optional[str] = None) -> Optional[Dict[str, Any]]:
-        return self.weight_tracker.live_thumb_tiles(model_name)
+        if meta is None:
+            return None
+        self._last_weight_state_meta = meta
+        self._weight_model_registry[(str(meta.model_name), str(meta.node_id))] = meta
+        image_cfg = None
+        if (
+            image_mode is not None
+            and image_target_width is not None
+            and image_target_height is not None
+        ):
+            image_cfg = self.configure_runtime_weight_image(
+                mode=int(image_mode),
+                target_width=int(image_target_width),
+                target_height=int(image_target_height),
+            )
+        return self.make_weight_state_notification(meta, image_cfg=image_cfg)
 
     # -- Pull-model: record data (called by training nodes) ---------------
 
@@ -1603,10 +1540,10 @@ class SaveRestoreNode(PipelineNode):
             return self._resp_tm_summary()
         elif qtype == QUERY_CHECKPOINT_INFO:
             return self._resp_checkpoint_info()
-        elif qtype == QUERY_WEIGHT_MAP:
-            return self._resp_weight_map(query)
         elif qtype == QUERY_CACHE_BROWSE:
             return self._resp_cache_browse(query)
+        elif qtype == QUERY_WEIGHT_REGISTRY:
+            return self._resp_weight_registry()
         return None
 
     def _resp_channel_list(self) -> Dict[str, Any]:
@@ -1689,16 +1626,6 @@ class SaveRestoreNode(PipelineNode):
                 }
         return info
 
-    def _resp_weight_map(self, query: Dict[str, Any]) -> Dict[str, Any]:
-        model_name = query.get("model") or None
-        data = self.weight_tracker.render_serialisable(model_name)
-        return {
-            "type": RESP_WEIGHT_MAP,
-            "models": self.weight_tracker.model_names(),
-            "active": self.weight_tracker.active_model(),
-            "map": data,
-        }
-
     def _resp_cache_browse(self, query: Dict[str, Any]) -> Dict[str, Any]:
         """Return a browsable summary of the training material cache.
 
@@ -1729,6 +1656,15 @@ class SaveRestoreNode(PipelineNode):
         page = entries[offset:offset + limit]
         return {"type": RESP_CACHE_BROWSE, "entries": page, "total": total}
 
+    def _resp_weight_registry(self) -> Dict[str, Any]:
+        meta = self._last_weight_state_meta
+        return {
+            "type": RESP_WEIGHT_REGISTRY,
+            "models": self.runtime_weight_registry(),
+            "active_model": str(meta.model_name) if meta is not None else "",
+            "active_node_id": str(meta.node_id) if meta is not None else "",
+        }
+
     # -- Notification helpers (lightweight, no data payload) ---------------
 
     def make_loss_notification(self, channel_key: str) -> Dict[str, Any]:
@@ -1750,8 +1686,6 @@ class SaveRestoreNode(PipelineNode):
         round_id: int,
         cycle: int,
         *,
-        thumb_path=None,
-        thumb_model=None,
         checkpoint_path=None,
     ) -> Dict[str, Any]:
         d = {
@@ -1760,16 +1694,48 @@ class SaveRestoreNode(PipelineNode):
             "cycle": int(cycle),
             "loss_summary": self.loss_store.summary(),
         }
-        if thumb_path is not None:
-            d["thumb_path"] = str(thumb_path)
-        if thumb_model is not None:
-            d["thumb_model"] = str(thumb_model)
+        meta = self._last_weight_state_meta
+        if meta is not None:
+            d["weight_state_publish_seq"] = int(meta.publish_seq)
+            d["weight_generation"] = int(meta.generation)
+            d["weight_architecture_version"] = int(meta.architecture_version)
+            d["weight_model"] = str(meta.model_name)
+            d["weight_node_id"] = str(meta.node_id)
         if checkpoint_path is not None:
             d["checkpoint_path"] = str(checkpoint_path)
         return d
 
-    def make_weight_map_notification(self, model_name: Optional[str] = None) -> Dict[str, Any]:
-        return {
-            "type": NOTIFY_WEIGHT_MAP,
-            "model": str(model_name or self.weight_tracker.active_model() or ""),
+    def make_weight_state_notification(
+        self,
+        meta: Optional[WeightStateMeta] = None,
+        *,
+        image_cfg: Optional[WeightImageConfig] = None,
+    ) -> Dict[str, Any]:
+        state_meta = meta if meta is not None else self.latest_weight_state_meta()
+        cfg = image_cfg if image_cfg is not None else self._last_weight_image_config
+        known_models = list(
+            dict.fromkeys(
+                str(entry["model"])
+                for entry in self.runtime_weight_registry()
+                if str(entry.get("model", "")).strip()
+            )
+        )
+        d = {
+            "type": NOTIFY_WEIGHT_STATE,
+            "model": str(state_meta.model_name if state_meta is not None else ""),
+            "node_id": str(state_meta.node_id if state_meta is not None else ""),
+            "publish_seq": int(state_meta.publish_seq if state_meta is not None else 0),
+            "generation": int(state_meta.generation if state_meta is not None else 0),
+            "architecture_version": int(
+                state_meta.architecture_version if state_meta is not None else 0
+            ),
+            "known_models": known_models,
         }
+        if cfg is not None:
+            d["image_mode"] = int(cfg.mode)
+            d["image_target_w"] = int(cfg.target_width)
+            d["image_target_h"] = int(cfg.target_height)
+            d["image_render_w"] = int(cfg.render_width)
+            d["image_render_h"] = int(cfg.render_height)
+            d["image_render_c"] = int(cfg.render_channels)
+        return d

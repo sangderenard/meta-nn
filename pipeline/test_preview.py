@@ -1,13 +1,16 @@
-import json
-from pathlib import Path
-import time
+from types import SimpleNamespace
+from tempfile import TemporaryDirectory
 
 import numpy as np
-from PIL import Image
 import torch
 
-from pipeline.nodus_loss_store import SCRUB_FLAG_HAS_THUMBS
 from pipeline.preview import build_classifier_preview_frames
+from pipeline.weight_image_cache import (
+    checkpoint_thumbnail_path,
+    checkpoint_thumbnail_root,
+    crop_weight_image_rgb,
+    save_checkpoint_thumbnail,
+)
 from wav_ml_viewer import _TransformerStatusOpenGLViewer
 
 
@@ -111,139 +114,201 @@ def test_viewer_backfills_late_frame_text_by_ring_cursor():
     assert viewer._panel_titles == ["late-a", "late-b", "late-c"]
 
 
-def test_viewer_builds_weight_map_from_ring_thumbnail_tiles():
-    class _FakeMeta:
-        def __init__(self, flags: int):
-            self.flags = flags
-
-    class _FakeRing:
+def test_viewer_enqueue_frame_does_not_push_weight_tiles():
+    class _RecordingRing:
         def __init__(self):
-            self._write_cursor = 6
-            self._length = 2
-            self._tiles = [
-                np.full((64, 64, 3), 10, dtype=np.uint8),
-                np.full((64, 64, 3), 40, dtype=np.uint8),
-                np.full((64, 64, 3), 90, dtype=np.uint8),
-            ]
+            self.calls = []
 
-        def locked(self):
-            class _Ctx:
-                def __enter__(self_inner):
-                    return self
+        def push(self, **kwargs):
+            self.calls.append(dict(kwargs))
+            return 12
 
-                def __exit__(self_inner, *exc):
-                    return False
+        def capacity(self):
+            return 8
 
-            return _Ctx()
+    viewer = _TransformerStatusOpenGLViewer(enabled=False, image_hw=(8, 8), graph_h=0)
+    viewer._scrub_ring = _RecordingRing()
 
-        def write_cursor(self):
-            return self._write_cursor
+    viewer.enqueue_frame(
+        {
+            "images": [
+                np.zeros((4, 4, 3), dtype=np.uint8),
+                np.zeros((4, 4, 3), dtype=np.uint8),
+                np.zeros((4, 4, 3), dtype=np.uint8),
+            ],
+            "caption": "frame",
+            "titles": ["a", "b", "c"],
+            "rows": [[], [], []],
+        }
+    )
+
+    assert len(viewer._scrub_ring.calls) == 1
+    call = viewer._scrub_ring.calls[0]
+    assert call["thumb0"] is None
+    assert call["thumb1"] is None
+    assert call["thumb2"] is None
+
+
+def test_shared_weight_render_rerenders_on_config_change_and_uses_target_dims():
+    class _FakeStateStore:
+        def get_meta(self):
+            return SimpleNamespace(publish_seq=7, model_name="toy")
+
+    class _FakeImageStore:
+        def __init__(self):
+            self.calls = []
+            self.limit_calls = []
+            self._cfg = None
+            self._image_seq = 0
+            self._max_entries = 512
+
+        def get_active_config(self):
+            return self._cfg
 
         def length(self):
-            return self._length
+            return 0
+
+        def stats(self):
+            return SimpleNamespace(max_entries=self._max_entries, max_total_bytes=0)
 
         def get_meta(self, _index):
-            return _FakeMeta(SCRUB_FLAG_HAS_THUMBS)
+            return None
 
-        def copy_thumbnail(self, _index, thumb_idx):
-            return self._tiles[thumb_idx].copy()
+        def set_limits(self, *, max_entries, max_total_bytes):
+            self.limit_calls.append((int(max_entries), int(max_total_bytes)))
+            return True
 
-    viewer = _TransformerStatusOpenGLViewer(enabled=False, image_hw=(8, 8), graph_h=10)
-    viewer._scrub_ring = _FakeRing()
-    viewer._active_weight_model_name = "toy"
+        def render_latest(self, _state_store, *, mode, target_width, target_height):
+            self.calls.append((int(mode), int(target_width), int(target_height)))
+            self._image_seq += 1
+            return True
 
-    rgb = viewer._weight_map_from_ring_cursor(5)
+        def latest_image(self):
+            meta = SimpleNamespace(
+                image_seq=self._image_seq,
+                state_publish_seq=7,
+                round_id=1,
+                cycle=2,
+                step=3,
+                model_name="toy",
+            )
+            rgb = np.full((6, 5, 3), 64, dtype=np.uint8)
+            return meta, rgb
 
-    assert rgb is not None
-    assert rgb.shape == (2 * viewer.panel_h + viewer.graph_total_h, viewer.panel_w, 3)
-    assert int(np.count_nonzero(rgb)) > 0
+    viewer = _TransformerStatusOpenGLViewer(enabled=False, image_hw=(8, 8), graph_h=0)
+    viewer._ipc_server_ref = SimpleNamespace(has_connection=True)
+    viewer._weight_state_store = _FakeStateStore()
+    image_store = _FakeImageStore()
+    image_store._max_entries = viewer._weight_history_maxlen
+    viewer._weight_image_store = image_store
+
+    image_store._cfg = SimpleNamespace(
+        state_publish_seq=7,
+        mode=1,
+        target_width=100,
+        target_height=80,
+        render_width=150,
+        render_height=120,
+        render_channels=3,
+        render_stride_bytes=450,
+    )
+    viewer._launch_shared_weight_render()
+    viewer._shared_weight_render_thread.join(timeout=2.0)
+    viewer._collect_shared_weight_render()
+
+    image_store._cfg = SimpleNamespace(
+        state_publish_seq=7,
+        mode=1,
+        target_width=140,
+        target_height=90,
+        render_width=210,
+        render_height=140,
+        render_channels=3,
+        render_stride_bytes=630,
+    )
+    viewer._launch_shared_weight_render()
+    viewer._shared_weight_render_thread.join(timeout=2.0)
+    viewer._collect_shared_weight_render()
+
+    assert image_store.calls == [(1, 100, 80), (1, 140, 90)]
+    assert image_store.limit_calls == [
+        (viewer._weight_history_maxlen, 450 * 120 * viewer._weight_history_maxlen),
+        (viewer._weight_history_maxlen, 630 * 140 * viewer._weight_history_maxlen),
+    ]
+    assert len(viewer._weight_snapshot_deque) == 2
+    assert viewer._weight_current_rgb_by_model["toy"].shape == (90, 140, 3)
 
 
-def test_viewer_renders_missing_checkpoint_thumbnail_from_checkpoint_file(tmp_path):
-    viewer = _TransformerStatusOpenGLViewer(enabled=False, image_hw=(8, 8), graph_h=10)
-    viewer._active_weight_model_name = "classifier"
+def test_crop_weight_image_rgb_center_crops_and_pads():
+    src = np.arange(4 * 6 * 3, dtype=np.uint8).reshape(4, 6, 3)
 
-    ckpt_path = tmp_path / "pipeline_checkpoint.pt"
-    torch.save(
+    cropped = crop_weight_image_rgb(src, target_width=2, target_height=2)
+    assert cropped.shape == (2, 2, 3)
+    np.testing.assert_array_equal(cropped, src[1:3, 2:4, :])
+
+    padded = crop_weight_image_rgb(src[:2, :2, :], target_width=4, target_height=4)
+    assert padded.shape == (4, 4, 3)
+    np.testing.assert_array_equal(padded[1:3, 1:3, :], src[:2, :2, :])
+
+
+def test_viewer_resolves_checkpoint_weight_image_from_disk():
+    viewer = _TransformerStatusOpenGLViewer(enabled=False, image_hw=(8, 8), graph_h=0)
+    viewer._loss_store = SimpleNamespace(
+        channel_keys=lambda: ["loss"],
+        channel_length=lambda _ck: 5,
+    )
+    viewer._loss_count_at_snap_deque.append({"loss": 5})
+    viewer.set_active_weight_model("generator")
+
+    with TemporaryDirectory() as tmp_dir:
+        root = checkpoint_thumbnail_root(tmp_dir)
+        rgb = np.full(viewer._weight_map_target_hw() + (3,), 96, dtype=np.uint8)
+        save_checkpoint_thumbnail(
+            checkpoint_thumbnail_path(
+                root,
+                round_id=3,
+                cycle=2,
+                model_name="generator",
+                generation=1,
+                architecture_version=7,
+            ),
+            rgb,
+        )
+        viewer.set_checkpoint_backup_dir(tmp_dir)
+        viewer.notify_pipeline_checkpoint_saved(
+            round_id=3,
+            cycle=2,
+            weight_model="generator",
+            weight_generation=1,
+            weight_architecture_version=7,
+        )
+        viewer._scrub_offset = 1
+        marker = viewer._checkpoint_marker_for_offset(1)
+        resolved = viewer._resolve_checkpoint_weight_rgb(marker, model_name="generator")
+
+    assert resolved is not None
+    assert resolved.shape == viewer._weight_map_target_hw() + (3,)
+    assert int(resolved[0, 0, 0]) == 96
+
+
+def test_viewer_tracks_weight_registry_and_active_tab():
+    viewer = _TransformerStatusOpenGLViewer(enabled=False, image_hw=(8, 8), graph_h=0)
+
+    viewer._on_sr_response(
         {
-            "round_id": 7,
-            "cycle": 2,
-            "classifier_state": {
-                "fc.weight": torch.tensor([[0.1, -0.2], [0.3, 0.4]], dtype=torch.float32),
-                "fc.bias": torch.tensor([0.01, -0.02], dtype=torch.float32),
-            },
-        },
-        ckpt_path,
+            "type": "resp_weight_registry",
+            "models": [
+                {"model": "generator"},
+                {"model": "discriminator"},
+            ],
+            "active_model": "generator",
+        }
     )
 
-    viewer.register_checkpoint_thumbnail(
-        7,
-        2,
-        checkpoint_path=str(ckpt_path),
-        model_name="classifier",
-    )
+    assert viewer._weight_model_order == ["generator", "discriminator"]
+    assert viewer._active_weight_model_name == "generator"
 
-    placeholder = viewer._load_checkpoint_thumbnail(0)
-    assert placeholder is not None
+    viewer.set_active_weight_model("discriminator")
 
-    thumb_path = None
-    for _ in range(60):
-        viewer._drain_checkpoint_thumbnail_results()
-        thumb_path = viewer._checkpoint_thumbs[0].get("thumb_path")
-        if thumb_path and Path(thumb_path).exists():
-            break
-        time.sleep(0.05)
-
-    assert thumb_path is not None
-    assert Path(thumb_path).exists()
-
-    rgb = viewer._load_checkpoint_thumbnail(0)
-    assert rgb is not None
-    assert rgb.shape == (2 * viewer.panel_h + viewer.graph_total_h, viewer.panel_w, 3)
-
-
-def test_viewer_replaces_legacy_checkpoint_thumbnail_with_architectural_render(tmp_path):
-    viewer = _TransformerStatusOpenGLViewer(enabled=False, image_hw=(8, 8), graph_h=10)
-    viewer._active_weight_model_name = "classifier"
-
-    ckpt_path = tmp_path / "pipeline_checkpoint.pt"
-    thumb_path = tmp_path / "weight_thumb_r000007_c0002.png"
-    torch.save(
-        {
-            "round_id": 7,
-            "cycle": 2,
-            "classifier_state": {
-                "fc.weight": torch.tensor([[0.1, -0.2], [0.3, 0.4]], dtype=torch.float32),
-                "fc.bias": torch.tensor([0.01, -0.02], dtype=torch.float32),
-            },
-        },
-        ckpt_path,
-    )
-    Image.fromarray(np.full((16, 16, 3), 200, dtype=np.uint8), mode="RGB").save(thumb_path, format="PNG")
-    thumb_path.with_suffix(".json").write_text(
-        '{"model":"classifier","mode":"parameter_groups","width":16,"height":16}',
-        encoding="utf-8",
-    )
-
-    viewer.register_checkpoint_thumbnail(
-        7,
-        2,
-        thumb_path=str(thumb_path),
-        checkpoint_path=str(ckpt_path),
-        model_name="classifier",
-    )
-
-    placeholder = viewer._load_checkpoint_thumbnail(0)
-    assert placeholder is not None
-
-    refreshed = None
-    for _ in range(60):
-        viewer._drain_checkpoint_thumbnail_results()
-        sidecar = json.loads(thumb_path.with_suffix(".json").read_text(encoding="utf-8"))
-        if str(sidecar.get("mode")) == "architectural_tall":
-            refreshed = viewer._load_checkpoint_thumbnail(0)
-            break
-        time.sleep(0.05)
-
-    assert refreshed is not None
-    assert refreshed.shape == (2 * viewer.panel_h + viewer.graph_total_h, viewer.panel_w, 3)
+    assert viewer._resolved_active_weight_model_name() == "discriminator"
+    assert viewer._weight_snapshot_deque is viewer._weight_snapshot_deques_by_model["discriminator"]

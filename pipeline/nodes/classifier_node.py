@@ -52,6 +52,7 @@ from pipeline.nodes.base import (
     IRTensorPortSpec,
     autocast_context,
     freeze,
+    make_runtime_weight_publish_callback,
     make_grad_scaler,
     module_device,
     resolve_amp_dtype,
@@ -360,6 +361,12 @@ class PregestationTrainNode(IRTrainingNode):
     def execute(self, ctx: PipelineContext) -> None:
         from pipeline.nodes.base import make_training_progress_callback
         preview_callback = make_classifier_step_preview_callback(ctx, self.node_id)
+        weight_update_callback = make_runtime_weight_publish_callback(
+            ctx,
+            model_name="classifier",
+            model=ctx.classifier,
+            node_id=self.node_id,
+        )
         result = _run_classifier_refresh_epochs(
             classifier=ctx.classifier,
             optimizer=ctx.classifier_optimizer,
@@ -383,6 +390,7 @@ class PregestationTrainNode(IRTrainingNode):
                 publish_loss=(preview_callback is None),
             ),
             stop_requested=ctx.stop_requested,
+            weight_update_callback=weight_update_callback,
             args=ctx.args,
         )
 
@@ -469,6 +477,12 @@ class GestationTrainNode(IRTrainingNode):
     def execute(self, ctx: PipelineContext) -> None:
         from pipeline.nodes.base import make_training_progress_callback
         preview_callback = make_classifier_step_preview_callback(ctx, self.node_id)
+        weight_update_callback = make_runtime_weight_publish_callback(
+            ctx,
+            model_name="classifier",
+            model=ctx.classifier,
+            node_id=self.node_id,
+        )
         result = _run_classifier_refresh_epochs(
             classifier=ctx.classifier,
             optimizer=ctx.classifier_optimizer,
@@ -492,6 +506,7 @@ class GestationTrainNode(IRTrainingNode):
                 publish_loss=(preview_callback is None),
             ),
             stop_requested=ctx.stop_requested,
+            weight_update_callback=weight_update_callback,
             args=ctx.args,
         )
 
@@ -577,6 +592,12 @@ class BerkeleyRefreshTrainNode(IRTrainingNode):
     def execute(self, ctx: PipelineContext) -> None:
         from pipeline.nodes.base import make_training_progress_callback
         preview_callback = make_classifier_step_preview_callback(ctx, self.node_id)
+        weight_update_callback = make_runtime_weight_publish_callback(
+            ctx,
+            model_name="classifier",
+            model=ctx.classifier,
+            node_id=self.node_id,
+        )
         result = _run_classifier_refresh_epochs(
             classifier=ctx.classifier,
             optimizer=ctx.classifier_optimizer,
@@ -600,6 +621,7 @@ class BerkeleyRefreshTrainNode(IRTrainingNode):
                 publish_loss=(preview_callback is None),
             ),
             stop_requested=ctx.stop_requested,
+            weight_update_callback=weight_update_callback,
             args=ctx.args,
         )
 
@@ -702,6 +724,12 @@ class LoRARoundNode(IRTrainingNode):
 
         # Cycle through churn-group terms with dedicated LoRA slots
         churn_terms = ctx.active_extra_terms[: self.cfg.lora_churn_slots]
+        weight_update_callback = make_runtime_weight_publish_callback(
+            ctx,
+            model_name="classifier",
+            model=ctx.classifier,
+            node_id=self.node_id,
+        )
         for term in churn_terms:
             slot_name = _term_to_slot_name(term)
             ensure_tiny_classifier_lora_slot(
@@ -727,6 +755,7 @@ class LoRARoundNode(IRTrainingNode):
                     grad_scaler=ctx.classifier_grad_scaler,
                     channels_last=self.cfg.channels_last,
                     stage_label=f"stageC_lora_{slot_name}",
+                    weight_update_callback=weight_update_callback,
                     args=ctx.args,
                 )
 
@@ -828,6 +857,12 @@ class FakeClassFeedbackNode(IRTrainingNode):
         )
 
     def execute(self, ctx: PipelineContext) -> None:
+        weight_update_callback = make_runtime_weight_publish_callback(
+            ctx,
+            model_name="classifier",
+            model=ctx.classifier,
+            node_id=self.node_id,
+        )
 
         _run_fake_class_refresh_epochs(
             classifier=ctx.classifier,
@@ -842,6 +877,7 @@ class FakeClassFeedbackNode(IRTrainingNode):
             amp_dtype=ctx.amp_dtype,
             grad_scaler=ctx.classifier_grad_scaler,
             class_names=ctx.class_names,
+            weight_update_callback=weight_update_callback,
             args=ctx.args,
         )
         _log("[fake-class] feedback epoch complete")
@@ -1053,6 +1089,7 @@ def _run_classifier_refresh_epochs(
     step_preview_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
     progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
     stop_requested: Optional[Callable[[], bool]] = None,
+    weight_update_callback: Optional[Callable[[int], None]] = None,
     grad_clip: float = 1.0,
     semantic_soft_target_max: float = 0.0,
     semantic_cosine_weight: float = CLASSIFIER_SEMANTIC_COSINE_WEIGHT,
@@ -1124,6 +1161,7 @@ def _run_classifier_refresh_epochs(
     total_target_steps = max(1, int(epochs) * steps_per_epoch)
     global_step = 0
     stop_now = False
+    optimizer_step_count = 0
     logged_refresh_microbatch_cap = -1
     try:
         for _ in range(int(epochs)):
@@ -1327,6 +1365,12 @@ def _run_classifier_refresh_epochs(
                         scaler.update()
                     else:
                         opt.step()
+                    optimizer_step_count += 1
+                    if weight_update_callback is not None:
+                        try:
+                            weight_update_callback(int(optimizer_step_count))
+                        except Exception:
+                            pass
                     opt.zero_grad(set_to_none=True)
                 total_loss += float(step_loss_value)
                 n += int(step_seen)
@@ -1445,6 +1489,7 @@ def _run_fake_class_refresh_epochs(
     balance_disc_groups: bool = True,
     step_preview_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
     stop_requested: Optional[Callable[[], bool]] = None,
+    weight_update_callback: Optional[Callable[[int], None]] = None,
     seed: int = 0,
     grad_clip: float = 1.0,
 ):
@@ -1541,6 +1586,7 @@ def _run_fake_class_refresh_epochs(
     total_target_steps = int(max(1, int(epochs)) * int(n_steps))
     t_start = time.time()
     stop_now = False
+    optimizer_step_count = 0
     opt.zero_grad(set_to_none=True)
     for _ in range(int(max(1, int(epochs)))):
         for step_idx in range(1, int(n_steps) + 1):
@@ -1636,6 +1682,12 @@ def _run_fake_class_refresh_epochs(
                     scaler.update()
                 else:
                     opt.step()
+                optimizer_step_count += 1
+                if weight_update_callback is not None:
+                    try:
+                        weight_update_callback(int(optimizer_step_count))
+                    except Exception:
+                        pass
                 opt.zero_grad(set_to_none=True)
 
             total_loss += float(loss.item()) * int(xb.shape[0])

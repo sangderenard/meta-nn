@@ -3,7 +3,6 @@ import multiprocessing.connection as _mp_connection
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from pipeline.nodus_loss_store import SCRUB_FLAG_HAS_THUMBS
 from pipeline.plan_protocol import (
     MESSAGE_TYPE_RUN_CONTROL,
     RunControlPayload,
@@ -143,15 +142,9 @@ def test_viewer_ipc_proxy_auto_reconnects_after_disconnect():
     assert calls == [(("localhost", 61999), "AF_INET", b"nodus_viewer_v1")]
 
 
-def test_viewer_ipc_proxy_pushes_weight_tiles_into_scrub_ring():
-    class _FakeSaveRestore:
-        def current_weight_thumb_tiles(self):
-            tile = np.full((64, 64, 3), 12, dtype=np.uint8)
-            return {"model": "classifier", "tiles": (tile, tile.copy(), tile.copy())}
-
+def test_viewer_ipc_proxy_does_not_push_weight_tiles_into_scrub_ring():
     proxy = _make_proxy()
     proxy._scrub_ring = _RecordingRing()
-    proxy.set_save_restore_node(_FakeSaveRestore())
 
     proxy.enqueue_frame(
         {
@@ -168,7 +161,65 @@ def test_viewer_ipc_proxy_pushes_weight_tiles_into_scrub_ring():
 
     assert len(proxy._scrub_ring.calls) == 1
     call = proxy._scrub_ring.calls[0]
-    assert int(call["flags"]) & int(SCRUB_FLAG_HAS_THUMBS)
-    assert call["thumb0"] is not None
-    assert call["thumb1"] is not None
-    assert call["thumb2"] is not None
+    assert call["thumb0"] is None
+    assert call["thumb1"] is None
+    assert call["thumb2"] is None
+
+
+def test_viewer_ipc_proxy_syncs_weight_image_spec_from_status():
+    class _FakeSaveRestore:
+        def __init__(self):
+            self.calls = []
+
+        def configure_runtime_weight_image(self, *, mode, target_width, target_height):
+            self.calls.append((int(mode), int(target_width), int(target_height)))
+            return None
+
+    proxy = _make_proxy()
+    fake_sr = _FakeSaveRestore()
+    proxy.set_save_restore_node(fake_sr)
+    proxy._conn = _QueuedConn(
+        [
+            {
+                "type": "status",
+                "stop_requested": False,
+                "paused": False,
+                "gate_override": False,
+                "preview_enabled": True,
+                "scrub_editor_enabled": True,
+                "cycle_selected": [True, True],
+                "weight_image_mode": 1,
+                "weight_panel_crop_w": 123,
+                "weight_panel_crop_h": 234,
+            }
+        ]
+    )
+
+    spec = proxy.weight_image_spec()
+
+    assert spec == {"mode": 1, "panel_crop_w": 123, "panel_crop_h": 234}
+    assert fake_sr.calls == [(1, 123, 234)]
+
+
+def test_viewer_ipc_proxy_retries_weight_image_spec_until_it_applies():
+    class _FakeSaveRestore:
+        def __init__(self):
+            self.calls = []
+            self.results = [None, object()]
+
+        def configure_runtime_weight_image(self, *, mode, target_width, target_height):
+            self.calls.append((int(mode), int(target_width), int(target_height)))
+            return self.results.pop(0)
+
+    proxy = _make_proxy()
+    proxy._weight_image_mode = 1
+    proxy._weight_panel_crop_w = 123
+    proxy._weight_panel_crop_h = 234
+    fake_sr = _FakeSaveRestore()
+
+    proxy.set_save_restore_node(fake_sr)
+    assert proxy._last_applied_weight_image_spec is None
+
+    proxy._sync_weight_image_spec_to_store()
+    assert proxy._last_applied_weight_image_spec == (1, 123, 234)
+    assert fake_sr.calls == [(1, 123, 234), (1, 123, 234)]

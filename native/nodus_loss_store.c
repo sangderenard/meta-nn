@@ -16,6 +16,7 @@
 #  define NODUS_BUILDING_DLL
 #endif
 #include "nodus_loss_store.h"
+#include "nodus_weight_image.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -36,6 +37,11 @@ static NodusLossStore *g_global;
    static void mutex_destroy(nodus_mutex_t *m) { DeleteCriticalSection(m); }
 #else
 #  include <pthread.h>
+#  include <fcntl.h>
+#  include <sys/mman.h>
+#  include <sys/stat.h>
+#  include <sys/types.h>
+#  include <unistd.h>
    typedef pthread_mutex_t nodus_mutex_t;
 
    static void mutex_init(nodus_mutex_t *m)    { pthread_mutex_init(m, NULL); }
@@ -1669,4 +1675,1619 @@ NODUS_API int32_t nodus_composite_cache_copy_panel(
     uint32_t n = (panel_bytes < buf_size) ? panel_bytes : buf_size;
     memcpy(out_buf, src, n);
     return (int32_t)n;
+}
+
+/* ==================================================================== */
+/*  Weight state store + rendered image cache                           */
+/* ==================================================================== */
+
+#define NODUS_WEIGHT_STATE_INIT_MAGIC    0x57535453u  /* 'WSTS' */
+#define NODUS_WEIGHT_IMAGE_INIT_MAGIC    0x57494D47u  /* 'WIMG' */
+#define NODUS_WEIGHT_BLOB_MAGIC          0x57534231u  /* 'WSB1' */
+#define NODUS_WEIGHT_STATE_MAX_PARAMS    4096
+
+#define NODUS_WEIGHT_STATE_SHM_NAME      "NodusWeightStateStore_v3"
+#define NODUS_WEIGHT_STATE_MTX_NAME      "NodusWeightStateStoreMutex_v3"
+#define NODUS_WEIGHT_IMAGE_SHM_NAME      "NodusWeightImageStore_v3"
+#define NODUS_WEIGHT_IMAGE_MTX_NAME      "NodusWeightImageStoreMutex_v3"
+
+typedef struct NodusMappedBlobHandle {
+#ifdef _WIN32
+    HANDLE   mapping;
+#else
+    int      fd;
+#endif
+    void    *ptr;
+    uint64_t size;
+    char     name[NODUS_WEIGHT_STORE_BLOB_NAME_MAX];
+} NodusMappedBlobHandle;
+
+typedef struct NodusWeightStateBlobHeader {
+    uint32_t magic;
+    uint32_t entry_count;
+    uint64_t publish_seq;
+    uint64_t generation;
+    uint64_t architecture_version;
+    int32_t  round_id;
+    int32_t  cycle;
+    int32_t  step;
+    char     model_name[NODUS_WEIGHT_STORE_NAME_MAX];
+    char     node_id[NODUS_WEIGHT_STORE_NAME_MAX];
+} NodusWeightStateBlobHeader;
+
+typedef struct NodusWeightStateBlobEntry {
+    uint64_t data_offset;
+    uint64_t numel;
+    uint32_t shape0;
+    uint32_t name_offset;
+    uint32_t name_len;
+    uint32_t reserved;
+} NodusWeightStateBlobEntry;
+
+typedef struct NodusWeightImageEntry {
+    uint64_t image_seq;
+    uint64_t state_publish_seq;
+    uint64_t generation;
+    uint64_t architecture_version;
+    uint64_t byte_count;
+    int32_t  round_id;
+    int32_t  cycle;
+    int32_t  step;
+    int32_t  w;
+    int32_t  h;
+    int32_t  c;
+    int32_t  stride_bytes;
+    int32_t  mode;
+    int32_t  target_w;
+    int32_t  target_h;
+    uint32_t flags;
+    char     model_name[NODUS_WEIGHT_STORE_NAME_MAX];
+    char     node_id[NODUS_WEIGHT_STORE_NAME_MAX];
+    char     blob_name[NODUS_WEIGHT_STORE_BLOB_NAME_MAX];
+} NodusWeightImageEntry;
+
+typedef struct NodusWeightImageActiveConfig {
+    uint64_t state_publish_seq;
+    uint64_t generation;
+    uint64_t architecture_version;
+    int32_t  round_id;
+    int32_t  cycle;
+    int32_t  step;
+    int32_t  mode;
+    int32_t  target_w;
+    int32_t  target_h;
+    int32_t  render_w;
+    int32_t  render_h;
+    int32_t  render_c;
+    int32_t  render_stride_bytes;
+    char     model_name[NODUS_WEIGHT_STORE_NAME_MAX];
+    char     node_id[NODUS_WEIGHT_STORE_NAME_MAX];
+} NodusWeightImageActiveConfig;
+
+typedef struct NodusWeightStateEntry {
+    uint64_t publish_seq;
+    uint64_t generation;
+    uint64_t architecture_version;
+    uint64_t blob_epoch;
+    uint64_t blob_bytes;
+    int32_t  round_id;
+    int32_t  cycle;
+    int32_t  step;
+    int32_t  param_count;
+    char     model_name[NODUS_WEIGHT_STORE_NAME_MAX];
+    char     node_id[NODUS_WEIGHT_STORE_NAME_MAX];
+    char     blob_name[NODUS_WEIGHT_STORE_BLOB_NAME_MAX];
+} NodusWeightStateEntry;
+
+struct NodusWeightStateStore {
+    nodus_mutex_t        lock;
+    uint32_t             initialized;
+    int32_t              entry_count;
+    uint64_t             next_publish_seq;
+    uint64_t             next_blob_epoch;
+    NodusWeightStateEntry entries[NODUS_WEIGHT_STATE_REGISTRY_CAPACITY];
+};
+
+struct NodusWeightImageStore {
+    nodus_mutex_t         lock;
+    uint32_t              initialized;
+    int32_t               max_entries;
+    int32_t               entry_count;
+    uint64_t              max_total_bytes;
+    uint64_t              total_bytes;
+    uint64_t              next_image_seq;
+    NodusWeightImageActiveConfig active_config;
+    NodusWeightImageEntry entries[NODUS_WEIGHT_IMAGE_CACHE_CAPACITY];
+};
+
+static NodusWeightStateStore *g_weight_state_global = NULL;
+static NodusWeightImageStore *g_weight_image_global = NULL;
+#ifdef _WIN32
+static HANDLE g_weight_state_shm_mutex = NULL;
+static HANDLE g_weight_image_shm_mutex = NULL;
+#endif
+static NodusMappedBlobHandle g_weight_state_entry_blobs[NODUS_WEIGHT_STATE_REGISTRY_CAPACITY] = {0};
+static NodusMappedBlobHandle g_weight_image_slot_blobs[NODUS_WEIGHT_IMAGE_CACHE_CAPACITY] = {0};
+
+static void copy_cstr_trunc(char *dst, size_t cap, const char *src) {
+    size_t i = 0;
+    if (!dst || cap == 0) return;
+    if (!src) {
+        dst[0] = '\0';
+        return;
+    }
+    while (src[i] != '\0' && i + 1 < cap) {
+        dst[i] = src[i];
+        i++;
+    }
+    dst[i] = '\0';
+}
+
+static uint64_t align_u64(uint64_t v, uint64_t a) {
+    if (a <= 1) return v;
+    return (v + (a - 1u)) & ~(a - 1u);
+}
+
+static int copy_out_string(const char *src, char *dst, int dst_len) {
+    if (!dst || dst_len <= 0) return 0;
+    copy_cstr_trunc(dst, (size_t)dst_len, src ? src : "");
+    return 0;
+}
+
+static int format_blob_os_name(char *out, size_t out_cap, const char *name) {
+    if (!out || out_cap == 0 || !name || !name[0]) return -1;
+#ifdef _WIN32
+    copy_cstr_trunc(out, out_cap, name);
+#else
+    if (name[0] == '/') {
+        copy_cstr_trunc(out, out_cap, name);
+    } else {
+        if (snprintf(out, out_cap, "/%s", name) < 0) return -1;
+    }
+#endif
+    return 0;
+}
+
+static void mapped_blob_close(NodusMappedBlobHandle *blob) {
+    if (!blob) return;
+#ifdef _WIN32
+    if (blob->ptr) {
+        UnmapViewOfFile(blob->ptr);
+    }
+    if (blob->mapping) {
+        CloseHandle(blob->mapping);
+    }
+    blob->mapping = NULL;
+#else
+    if (blob->ptr && blob->size > 0) {
+        munmap(blob->ptr, (size_t)blob->size);
+    }
+    if (blob->name[0] != '\0' && blob->fd >= 0) {
+        close(blob->fd);
+    }
+    blob->fd = -1;
+#endif
+    blob->ptr = NULL;
+    blob->size = 0;
+    blob->name[0] = '\0';
+}
+
+static int mapped_blob_create_rw(NodusMappedBlobHandle *blob, const char *name, uint64_t size) {
+    char os_name[NODUS_WEIGHT_STORE_BLOB_NAME_MAX + 8];
+    if (!blob || !name || size == 0) return -1;
+    memset(blob, 0, sizeof(*blob));
+#ifndef _WIN32
+    blob->fd = -1;
+#endif
+    if (format_blob_os_name(os_name, sizeof(os_name), name) != 0) return -1;
+#ifdef _WIN32
+    {
+        DWORD size_lo = (DWORD)(size & 0xffffffffu);
+        DWORD size_hi = (DWORD)((size >> 32u) & 0xffffffffu);
+        HANDLE mapping = CreateFileMappingA(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE, size_hi, size_lo, os_name);
+        if (!mapping) return -1;
+        void *ptr = MapViewOfFile(mapping, FILE_MAP_ALL_ACCESS, 0, 0, (SIZE_T)size);
+        if (!ptr) {
+            CloseHandle(mapping);
+            return -1;
+        }
+        blob->mapping = mapping;
+        blob->ptr = ptr;
+    }
+#else
+    {
+        int fd = shm_open(os_name, O_CREAT | O_RDWR, 0600);
+        if (fd < 0) return -1;
+        if (ftruncate(fd, (off_t)size) != 0) {
+            close(fd);
+            return -1;
+        }
+        void *ptr = mmap(NULL, (size_t)size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+        if (ptr == MAP_FAILED) {
+            close(fd);
+            return -1;
+        }
+        blob->fd = fd;
+        blob->ptr = ptr;
+    }
+#endif
+    blob->size = size;
+    copy_cstr_trunc(blob->name, sizeof(blob->name), name);
+    return 0;
+}
+
+static int mapped_blob_open_ro(NodusMappedBlobHandle *blob, const char *name, uint64_t size_hint) {
+    char os_name[NODUS_WEIGHT_STORE_BLOB_NAME_MAX + 8];
+    if (!blob || !name || !name[0]) return -1;
+    memset(blob, 0, sizeof(*blob));
+#ifndef _WIN32
+    blob->fd = -1;
+#endif
+    if (format_blob_os_name(os_name, sizeof(os_name), name) != 0) return -1;
+#ifdef _WIN32
+    {
+        HANDLE mapping = OpenFileMappingA(FILE_MAP_READ, FALSE, os_name);
+        if (!mapping) return -1;
+        void *ptr = MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, (SIZE_T)size_hint);
+        if (!ptr) {
+            CloseHandle(mapping);
+            return -1;
+        }
+        blob->mapping = mapping;
+        blob->ptr = ptr;
+    }
+#else
+    {
+        int fd = shm_open(os_name, O_RDONLY, 0600);
+        if (fd < 0) return -1;
+        void *ptr = mmap(NULL, (size_t)size_hint, PROT_READ, MAP_SHARED, fd, 0);
+        if (ptr == MAP_FAILED) {
+            close(fd);
+            return -1;
+        }
+        blob->fd = fd;
+        blob->ptr = ptr;
+    }
+#endif
+    blob->size = size_hint;
+    copy_cstr_trunc(blob->name, sizeof(blob->name), name);
+    return 0;
+}
+
+static void weight_state_store_init(NodusWeightStateStore *store, int cross_process) {
+#ifdef _WIN32
+    (void)cross_process;
+    mutex_init(&store->lock);
+#else
+    if (cross_process) mutex_init_shared(&store->lock);
+    else mutex_init(&store->lock);
+#endif
+    store->initialized = NODUS_WEIGHT_STATE_INIT_MAGIC;
+    store->entry_count = 0;
+    store->next_publish_seq = 0u;
+    store->next_blob_epoch = 0u;
+    memset(store->entries, 0, sizeof(store->entries));
+}
+
+static void weight_image_store_init(NodusWeightImageStore *store, int cross_process) {
+    int i;
+#ifdef _WIN32
+    (void)cross_process;
+    mutex_init(&store->lock);
+#else
+    if (cross_process) mutex_init_shared(&store->lock);
+    else mutex_init(&store->lock);
+#endif
+    store->initialized = NODUS_WEIGHT_IMAGE_INIT_MAGIC;
+    store->max_entries = NODUS_WEIGHT_IMAGE_CACHE_CAPACITY;
+    store->entry_count = 0;
+    store->max_total_bytes = NODUS_WEIGHT_IMAGE_DEFAULT_MAX_BYTES;
+    store->total_bytes = 0u;
+    store->next_image_seq = 0;
+    memset(&store->active_config, 0, sizeof(store->active_config));
+    for (i = 0; i < NODUS_WEIGHT_IMAGE_CACHE_CAPACITY; i++) {
+        memset(&store->entries[i], 0, sizeof(store->entries[i]));
+    }
+}
+
+#ifdef _WIN32
+static void weight_state_store_lock(NodusWeightStateStore *store) {
+    if (store == g_weight_state_global && g_weight_state_shm_mutex)
+        WaitForSingleObject(g_weight_state_shm_mutex, INFINITE);
+    else
+        EnterCriticalSection(&store->lock);
+}
+static void weight_state_store_unlock(NodusWeightStateStore *store) {
+    if (store == g_weight_state_global && g_weight_state_shm_mutex)
+        ReleaseMutex(g_weight_state_shm_mutex);
+    else
+        LeaveCriticalSection(&store->lock);
+}
+static void weight_image_store_lock(NodusWeightImageStore *store) {
+    if (store == g_weight_image_global && g_weight_image_shm_mutex)
+        WaitForSingleObject(g_weight_image_shm_mutex, INFINITE);
+    else
+        EnterCriticalSection(&store->lock);
+}
+static void weight_image_store_unlock(NodusWeightImageStore *store) {
+    if (store == g_weight_image_global && g_weight_image_shm_mutex)
+        ReleaseMutex(g_weight_image_shm_mutex);
+    else
+        LeaveCriticalSection(&store->lock);
+}
+#else
+static void weight_state_store_lock(NodusWeightStateStore *store)   { pthread_mutex_lock(&store->lock); }
+static void weight_state_store_unlock(NodusWeightStateStore *store) { pthread_mutex_unlock(&store->lock); }
+static void weight_image_store_lock(NodusWeightImageStore *store)   { pthread_mutex_lock(&store->lock); }
+static void weight_image_store_unlock(NodusWeightImageStore *store) { pthread_mutex_unlock(&store->lock); }
+#endif
+
+static void weight_image_store_zero_entry(NodusWeightImageEntry *entry) {
+    if (!entry) return;
+    memset(entry, 0, sizeof(*entry));
+}
+
+static void mapped_blob_zero(NodusMappedBlobHandle *blob) {
+    if (!blob) return;
+    memset(blob, 0, sizeof(*blob));
+#ifndef _WIN32
+    blob->fd = -1;
+#endif
+}
+
+static void weight_state_store_zero_entry(NodusWeightStateEntry *entry) {
+    if (!entry) return;
+    memset(entry, 0, sizeof(*entry));
+}
+
+static int weight_state_store_find_locked(
+        const NodusWeightStateStore *store,
+        const char *model_name,
+        const char *node_id)
+{
+    int i;
+    if (!store) return -1;
+    for (i = 0; i < store->entry_count; i++) {
+        if (strcmp(store->entries[i].model_name, model_name ? model_name : "") != 0) continue;
+        if (strcmp(store->entries[i].node_id, node_id ? node_id : "") != 0) continue;
+        return i;
+    }
+    return -1;
+}
+
+static void weight_state_store_remove_locked(NodusWeightStateStore *store, int logical_index) {
+    int move_count;
+    if (!store || logical_index < 0 || logical_index >= store->entry_count) return;
+    mapped_blob_close(&g_weight_state_entry_blobs[logical_index]);
+    move_count = store->entry_count - logical_index - 1;
+    if (move_count > 0) {
+        memmove(&store->entries[logical_index],
+                &store->entries[logical_index + 1],
+                (size_t)move_count * sizeof(store->entries[0]));
+        memmove(&g_weight_state_entry_blobs[logical_index],
+                &g_weight_state_entry_blobs[logical_index + 1],
+                (size_t)move_count * sizeof(g_weight_state_entry_blobs[0]));
+    }
+    weight_state_store_zero_entry(&store->entries[store->entry_count - 1]);
+    mapped_blob_zero(&g_weight_state_entry_blobs[store->entry_count - 1]);
+    store->entry_count--;
+}
+
+static int weight_state_store_copy_entry_locked(
+        const NodusWeightStateStore *store,
+        int index,
+        uint64_t *out_publish_seq,
+        uint64_t *out_generation,
+        uint64_t *out_architecture_version,
+        int32_t *out_round_id,
+        int32_t *out_cycle,
+        int32_t *out_step,
+        int32_t *out_param_count,
+        uint64_t *out_blob_bytes,
+        char *out_model_name,
+        int out_model_name_buflen,
+        char *out_node_id,
+        int out_node_id_buflen,
+        char *out_blob_name,
+        int out_blob_name_buflen)
+{
+    const NodusWeightStateEntry *entry;
+    if (!store || index < 0 || index >= store->entry_count) return -1;
+    entry = &store->entries[index];
+    if (entry->publish_seq == 0u || entry->blob_name[0] == '\0') return -1;
+    if (out_publish_seq) *out_publish_seq = entry->publish_seq;
+    if (out_generation) *out_generation = entry->generation;
+    if (out_architecture_version) *out_architecture_version = entry->architecture_version;
+    if (out_round_id) *out_round_id = entry->round_id;
+    if (out_cycle) *out_cycle = entry->cycle;
+    if (out_step) *out_step = entry->step;
+    if (out_param_count) *out_param_count = entry->param_count;
+    if (out_blob_bytes) *out_blob_bytes = entry->blob_bytes;
+    copy_out_string(entry->model_name, out_model_name, out_model_name_buflen);
+    copy_out_string(entry->node_id, out_node_id, out_node_id_buflen);
+    copy_out_string(entry->blob_name, out_blob_name, out_blob_name_buflen);
+    return 0;
+}
+
+static void weight_image_store_remove_locked(NodusWeightImageStore *store, int logical_index) {
+    int move_count;
+    if (!store || logical_index < 0 || logical_index >= store->entry_count) return;
+    if (store->entries[logical_index].byte_count <= store->total_bytes) {
+        store->total_bytes -= store->entries[logical_index].byte_count;
+    } else {
+        store->total_bytes = 0u;
+    }
+    mapped_blob_close(&g_weight_image_slot_blobs[logical_index]);
+    move_count = store->entry_count - logical_index - 1;
+    if (move_count > 0) {
+        memmove(&store->entries[logical_index],
+                &store->entries[logical_index + 1],
+                (size_t)move_count * sizeof(store->entries[0]));
+        memmove(&g_weight_image_slot_blobs[logical_index],
+                &g_weight_image_slot_blobs[logical_index + 1],
+                (size_t)move_count * sizeof(g_weight_image_slot_blobs[0]));
+    }
+    weight_image_store_zero_entry(&store->entries[store->entry_count - 1]);
+    mapped_blob_zero(&g_weight_image_slot_blobs[store->entry_count - 1]);
+    store->entry_count--;
+}
+
+static void weight_image_store_clear_locked(NodusWeightImageStore *store) {
+    if (!store) return;
+    while (store->entry_count > 0) {
+        weight_image_store_remove_locked(store, 0);
+    }
+}
+
+static int weight_image_store_choose_evict_locked(const NodusWeightImageStore *store) {
+    int i;
+    if (!store || store->entry_count <= 0) return -1;
+    for (i = 0; i < store->entry_count; i++) {
+        if ((store->entries[i].flags & NODUS_WEIGHT_IMAGE_FLAG_CHECKPOINT) == 0u) {
+            return i;
+        }
+    }
+    return 0;
+}
+
+static void weight_image_store_trim_locked(NodusWeightImageStore *store) {
+    if (!store) return;
+    while (store->entry_count > store->max_entries
+            || (store->entry_count > 1
+                && store->max_total_bytes > 0u
+                && store->total_bytes > store->max_total_bytes)) {
+        int evict_index = weight_image_store_choose_evict_locked(store);
+        if (evict_index < 0) break;
+        weight_image_store_remove_locked(store, evict_index);
+    }
+}
+
+NODUS_API NodusWeightStateStore* nodus_weight_state_store_get_global(void) {
+    if (g_weight_state_global) return g_weight_state_global;
+#ifdef _WIN32
+    {
+        HANDLE shm = NULL;
+        int created = 0;
+        g_weight_state_shm_mutex = CreateMutexA(NULL, FALSE, NODUS_WEIGHT_STATE_MTX_NAME);
+        if (!g_weight_state_shm_mutex) {
+            fprintf(stderr, "[nodus] FATAL: CreateMutexA weight state failed (%lu)\n", (unsigned long)GetLastError());
+            abort();
+        }
+        shm = CreateFileMappingA(
+            INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE, 0,
+            (DWORD)sizeof(NodusWeightStateStore),
+            NODUS_WEIGHT_STATE_SHM_NAME
+        );
+        if (!shm) {
+            fprintf(stderr, "[nodus] FATAL: CreateFileMappingA weight state failed (%lu)\n", (unsigned long)GetLastError());
+            abort();
+        }
+        created = (GetLastError() != ERROR_ALREADY_EXISTS);
+        g_weight_state_global = (NodusWeightStateStore*)MapViewOfFile(shm, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(NodusWeightStateStore));
+        if (!g_weight_state_global) {
+            fprintf(stderr, "[nodus] FATAL: MapViewOfFile weight state failed (%lu)\n", (unsigned long)GetLastError());
+            abort();
+        }
+        if (created || g_weight_state_global->initialized != NODUS_WEIGHT_STATE_INIT_MAGIC) {
+            memset(g_weight_state_global, 0, sizeof(NodusWeightStateStore));
+            weight_state_store_init(g_weight_state_global, 1);
+        }
+    }
+#else
+    {
+        int fd = shm_open("/" NODUS_WEIGHT_STATE_SHM_NAME, O_CREAT | O_RDWR, 0600);
+        if (fd < 0) {
+            perror("[nodus] FATAL: shm_open weight state");
+            abort();
+        }
+        if (ftruncate(fd, (off_t)sizeof(NodusWeightStateStore)) != 0) {
+            perror("[nodus] FATAL: ftruncate weight state");
+            abort();
+        }
+        g_weight_state_global = (NodusWeightStateStore*)mmap(NULL, sizeof(NodusWeightStateStore), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+        if (g_weight_state_global == MAP_FAILED) {
+            perror("[nodus] FATAL: mmap weight state");
+            abort();
+        }
+        close(fd);
+        if (g_weight_state_global->initialized != NODUS_WEIGHT_STATE_INIT_MAGIC) {
+            memset(g_weight_state_global, 0, sizeof(NodusWeightStateStore));
+            weight_state_store_init(g_weight_state_global, 1);
+        }
+    }
+#endif
+    return g_weight_state_global;
+}
+
+NODUS_API NodusWeightImageStore* nodus_weight_image_store_get_global(void) {
+    if (g_weight_image_global) return g_weight_image_global;
+#ifdef _WIN32
+    {
+        HANDLE shm = NULL;
+        int created = 0;
+        g_weight_image_shm_mutex = CreateMutexA(NULL, FALSE, NODUS_WEIGHT_IMAGE_MTX_NAME);
+        if (!g_weight_image_shm_mutex) {
+            fprintf(stderr, "[nodus] FATAL: CreateMutexA weight image failed (%lu)\n", (unsigned long)GetLastError());
+            abort();
+        }
+        shm = CreateFileMappingA(
+            INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE, 0,
+            (DWORD)sizeof(NodusWeightImageStore),
+            NODUS_WEIGHT_IMAGE_SHM_NAME
+        );
+        if (!shm) {
+            fprintf(stderr, "[nodus] FATAL: CreateFileMappingA weight image failed (%lu)\n", (unsigned long)GetLastError());
+            abort();
+        }
+        created = (GetLastError() != ERROR_ALREADY_EXISTS);
+        g_weight_image_global = (NodusWeightImageStore*)MapViewOfFile(shm, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(NodusWeightImageStore));
+        if (!g_weight_image_global) {
+            fprintf(stderr, "[nodus] FATAL: MapViewOfFile weight image failed (%lu)\n", (unsigned long)GetLastError());
+            abort();
+        }
+        if (created || g_weight_image_global->initialized != NODUS_WEIGHT_IMAGE_INIT_MAGIC) {
+            memset(g_weight_image_global, 0, sizeof(NodusWeightImageStore));
+            weight_image_store_init(g_weight_image_global, 1);
+        }
+    }
+#else
+    {
+        int fd = shm_open("/" NODUS_WEIGHT_IMAGE_SHM_NAME, O_CREAT | O_RDWR, 0600);
+        if (fd < 0) {
+            perror("[nodus] FATAL: shm_open weight image");
+            abort();
+        }
+        if (ftruncate(fd, (off_t)sizeof(NodusWeightImageStore)) != 0) {
+            perror("[nodus] FATAL: ftruncate weight image");
+            abort();
+        }
+        g_weight_image_global = (NodusWeightImageStore*)mmap(NULL, sizeof(NodusWeightImageStore), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+        if (g_weight_image_global == MAP_FAILED) {
+            perror("[nodus] FATAL: mmap weight image");
+            abort();
+        }
+        close(fd);
+        if (g_weight_image_global->initialized != NODUS_WEIGHT_IMAGE_INIT_MAGIC) {
+            memset(g_weight_image_global, 0, sizeof(NodusWeightImageStore));
+            weight_image_store_init(g_weight_image_global, 1);
+        }
+    }
+#endif
+    return g_weight_image_global;
+}
+
+NODUS_API int nodus_weight_state_store_publish_flat(
+        NodusWeightStateStore *store,
+        const char *model_name,
+        const char *node_id,
+        int32_t round_id,
+        int32_t cycle,
+        int32_t step,
+        uint64_t generation,
+        uint64_t architecture_version,
+        uint64_t publish_seq,
+        const char *const *param_names,
+        const float *const *param_data,
+        const int32_t *param_numel,
+        const int32_t *param_shape0,
+        int32_t num_params)
+{
+    uint64_t total_size;
+    uint64_t data_off;
+    uint64_t blob_epoch;
+    uint64_t next_publish_seq;
+    int32_t i;
+    int existing_index;
+    NodusMappedBlobHandle blob = {0};
+    NodusWeightStateBlobHeader *hdr = NULL;
+    NodusWeightStateBlobEntry *entries = NULL;
+    char blob_name[NODUS_WEIGHT_STORE_BLOB_NAME_MAX];
+    if (!store || !param_names || !param_data || !param_numel || !param_shape0) return -1;
+    if (num_params <= 0 || num_params > NODUS_WEIGHT_STATE_MAX_PARAMS) return -1;
+
+    total_size = sizeof(NodusWeightStateBlobHeader)
+               + ((uint64_t)num_params * (uint64_t)sizeof(NodusWeightStateBlobEntry));
+    total_size = align_u64(total_size, 8u);
+    for (i = 0; i < num_params; i++) {
+        size_t name_len;
+        if (!param_names[i] || !param_data[i] || param_numel[i] <= 0 || param_shape0[i] <= 0) return -1;
+        name_len = strlen(param_names[i]);
+        total_size += (uint64_t)(name_len + 1u);
+        total_size = align_u64(total_size, 8u);
+        total_size += ((uint64_t)param_numel[i] * (uint64_t)sizeof(float));
+        total_size = align_u64(total_size, 8u);
+    }
+
+    weight_state_store_lock(store);
+    blob_epoch = store->next_blob_epoch + 1u;
+    next_publish_seq = store->next_publish_seq + 1u;
+    if (publish_seq == 0u) publish_seq = next_publish_seq;
+    if (snprintf(blob_name, sizeof(blob_name), "NodusWeightStateBlob_%llu", (unsigned long long)blob_epoch) < 0) {
+        weight_state_store_unlock(store);
+        return -1;
+    }
+    if (mapped_blob_create_rw(&blob, blob_name, total_size) != 0) {
+        weight_state_store_unlock(store);
+        return -1;
+    }
+
+    memset(blob.ptr, 0, (size_t)total_size);
+    hdr = (NodusWeightStateBlobHeader*)blob.ptr;
+    entries = (NodusWeightStateBlobEntry*)((uint8_t*)blob.ptr + sizeof(NodusWeightStateBlobHeader));
+    hdr->magic = NODUS_WEIGHT_BLOB_MAGIC;
+    hdr->entry_count = (uint32_t)num_params;
+    hdr->publish_seq = publish_seq;
+    hdr->generation = generation;
+    hdr->architecture_version = architecture_version;
+    hdr->round_id = round_id;
+    hdr->cycle = cycle;
+    hdr->step = step;
+    copy_cstr_trunc(hdr->model_name, sizeof(hdr->model_name), model_name ? model_name : "");
+    copy_cstr_trunc(hdr->node_id, sizeof(hdr->node_id), node_id ? node_id : "");
+
+    data_off = align_u64(
+        sizeof(NodusWeightStateBlobHeader) + ((uint64_t)num_params * (uint64_t)sizeof(NodusWeightStateBlobEntry)),
+        8u
+    );
+    for (i = 0; i < num_params; i++) {
+        uint64_t name_len = (uint64_t)strlen(param_names[i]);
+        entries[i].name_offset = (uint32_t)data_off;
+        entries[i].name_len = (uint32_t)name_len;
+        memcpy((uint8_t*)blob.ptr + data_off, param_names[i], (size_t)name_len + 1u);
+        data_off += name_len + 1u;
+        data_off = align_u64(data_off, 8u);
+        entries[i].data_offset = data_off;
+        entries[i].numel = (uint64_t)param_numel[i];
+        entries[i].shape0 = (uint32_t)param_shape0[i];
+        memcpy((uint8_t*)blob.ptr + data_off, param_data[i], (size_t)param_numel[i] * sizeof(float));
+        data_off += ((uint64_t)param_numel[i] * (uint64_t)sizeof(float));
+        data_off = align_u64(data_off, 8u);
+    }
+
+    existing_index = weight_state_store_find_locked(store, model_name, node_id);
+    if (existing_index >= 0) {
+        weight_state_store_remove_locked(store, existing_index);
+    } else if (store->entry_count >= NODUS_WEIGHT_STATE_REGISTRY_CAPACITY) {
+        weight_state_store_remove_locked(store, 0);
+    }
+    if (store->entry_count >= NODUS_WEIGHT_STATE_REGISTRY_CAPACITY) {
+        mapped_blob_close(&blob);
+        weight_state_store_unlock(store);
+        return -1;
+    }
+    g_weight_state_entry_blobs[store->entry_count] = blob;
+    weight_state_store_zero_entry(&store->entries[store->entry_count]);
+    store->entries[store->entry_count].publish_seq = publish_seq;
+    store->entries[store->entry_count].generation = generation;
+    store->entries[store->entry_count].architecture_version = architecture_version;
+    store->entries[store->entry_count].blob_epoch = blob_epoch;
+    store->entries[store->entry_count].blob_bytes = total_size;
+    store->entries[store->entry_count].round_id = round_id;
+    store->entries[store->entry_count].cycle = cycle;
+    store->entries[store->entry_count].step = step;
+    store->entries[store->entry_count].param_count = num_params;
+    copy_cstr_trunc(store->entries[store->entry_count].model_name, sizeof(store->entries[store->entry_count].model_name), model_name ? model_name : "");
+    copy_cstr_trunc(store->entries[store->entry_count].node_id, sizeof(store->entries[store->entry_count].node_id), node_id ? node_id : "");
+    copy_cstr_trunc(store->entries[store->entry_count].blob_name, sizeof(store->entries[store->entry_count].blob_name), blob_name);
+    store->entry_count++;
+    store->next_blob_epoch = blob_epoch;
+    if (publish_seq > store->next_publish_seq) {
+        store->next_publish_seq = publish_seq;
+    } else {
+        store->next_publish_seq = next_publish_seq;
+    }
+    weight_state_store_unlock(store);
+    return 0;
+}
+
+NODUS_API int nodus_weight_state_store_get_meta(
+        const NodusWeightStateStore *store,
+        uint64_t *out_publish_seq,
+        uint64_t *out_generation,
+        uint64_t *out_architecture_version,
+        int32_t *out_round_id,
+        int32_t *out_cycle,
+        int32_t *out_step,
+        int32_t *out_param_count,
+        uint64_t *out_blob_bytes,
+        char *out_model_name,
+        int out_model_name_buflen,
+        char *out_node_id,
+        int out_node_id_buflen,
+        char *out_blob_name,
+        int out_blob_name_buflen)
+{
+    NodusWeightStateStore *st = (NodusWeightStateStore*)store;
+    if (!st) return -1;
+    weight_state_store_lock(st);
+    if (st->entry_count <= 0) {
+        weight_state_store_unlock(st);
+        return -1;
+    }
+    if (weight_state_store_copy_entry_locked(
+            st,
+            st->entry_count - 1,
+            out_publish_seq,
+            out_generation,
+            out_architecture_version,
+            out_round_id,
+            out_cycle,
+            out_step,
+            out_param_count,
+            out_blob_bytes,
+            out_model_name,
+            out_model_name_buflen,
+            out_node_id,
+            out_node_id_buflen,
+            out_blob_name,
+            out_blob_name_buflen
+        ) != 0) {
+        weight_state_store_unlock(st);
+        return -1;
+    }
+    weight_state_store_unlock(st);
+    return 0;
+}
+
+NODUS_API int32_t nodus_weight_state_store_count(const NodusWeightStateStore *store) {
+    NodusWeightStateStore *st = (NodusWeightStateStore*)store;
+    int32_t count = 0;
+    if (!st) return 0;
+    weight_state_store_lock(st);
+    count = st->entry_count;
+    weight_state_store_unlock(st);
+    return count;
+}
+
+NODUS_API int nodus_weight_state_store_get_meta_at(
+        const NodusWeightStateStore *store,
+        int32_t index,
+        uint64_t *out_publish_seq,
+        uint64_t *out_generation,
+        uint64_t *out_architecture_version,
+        int32_t *out_round_id,
+        int32_t *out_cycle,
+        int32_t *out_step,
+        int32_t *out_param_count,
+        uint64_t *out_blob_bytes,
+        char *out_model_name,
+        int out_model_name_buflen,
+        char *out_node_id,
+        int out_node_id_buflen,
+        char *out_blob_name,
+        int out_blob_name_buflen)
+{
+    NodusWeightStateStore *st = (NodusWeightStateStore*)store;
+    int rc;
+    if (!st) return -1;
+    weight_state_store_lock(st);
+    rc = weight_state_store_copy_entry_locked(
+        st,
+        (int)index,
+        out_publish_seq,
+        out_generation,
+        out_architecture_version,
+        out_round_id,
+        out_cycle,
+        out_step,
+        out_param_count,
+        out_blob_bytes,
+        out_model_name,
+        out_model_name_buflen,
+        out_node_id,
+        out_node_id_buflen,
+        out_blob_name,
+        out_blob_name_buflen
+    );
+    weight_state_store_unlock(st);
+    return rc;
+}
+
+NODUS_API int nodus_weight_state_store_get_meta_for(
+        const NodusWeightStateStore *store,
+        const char *model_name,
+        const char *node_id,
+        uint64_t *out_publish_seq,
+        uint64_t *out_generation,
+        uint64_t *out_architecture_version,
+        int32_t *out_round_id,
+        int32_t *out_cycle,
+        int32_t *out_step,
+        int32_t *out_param_count,
+        uint64_t *out_blob_bytes,
+        char *out_blob_name,
+        int out_blob_name_buflen)
+{
+    NodusWeightStateStore *st = (NodusWeightStateStore*)store;
+    int index;
+    int rc;
+    if (!st) return -1;
+    weight_state_store_lock(st);
+    index = weight_state_store_find_locked(st, model_name, node_id);
+    if (index < 0) {
+        weight_state_store_unlock(st);
+        return -1;
+    }
+    rc = weight_state_store_copy_entry_locked(
+        st,
+        index,
+        out_publish_seq,
+        out_generation,
+        out_architecture_version,
+        out_round_id,
+        out_cycle,
+        out_step,
+        out_param_count,
+        out_blob_bytes,
+        NULL,
+        0,
+        NULL,
+        0,
+        out_blob_name,
+        out_blob_name_buflen
+    );
+    weight_state_store_unlock(st);
+    return rc;
+}
+
+static int weight_state_store_select_meta(
+        const NodusWeightStateStore *state_store,
+        const char *model_name,
+        const char *node_id,
+        uint64_t *out_publish_seq,
+        uint64_t *out_generation,
+        uint64_t *out_architecture_version,
+        int32_t *out_round_id,
+        int32_t *out_cycle,
+        int32_t *out_step,
+        int32_t *out_param_count,
+        uint64_t *out_blob_bytes,
+        char *out_model_name,
+        int out_model_name_buflen,
+        char *out_node_id,
+        int out_node_id_buflen,
+        char *out_blob_name,
+        int out_blob_name_buflen)
+{
+    if (model_name && model_name[0] != '\0') {
+        int rc = nodus_weight_state_store_get_meta_for(
+            state_store,
+            model_name,
+            node_id,
+            out_publish_seq,
+            out_generation,
+            out_architecture_version,
+            out_round_id,
+            out_cycle,
+            out_step,
+            out_param_count,
+            out_blob_bytes,
+            out_blob_name,
+            out_blob_name_buflen
+        );
+        if (rc != 0) return rc;
+        copy_out_string(model_name, out_model_name, out_model_name_buflen);
+        copy_out_string(node_id ? node_id : "", out_node_id, out_node_id_buflen);
+        return 0;
+    }
+    return nodus_weight_state_store_get_meta(
+        state_store,
+        out_publish_seq,
+        out_generation,
+        out_architecture_version,
+        out_round_id,
+        out_cycle,
+        out_step,
+        out_param_count,
+        out_blob_bytes,
+        out_model_name,
+        out_model_name_buflen,
+        out_node_id,
+        out_node_id_buflen,
+        out_blob_name,
+        out_blob_name_buflen
+    );
+}
+
+static int weight_image_store_publish_rgb(
+        NodusWeightImageStore *store,
+        const char *model_name,
+        const char *node_id,
+        int32_t round_id,
+        int32_t cycle,
+        int32_t step,
+        uint64_t state_publish_seq,
+        uint64_t generation,
+        uint64_t architecture_version,
+        const uint8_t *rgb,
+        int32_t w,
+        int32_t h,
+        int32_t c,
+        int32_t mode,
+        int32_t target_w,
+        int32_t target_h,
+        uint32_t flags)
+{
+    uint64_t byte_count;
+    uint64_t image_seq;
+    int write_pos;
+    int logical;
+    uint32_t carry_flags = 0u;
+    int32_t carry_round_id = round_id;
+    int32_t carry_cycle = cycle;
+    NodusMappedBlobHandle blob = {0};
+    char blob_name[NODUS_WEIGHT_STORE_BLOB_NAME_MAX];
+    NodusWeightImageEntry *entry = NULL;
+    if (!store || !rgb || w <= 0 || h <= 0 || c <= 0) return -1;
+    byte_count = (uint64_t)w * (uint64_t)h * (uint64_t)c;
+    weight_image_store_lock(store);
+    image_seq = store->next_image_seq + 1u;
+    if (snprintf(blob_name, sizeof(blob_name), "NodusWeightImageBlob_%llu", (unsigned long long)image_seq) < 0) {
+        weight_image_store_unlock(store);
+        return -1;
+    }
+    if (mapped_blob_create_rw(&blob, blob_name, byte_count) != 0) {
+        weight_image_store_unlock(store);
+        return -1;
+    }
+    memcpy(blob.ptr, rgb, (size_t)byte_count);
+
+    for (logical = store->entry_count - 1; logical >= 0; logical--) {
+        if (store->entries[logical].state_publish_seq == state_publish_seq) {
+            carry_flags |= store->entries[logical].flags;
+            if ((store->entries[logical].flags & NODUS_WEIGHT_IMAGE_FLAG_CHECKPOINT) != 0u) {
+                carry_round_id = store->entries[logical].round_id;
+                carry_cycle = store->entries[logical].cycle;
+            }
+            weight_image_store_remove_locked(store, logical);
+        }
+    }
+    while ((store->entry_count >= store->max_entries && store->entry_count > 0)
+            || (store->max_total_bytes > 0u && (store->total_bytes + byte_count) > store->max_total_bytes
+                && store->entry_count > 0)) {
+        int evict_index = weight_image_store_choose_evict_locked(store);
+        if (evict_index < 0) break;
+        weight_image_store_remove_locked(store, evict_index);
+    }
+    if (store->entry_count >= NODUS_WEIGHT_IMAGE_CACHE_CAPACITY) {
+        mapped_blob_close(&blob);
+        weight_image_store_unlock(store);
+        return -1;
+    }
+
+    write_pos = store->entry_count;
+    g_weight_image_slot_blobs[write_pos] = blob;
+    entry = &store->entries[write_pos];
+    weight_image_store_zero_entry(entry);
+    entry->image_seq = image_seq;
+    entry->state_publish_seq = state_publish_seq;
+    entry->generation = generation;
+    entry->architecture_version = architecture_version;
+    entry->byte_count = byte_count;
+    entry->round_id = carry_round_id;
+    entry->cycle = carry_cycle;
+    entry->step = step;
+    entry->w = w;
+    entry->h = h;
+    entry->c = c;
+    entry->stride_bytes = w * c;
+    entry->mode = mode;
+    entry->target_w = target_w;
+    entry->target_h = target_h;
+    entry->flags = flags | carry_flags;
+    copy_cstr_trunc(entry->model_name, sizeof(entry->model_name), model_name ? model_name : "");
+    copy_cstr_trunc(entry->node_id, sizeof(entry->node_id), node_id ? node_id : "");
+    copy_cstr_trunc(entry->blob_name, sizeof(entry->blob_name), blob_name);
+    store->entry_count++;
+    store->total_bytes += byte_count;
+    store->next_image_seq = image_seq;
+    weight_image_store_trim_locked(store);
+    weight_image_store_unlock(store);
+    return 0;
+}
+
+NODUS_API int nodus_weight_image_store_render_latest(
+        NodusWeightStateStore *state_store,
+        NodusWeightImageStore *image_store,
+        int mode,
+        int32_t target_w,
+        int32_t target_h)
+{
+    return nodus_weight_image_store_render_for(
+        state_store,
+        image_store,
+        NULL,
+        NULL,
+        mode,
+        target_w,
+        target_h
+    );
+}
+
+NODUS_API int nodus_weight_image_store_measure_for(
+        const NodusWeightStateStore *state_store,
+        const char *model_name,
+        const char *node_id,
+        int mode,
+        int32_t target_w,
+        int32_t target_h,
+        uint64_t *out_state_publish_seq,
+        uint64_t *out_generation,
+        uint64_t *out_architecture_version,
+        int32_t *out_round_id,
+        int32_t *out_cycle,
+        int32_t *out_step,
+        int32_t *out_render_w,
+        int32_t *out_render_h,
+        int32_t *out_render_c,
+        int32_t *out_render_stride_bytes)
+{
+    char blob_name[NODUS_WEIGHT_STORE_BLOB_NAME_MAX];
+    char selected_model_name[NODUS_WEIGHT_STORE_NAME_MAX];
+    char selected_node_id[NODUS_WEIGHT_STORE_NAME_MAX];
+    uint64_t publish_seq = 0;
+    uint64_t generation = 0;
+    uint64_t architecture_version = 0;
+    uint64_t blob_bytes = 0;
+    int32_t round_id = 0, cycle = 0, step = 0, param_count = 0;
+    NodusMappedBlobHandle blob = {0};
+    const NodusWeightStateBlobHeader *hdr = NULL;
+    const NodusWeightStateBlobEntry *entries = NULL;
+    const char **names = NULL;
+    const float **data_ptrs = NULL;
+    int32_t *numel = NULL;
+    int32_t *shape0 = NULL;
+    int32_t out_w = 0, out_h = 0;
+    int rc = -1;
+    int32_t i;
+
+    if (!state_store) return -1;
+    if (weight_state_store_select_meta(
+            state_store,
+            model_name,
+            node_id,
+            &publish_seq,
+            &generation,
+            &architecture_version,
+            &round_id,
+            &cycle,
+            &step,
+            &param_count,
+            &blob_bytes,
+            selected_model_name,
+            (int)sizeof(selected_model_name),
+            selected_node_id,
+            (int)sizeof(selected_node_id),
+            blob_name,
+            (int)sizeof(blob_name)
+        ) != 0) {
+        return -1;
+    }
+    if (mapped_blob_open_ro(&blob, blob_name, blob_bytes) != 0) return -1;
+    hdr = (const NodusWeightStateBlobHeader*)blob.ptr;
+    if (!hdr || hdr->magic != NODUS_WEIGHT_BLOB_MAGIC || hdr->entry_count == 0u) {
+        mapped_blob_close(&blob);
+        return -1;
+    }
+    entries = (const NodusWeightStateBlobEntry*)((const uint8_t*)blob.ptr + sizeof(NodusWeightStateBlobHeader));
+    names = (const char**)calloc((size_t)hdr->entry_count, sizeof(const char*));
+    data_ptrs = (const float**)calloc((size_t)hdr->entry_count, sizeof(const float*));
+    numel = (int32_t*)calloc((size_t)hdr->entry_count, sizeof(int32_t));
+    shape0 = (int32_t*)calloc((size_t)hdr->entry_count, sizeof(int32_t));
+    if (!names || !data_ptrs || !numel || !shape0) goto cleanup;
+    for (i = 0; i < (int32_t)hdr->entry_count; i++) {
+        const NodusWeightStateBlobEntry *e = &entries[i];
+        if (e->name_offset >= blob.size || e->data_offset >= blob.size) goto cleanup;
+        if ((e->name_offset + (uint64_t)e->name_len + 1u) > blob.size) goto cleanup;
+        if ((e->data_offset + (e->numel * (uint64_t)sizeof(float))) > blob.size) goto cleanup;
+        names[i] = (const char*)((const uint8_t*)blob.ptr + e->name_offset);
+        data_ptrs[i] = (const float*)((const uint8_t*)blob.ptr + e->data_offset);
+        numel[i] = (int32_t)e->numel;
+        shape0[i] = (int32_t)e->shape0;
+    }
+    if (nodus_weight_image_measure_from_state_dict(
+            names,
+            data_ptrs,
+            numel,
+            shape0,
+            (int32_t)hdr->entry_count,
+            mode,
+            target_w,
+            target_h,
+            &out_w,
+            &out_h
+        ) != 0) {
+        goto cleanup;
+    }
+    if (out_state_publish_seq) *out_state_publish_seq = hdr->publish_seq;
+    if (out_generation) *out_generation = hdr->generation;
+    if (out_architecture_version) *out_architecture_version = hdr->architecture_version;
+    if (out_round_id) *out_round_id = hdr->round_id;
+    if (out_cycle) *out_cycle = hdr->cycle;
+    if (out_step) *out_step = hdr->step;
+    if (out_render_w) *out_render_w = out_w;
+    if (out_render_h) *out_render_h = out_h;
+    if (out_render_c) *out_render_c = 3;
+    if (out_render_stride_bytes) *out_render_stride_bytes = out_w * 3;
+    rc = 0;
+cleanup:
+    if (shape0) free(shape0);
+    if (numel) free(numel);
+    if (data_ptrs) free(data_ptrs);
+    if (names) free(names);
+    mapped_blob_close(&blob);
+    return rc;
+}
+
+NODUS_API int nodus_weight_image_store_render_for(
+        NodusWeightStateStore *state_store,
+        NodusWeightImageStore *image_store,
+        const char *model_name,
+        const char *node_id,
+        int mode,
+        int32_t target_w,
+        int32_t target_h)
+{
+    char blob_name[NODUS_WEIGHT_STORE_BLOB_NAME_MAX];
+    char selected_model_name[NODUS_WEIGHT_STORE_NAME_MAX];
+    char selected_node_id[NODUS_WEIGHT_STORE_NAME_MAX];
+    uint64_t publish_seq = 0;
+    uint64_t generation = 0;
+    uint64_t architecture_version = 0;
+    uint64_t blob_bytes = 0;
+    int32_t round_id = 0, cycle = 0, step = 0, param_count = 0;
+    NodusMappedBlobHandle blob = {0};
+    const NodusWeightStateBlobHeader *hdr = NULL;
+    const NodusWeightStateBlobEntry *entries = NULL;
+    const char **names = NULL;
+    const float **data_ptrs = NULL;
+    int32_t *numel = NULL;
+    int32_t *shape0 = NULL;
+    uint8_t *out_rgb = NULL;
+    int32_t out_w = 0, out_h = 0;
+    int rc = -1;
+    int32_t i;
+
+    if (!state_store || !image_store) return -1;
+    if (weight_state_store_select_meta(
+            state_store,
+            model_name,
+            node_id,
+            &publish_seq,
+            &generation,
+            &architecture_version,
+            &round_id,
+            &cycle,
+            &step,
+            &param_count,
+            &blob_bytes,
+            selected_model_name,
+            (int)sizeof(selected_model_name),
+            selected_node_id,
+            (int)sizeof(selected_node_id),
+            blob_name,
+            (int)sizeof(blob_name)
+        ) != 0) {
+        return -1;
+    }
+    if (mapped_blob_open_ro(&blob, blob_name, blob_bytes) != 0) return -1;
+    hdr = (const NodusWeightStateBlobHeader*)blob.ptr;
+    if (!hdr || hdr->magic != NODUS_WEIGHT_BLOB_MAGIC || hdr->entry_count == 0u) {
+        mapped_blob_close(&blob);
+        return -1;
+    }
+    entries = (const NodusWeightStateBlobEntry*)((const uint8_t*)blob.ptr + sizeof(NodusWeightStateBlobHeader));
+    names = (const char**)calloc((size_t)hdr->entry_count, sizeof(const char*));
+    data_ptrs = (const float**)calloc((size_t)hdr->entry_count, sizeof(const float*));
+    numel = (int32_t*)calloc((size_t)hdr->entry_count, sizeof(int32_t));
+    shape0 = (int32_t*)calloc((size_t)hdr->entry_count, sizeof(int32_t));
+    if (!names || !data_ptrs || !numel || !shape0) goto cleanup;
+    for (i = 0; i < (int32_t)hdr->entry_count; i++) {
+        const NodusWeightStateBlobEntry *e = &entries[i];
+        if (e->name_offset >= blob.size || e->data_offset >= blob.size) goto cleanup;
+        if ((e->name_offset + (uint64_t)e->name_len + 1u) > blob.size) goto cleanup;
+        if ((e->data_offset + (e->numel * (uint64_t)sizeof(float))) > blob.size) goto cleanup;
+        names[i] = (const char*)((const uint8_t*)blob.ptr + e->name_offset);
+        data_ptrs[i] = (const float*)((const uint8_t*)blob.ptr + e->data_offset);
+        numel[i] = (int32_t)e->numel;
+        shape0[i] = (int32_t)e->shape0;
+    }
+    if (nodus_weight_image_from_state_dict(
+            names,
+            data_ptrs,
+            numel,
+            shape0,
+            (int32_t)hdr->entry_count,
+            NULL,
+            NULL,
+            mode,
+            target_w,
+            target_h,
+            &out_rgb,
+            &out_w,
+            &out_h
+        ) != 0) {
+        goto cleanup;
+    }
+    rc = weight_image_store_publish_rgb(
+        image_store,
+        hdr->model_name,
+        hdr->node_id,
+        hdr->round_id,
+        hdr->cycle,
+        hdr->step,
+        hdr->publish_seq,
+        hdr->generation,
+        hdr->architecture_version,
+        out_rgb,
+        out_w,
+        out_h,
+        3,
+        (int32_t)mode,
+        target_w,
+        target_h,
+        0u
+    );
+cleanup:
+    if (out_rgb) nodus_weight_image_free(out_rgb);
+    if (shape0) free(shape0);
+    if (numel) free(numel);
+    if (data_ptrs) free(data_ptrs);
+    if (names) free(names);
+    mapped_blob_close(&blob);
+    return rc;
+}
+
+NODUS_API int32_t nodus_weight_image_store_length(const NodusWeightImageStore *store) {
+    return store ? store->entry_count : 0;
+}
+
+NODUS_API int32_t nodus_weight_image_store_capacity(const NodusWeightImageStore *store) {
+    return store ? store->max_entries : 0;
+}
+
+NODUS_API int nodus_weight_image_store_set_limits(
+        NodusWeightImageStore *store,
+        int32_t max_entries,
+        uint64_t max_total_bytes)
+{
+    if (!store) return -1;
+    if (max_entries <= 0) max_entries = NODUS_WEIGHT_IMAGE_CACHE_CAPACITY;
+    if (max_entries > NODUS_WEIGHT_IMAGE_CACHE_CAPACITY) {
+        max_entries = NODUS_WEIGHT_IMAGE_CACHE_CAPACITY;
+    }
+    if (max_total_bytes == 0u) {
+        max_total_bytes = NODUS_WEIGHT_IMAGE_DEFAULT_MAX_BYTES;
+    }
+    weight_image_store_lock(store);
+    store->max_entries = max_entries;
+    store->max_total_bytes = max_total_bytes;
+    weight_image_store_trim_locked(store);
+    weight_image_store_unlock(store);
+    return 0;
+}
+
+NODUS_API int nodus_weight_image_store_get_stats(
+        const NodusWeightImageStore *store,
+        int32_t *out_max_entries,
+        int32_t *out_entry_count,
+        uint64_t *out_max_total_bytes,
+        uint64_t *out_total_bytes)
+{
+    NodusWeightImageStore *st = (NodusWeightImageStore*)store;
+    if (!st) return -1;
+    weight_image_store_lock(st);
+    if (out_max_entries) *out_max_entries = st->max_entries;
+    if (out_entry_count) *out_entry_count = st->entry_count;
+    if (out_max_total_bytes) *out_max_total_bytes = st->max_total_bytes;
+    if (out_total_bytes) *out_total_bytes = st->total_bytes;
+    weight_image_store_unlock(st);
+    return 0;
+}
+
+NODUS_API int nodus_weight_image_store_configure_latest(
+        NodusWeightStateStore *state_store,
+        NodusWeightImageStore *image_store,
+        int mode,
+        int32_t target_w,
+        int32_t target_h)
+{
+    char blob_name[NODUS_WEIGHT_STORE_BLOB_NAME_MAX];
+    char model_name[NODUS_WEIGHT_STORE_NAME_MAX];
+    char node_id[NODUS_WEIGHT_STORE_NAME_MAX];
+    uint64_t publish_seq = 0;
+    uint64_t generation = 0;
+    uint64_t architecture_version = 0;
+    uint64_t blob_bytes = 0;
+    int32_t round_id = 0, cycle = 0, step = 0, param_count = 0;
+    NodusMappedBlobHandle blob = {0};
+    const NodusWeightStateBlobHeader *hdr = NULL;
+    const NodusWeightStateBlobEntry *entries = NULL;
+    const char **names = NULL;
+    const float **data_ptrs = NULL;
+    int32_t *numel = NULL;
+    int32_t *shape0 = NULL;
+    int32_t render_w = 0, render_h = 0;
+    int rc = -1;
+    int32_t i;
+
+    if (!state_store || !image_store) return -1;
+    if (nodus_weight_state_store_get_meta(
+            state_store,
+            &publish_seq,
+            &generation,
+            &architecture_version,
+            &round_id,
+            &cycle,
+            &step,
+            &param_count,
+            &blob_bytes,
+            model_name,
+            (int)sizeof(model_name),
+            node_id,
+            (int)sizeof(node_id),
+            blob_name,
+            (int)sizeof(blob_name)
+        ) != 0) {
+        return -1;
+    }
+    if (mapped_blob_open_ro(&blob, blob_name, blob_bytes) != 0) return -1;
+    hdr = (const NodusWeightStateBlobHeader*)blob.ptr;
+    if (!hdr || hdr->magic != NODUS_WEIGHT_BLOB_MAGIC || hdr->entry_count == 0u) {
+        mapped_blob_close(&blob);
+        return -1;
+    }
+    entries = (const NodusWeightStateBlobEntry*)((const uint8_t*)blob.ptr + sizeof(NodusWeightStateBlobHeader));
+    names = (const char**)calloc((size_t)hdr->entry_count, sizeof(const char*));
+    data_ptrs = (const float**)calloc((size_t)hdr->entry_count, sizeof(const float*));
+    numel = (int32_t*)calloc((size_t)hdr->entry_count, sizeof(int32_t));
+    shape0 = (int32_t*)calloc((size_t)hdr->entry_count, sizeof(int32_t));
+    if (!names || !data_ptrs || !numel || !shape0) goto cleanup;
+    for (i = 0; i < (int32_t)hdr->entry_count; i++) {
+        const NodusWeightStateBlobEntry *e = &entries[i];
+        if (e->name_offset >= blob.size || e->data_offset >= blob.size) goto cleanup;
+        if ((e->name_offset + (uint64_t)e->name_len + 1u) > blob.size) goto cleanup;
+        if ((e->data_offset + (e->numel * (uint64_t)sizeof(float))) > blob.size) goto cleanup;
+        names[i] = (const char*)((const uint8_t*)blob.ptr + e->name_offset);
+        data_ptrs[i] = (const float*)((const uint8_t*)blob.ptr + e->data_offset);
+        numel[i] = (int32_t)e->numel;
+        shape0[i] = (int32_t)e->shape0;
+    }
+    if (nodus_weight_image_measure_from_state_dict(
+            names,
+            data_ptrs,
+            numel,
+            shape0,
+            (int32_t)hdr->entry_count,
+            mode,
+            target_w,
+            target_h,
+            &render_w,
+            &render_h
+        ) != 0) {
+        goto cleanup;
+    }
+
+    weight_image_store_lock(image_store);
+    if (image_store->active_config.mode != (int32_t)mode
+            || image_store->active_config.target_w != target_w
+            || image_store->active_config.target_h != target_h
+            || image_store->active_config.generation != hdr->generation
+            || image_store->active_config.architecture_version != hdr->architecture_version
+            || strcmp(image_store->active_config.model_name, hdr->model_name) != 0
+            || strcmp(image_store->active_config.node_id, hdr->node_id) != 0) {
+        weight_image_store_clear_locked(image_store);
+    }
+    image_store->active_config.state_publish_seq = hdr->publish_seq;
+    image_store->active_config.generation = hdr->generation;
+    image_store->active_config.architecture_version = hdr->architecture_version;
+    image_store->active_config.round_id = hdr->round_id;
+    image_store->active_config.cycle = hdr->cycle;
+    image_store->active_config.step = hdr->step;
+    image_store->active_config.mode = (int32_t)mode;
+    image_store->active_config.target_w = target_w;
+    image_store->active_config.target_h = target_h;
+    image_store->active_config.render_w = render_w;
+    image_store->active_config.render_h = render_h;
+    image_store->active_config.render_c = 3;
+    image_store->active_config.render_stride_bytes = render_w * 3;
+    copy_cstr_trunc(image_store->active_config.model_name, sizeof(image_store->active_config.model_name), hdr->model_name);
+    copy_cstr_trunc(image_store->active_config.node_id, sizeof(image_store->active_config.node_id), hdr->node_id);
+    weight_image_store_unlock(image_store);
+    rc = 0;
+
+cleanup:
+    if (shape0) free(shape0);
+    if (numel) free(numel);
+    if (data_ptrs) free(data_ptrs);
+    if (names) free(names);
+    mapped_blob_close(&blob);
+    return rc;
+}
+
+NODUS_API int nodus_weight_image_store_get_active_config(
+        const NodusWeightImageStore *store,
+        uint64_t *out_state_publish_seq,
+        uint64_t *out_generation,
+        uint64_t *out_architecture_version,
+        int32_t *out_round_id,
+        int32_t *out_cycle,
+        int32_t *out_step,
+        int32_t *out_mode,
+        int32_t *out_target_w,
+        int32_t *out_target_h,
+        int32_t *out_render_w,
+        int32_t *out_render_h,
+        int32_t *out_render_c,
+        int32_t *out_render_stride_bytes,
+        char *out_model_name,
+        int out_model_name_buflen,
+        char *out_node_id,
+        int out_node_id_buflen)
+{
+    NodusWeightImageStore *st = (NodusWeightImageStore*)store;
+    if (!st) return -1;
+    weight_image_store_lock(st);
+    if (st->active_config.state_publish_seq == 0u) {
+        weight_image_store_unlock(st);
+        return -1;
+    }
+    if (out_state_publish_seq) *out_state_publish_seq = st->active_config.state_publish_seq;
+    if (out_generation) *out_generation = st->active_config.generation;
+    if (out_architecture_version) *out_architecture_version = st->active_config.architecture_version;
+    if (out_round_id) *out_round_id = st->active_config.round_id;
+    if (out_cycle) *out_cycle = st->active_config.cycle;
+    if (out_step) *out_step = st->active_config.step;
+    if (out_mode) *out_mode = st->active_config.mode;
+    if (out_target_w) *out_target_w = st->active_config.target_w;
+    if (out_target_h) *out_target_h = st->active_config.target_h;
+    if (out_render_w) *out_render_w = st->active_config.render_w;
+    if (out_render_h) *out_render_h = st->active_config.render_h;
+    if (out_render_c) *out_render_c = st->active_config.render_c;
+    if (out_render_stride_bytes) *out_render_stride_bytes = st->active_config.render_stride_bytes;
+    copy_out_string(st->active_config.model_name, out_model_name, out_model_name_buflen);
+    copy_out_string(st->active_config.node_id, out_node_id, out_node_id_buflen);
+    weight_image_store_unlock(st);
+    return 0;
+}
+
+NODUS_API int nodus_weight_image_store_get_meta(
+        const NodusWeightImageStore *store,
+        int32_t index,
+        uint64_t *out_image_seq,
+        uint64_t *out_state_publish_seq,
+        uint64_t *out_generation,
+        uint64_t *out_architecture_version,
+        int32_t *out_round_id,
+        int32_t *out_cycle,
+        int32_t *out_step,
+        int32_t *out_w,
+        int32_t *out_h,
+        int32_t *out_c,
+        int32_t *out_stride_bytes,
+        uint64_t *out_byte_count,
+        uint32_t *out_flags,
+        char *out_model_name,
+        int out_model_name_buflen,
+        char *out_node_id,
+        int out_node_id_buflen,
+        char *out_blob_name,
+        int out_blob_name_buflen)
+{
+    NodusWeightImageStore *st = (NodusWeightImageStore*)store;
+    const NodusWeightImageEntry *entry;
+    if (!st) return -1;
+    weight_image_store_lock(st);
+    if (index < 0 || index >= st->entry_count) {
+        weight_image_store_unlock(st);
+        return -1;
+    }
+    entry = &st->entries[index];
+    if (entry->image_seq == 0u || entry->blob_name[0] == '\0') {
+        weight_image_store_unlock(st);
+        return -1;
+    }
+    if (out_image_seq) *out_image_seq = entry->image_seq;
+    if (out_state_publish_seq) *out_state_publish_seq = entry->state_publish_seq;
+    if (out_generation) *out_generation = entry->generation;
+    if (out_architecture_version) *out_architecture_version = entry->architecture_version;
+    if (out_round_id) *out_round_id = entry->round_id;
+    if (out_cycle) *out_cycle = entry->cycle;
+    if (out_step) *out_step = entry->step;
+    if (out_w) *out_w = entry->w;
+    if (out_h) *out_h = entry->h;
+    if (out_c) *out_c = entry->c;
+    if (out_stride_bytes) *out_stride_bytes = entry->stride_bytes;
+    if (out_byte_count) *out_byte_count = entry->byte_count;
+    if (out_flags) *out_flags = entry->flags;
+    copy_out_string(entry->model_name, out_model_name, out_model_name_buflen);
+    copy_out_string(entry->node_id, out_node_id, out_node_id_buflen);
+    copy_out_string(entry->blob_name, out_blob_name, out_blob_name_buflen);
+    weight_image_store_unlock(st);
+    return 0;
+}
+
+NODUS_API int32_t nodus_weight_image_store_copy_image(
+        const NodusWeightImageStore *store,
+        int32_t index,
+        uint8_t *out_buf,
+        uint64_t buf_size)
+{
+    uint64_t byte_count = 0;
+    char blob_name[NODUS_WEIGHT_STORE_BLOB_NAME_MAX];
+    NodusMappedBlobHandle blob = {0};
+    if (!store || !out_buf || index < 0 || index >= store->entry_count) return -1;
+    if (nodus_weight_image_store_get_meta(
+            store,
+            index,
+            NULL,
+            NULL,
+            NULL,
+            NULL,
+            NULL,
+            NULL,
+            NULL,
+            NULL,
+            NULL,
+            NULL,
+            NULL,
+            &byte_count,
+            NULL,
+            NULL,
+            0,
+            NULL,
+            0,
+            blob_name,
+            (int)sizeof(blob_name)
+        ) != 0) {
+        return -1;
+    }
+    if (buf_size < byte_count) return -1;
+    if (mapped_blob_open_ro(&blob, blob_name, byte_count) != 0) return -1;
+    memcpy(out_buf, blob.ptr, (size_t)byte_count);
+    mapped_blob_close(&blob);
+    return (int32_t)byte_count;
+}
+
+NODUS_API int nodus_weight_image_store_mark_checkpoint(
+        NodusWeightImageStore *store,
+        uint64_t state_publish_seq,
+        int32_t round_id,
+        int32_t cycle)
+{
+    int logical;
+    if (!store || state_publish_seq == 0u) return -1;
+    weight_image_store_lock(store);
+    for (logical = store->entry_count - 1; logical >= 0; logical--) {
+        NodusWeightImageEntry *entry = &store->entries[logical];
+        if (entry->state_publish_seq == state_publish_seq) {
+            entry->flags |= NODUS_WEIGHT_IMAGE_FLAG_CHECKPOINT;
+            entry->round_id = round_id;
+            entry->cycle = cycle;
+            weight_image_store_unlock(store);
+            return 0;
+        }
+    }
+    weight_image_store_unlock(store);
+    return -1;
 }

@@ -13,13 +13,12 @@ import torch.nn.functional as F
 from pipeline.nodus_loss_store import (
     NodusCompositeCache,
     NodusScrubRing,
+    WeightImageConfig,
+    NodusWeightImageStore,
+    NodusWeightStateStore,
     SCRUB_FLAG_HAS_IMAGE,
     SCRUB_FLAG_HAS_OUTPUT,
     SCRUB_FLAG_HAS_TARGET,
-    SCRUB_FLAG_HAS_THUMBS,
-    SCRUB_NUM_THUMBS,
-    SCRUB_THUMB_H,
-    SCRUB_THUMB_W,
 )
 from pipeline.plan_protocol import (
     MESSAGE_TYPE_EXECUTION_EVENT,
@@ -37,7 +36,17 @@ from pipeline.plan_protocol import (
     make_envelope,
     parse_envelope,
 )
-from pipeline.weight_map import annotate_weight_map, render_weight_image, snapshot_parameter_state_from_state_dict
+from pipeline.weight_map import annotate_weight_map
+from pipeline.weight_image_cache import (
+    WEIGHT_IMAGE_FLAG_CHECKPOINT,
+    checkpoint_thumbnail_path,
+    checkpoint_thumbnail_root,
+    crop_weight_image_rgb,
+    find_checkpoint_thumbnail,
+    load_checkpoint_thumbnail,
+    plan_weight_image_evictions,
+    save_checkpoint_thumbnail,
+)
 
 # ---------------------------------------------------------------------------
 # Loss logging constants and binary record format
@@ -52,55 +61,6 @@ _LEGACY_STAGE_NAMES: Dict[int, str] = {
     4: "wcls",
     5: "wcls_eval",
 }
-
-
-def _resize_rgb_nearest(rgb: np.ndarray, size_hw: Tuple[int, int]) -> np.ndarray:
-    out_h = max(1, int(size_hw[0]))
-    out_w = max(1, int(size_hw[1]))
-    try:
-        from PIL import Image
-
-        img = Image.fromarray(np.asarray(rgb, dtype=np.uint8), mode="RGB")
-        return np.asarray(img.resize((out_w, out_h), Image.NEAREST), dtype=np.uint8)
-    except Exception:
-        src = np.asarray(rgb, dtype=np.uint8)
-        y_idx = np.floor(np.linspace(0, max(0, src.shape[0] - 1), out_h)).astype(np.int64)
-        x_idx = np.floor(np.linspace(0, max(0, src.shape[1] - 1), out_w)).astype(np.int64)
-        return src[y_idx][:, x_idx]
-
-
-def _compose_weight_thumb_stack(tiles: Sequence[np.ndarray]) -> np.ndarray:
-    valid_tiles = [np.ascontiguousarray(np.asarray(tile, dtype=np.uint8)) for tile in list(tiles)[:SCRUB_NUM_THUMBS]]
-    if len(valid_tiles) != SCRUB_NUM_THUMBS:
-        raise ValueError("expected a full scrub thumbnail tile stack")
-    return np.concatenate(valid_tiles, axis=0)
-
-
-def _extract_checkpoint_weight_state(
-    payload: Dict[str, Any],
-    model_name: Optional[str],
-) -> Tuple[Optional[str], Optional[Dict[str, torch.Tensor]]]:
-    if not isinstance(payload, dict):
-        return None, None
-    if model_name:
-        state_key = f"{str(model_name)}_state"
-        state_blob = payload.get(state_key)
-        if isinstance(state_blob, dict):
-            _keys, snap = snapshot_parameter_state_from_state_dict(state_blob)
-            if snap:
-                return str(model_name), snap
-    for key, value in payload.items():
-        if not str(key).endswith("_state") or not isinstance(value, dict):
-            continue
-        _keys, snap = snapshot_parameter_state_from_state_dict(value)
-        if snap:
-            return str(key[:-6]), snap
-    if "state_dict" in payload and isinstance(payload["state_dict"], dict):
-        _keys, snap = snapshot_parameter_state_from_state_dict(payload["state_dict"])
-        if snap:
-            return str(model_name or "state_dict"), snap
-    return None, None
-
 
 def _hsl_to_rgb(h: float, s: float, l: float) -> Tuple[int, int, int]:
     """Convert HSL (h in [0,360), s/l in [0,1]) to RGB (each 0-255)."""
@@ -447,6 +407,14 @@ class _TransformerStatusOpenGLViewer:
         self._composite_cache: Optional[NodusCompositeCache] = (
             NodusCompositeCache(capacity=512) if self._scrub_ring is not None else None
         )
+        try:
+            self._weight_state_store: Optional[NodusWeightStateStore] = NodusWeightStateStore.get_global()
+        except Exception:
+            self._weight_state_store = None
+        try:
+            self._weight_image_store: Optional[NodusWeightImageStore] = NodusWeightImageStore.get_global()
+        except Exception:
+            self._weight_image_store = None
         self._last_ring_cursor: int = 0
         # Text metadata for the most-recently consumed frame (set from IPC signal
         # or directly by same-process update()).
@@ -464,19 +432,10 @@ class _TransformerStatusOpenGLViewer:
         # -inf forces an immediate first render on the first _present() call.
         self._sidebar_dirty: bool = True
         self._preview_work_queue_ref: Optional[Any] = None
-        self._weight_model_refs: Dict[str, Any] = {}
-        # Optional per-model state-dicts for the red diff overlay:
-        #   _weight_disk_states  - weights loaded from the on-disk checkpoint file
-        #   _weight_ckpt_states  - weights from the pipeline checkpoint (to-be-merged)
-        self._weight_disk_states: Dict[str, Optional[Dict[str, Any]]] = {}
-        self._weight_ckpt_states: Dict[str, Optional[Dict[str, Any]]] = {}
         # -- Scrub / history ---------------------------------------------------
-        # Weight-map snapshots accumulated at sidebar render rate (4 Hz).
-        # _scrub_offset = 0 -> live; N -> show the snapshot N ticks back.
+        # GUI-local copies of rendered weight images for scrub history.
         self._weight_history_maxlen: int = 512
         self._weight_snapshot_deque: deque = deque(maxlen=self._weight_history_maxlen)
-        # Loss series lengths recorded once per sidebar tick so the graph renderer
-        # can map each snapshot -> x-pixel for the cache-region band and cursor.
         self._loss_count_at_snap_deque: deque = deque(maxlen=self._weight_history_maxlen)
         self._last_step_txt: str = ""
         self._scrub_offset: int = 0
@@ -487,42 +446,28 @@ class _TransformerStatusOpenGLViewer:
         # Prev/Next checkpoint navigation button rects (window coords).
         self._prev_ckpt_btn_rect: Optional[Tuple[int, int, int, int]] = None
         self._next_ckpt_btn_rect: Optional[Tuple[int, int, int, int]] = None
-        # Sparse weight-state snapshots: a small fixed count spread evenly across
-        # the full visual cache so there are a couple of real restore points to
-        # scrub to without copying enormous state_dicts constantly.
-        # e.g. 4 snapshots across 512-frame cache -> stride 128 visual ticks
-        #      @ 4 Hz sidebar rate ~= one snapshot every ~32 seconds.
-        _weight_snap_count: int = 4
-        self._weight_snap_stride: int = max(1, self._weight_history_maxlen // _weight_snap_count)
-        self._weight_state_sparse_deque: deque = deque(maxlen=_weight_snap_count)
-        self._snap_total: int = 0  # monotonically increasing visual snap counter
-        # Directory for on-disk sparse weight backup files (set via set_weight_snap_dir).
-        # Each sparse snapshot also saves a .pt file so restore works after restart.
-        self._weight_snap_dir: Optional[Path] = None
-        # Loss-count positions recorded at each disk save, for graph markers.
-        # Unbounded list: accumulates all markers including pre-existing ones loaded at startup.
+        # Loss-count positions recorded at each checkpoint save, for graph markers.
         self._disk_save_loss_counts: list = []
-        # Checkpoint thumbnail registry -- ordered list of discovered checkpoint
-        # entries beyond the in-memory cache.  Each entry is a dict with keys:
-        #   round_id, cycle, thumb_path (Path or None), loss_counts ({sid:int})
-        # Populated by register_checkpoint_thumbnail() and set_checkpoint_backup_dir().
-        # Sorted oldest->newest (index 0 = oldest checkpoint).
-        self._checkpoint_thumbs: List[Dict[str, Any]] = []
-        self._checkpoint_thumb_cache: "OrderedDict[Tuple[int, int, str], np.ndarray]" = OrderedDict()
-        self._checkpoint_thumb_pending: set[Tuple[int, int, str]] = set()
-        self._checkpoint_thumb_results: deque = deque(maxlen=64)
-        self._checkpoint_thumb_lock = threading.Lock()
-        self._checkpoint_thumb_cache_limit: int = 48
-        # Background thread for weight image + state_dict snapshot.
-        # Main thread fires it and checks for completion; never blocks.
-        self._weight_snap_thread: Optional[threading.Thread] = None
-        self._weight_snap_result: Optional[Dict[str, Any]] = None
+        self._shared_weight_render_thread: Optional[threading.Thread] = None
+        self._shared_weight_render_result: Optional[Dict[str, Any]] = None
+        self._last_weight_state_publish_seq: int = 0
+        self._last_weight_image_seq: int = 0
+        self._last_weight_render_sig: Optional[Tuple[int, int, int, int, int, int]] = None
+        self._pending_checkpoint_weight_marks: Dict[int, Tuple[int, int]] = {}
+        self._checkpoint_backup_dir: Optional[Path] = None
+        self._checkpoint_live_dir: Optional[Path] = None
+        self._weight_image_mode: int = 1
+        self._weight_model_order: List[str] = []
+        self._weight_snapshot_deques_by_model: Dict[str, deque] = {}
+        self._weight_current_rgb_by_model: Dict[str, np.ndarray] = {}
+        self._weight_current_meta_by_model: Dict[str, Dict[str, Any]] = {}
+        self._weight_tab_hit_boxes: List[Tuple[str, Tuple[int, int, int, int]]] = []
+        self._checkpoint_marker_records: List[Dict[str, Any]] = []
+        self._checkpoint_weight_records: Dict[Tuple[int, int, str], Dict[str, Any]] = {}
+        self._checkpoint_weight_rgb_cache: Dict[Tuple[int, int, str], np.ndarray] = {}
+        self._weight_measure_cfg_cache: Dict[Tuple[str, str, int, int, int], WeightImageConfig] = {}
         # Which model to display in the right sidebar (None = first available).
         self._active_weight_model_name: Optional[str] = None
-        # Delta logging: print param name when max|D| exceeds this threshold.
-        self._weight_delta_threshold: float = 0.01
-        # Previous sparse snapshot for delta comparison.
-        self._prev_weight_snap: Dict[str, Dict[str, Any]] = {}
 
         # -- Pull-model data (populated by SaveRestoreNode responses) ------
         # Pending responses waiting to be processed.
@@ -858,8 +803,6 @@ class _TransformerStatusOpenGLViewer:
             return None
         if self._scrub_offset == 0:
             return clen - 1
-        if self._scrub_in_checkpoint_zone() and self._scrub_offset > self._cache_snap_count():
-            return None
         off = max(1, min(clen, int(self._scrub_offset)))
         return max(0, min(clen - 1, clen - off))
 
@@ -1183,231 +1126,432 @@ class _TransformerStatusOpenGLViewer:
         # Scrub offset: slen - idx  (offset 1 = newest; slen = oldest).
         return max(1, slen - best_idx)
 
-    # -- Checkpoint thumbnail registry ------------------------------------------
-
-    def register_checkpoint_thumbnail(
-        self,
-        round_id: int,
-        cycle: int,
-        thumb_path: Optional["Path"] = None,
-        loss_counts: Optional[Dict[str, int]] = None,
-        model_name: Optional[str] = None,
-        checkpoint_path: Optional["Path"] = None,
-    ) -> None:
-        """Register a checkpoint entry for extended scrub navigation.
-
-        Called at checkpoint-save time (via notify) and at startup when
-        discovering existing checkpoints on disk.  Entries are kept sorted
-        oldest->newest by (round_id, cycle).
-        """
-        # Insert in sorted order
-        idx = len(self._checkpoint_thumbs)
-        for i, e in enumerate(self._checkpoint_thumbs):
-            if (e["round_id"], e["cycle"]) > (round_id, cycle):
-                idx = i
-                break
-            if e["round_id"] == round_id and e["cycle"] == cycle:
-                merged = dict(e)
-                if thumb_path is not None:
-                    merged["thumb_path"] = str(thumb_path)
-                if checkpoint_path is not None:
-                    merged["checkpoint_path"] = str(checkpoint_path)
-                if loss_counts:
-                    merged["loss_counts"] = dict(loss_counts)
-                if model_name:
-                    merged["model_name"] = str(model_name)
-                self._checkpoint_thumbs[i] = merged
-                return
-        self._checkpoint_thumbs.insert(
-            idx,
-            {
-                "round_id": int(round_id),
-                "cycle": int(cycle),
-                "thumb_path": (str(thumb_path) if thumb_path is not None else None),
-                "checkpoint_path": (str(checkpoint_path) if checkpoint_path is not None else None),
-                "loss_counts": dict(loss_counts or {}),
-                "model_name": (str(model_name) if model_name else None),
-            },
-        )
-
     def _weight_map_target_hw(self) -> Tuple[int, int]:
         return (2 * self.panel_h + self.graph_total_h + self._weight_map_extra_h, self.panel_w)
 
-    def _checkpoint_cache_key(self, entry: Dict[str, Any], model_name: Optional[str]) -> Tuple[int, int, str]:
-        return (
-            int(entry.get("round_id", 0)),
-            int(entry.get("cycle", 0)),
-            str(model_name or "").strip(),
-        )
-
-    def _target_checkpoint_model_name(self, entry: Dict[str, Any]) -> Optional[str]:
-        name = str(self._active_weight_model_name or entry.get("model_name") or "").strip()
-        return name or None
-
-    def _remember_checkpoint_thumbnail(self, cache_key: Tuple[int, int, str], rgb: np.ndarray) -> np.ndarray:
-        arr = np.ascontiguousarray(np.asarray(rgb, dtype=np.uint8))
-        self._checkpoint_thumb_cache[cache_key] = arr
-        self._checkpoint_thumb_cache.move_to_end(cache_key)
-        while len(self._checkpoint_thumb_cache) > self._checkpoint_thumb_cache_limit:
-            self._checkpoint_thumb_cache.popitem(last=False)
-        return arr
-
-    def _queue_checkpoint_thumbnail_render(self, entry: Dict[str, Any], model_name: Optional[str]) -> None:
-        checkpoint_path = entry.get("checkpoint_path")
-        if checkpoint_path is None or not Path(checkpoint_path).exists():
-            return
-        cache_key = self._checkpoint_cache_key(entry, model_name)
-        with self._checkpoint_thumb_lock:
-            if cache_key in self._checkpoint_thumb_pending:
-                return
-            self._checkpoint_thumb_pending.add(cache_key)
-        target_hw = self._weight_map_target_hw()
-        round_id = int(entry.get("round_id", 0))
-        cycle = int(entry.get("cycle", 0))
-        thumb_path = entry.get("thumb_path")
-        if not thumb_path:
-            thumb_path = str(Path(checkpoint_path).with_name(f"weight_thumb_r{round_id:06d}_c{cycle:04d}.png"))
-
-        def _worker() -> None:
-            result: Dict[str, Any] = {
-                "cache_key": cache_key,
-                "round_id": round_id,
-                "cycle": cycle,
-                "thumb_path": str(thumb_path),
-            }
-            try:
-                payload = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-                picked_model, state = _extract_checkpoint_weight_state(payload, model_name)
-                if state is None:
-                    raise ValueError(f"no usable *_state payload in {checkpoint_path}")
-                _tgt_h, _tgt_w = target_hw
-                rgb, _meta = render_weight_image(
-                    state,
-                    target_width=_tgt_w,
-                    target_height=_tgt_h,
-                )
-                rgb = annotate_weight_map(
-                    rgb,
-                    title=f"{picked_model or 'weights'} r{round_id}",
-                    subtitle="",
-                )
-                out_path = Path(thumb_path)
-                out_path.parent.mkdir(parents=True, exist_ok=True)
-                from PIL import Image
-
-                Image.fromarray(rgb, mode="RGB").save(out_path, format="PNG")
-                out_path.with_suffix(".json").write_text(
-                    json.dumps(
-                        {
-                            "model": str(picked_model or ""),
-                            "round_id": int(round_id),
-                            "cycle": int(cycle),
-                            "mode": "architectural_tall",
-                            "width": int(rgb.shape[1]),
-                            "height": int(rgb.shape[0]),
-                            "checkpoint_path": str(checkpoint_path),
-                        },
-                        indent=2,
-                    ),
-                    encoding="utf-8",
-                )
-                result["model_name"] = str(picked_model or "")
-                result["rgb"] = rgb
-            except Exception as exc:
-                result["error"] = str(exc)
-            finally:
-                with self._checkpoint_thumb_lock:
-                    self._checkpoint_thumb_results.append(result)
-                    self._checkpoint_thumb_pending.discard(cache_key)
-
-        threading.Thread(target=_worker, daemon=True).start()
-
-    def _drain_checkpoint_thumbnail_results(self) -> None:
-        changed = False
-        while True:
-            with self._checkpoint_thumb_lock:
-                if not self._checkpoint_thumb_results:
-                    break
-                result = self._checkpoint_thumb_results.popleft()
-            rgb = result.get("rgb")
-            if rgb is not None:
-                self._remember_checkpoint_thumbnail(result["cache_key"], rgb)
-                for entry in self._checkpoint_thumbs:
-                    if (
-                        int(entry.get("round_id", 0)) == int(result.get("round_id", -1))
-                        and int(entry.get("cycle", 0)) == int(result.get("cycle", -1))
-                    ):
-                        entry["thumb_path"] = str(result.get("thumb_path") or entry.get("thumb_path") or "")
-                        if result.get("model_name"):
-                            entry["model_name"] = str(result["model_name"])
-                        break
-                changed = True
-        if changed:
-            self._sidebar_dirty = True
-
-    def _load_checkpoint_thumbnail(self, ckpt_idx: int) -> Optional[np.ndarray]:
-        """Load a checkpoint thumbnail image and scale to the weight-map panel size.
-
-        Returns a right-panel-sized RGB array.
-        """
-        if ckpt_idx < 0 or ckpt_idx >= len(self._checkpoint_thumbs):
-            return None
-        entry = self._checkpoint_thumbs[ckpt_idx]
-        target_model = self._target_checkpoint_model_name(entry)
-        cache_key = self._checkpoint_cache_key(entry, target_model)
-        cached = self._checkpoint_thumb_cache.get(cache_key)
-        if cached is not None:
-            self._checkpoint_thumb_cache.move_to_end(cache_key)
-            return np.ascontiguousarray(cached.copy())
-        thumb_path = entry.get("thumb_path")
-        thumb_model = str(entry.get("model_name") or "").strip()
-        thumb_mode = ""
+    def _blank_weight_map_rgb(self) -> np.ndarray:
         target_h, target_w = self._weight_map_target_hw()
-        if thumb_path is None or not Path(thumb_path).exists():
-            self._queue_checkpoint_thumbnail_render(entry, target_model)
-            return self._render_checkpoint_placeholder(entry, text="rendering thumbnail")
-        sidecar = Path(thumb_path).with_suffix(".json")
-        if sidecar.exists():
-            try:
-                side_meta = json.loads(sidecar.read_text(encoding="utf-8"))
-                thumb_model = str(side_meta.get("model") or thumb_model).strip()
-                thumb_mode = str(side_meta.get("mode") or "").strip().lower()
-            except Exception:
-                pass
-        if thumb_mode != "architectural_tall":
-            self._queue_checkpoint_thumbnail_render(entry, target_model)
-            return self._render_checkpoint_placeholder(entry, text="refreshing thumbnail")
-        if target_model and thumb_model and thumb_model != target_model:
-            self._queue_checkpoint_thumbnail_render(entry, target_model)
-            return self._render_checkpoint_placeholder(entry, text="rendering thumbnail")
-        try:
-            from PIL import Image
-            img = Image.open(str(thumb_path)).convert("RGB").resize((target_w, target_h), Image.NEAREST)
-            rgb = np.asarray(img, dtype=np.uint8)
-            if thumb_model:
-                entry["model_name"] = thumb_model
-            return self._remember_checkpoint_thumbnail(cache_key, rgb)
-        except Exception:
-            self._queue_checkpoint_thumbnail_render(entry, target_model)
-            return self._render_checkpoint_placeholder(entry, text="render failed")
+        return np.full((target_h, target_w, 3), 14, dtype=np.uint8)
 
-    def _render_checkpoint_placeholder(self, entry: Dict[str, Any], *, text: str = "no thumbnail") -> np.ndarray:
-        """Render a placeholder when no thumbnail file exists."""
-        H, W = self._weight_map_target_hw()
-        rgb = np.full((H, W, 3), (14, 16, 20), dtype=np.uint8)
+    @staticmethod
+    def _normalise_weight_model_name(name: Optional[str]) -> str:
+        return str(name or "").strip()
+
+    def _register_weight_model(self, name: Optional[str]) -> Optional[str]:
+        model_name = self._normalise_weight_model_name(name)
+        if not model_name:
+            return None
+        if model_name not in self._weight_model_order:
+            self._weight_model_order.append(model_name)
+        if model_name not in self._weight_snapshot_deques_by_model:
+            self._weight_snapshot_deques_by_model[model_name] = deque(maxlen=self._weight_history_maxlen)
+        if model_name not in self._weight_current_rgb_by_model:
+            self._weight_current_rgb_by_model[model_name] = self._blank_weight_map_rgb()
+        if self._active_weight_model_name is None:
+            self._active_weight_model_name = model_name
+            self._weight_snapshot_deque = self._weight_snapshot_deques_by_model[model_name]
+        return model_name
+
+    def _resolved_active_weight_model_name(self) -> Optional[str]:
+        active = self._normalise_weight_model_name(self._active_weight_model_name)
+        if active and active in self._weight_snapshot_deques_by_model:
+            self._weight_snapshot_deque = self._weight_snapshot_deques_by_model[active]
+            return active
+        if self._weight_model_order:
+            active = str(self._weight_model_order[0])
+            self._active_weight_model_name = active
+            self._weight_snapshot_deque = self._weight_snapshot_deques_by_model[active]
+            return active
+        return None
+
+    def _remember_checkpoint_weight_record(
+        self,
+        *,
+        round_id: int,
+        cycle: int,
+        model_name: Optional[str],
+        generation: int = 0,
+        architecture_version: int = 0,
+        state_publish_seq: int = 0,
+        node_id: str = "",
+    ) -> None:
+        model_key = self._register_weight_model(model_name)
+        if model_key is None or int(round_id) <= 0:
+            return
+        self._checkpoint_weight_records[(int(round_id), int(cycle), model_key)] = {
+            "round_id": int(round_id),
+            "cycle": int(cycle),
+            "model_name": str(model_key),
+            "generation": int(generation),
+            "architecture_version": int(architecture_version),
+            "state_publish_seq": int(state_publish_seq),
+            "node_id": str(node_id or ""),
+        }
+
+    def _checkpoint_offset_for_loss_counts(self, loss_counts: Dict[str, int]) -> Optional[int]:
+        if not loss_counts:
+            return None
+        snap_list = list(self._loss_count_at_snap_deque)
+        slen = len(snap_list)
+        if slen <= 0:
+            return None
+        lengths = self._loss_channel_lengths()
+        ref_sid = max(lengths, key=lengths.get, default=None)
+        if ref_sid is None or ref_sid not in loss_counts:
+            return None
+        target_n = int(loss_counts.get(ref_sid, 0) or 0)
+        if target_n <= 0:
+            return None
+        best_idx = 0
+        best_dist = abs(int(snap_list[0].get(ref_sid, 0)) - target_n)
+        for idx, snap in enumerate(snap_list):
+            dist = abs(int(snap.get(ref_sid, 0)) - target_n)
+            if dist < best_dist:
+                best_dist = dist
+                best_idx = idx
+        return max(1, slen - best_idx)
+
+    def _checkpoint_marker_for_offset(self, offset: int) -> Optional[Dict[str, Any]]:
+        target_offset = max(1, int(offset))
+        for record in self._checkpoint_marker_records:
+            counts = record.get("loss_counts")
+            if not isinstance(counts, dict):
+                continue
+            marker_offset = self._checkpoint_offset_for_loss_counts(counts)
+            if marker_offset is not None and int(marker_offset) == int(target_offset):
+                return dict(record)
+        return None
+
+    def _checkpoint_record_for_model(
+        self,
+        marker: Optional[Dict[str, Any]],
+        model_name: Optional[str],
+    ) -> Optional[Dict[str, Any]]:
+        if not isinstance(marker, dict):
+            return None
+        model_key = self._normalise_weight_model_name(model_name)
+        if not model_key:
+            return dict(marker)
+        key = (
+            int(marker.get("round_id", 0) or 0),
+            int(marker.get("cycle", 0) or 0),
+            model_key,
+        )
+        record = self._checkpoint_weight_records.get(key)
+        if record is not None:
+            merged = dict(marker)
+            merged.update(record)
+            return merged
+        return dict(marker)
+
+    def _find_checkpoint_image_store_index(
+        self,
+        *,
+        round_id: int,
+        cycle: int,
+        model_name: str,
+        generation: int = 0,
+        architecture_version: int = 0,
+    ) -> Optional[int]:
+        store = self._weight_image_store
+        if store is None:
+            return None
+        model_key = self._normalise_weight_model_name(model_name)
+        for index in range(max(0, int(store.length())) - 1, -1, -1):
+            meta = store.get_meta(index)
+            if meta is None:
+                continue
+            if (int(meta.flags) & int(WEIGHT_IMAGE_FLAG_CHECKPOINT)) == 0:
+                continue
+            if int(meta.round_id) != int(round_id) or int(meta.cycle) != int(cycle):
+                continue
+            if self._normalise_weight_model_name(getattr(meta, "model_name", "")) != model_key:
+                continue
+            if int(generation) > 0 and int(getattr(meta, "generation", 0) or 0) != int(generation):
+                continue
+            if (
+                int(architecture_version) > 0
+                and int(getattr(meta, "architecture_version", 0) or 0) != int(architecture_version)
+            ):
+                continue
+            return int(index)
+        return None
+
+    def _checkpoint_thumbnail_cache_key(
+        self,
+        *,
+        round_id: int,
+        cycle: int,
+        model_name: str,
+    ) -> Tuple[int, int, str]:
+        return (int(round_id), int(cycle), self._normalise_weight_model_name(model_name))
+
+    def _checkpoint_can_render_live_state(
+        self,
+        record: Optional[Dict[str, Any]],
+        *,
+        model_name: str,
+    ) -> bool:
+        if not self._has_shared_weight_pipeline():
+            return False
+        if not isinstance(record, dict):
+            return False
+        state_store = self._weight_state_store
+        if state_store is None:
+            return False
+        state_meta = state_store.get_meta()
+        if state_meta is None:
+            return False
+        if self._normalise_weight_model_name(getattr(state_meta, "model_name", "")) != self._normalise_weight_model_name(model_name):
+            return False
+        if int(record.get("round_id", 0) or 0) > 0 and int(state_meta.round_id) != int(record.get("round_id", 0) or 0):
+            return False
+        if int(record.get("cycle", 0) or 0) > 0 and int(state_meta.cycle) != int(record.get("cycle", 0) or 0):
+            return False
+        if (
+            int(record.get("state_publish_seq", 0) or 0) > 0
+            and int(state_meta.publish_seq) != int(record.get("state_publish_seq", 0) or 0)
+        ):
+            return False
+        if int(record.get("generation", 0) or 0) > 0 and int(getattr(state_meta, "generation", 0) or 0) != int(record.get("generation", 0) or 0):
+            return False
+        if (
+            int(record.get("architecture_version", 0) or 0) > 0
+            and int(getattr(state_meta, "architecture_version", 0) or 0) != int(record.get("architecture_version", 0) or 0)
+        ):
+            return False
+        return True
+
+    def _resolve_checkpoint_weight_rgb(
+        self,
+        marker: Optional[Dict[str, Any]],
+        *,
+        model_name: Optional[str],
+    ) -> Optional[np.ndarray]:
+        record = self._checkpoint_record_for_model(marker, model_name)
+        if not isinstance(record, dict):
+            return None
+        model_key = self._normalise_weight_model_name(record.get("model_name") or model_name)
+        round_id = int(record.get("round_id", 0) or 0)
+        cycle = int(record.get("cycle", 0) or 0)
+        if round_id <= 0 or not model_key:
+            return None
+        cache_key = self._checkpoint_thumbnail_cache_key(
+            round_id=round_id,
+            cycle=cycle,
+            model_name=model_key,
+        )
+        cached = self._checkpoint_weight_rgb_cache.get(cache_key)
+        if cached is not None:
+            return np.ascontiguousarray(np.asarray(cached, dtype=np.uint8)).copy()
+        root = self._checkpoint_thumbnail_root_path()
+        path: Optional[Path] = None
+        if root is not None:
+            generation = int(record.get("generation", 0) or 0)
+            architecture_version = int(record.get("architecture_version", 0) or 0)
+            path = find_checkpoint_thumbnail(
+                root,
+                round_id=round_id,
+                cycle=cycle,
+                model_name=model_key,
+                generation=(generation if generation > 0 else None),
+                architecture_version=(architecture_version if architecture_version > 0 else None),
+            )
+        if path is None:
+            index = self._find_checkpoint_image_store_index(
+                round_id=round_id,
+                cycle=cycle,
+                model_name=model_key,
+                generation=int(record.get("generation", 0) or 0),
+                architecture_version=int(record.get("architecture_version", 0) or 0),
+            )
+            if index is not None:
+                path = self._persist_checkpoint_weight_thumbnail(
+                    int(index),
+                    target_width=int(self.panel_w),
+                    target_height=int(self._weight_map_target_hw()[0]),
+                )
+        if path is None and self._checkpoint_can_render_live_state(record, model_name=model_key):
+            self._launch_shared_weight_render()
+            index = self._find_checkpoint_image_store_index(
+                round_id=round_id,
+                cycle=cycle,
+                model_name=model_key,
+                generation=int(record.get("generation", 0) or 0),
+                architecture_version=int(record.get("architecture_version", 0) or 0),
+            )
+            if index is not None:
+                path = self._persist_checkpoint_weight_thumbnail(
+                    int(index),
+                    target_width=int(self.panel_w),
+                    target_height=int(self._weight_map_target_hw()[0]),
+                )
+        if path is None:
+            return None
+        try:
+            rgb = load_checkpoint_thumbnail(path)
+        except Exception:
+            return None
+        cropped = crop_weight_image_rgb(
+            rgb,
+            target_width=int(self.panel_w),
+            target_height=int(self._weight_map_target_hw()[0]),
+        )
+        self._checkpoint_weight_rgb_cache[cache_key] = cropped.copy()
+        return cropped
+
+    def _compose_weight_sidebar_rgb(
+        self,
+        base_rgb: np.ndarray,
+        *,
+        active_model: Optional[str],
+        checkpoint_marker: Optional[Dict[str, Any]] = None,
+    ) -> np.ndarray:
+        out = crop_weight_image_rgb(
+            np.ascontiguousarray(np.asarray(base_rgb, dtype=np.uint8)),
+            target_width=int(self.panel_w),
+            target_height=int(self._weight_map_target_hw()[0]),
+        )
+        self._weight_tab_hit_boxes = []
+        model_names = [str(name) for name in self._weight_model_order if str(name)]
+        if active_model and active_model not in model_names:
+            model_names.append(str(active_model))
+        if not model_names:
+            return out
         try:
             from PIL import Image, ImageDraw, ImageFont
-            im = Image.fromarray(rgb)
-            draw = ImageDraw.Draw(im)
+
+            im = Image.fromarray(out)
+            draw = ImageDraw.Draw(im, "RGBA")
             font = ImageFont.load_default()
-            r = entry.get("round_id", "?")
-            c = entry.get("cycle", "?")
-            draw.text((4, 4), f"CKPT r{r} c{c}", fill=(200, 170, 40), font=font)
-            draw.text((4, 20), str(text), fill=(80, 80, 100), font=font)
-            rgb = np.asarray(im, dtype=np.uint8)
+            tab_h = 18
+            draw.rectangle([(0, 0), (int(out.shape[1]) - 1, tab_h + 3)], fill=(12, 16, 22, 208))
+            x = 4
+            for model_name in model_names:
+                label = str(model_name)
+                tab_w = max(30, min(int(out.shape[1]) - 8, len(label) * 7 + 12))
+                box = (x, 2, min(int(out.shape[1]) - 4, x + tab_w), 2 + tab_h)
+                is_active = str(label) == str(active_model or "")
+                fill = (78, 112, 156, 230) if is_active else (28, 34, 44, 220)
+                outline = (160, 206, 255, 255) if is_active else (76, 86, 98, 255)
+                fg = (236, 244, 255, 255) if is_active else (170, 178, 188, 255)
+                draw.rectangle([box[0], box[1], box[2], box[3]], fill=fill, outline=outline)
+                draw.text((box[0] + 5, box[1] + 3), label, fill=fg, font=font)
+                self._weight_tab_hit_boxes.append((label, box))
+                x = int(box[2]) + 4
+                if x >= int(out.shape[1]) - 24:
+                    break
+            status = "live"
+            if isinstance(checkpoint_marker, dict) and int(checkpoint_marker.get("round_id", 0) or 0) > 0:
+                status = f"checkpoint r{int(checkpoint_marker.get('round_id', 0))} c{int(checkpoint_marker.get('cycle', 0))}"
+            active_label = str(active_model or "weights")
+            draw.text((6, tab_h + 5), f"{active_label}  {status}", fill=(230, 236, 246, 255), font=font)
+            return np.ascontiguousarray(np.asarray(im, dtype=np.uint8))
         except Exception:
-            pass
-        return rgb
+            return out
+
+    def _visible_weight_map_rgb(self) -> np.ndarray:
+        active_model = self._resolved_active_weight_model_name()
+        checkpoint_marker: Optional[Dict[str, Any]] = None
+        if active_model is None and self._scrub_offset > 0:
+            checkpoint_marker = self._checkpoint_marker_for_offset(self._scrub_offset)
+            marker_model = self._normalise_weight_model_name(
+                checkpoint_marker.get("model_name") if isinstance(checkpoint_marker, dict) else ""
+            )
+            if marker_model:
+                active_model = self._register_weight_model(marker_model)
+        base_rgb: Optional[np.ndarray] = None
+        if self._scrub_offset > 0:
+            checkpoint_marker = self._checkpoint_marker_for_offset(self._scrub_offset)
+            if checkpoint_marker is not None and active_model is not None:
+                base_rgb = self._resolve_checkpoint_weight_rgb(
+                    checkpoint_marker,
+                    model_name=active_model,
+                )
+            if base_rgb is None:
+                base_rgb = self._history_weight_map_at_offset(
+                    self._scrub_offset,
+                    model_name=active_model,
+                )
+        elif active_model is not None:
+            base_rgb = self._weight_current_rgb_by_model.get(active_model)
+        if base_rgb is None:
+            base_rgb = self._blank_weight_map_rgb()
+        return self._compose_weight_sidebar_rgb(
+            base_rgb,
+            active_model=active_model,
+            checkpoint_marker=checkpoint_marker,
+        )
+
+    def _weight_state_registry_entries(self) -> List[Any]:
+        store = self._weight_state_store
+        if store is None:
+            return []
+        list_meta = getattr(store, "list_meta", None)
+        if callable(list_meta):
+            try:
+                metas = list_meta()
+            except Exception:
+                metas = []
+            if metas:
+                return list(metas)
+        meta = store.get_meta()
+        return [meta] if meta is not None else []
+
+    def _weight_image_present_for_state(self, state_meta: Any) -> bool:
+        store = self._weight_image_store
+        if store is None or state_meta is None:
+            return False
+        target_model = self._normalise_weight_model_name(getattr(state_meta, "model_name", ""))
+        target_node = str(getattr(state_meta, "node_id", "") or "")
+        target_publish_seq = int(getattr(state_meta, "publish_seq", 0) or 0)
+        for index in range(max(0, int(store.length())) - 1, -1, -1):
+            image_meta = store.get_meta(index)
+            if image_meta is None:
+                continue
+            if int(getattr(image_meta, "state_publish_seq", 0) or 0) != target_publish_seq:
+                continue
+            if self._normalise_weight_model_name(getattr(image_meta, "model_name", "")) != target_model:
+                continue
+            if str(getattr(image_meta, "node_id", "") or "") != target_node:
+                continue
+            return True
+        return False
+
+    def _measure_weight_state_cfg(
+        self,
+        state_meta: Any,
+        *,
+        mode: int,
+        target_width: int,
+        target_height: int,
+    ) -> Optional[WeightImageConfig]:
+        if state_meta is None or self._weight_state_store is None or self._weight_image_store is None:
+            return None
+        key = (
+            self._normalise_weight_model_name(getattr(state_meta, "model_name", "")),
+            str(getattr(state_meta, "node_id", "") or ""),
+            int(getattr(state_meta, "publish_seq", 0) or 0),
+            int(mode),
+            (int(target_width) << 16) ^ int(target_height),
+        )
+        cached = self._weight_measure_cfg_cache.get(key)
+        if cached is not None:
+            return cached
+        try:
+            cfg = self._weight_image_store.measure_for(
+                self._weight_state_store,
+                model_name=str(getattr(state_meta, "model_name", "") or ""),
+                node_id=str(getattr(state_meta, "node_id", "") or ""),
+                mode=int(mode),
+                target_width=int(target_width),
+                target_height=int(target_height),
+            )
+        except Exception:
+            return None
+        if cfg is not None:
+            self._weight_measure_cfg_cache[key] = cfg
+        return cfg
 
     # -- Sidebar public API -----------------------------------------------------
 
@@ -1416,114 +1560,31 @@ class _TransformerStatusOpenGLViewer:
         self._preview_work_queue_ref = work_queue
 
     def _history_snap_count(self) -> int:
-        """Total scrub positions: in-memory cache + on-disk checkpoint thumbnails."""
         cc_len = self._composite_cache.length() if self._composite_cache else 0
-        cache_len = max(
-            len(self._weight_snapshot_deque),
-            cc_len,
-            len(self._loss_count_at_snap_deque),
-        )
-        return cache_len + len(self._checkpoint_thumbs)
-
-    def _cache_snap_count(self) -> int:
-        """In-memory cache positions only (without checkpoint thumbnails)."""
-        cc_len = self._composite_cache.length() if self._composite_cache else 0
+        active_model = self._resolved_active_weight_model_name()
+        if active_model is not None:
+            weight_len = len(self._weight_snapshot_deques_by_model.get(active_model, ()))
+        else:
+            weight_len = len(self._weight_snapshot_deque)
         return max(
-            len(self._weight_snapshot_deque),
+            int(weight_len),
             cc_len,
             len(self._loss_count_at_snap_deque),
         )
 
-    def _scrub_in_checkpoint_zone(self) -> bool:
-        """True when the current scrub offset is beyond in-memory cache."""
-        return self._scrub_offset > self._cache_snap_count()
-
-    def _checkpoint_index_from_offset(self, offset: int) -> Optional[int]:
-        """Map a scrub offset in the checkpoint zone to a _checkpoint_thumbs index.
-
-        Checkpoint zone offsets start at cache_len + 1.
-        Returns index into _checkpoint_thumbs (newest first) or None.
-        """
-        cache_len = self._cache_snap_count()
-        if offset <= cache_len:
-            return None
-        # ckpt_offset 1 = most-recent checkpoint, N = oldest
-        ckpt_offset = offset - cache_len
-        n = len(self._checkpoint_thumbs)
-        if n == 0 or ckpt_offset > n:
-            return None
-        # _checkpoint_thumbs is sorted oldest->newest, so index for newest-first:
-        return n - ckpt_offset
-
-    def _ring_index_from_cursor(self, ring_cursor: int) -> Optional[int]:
-        ring = self._scrub_ring
-        if ring is None:
-            return None
-        with ring.locked():
-            write_cursor = int(ring.write_cursor())
-            ring_len = int(ring.length())
-        first_cursor = write_cursor - ring_len
-        cursor = int(ring_cursor)
-        if cursor < first_cursor or cursor >= write_cursor:
-            return None
-        return cursor - first_cursor
-
-    def _weight_map_from_ring_cursor(self, ring_cursor: Optional[int]) -> Optional[np.ndarray]:
-        if ring_cursor is None:
-            return None
-        ring_idx = self._ring_index_from_cursor(int(ring_cursor))
-        if ring_idx is None:
-            return None
-        ring = self._scrub_ring
-        if ring is None:
-            return None
-        meta = ring.get_meta(ring_idx)
-        if meta is None or not (int(meta.flags) & int(SCRUB_FLAG_HAS_THUMBS)):
-            return None
-        tiles: List[np.ndarray] = []
-        for thumb_idx in range(SCRUB_NUM_THUMBS):
-            tile = ring.copy_thumbnail(ring_idx, thumb_idx)
-            if tile is None:
-                return None
-            tiles.append(tile)
-        rgb = _compose_weight_thumb_stack(tiles)
-        title = str(self._active_weight_model_name or "").strip()
-        if title:
-            rgb = annotate_weight_map(rgb, title=title, subtitle="")
-        return rgb
-
-    def _checkpoint_index_for_loss_counts(self, loss_counts: Dict[str, int]) -> Optional[int]:
-        if not isinstance(loss_counts, dict) or not self._checkpoint_thumbs:
-            return None
-        lengths = self._loss_channel_lengths()
-        ref_sid = max(lengths, key=lengths.get, default=None)
-        if ref_sid is None or ref_sid not in loss_counts:
-            return None
-        cursor_count = int(loss_counts.get(ref_sid, 0))
-        best_idx: Optional[int] = None
-        best_count = -1
-        for idx, entry in enumerate(self._checkpoint_thumbs):
-            ckpt_counts = entry.get("loss_counts") if isinstance(entry, dict) else None
-            if not isinstance(ckpt_counts, dict) or ref_sid not in ckpt_counts:
-                continue
-            ckpt_count = int(ckpt_counts.get(ref_sid, 0))
-            if ckpt_count <= cursor_count and ckpt_count >= best_count:
-                best_idx = idx
-                best_count = ckpt_count
-        return best_idx
-
-    def _record_history_snap(self, ring_cursor: Optional[int] = None) -> None:
-        """Record a weight-map snapshot and loss-count position for the latest
-        composite-cache entry.  Called once per composite built in _present()."""
-        self._loss_count_at_snap_deque.append(
-            self._loss_channel_lengths()
-        )
-        self._weight_snapshot_deque.append(
-            {
-                "ring_cursor": (int(ring_cursor) if ring_cursor is not None else None),
-                "weight_map": np.ascontiguousarray(np.asarray(self._weight_map_rgb, dtype=np.uint8)).copy(),
-            }
-        )
+    def _record_history_snap(self, _ring_cursor: Optional[int] = None) -> None:
+        self._loss_count_at_snap_deque.append(self._loss_channel_lengths())
+        active_model = self._resolved_active_weight_model_name()
+        if active_model is None:
+            return
+        current_rgb = self._weight_current_rgb_by_model.get(active_model)
+        if current_rgb is None:
+            return
+        snaps = self._weight_snapshot_deques_by_model.get(active_model)
+        if snaps is None:
+            return
+        snaps.append(np.ascontiguousarray(np.asarray(current_rgb, dtype=np.uint8)).copy())
+        self._weight_snapshot_deque = snaps
 
     def _apply_composite_to_display(self, cache_index: int) -> None:
         """Upload the three RGB panels from the composite cache to OpenGL textures
@@ -1544,9 +1605,6 @@ class _TransformerStatusOpenGLViewer:
         cache = self._composite_cache
         if cache is None:
             return
-        # If in checkpoint zone, no preview frame is available.
-        if self._scrub_in_checkpoint_zone() and offset > self._cache_snap_count():
-            return
         clen = cache.length()
         if clen <= 0:
             return
@@ -1560,35 +1618,23 @@ class _TransformerStatusOpenGLViewer:
                 self._upload_texture(int(tid), panels[i])
         self._apply_cached_frame_text(idx)
 
-
-    def _history_weight_map_at_offset(self, offset: int) -> Optional[np.ndarray]:
-        # Check checkpoint zone first
-        ckpt_idx = self._checkpoint_index_from_offset(offset)
-        if ckpt_idx is not None:
-            return self._load_checkpoint_thumbnail(ckpt_idx)
-        snaps = list(self._weight_snapshot_deque)
+    def _history_weight_map_at_offset(
+        self,
+        offset: int,
+        *,
+        model_name: Optional[str] = None,
+    ) -> Optional[np.ndarray]:
+        model_key = self._normalise_weight_model_name(model_name)
+        if model_key:
+            snaps = list(self._weight_snapshot_deques_by_model.get(model_key, ()))
+        else:
+            snaps = list(self._weight_snapshot_deque)
         slen = len(snaps)
         if slen <= 0:
             return None
         off = max(1, min(slen, int(offset)))
         idx = max(0, min(slen - 1, slen - off))
-        blob = snaps[idx]
-        if not isinstance(blob, dict):
-            return None
-        ring_rgb = self._weight_map_from_ring_cursor(blob.get("ring_cursor"))
-        if ring_rgb is not None:
-            return ring_rgb
-        counts = list(self._loss_count_at_snap_deque)
-        if 0 <= idx < len(counts):
-            hist_ckpt_idx = self._checkpoint_index_for_loss_counts(counts[idx])
-            if hist_ckpt_idx is not None:
-                hist_ckpt = self._load_checkpoint_thumbnail(hist_ckpt_idx)
-                if hist_ckpt is not None:
-                    return hist_ckpt
-        weight_map = blob.get("weight_map", None)
-        if weight_map is None:
-            return None
-        return np.ascontiguousarray(np.asarray(weight_map, dtype=np.uint8))
+        return np.ascontiguousarray(np.asarray(snaps[idx], dtype=np.uint8))
 
     def set_training_graph_worker_hello(self, payload: Dict[str, Any]) -> None:
         self._graph_worker_hello = dict(payload or {})
@@ -1609,27 +1655,6 @@ class _TransformerStatusOpenGLViewer:
         self._top_bar_dirty = True
         self._graph_dirty = True
 
-    def set_weight_model_refs(
-        self,
-        models: Dict[str, Any],
-        disk_states: Optional[Dict[str, Optional[Dict[str, Any]]]] = None,
-        ckpt_states: Optional[Dict[str, Optional[Dict[str, Any]]]] = None,
-    ) -> None:
-        """Register the *currently active* nn.Module instances for weight-map display.
-
-        Pass only models that are actually being run right now - the map shows
-        exactly what is given.  Optionally supply state-dicts for the red diff
-        overlay:
-          disk_states  - {name: state_dict} loaded straight from the on-disk file
-          ckpt_states  - {name: state_dict} from the pipeline checkpoint that
-                         holds data to be integrated with the base model
-        The red overlay pixel intensity = normalised |disk_weight - ckpt_weight|.
-        """
-        self._weight_model_refs = dict(models)
-        self._weight_disk_states = dict(disk_states) if disk_states else {}
-        self._weight_ckpt_states = dict(ckpt_states) if ckpt_states else {}
-        self._sidebar_dirty = True
-
     def set_restore_state_callback(self, fn: "Callable[[int], None]") -> None:
         """Register a callback invoked when the user clicks RESTORE STATE.
 
@@ -1642,34 +1667,380 @@ class _TransformerStatusOpenGLViewer:
         self._on_restore_state = fn
 
     def set_active_weight_model(self, name: Optional[str]) -> None:
-        """Set which model name is shown in the right sidebar weight image.
-
-        Pass ``None`` to fall back to the first key in ``_weight_model_refs``.
-        """
-        self._active_weight_model_name = name if name is None else str(name)
+        """Set which model name is shown in the right sidebar weight image."""
+        if name is None:
+            self._active_weight_model_name = None
+        else:
+            self._active_weight_model_name = self._register_weight_model(name)
+        active = self._resolved_active_weight_model_name()
+        if active is not None:
+            self._sr_weight_active = str(active)
         self._sidebar_dirty = True
 
-    def set_weight_snap_dir(self, path) -> None:
-        """Set the directory where per-snapshot weight .pt backup files are written.
+    def weight_image_spec(self) -> Dict[str, int]:
+        target_h, target_w = self._weight_map_target_hw()
+        return {
+            "mode": int(self._weight_image_mode),
+            "panel_crop_w": int(target_w),
+            "panel_crop_h": int(target_h),
+        }
 
-        Files are named ``snap_{snap_total:08d}.pt`` and deleted automatically
-        when the corresponding entry ages out of the sparse deque.
-        """
-        self._weight_snap_dir = Path(path) if path is not None else None
+    @staticmethod
+    def _weight_render_signature(cfg: WeightImageConfig) -> Tuple[int, int, int, int, int, int]:
+        return (
+            int(cfg.state_publish_seq),
+            int(cfg.mode),
+            int(cfg.target_width),
+            int(cfg.target_height),
+            int(cfg.render_width),
+            int(cfg.render_height),
+        )
 
-    def get_restore_state_dicts(self, offset: int) -> Optional[Dict[str, Dict]]:
-        """Return the weight state-dicts for the snapshot at *offset* positions back.
+    def _apply_weight_image_store_limits(self, cfg: WeightImageConfig) -> None:
+        store = self._weight_image_store
+        if store is None:
+            return
+        set_limits = getattr(store, "set_limits", None)
+        if not callable(set_limits):
+            return
+        row_bytes = int(getattr(cfg, "render_stride_bytes", 0) or 0)
+        if row_bytes <= 0:
+            row_bytes = int(cfg.render_width) * max(1, int(cfg.render_channels))
+        image_bytes = row_bytes * max(1, int(cfg.render_height))
+        max_entries = max(1, int(self._weight_history_maxlen))
+        max_total_bytes = max(1, image_bytes) * max_entries
+        self._persist_weight_image_evictions_for_limits(cfg)
+        try:
+            set_limits(max_entries=max_entries, max_total_bytes=max_total_bytes)
+        except Exception:
+            return
 
-        offset=1 -> most recent snapshot; offset=N -> Nth most recent (oldest = N where
-        N == len(sparse deque)).  Mirrors the same indexing used by the scrub display.
-        Returns ``None`` if the sparse deque is empty."""
-        snaps = list(self._weight_state_sparse_deque)
-        slen = len(snaps)
-        if not snaps:
+    def _checkpoint_thumbnail_root_path(self) -> Optional[Path]:
+        if self._checkpoint_backup_dir is not None:
+            return checkpoint_thumbnail_root(self._checkpoint_backup_dir)
+        if self._checkpoint_live_dir is not None:
+            return checkpoint_thumbnail_root(self._checkpoint_live_dir / "_weight_backup")
+        return None
+
+    def _persist_checkpoint_weight_thumbnail(
+        self,
+        index: int,
+        *,
+        target_width: int,
+        target_height: int,
+    ) -> Optional[Path]:
+        store = self._weight_image_store
+        root = self._checkpoint_thumbnail_root_path()
+        if store is None or root is None:
             return None
-        off = max(1, min(slen, int(offset)))
-        idx = max(0, min(slen - 1, slen - off))
-        return snaps[idx]["states"]
+        meta = store.get_meta(int(index))
+        if meta is None:
+            return None
+        if (int(meta.flags) & int(WEIGHT_IMAGE_FLAG_CHECKPOINT)) == 0:
+            return None
+        rgb = store.copy_image(int(index))
+        if rgb is None:
+            return None
+        cropped = crop_weight_image_rgb(
+            rgb,
+            target_width=int(target_width),
+            target_height=int(target_height),
+        )
+        path = checkpoint_thumbnail_path(
+            root,
+            round_id=int(meta.round_id),
+            cycle=int(meta.cycle),
+            model_name=str(meta.model_name),
+            generation=int(meta.generation),
+            architecture_version=int(meta.architecture_version),
+        )
+        try:
+            saved = save_checkpoint_thumbnail(path, cropped)
+        except Exception:
+            return None
+        self._remember_checkpoint_weight_record(
+            round_id=int(meta.round_id),
+            cycle=int(meta.cycle),
+            model_name=str(meta.model_name),
+            generation=int(getattr(meta, "generation", 0) or 0),
+            architecture_version=int(getattr(meta, "architecture_version", 0) or 0),
+            state_publish_seq=int(getattr(meta, "state_publish_seq", 0) or 0),
+            node_id=str(getattr(meta, "node_id", "") or ""),
+        )
+        self._checkpoint_weight_rgb_cache.pop(
+            self._checkpoint_thumbnail_cache_key(
+                round_id=int(meta.round_id),
+                cycle=int(meta.cycle),
+                model_name=str(meta.model_name),
+            ),
+            None,
+        )
+        return saved
+
+    def _persist_weight_image_evictions(
+        self,
+        evict_indices: Sequence[int],
+        *,
+        target_width: int,
+        target_height: int,
+    ) -> None:
+        for index in sorted({int(i) for i in evict_indices}):
+            try:
+                self._persist_checkpoint_weight_thumbnail(
+                    int(index),
+                    target_width=int(target_width),
+                    target_height=int(target_height),
+                )
+            except Exception:
+                continue
+
+    def _persist_weight_image_evictions_for_limits(self, cfg: WeightImageConfig) -> None:
+        store = self._weight_image_store
+        if store is None:
+            return
+        row_bytes = int(getattr(cfg, "render_stride_bytes", 0) or 0)
+        if row_bytes <= 0:
+            row_bytes = int(cfg.render_width) * max(1, int(cfg.render_channels))
+        image_bytes = row_bytes * max(1, int(cfg.render_height))
+        max_entries = max(1, int(self._weight_history_maxlen))
+        max_total_bytes = max(1, image_bytes) * max_entries
+        entries = [store.get_meta(i) for i in range(max(0, int(store.length())))]
+        evict_indices = plan_weight_image_evictions(
+            [entry for entry in entries if entry is not None],
+            max_entries=int(max_entries),
+            max_total_bytes=int(max_total_bytes),
+        )
+        self._persist_weight_image_evictions(
+            evict_indices,
+            target_width=int(cfg.target_width),
+            target_height=int(cfg.target_height),
+        )
+
+    def _persist_weight_image_evictions_for_render(self, cfg: WeightImageConfig) -> None:
+        store = self._weight_image_store
+        if store is None:
+            return
+        stats = store.stats()
+        if stats is None:
+            return
+        row_bytes = int(getattr(cfg, "render_stride_bytes", 0) or 0)
+        if row_bytes <= 0:
+            row_bytes = int(cfg.render_width) * max(1, int(cfg.render_channels))
+        incoming_bytes = row_bytes * max(1, int(cfg.render_height))
+        entries = [store.get_meta(i) for i in range(max(0, int(store.length())))]
+        evict_indices = plan_weight_image_evictions(
+            [entry for entry in entries if entry is not None],
+            max_entries=max(1, int(stats.max_entries)),
+            max_total_bytes=max(0, int(stats.max_total_bytes)),
+            incoming_bytes=max(0, int(incoming_bytes)),
+        )
+        self._persist_weight_image_evictions(
+            evict_indices,
+            target_width=int(cfg.target_width),
+            target_height=int(cfg.target_height),
+        )
+
+    def _has_shared_weight_pipeline(self) -> bool:
+        return (
+            self._weight_state_store is not None
+            and self._weight_image_store is not None
+            and self.has_training_connection()
+        )
+
+    def _launch_shared_weight_render(self) -> None:
+        if not self._has_shared_weight_pipeline():
+            return
+        if self._shared_weight_render_thread is not None:
+            return
+        state_store = self._weight_state_store
+        image_store = self._weight_image_store
+        if state_store is None or image_store is None:
+            return
+        spec = self.weight_image_spec()
+        mode = int(spec.get("mode", self._weight_image_mode) or self._weight_image_mode)
+        target_width = int(spec.get("panel_crop_w", self.panel_w) or self.panel_w)
+        target_height = int(spec.get("panel_crop_h", self._weight_map_target_hw()[0]) or self._weight_map_target_hw()[0])
+        active_model = self._resolved_active_weight_model_name()
+        registry_entries = list(self._weight_state_registry_entries())
+        if not registry_entries:
+            return
+        for state_meta in registry_entries:
+            self._register_weight_model(getattr(state_meta, "model_name", ""))
+        registry_entries.sort(
+            key=lambda meta: (
+                0 if self._normalise_weight_model_name(getattr(meta, "model_name", "")) == str(active_model or "") else 1,
+                -int(getattr(meta, "publish_seq", 0) or 0),
+            )
+        )
+        measured_cfgs: List[WeightImageConfig] = []
+        pending_state_meta = None
+        pending_cfg = None
+        for state_meta in registry_entries:
+            cfg = self._measure_weight_state_cfg(
+                state_meta,
+                mode=int(mode),
+                target_width=int(target_width),
+                target_height=int(target_height),
+            )
+            if cfg is not None:
+                measured_cfgs.append(cfg)
+            if pending_state_meta is None and not self._weight_image_present_for_state(state_meta):
+                pending_state_meta = state_meta
+                pending_cfg = cfg
+        limit_cfg = None
+        if measured_cfgs:
+            limit_cfg = max(
+                measured_cfgs,
+                key=lambda cfg: int(getattr(cfg, "render_stride_bytes", 0) or 0) * max(1, int(getattr(cfg, "render_height", 0) or 0)),
+            )
+        elif pending_cfg is not None:
+            limit_cfg = pending_cfg
+        if limit_cfg is not None:
+            self._apply_weight_image_store_limits(limit_cfg)
+            self._persist_weight_image_evictions_for_render(limit_cfg)
+        if pending_state_meta is None:
+            return
+        render_sig = (
+            int(getattr(pending_state_meta, "publish_seq", 0) or 0),
+            int(mode),
+            int(target_width),
+            int(target_height),
+            self._normalise_weight_model_name(getattr(pending_state_meta, "model_name", "")),
+            str(getattr(pending_state_meta, "node_id", "") or ""),
+        )
+        result_box: Dict[str, Any] = {}
+
+        def _shared_weight_worker(
+            _self=self,
+            _state_store=state_store,
+            _image_store=image_store,
+            _state_meta=pending_state_meta,
+            _box=result_box,
+        ) -> None:
+            ok = _image_store.render_for(
+                _state_store,
+                model_name=str(getattr(_state_meta, "model_name", "") or ""),
+                node_id=str(getattr(_state_meta, "node_id", "") or ""),
+                mode=int(mode),
+                target_width=int(target_width),
+                target_height=int(target_height),
+            )
+            _box["state_publish_seq"] = int(_state_meta.publish_seq)
+            _box["model_name"] = str(_state_meta.model_name)
+            _box["render_sig"] = render_sig
+            if not ok:
+                _box["ok"] = False
+                return
+            latest = _image_store.latest_image()
+            if latest is None:
+                _box["ok"] = False
+                return
+            image_meta, rgb = latest
+            subtitle = f"r{int(image_meta.round_id)} c{int(image_meta.cycle)} s{int(image_meta.step)}"
+            _box["ok"] = True
+            _box["image_meta"] = image_meta
+            _box["weight_map"] = annotate_weight_map(
+                np.ascontiguousarray(np.asarray(rgb, dtype=np.uint8)),
+                title=str(image_meta.model_name or _state_meta.model_name or ""),
+                subtitle=subtitle,
+            )
+
+        self._shared_weight_render_result = result_box
+        self._shared_weight_render_thread = threading.Thread(
+            target=_shared_weight_worker,
+            name="shared-weight-render",
+            daemon=True,
+        )
+        self._shared_weight_render_thread.start()
+
+    def _collect_shared_weight_render(self) -> None:
+        thread = self._shared_weight_render_thread
+        result = self._shared_weight_render_result
+        if thread is None or thread.is_alive() or result is None:
+            return
+        self._shared_weight_render_thread = None
+        self._shared_weight_render_result = None
+        if not bool(result.get("ok")):
+            return
+        image_meta = result.get("image_meta")
+        weight_map = result.get("weight_map")
+        if image_meta is None or weight_map is None:
+            return
+        self._last_weight_state_publish_seq = int(result.get("state_publish_seq", 0) or 0)
+        self._last_weight_image_seq = int(getattr(image_meta, "image_seq", 0) or 0)
+        render_sig = result.get("render_sig")
+        if isinstance(render_sig, tuple):
+            self._last_weight_render_sig = render_sig
+        pending_ckpt = self._pending_checkpoint_weight_marks.pop(
+            int(getattr(image_meta, "state_publish_seq", 0) or 0),
+            None,
+        )
+        if pending_ckpt is not None:
+            self._mark_checkpoint_weight_image(
+                int(getattr(image_meta, "state_publish_seq", 0) or 0),
+                int(pending_ckpt[0]),
+                int(pending_ckpt[1]),
+            )
+            self._remember_checkpoint_weight_record(
+                round_id=int(pending_ckpt[0]),
+                cycle=int(pending_ckpt[1]),
+                model_name=str(getattr(image_meta, "model_name", "") or result.get("model_name") or ""),
+                generation=int(getattr(image_meta, "generation", 0) or 0),
+                architecture_version=int(getattr(image_meta, "architecture_version", 0) or 0),
+                state_publish_seq=int(getattr(image_meta, "state_publish_seq", 0) or 0),
+                node_id=str(getattr(image_meta, "node_id", "") or ""),
+            )
+        model_name = self._register_weight_model(
+            str(result.get("model_name") or getattr(image_meta, "model_name", "") or "")
+        )
+        active_cfg = result.get("active_cfg")
+        if active_cfg is not None:
+            weight_map = crop_weight_image_rgb(
+                np.ascontiguousarray(np.asarray(weight_map, dtype=np.uint8)),
+                target_width=int(getattr(active_cfg, "target_width", 0) or weight_map.shape[1]),
+                target_height=int(getattr(active_cfg, "target_height", 0) or weight_map.shape[0]),
+            )
+        weight_map = np.ascontiguousarray(np.asarray(weight_map, dtype=np.uint8))
+        if model_name is not None:
+            self._weight_current_rgb_by_model[model_name] = weight_map.copy()
+            self._weight_current_meta_by_model[model_name] = {
+                "model_name": str(model_name),
+                "state_publish_seq": int(getattr(image_meta, "state_publish_seq", 0) or 0),
+                "image_seq": int(getattr(image_meta, "image_seq", 0) or 0),
+                "round_id": int(getattr(image_meta, "round_id", 0) or 0),
+                "cycle": int(getattr(image_meta, "cycle", 0) or 0),
+                "step": int(getattr(image_meta, "step", 0) or 0),
+                "generation": int(getattr(image_meta, "generation", 0) or 0),
+                "architecture_version": int(getattr(image_meta, "architecture_version", 0) or 0),
+                "node_id": str(getattr(image_meta, "node_id", "") or ""),
+            }
+            snaps = self._weight_snapshot_deques_by_model.get(model_name)
+            if snaps is not None:
+                snaps.append(weight_map.copy())
+                if str(self._resolved_active_weight_model_name() or "") == str(model_name):
+                    self._weight_snapshot_deque = snaps
+        self._sidebar_dirty = True
+
+    def _mark_checkpoint_weight_image(self, state_publish_seq: int, round_id: int, cycle: int) -> None:
+        store = self._weight_image_store
+        if store is None or int(state_publish_seq) <= 0:
+            return
+        try:
+            marked = store.mark_checkpoint(
+                int(state_publish_seq),
+                round_id=int(round_id),
+                cycle=int(cycle),
+            )
+            if not marked:
+                self._pending_checkpoint_weight_marks[int(state_publish_seq)] = (
+                    int(round_id),
+                    int(cycle),
+                )
+        except Exception:
+            self._pending_checkpoint_weight_marks[int(state_publish_seq)] = (
+                int(round_id),
+                int(cycle),
+            )
 
     # -- Sidebar render methods -------------------------------------------------
 
@@ -1801,21 +2172,7 @@ class _TransformerStatusOpenGLViewer:
             y_info = btn_y1 + 6
             total = self._history_snap_count()
             can_restore = callable(self._on_restore_state)
-            in_ckpt_zone = self._scrub_in_checkpoint_zone()
-            if scrubbing and in_ckpt_zone:
-                ckpt_idx = self._checkpoint_index_from_offset(self._scrub_offset)
-                if ckpt_idx is not None and ckpt_idx < len(self._checkpoint_thumbs):
-                    ent = self._checkpoint_thumbs[ckpt_idx]
-                    draw.text((4, y_info), f"ckpt r{ent['round_id']} c{ent['cycle']}",
-                              fill=(200, 170, 40), font=font)
-                else:
-                    draw.text((4, y_info), f"checkpoint zone ({self._scrub_offset}/{total})",
-                              fill=(200, 170, 40), font=font)
-                draw.text((4, y_info + 12), "wheel \u2191\u2193 to navigate",
-                          fill=(140, 120, 80), font=font)
-                draw.text((4, y_info + 24), "showing weight thumbnail",
-                          fill=(140, 120, 80), font=font)
-            elif scrubbing:
+            if scrubbing:
                 draw.text((4, y_info),      f"scrub: -{self._scrub_offset} / {total}",
                           fill=(180, 160, 220), font=font)
                 draw.text((4, y_info + 12), "wheel \u2191\u2193 to navigate",
@@ -1911,76 +2268,22 @@ class _TransformerStatusOpenGLViewer:
         total = max(1, self._history_snap_count())
         offset = int(self._scrub_offset)
         fill_frac = float(offset) / float(total)
-        in_ckpt_zone = self._scrub_in_checkpoint_zone()
-        color = (200, 170, 40) if in_ckpt_zone else (170, 80, 220) if offset > 0 else (60, 80, 110)
+        color = (170, 80, 220) if offset > 0 else (60, 80, 110)
         dial = self._render_knob("scrub", fill_frac=fill_frac, color=color)
         try:
             from PIL import Image, ImageDraw, ImageFont
             im = Image.fromarray(dial)
             draw = ImageDraw.Draw(im)
             font = ImageFont.load_default()
-            if in_ckpt_zone:
-                ckpt_idx = self._checkpoint_index_from_offset(offset)
-                if ckpt_idx is not None and ckpt_idx < len(self._checkpoint_thumbs):
-                    entry = self._checkpoint_thumbs[ckpt_idx]
-                    txt = f"ckpt r{entry['round_id']}"
-                else:
-                    txt = "ckpt"
-                draw.text(
-                    (self.panel_w // 2 - len(txt) * 3, self.panel_h // 2 - 4),
-                    txt, fill=(200, 170, 40), font=font,
-                )
-            else:
-                txt = f"-{offset}" if offset > 0 else "live"
-                draw.text(
-                    (self.panel_w // 2 - len(txt) * 3, self.panel_h // 2 - 4),
-                    txt, fill=(220, 210, 240), font=font,
-                )
+            txt = f"-{offset}" if offset > 0 else "live"
+            draw.text(
+                (self.panel_w // 2 - len(txt) * 3, self.panel_h // 2 - 4),
+                txt, fill=(220, 210, 240), font=font,
+            )
             dial = np.asarray(im, dtype=np.uint8)
         except Exception:
             pass
         return dial
-
-    def _render_weight_map(self) -> np.ndarray:
-        """Render weight image via the single render_weight_image function, crop to display."""
-        H, W = self._weight_map_target_hw()
-        out = np.full((H, W, 3), np.array([14, 16, 20], dtype=np.uint8), dtype=np.uint8)
-        refs = self._weight_model_refs
-        if not refs:
-            try:
-                from PIL import Image, ImageDraw, ImageFont
-                im = Image.fromarray(out)
-                draw = ImageDraw.Draw(im)
-                font = ImageFont.load_default()
-                draw.text((4, 4), "no weight refs\nset_weight_model_refs()", fill=(70, 78, 90), font=font)
-                out = np.asarray(im, dtype=np.uint8)
-            except Exception:
-                pass
-            return out
-
-        _active_name = self._active_weight_model_name
-        if _active_name is None or _active_name not in refs:
-            _active_name = next(iter(refs))
-        model = refs[_active_name]
-        try:
-            _sd_snap = {k: v.detach().float().cpu()
-                        for k, v in model.state_dict().items()}
-            param_keys = list(_sd_snap.keys())
-            reference = self._weight_disk_states.get(_active_name)
-            rgb, _meta = render_weight_image(
-                _sd_snap,
-                parameter_keys=param_keys,
-                reference_state=reference,
-                target_width=W,
-                target_height=H,
-            )
-            # Crop to display area (image may exceed target when neuron count > target)
-            crop_h = min(H, rgb.shape[0])
-            crop_w = min(W, rgb.shape[1])
-            out[:crop_h, :crop_w] = rgb[:crop_h, :crop_w]
-        except Exception:
-            pass
-        return out
 
     def _draw_texture_px(self, tex_id: int, x0: int, y0: int, x1: int, y1: int):
         gl = self._gl
@@ -2004,7 +2307,6 @@ class _TransformerStatusOpenGLViewer:
         if (not self._ready) or (not self.enabled) or self._stop_requested:
             return
         now = time.perf_counter()
-        self._drain_checkpoint_thumbnail_results()
 
         # -- Drain new scrub ring entries into the composite cache ----------
         ring = self._scrub_ring
@@ -2058,111 +2360,13 @@ class _TransformerStatusOpenGLViewer:
         else:
             self._apply_composite_at_offset(self._scrub_offset)
 
-        # Sidebar: btn_panel + scrub_dial every pump (cheap); weight snap is count-driven.
+        # Sidebar panels redraw every pump; live weight images arrive via shared memory.
         self._cache_map_rgb  = self._render_btn_panel()
         self._frame_knob_rgb = self._render_scrub_dial()
-        if self._scrub_offset == 0:
-            if self._weight_snapshot_deque:
-                live_blob = self._weight_snapshot_deque[-1]
-                if isinstance(live_blob, dict):
-                    live_wmap = self._weight_map_from_ring_cursor(live_blob.get("ring_cursor"))
-                    if live_wmap is not None:
-                        self._weight_map_rgb = live_wmap
-            # Collect finished background snap if ready.
-            if (self._weight_snap_thread is not None
-                    and not self._weight_snap_thread.is_alive()
-                    and self._weight_snap_result is not None):
-                _res = self._weight_snap_result
-                self._weight_snap_result = None
-                self._weight_snap_thread = None
-                _wmap = _res.get("weight_map")
-                if _wmap is not None:
-                    self._weight_map_rgb = _wmap
-                    if self._weight_snapshot_deque:
-                        _prev_blob = self._weight_snapshot_deque[-1]
-                        self._weight_snapshot_deque[-1] = {
-                            "ring_cursor": (_prev_blob.get("ring_cursor") if isinstance(_prev_blob, dict) else None),
-                            "weight_map": _wmap.copy(),
-                        }
-                    else:
-                        self._weight_snapshot_deque.append({"ring_cursor": None, "weight_map": _wmap.copy()})
-                _sst = _res.get("states")
-                if _sst is not None:
-                    # Delete the file for the entry about to be evicted before it's gone.
-                    _sd_maxlen = self._weight_state_sparse_deque.maxlen
-                    if _sd_maxlen is not None and len(self._weight_state_sparse_deque) >= _sd_maxlen:
-                        _evict = self._weight_state_sparse_deque[0]
-                        _evict_file = _evict.get("file")
-                        if _evict_file is not None:
-                            try:
-                                Path(_evict_file).unlink(missing_ok=True)
-                            except Exception:
-                                pass
-                    if _sst:
-                        self._prev_weight_snap = _sst
-                    # Record loss-count position for the graph marker.
-                    self._disk_save_loss_counts.append(
-                        self._loss_channel_lengths()
-                    )
-                    self._weight_state_sparse_deque.append({
-                        "snap_total": _res["snap_total"],
-                        "states": _sst,
-                        "file": _res.get("file"),
-                    })
-            # Fire a new background snap at the stride rate (only if previous finished).
-            self._snap_total += 1
-            if (self._snap_total % self._weight_snap_stride == 0
-                    and self._weight_model_refs
-                    and self._weight_snap_thread is None):
-                _snap_total_capture = self._snap_total
-                _model_refs_capture = dict(self._weight_model_refs)
-                _prev_snap_capture  = dict(self._prev_weight_snap)
-                _result_box: Dict[str, Any] = {}
-                def _weight_snap_worker(
-                        _refs=_model_refs_capture,
-                        _st=_snap_total_capture,
-                        _box=_result_box,
-                        _prev=_prev_snap_capture,
-                        _self=self) -> None:
-                    _wmap = _self._render_weight_map()
-                    _box["weight_map"] = _wmap
-                    _box["snap_total"] = _st
-                    _sparse: Dict[str, Any] = {}
-                    for _sn, _sm in _refs.items():
-                        try:
-                            _sparse[_sn] = {
-                                _k: _v.detach().cpu().clone()
-                                for _k, _v in _sm.state_dict().items()
-                            }
-                        except Exception:
-                            pass
-                    _box["states"] = _sparse
-                    # Log params whose weights shifted by more than threshold.
-                    _thresh = _self._weight_delta_threshold
-                    for _mn, _msd in _sparse.items():
-                        _prev_msd = _prev.get(_mn)
-                        if _prev_msd is None:
-                            continue
-                        for _pkey, _ptens in _msd.items():
-                            _pprev = _prev_msd.get(_pkey)
-                            if _pprev is None or _pprev.shape != _ptens.shape:
-                                continue
-                            try:
-                                _d = (_ptens.float() - _pprev.float()).abs().max().item()
-                                if _d > _thresh:
-                                    print(f"[weight_delta] {_mn}.{_pkey}: max|\u0394|={_d:.4f}")
-                            except Exception:
-                                pass
-                self._weight_snap_result = _result_box
-                self._weight_snap_thread = threading.Thread(
-                    target=_weight_snap_worker, daemon=True)
-                self._weight_snap_thread.start()
-        else:
-            # Frozen: show the snapshot at the chosen offset.
-            # _scrub_offset 1 = most-recent snapshot; _slen = oldest.
-            weight_map = self._history_weight_map_at_offset(self._scrub_offset)
-            if weight_map is not None:
-                self._weight_map_rgb = weight_map
+        if self._has_shared_weight_pipeline():
+            self._collect_shared_weight_render()
+            self._launch_shared_weight_render()
+        self._weight_map_rgb = self._visible_weight_map_rgb()
         self._sidebar_dirty = True
 
         dirty = bool(self._top_bar_dirty or self._panel_text_dirty or self._graph_dirty or self._sidebar_dirty)
@@ -2287,6 +2491,21 @@ class _TransformerStatusOpenGLViewer:
                     return True
         return False
 
+    def _handle_weight_tab_click(self, x: int, y: int) -> bool:
+        if not self._weight_tab_hit_boxes:
+            return False
+        rx0 = int(self._col_x + self.num_panels * self.panel_w)
+        xi = int(x) - rx0
+        yi = int(y) - int(self.top_bar_h)
+        if xi < 0 or yi < 0:
+            return False
+        for model_name, box in self._weight_tab_hit_boxes:
+            x0, y0, x1, y1 = box
+            if x0 <= xi <= x1 and y0 <= yi <= y1:
+                self.set_active_weight_model(model_name)
+                return True
+        return False
+
     def _poll_events(self):
         if (not self._ready) or (self._pygame is None):
             return
@@ -2330,21 +2549,16 @@ class _TransformerStatusOpenGLViewer:
                                 srv = self._ipc_server_ref
                                 if srv is not None and getattr(srv, "has_connection", False):
                                     try:
-                                        restore_msg = {
+                                        srv.send_query({
                                             "type": "restore",
                                             "offset": int(self._scrub_offset),
-                                        }
-                                        if self._scrub_in_checkpoint_zone():
-                                            ckpt_idx = self._checkpoint_index_from_offset(self._scrub_offset)
-                                            if ckpt_idx is not None and 0 <= ckpt_idx < len(self._checkpoint_thumbs):
-                                                ent = self._checkpoint_thumbs[ckpt_idx]
-                                                restore_msg["round_id"] = int(ent.get("round_id", 0))
-                                                restore_msg["cycle"] = int(ent.get("cycle", 0))
-                                        srv.send_query(restore_msg)
+                                        })
                                     except Exception:
                                         pass
                                 self._scrub_offset = 0
                                 self._weight_snapshot_deque.clear()
+                                for snaps in self._weight_snapshot_deques_by_model.values():
+                                    snaps.clear()
                                 if self._composite_cache is not None:
                                     self._composite_cache.clear()
                                 self._clear_frame_text_cache()
@@ -2374,6 +2588,9 @@ class _TransformerStatusOpenGLViewer:
                                     self._graph_dirty = True
                                     self._present(force=True)
                                 continue
+                        if self._handle_weight_tab_click(xi, yi):
+                            self._present(force=True)
+                            continue
                         # Graph toolbar + legend clicks.
                         graph_y0 = int(self.top_bar_h + 2 * self.panel_h)
                         if graph_y0 <= yi < graph_y0 + self.graph_total_h:
@@ -2419,7 +2636,18 @@ class _TransformerStatusOpenGLViewer:
         self._sr_poll_data()
         self._present(force=False)
 
-    def notify_pipeline_checkpoint_saved(self) -> None:
+    def notify_pipeline_checkpoint_saved(
+        self,
+        *,
+        round_id: int = 0,
+        cycle: int = 0,
+        checkpoint_path: Optional[str] = None,
+        weight_state_publish_seq: int = 0,
+        weight_model: Optional[str] = None,
+        weight_generation: int = 0,
+        weight_architecture_version: int = 0,
+        weight_node_id: str = "",
+    ) -> None:
         """Call this immediately after every _save_training_segment_snapshot call.
 
         Records the current loss-series lengths so the loss graph can draw a gold
@@ -2428,6 +2656,27 @@ class _TransformerStatusOpenGLViewer:
         """
         snapshot = self._loss_channel_lengths()
         self._disk_save_loss_counts.append(snapshot)
+        record = {
+            "loss_counts": dict(snapshot),
+            "round_id": int(round_id),
+            "cycle": int(cycle),
+            "checkpoint_path": str(checkpoint_path or ""),
+            "state_publish_seq": int(weight_state_publish_seq),
+            "model_name": self._normalise_weight_model_name(weight_model),
+            "generation": int(weight_generation),
+            "architecture_version": int(weight_architecture_version),
+            "node_id": str(weight_node_id or ""),
+        }
+        self._checkpoint_marker_records.append(record)
+        self._remember_checkpoint_weight_record(
+            round_id=int(round_id),
+            cycle=int(cycle),
+            model_name=weight_model,
+            generation=int(weight_generation),
+            architecture_version=int(weight_architecture_version),
+            state_publish_seq=int(weight_state_publish_seq),
+            node_id=str(weight_node_id or ""),
+        )
         self._graph_dirty = True
 
     def notify_checkpoint_at_walltime(self, wall_ts: float) -> None:
@@ -2458,6 +2707,19 @@ class _TransformerStatusOpenGLViewer:
             snapshot[ck] = idx + 1  # 1-based count mirrors length convention
         if snapshot:
             self._disk_save_loss_counts.append(snapshot)
+            self._checkpoint_marker_records.append(
+                {
+                    "loss_counts": dict(snapshot),
+                    "round_id": 0,
+                    "cycle": 0,
+                    "checkpoint_path": "",
+                    "state_publish_seq": 0,
+                    "model_name": "",
+                    "generation": 0,
+                    "architecture_version": 0,
+                    "node_id": "",
+                }
+            )
             self._graph_dirty = True
 
     def set_checkpoint_backup_dir(self, path) -> None:
@@ -2467,13 +2729,12 @@ class _TransformerStatusOpenGLViewer:
         ``.pt`` files.  The directory's mtime (or the most-recently-modified .pt
         inside it) is used as the wall-clock timestamp.  A gold marker is placed
         on the loss graph at that time via ``notify_checkpoint_at_walltime``.
-
-        Also discovers ``weight_thumb_r*_c*.png`` thumbnails so the extended
-        scrub wheel can show checkpoint weight snapshots.
         """
         p = Path(path)
         if not p.is_dir():
             return
+        self._checkpoint_backup_dir = p
+        self._checkpoint_weight_rgb_cache.clear()
         _times: list = []
         for sub in sorted(p.iterdir()):
             if not sub.is_dir():
@@ -2487,44 +2748,6 @@ class _TransformerStatusOpenGLViewer:
             # Use the newest .pt mtime in the sub-dir as the checkpoint time.
             t = max(f.stat().st_mtime for f in pts)
             _times.append(t)
-            # Discover weight thumbnails and register for extended scrub.
-            import re as _re
-            found_thumb = False
-            for thumb in sub.glob("weight_thumb_r*_c*.png"):
-                m = _re.search(r"weight_thumb_r(\d+)_c(\d+)\.png$", thumb.name)
-                if m:
-                    found_thumb = True
-                    rid = int(m.group(1))
-                    cid = int(m.group(2))
-                    model_name = None
-                    sidecar = thumb.with_suffix(".json")
-                    if sidecar.exists():
-                        try:
-                            meta = json.loads(sidecar.read_text(encoding="utf-8"))
-                            model_name = meta.get("model")
-                        except Exception:
-                            model_name = None
-                    self.register_checkpoint_thumbnail(
-                        rid,
-                        cid,
-                        thumb_path=str(thumb),
-                        model_name=model_name,
-                        checkpoint_path=str(checkpoint_path),
-                    )
-            if (not found_thumb) and checkpoint_path.exists():
-                try:
-                    payload = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-                    rid = int(payload.get("round_id", 0)) if isinstance(payload, dict) else 0
-                    cid = int(payload.get("cycle", 0)) if isinstance(payload, dict) else 0
-                    model_name, _state = _extract_checkpoint_weight_state(payload if isinstance(payload, dict) else {}, self._active_weight_model_name)
-                    self.register_checkpoint_thumbnail(
-                        rid,
-                        cid,
-                        checkpoint_path=str(checkpoint_path),
-                        model_name=model_name,
-                    )
-                except Exception:
-                    pass
         for t in _times:
             self.notify_checkpoint_at_walltime(t)
 
@@ -2598,26 +2821,35 @@ class _TransformerStatusOpenGLViewer:
         elif t == "notify_new_result":
             pass  # Next poll will pull it
         elif t == "notify_checkpoint":
-            self.notify_pipeline_checkpoint_saved()
             r = int(msg.get("round_id", 0))
             c = int(msg.get("cycle", 0))
-            tp = msg.get("thumb_path")
-            tm = msg.get("thumb_model")
-            cp = msg.get("checkpoint_path")
-            loss_counts = self._loss_channel_lengths()
-            self.register_checkpoint_thumbnail(
-                r,
-                c,
-                thumb_path=tp,
-                loss_counts=loss_counts,
-                model_name=tm,
-                checkpoint_path=cp,
+            checkpoint_path = str(msg.get("checkpoint_path", "") or "").strip()
+            if checkpoint_path:
+                try:
+                    self._checkpoint_live_dir = Path(checkpoint_path).resolve().parent
+                except Exception:
+                    self._checkpoint_live_dir = Path(checkpoint_path).parent
+            self.notify_pipeline_checkpoint_saved(
+                round_id=int(r),
+                cycle=int(c),
+                checkpoint_path=checkpoint_path,
+                weight_state_publish_seq=int(msg.get("weight_state_publish_seq", 0) or 0),
+                weight_model=str(msg.get("weight_model", "") or ""),
+                weight_generation=int(msg.get("weight_generation", 0) or 0),
+                weight_architecture_version=int(msg.get("weight_architecture_version", 0) or 0),
+                weight_node_id=str(msg.get("weight_node_id", "") or ""),
             )
-        elif t == "notify_weight_map":
+            state_publish_seq = int(msg.get("weight_state_publish_seq", 0) or 0)
+            self._mark_checkpoint_weight_image(state_publish_seq, r, c)
+        elif t == "notify_weight_state":
             self._sidebar_dirty = True
-            model_name = msg.get("model")
-            if model_name:
-                self._active_weight_model_name = str(model_name)
+            for name in list(msg.get("known_models", []) or []):
+                self._register_weight_model(name)
+            model_name = self._register_weight_model(msg.get("model"))
+            if self._active_weight_model_name is None and model_name is not None:
+                self.set_active_weight_model(model_name)
+            self._sr_weight_models = [str(name) for name in self._weight_model_order]
+            self._sr_weight_active = self._normalise_weight_model_name(msg.get("model"))
 
     def _on_sr_response(self, msg: dict) -> None:
         """Handle a response to one of our queries from the SaveRestoreNode."""
@@ -2640,28 +2872,22 @@ class _TransformerStatusOpenGLViewer:
                 if rows:
                     self._ring_text_rows = [list(r) for r in rows]
 
-        elif t == "resp_weight_map":
-            wmap = msg.get("map")
-            if wmap is not None:
-                try:
-                    rgb_list = wmap.get("rgb")
-                    if rgb_list is not None:
-                        rgb_arr = np.array(rgb_list, dtype=np.uint8)
-                        self._weight_map_rgb = rgb_arr
-                        self._sidebar_dirty = True
-                    model_name = wmap.get("model")
-                    if model_name:
-                        self._active_weight_model_name = str(model_name)
-                except Exception:
-                    pass
-            self._sr_weight_models = msg.get("models", [])
-            self._sr_weight_active = msg.get("active")
-            if self._sr_weight_active:
-                self._active_weight_model_name = str(self._sr_weight_active)
-
         elif t == "resp_cache_browse":
             self._sr_cache_entries = msg.get("entries", [])
             self._sr_cache_total = int(msg.get("total", 0))
+
+        elif t == "resp_weight_registry":
+            models = []
+            for entry in list(msg.get("models", []) or []):
+                if not isinstance(entry, dict):
+                    continue
+                model_name = self._register_weight_model(entry.get("model"))
+                if model_name is not None:
+                    models.append(model_name)
+            self._sr_weight_models = list(dict.fromkeys(models))
+            self._sr_weight_active = self._normalise_weight_model_name(msg.get("active_model"))
+            if self._active_weight_model_name is None and self._sr_weight_active:
+                self.set_active_weight_model(self._sr_weight_active)
 
     def _sr_poll_data(self) -> None:
         """Periodically request fresh data from the SaveRestoreNode.
@@ -2683,6 +2909,7 @@ class _TransformerStatusOpenGLViewer:
             return
 
         srv.send_query({"type": "query_channel_list"})
+        srv.send_query({"type": "query_weight_registry"})
 
         for ch_info in self._sr_channel_registry:
             ck = ch_info.get("key", "")
@@ -3235,18 +3462,8 @@ class _TransformerStatusOpenGLViewer:
             target_rgb = np.asarray(images[0], dtype=np.uint8)
             input_rgb = np.asarray(images[1], dtype=np.uint8)
             output_rgb = np.asarray(images[2], dtype=np.uint8)
-            thumb_stack = _resize_rgb_nearest(
-                self._weight_map_rgb,
-                (SCRUB_THUMB_H * SCRUB_NUM_THUMBS, SCRUB_THUMB_W),
-            )
-            weight_tiles = tuple(
-                np.ascontiguousarray(
-                    thumb_stack[idx * SCRUB_THUMB_H : (idx + 1) * SCRUB_THUMB_H].copy()
-                )
-                for idx in range(SCRUB_NUM_THUMBS)
-            )
             h, w = target_rgb.shape[0], target_rgb.shape[1]
-            flags = SCRUB_FLAG_HAS_IMAGE | SCRUB_FLAG_HAS_TARGET | SCRUB_FLAG_HAS_OUTPUT | SCRUB_FLAG_HAS_THUMBS
+            flags = SCRUB_FLAG_HAS_IMAGE | SCRUB_FLAG_HAS_TARGET | SCRUB_FLAG_HAS_OUTPUT
             ring_cursor = self._scrub_ring.push(
                 step=0, round_id=0, ts=time.time(), loss=0.0,
                 channel_key="preview", flags=flags,
@@ -3254,9 +3471,9 @@ class _TransformerStatusOpenGLViewer:
                 training_image=input_rgb,
                 output_image=output_rgb,
                 target_data=target_rgb,
-                thumb0=weight_tiles[0],
-                thumb1=weight_tiles[1],
-                thumb2=weight_tiles[2],
+                thumb0=None,
+                thumb1=None,
+                thumb2=None,
             )
         self._stage_frame_text(
             ring_cursor,
@@ -3291,19 +3508,9 @@ class _TransformerStatusOpenGLViewer:
         target_rgb = _tensor_to_rgb_u8_image(clean_img)
         input_rgb = _tensor_to_rgb_u8_image(input_img)
         output_rgb = _tensor_to_rgb_u8_image(output_img)
-        thumb_stack = _resize_rgb_nearest(
-            self._weight_map_rgb,
-            (SCRUB_THUMB_H * SCRUB_NUM_THUMBS, SCRUB_THUMB_W),
-        )
-        weight_tiles = tuple(
-            np.ascontiguousarray(
-                thumb_stack[idx * SCRUB_THUMB_H : (idx + 1) * SCRUB_THUMB_H].copy()
-            )
-            for idx in range(SCRUB_NUM_THUMBS)
-        )
         h, w = target_rgb.shape[0], target_rgb.shape[1]
 
-        flags = SCRUB_FLAG_HAS_IMAGE | SCRUB_FLAG_HAS_TARGET | SCRUB_FLAG_HAS_OUTPUT | SCRUB_FLAG_HAS_THUMBS
+        flags = SCRUB_FLAG_HAS_IMAGE | SCRUB_FLAG_HAS_TARGET | SCRUB_FLAG_HAS_OUTPUT
         ring_cursor = ring.push(
             step=0,
             round_id=0,
@@ -3316,9 +3523,9 @@ class _TransformerStatusOpenGLViewer:
             training_image=input_rgb,
             output_image=output_rgb,
             target_data=target_rgb,
-            thumb0=weight_tiles[0],
-            thumb1=weight_tiles[1],
-            thumb2=weight_tiles[2],
+            thumb0=None,
+            thumb1=None,
+            thumb2=None,
         )
         self._stage_frame_text(
             ring_cursor,
@@ -3487,6 +3694,13 @@ class ViewerIPCServer:
             is_paused = bool(self._viewer._paused)
             is_preview = bool(self._viewer._preview_enabled)
             is_scrub_editor = bool(self._viewer._scrub_editor_enabled)
+            weight_spec = {}
+            get_weight_spec = getattr(self._viewer, "weight_image_spec", None)
+            if callable(get_weight_spec):
+                try:
+                    weight_spec = dict(get_weight_spec() or {})
+                except Exception:
+                    weight_spec = {}
             status = {
                 "type": "status",
                 "stop_requested": is_stopping,
@@ -3495,6 +3709,9 @@ class ViewerIPCServer:
                 "preview_enabled": is_preview,
                 "scrub_editor_enabled": is_scrub_editor,
                 "cycle_selected": list(self._viewer._cycle_selected),
+                "weight_image_mode": int(weight_spec.get("mode", 1) or 1),
+                "weight_panel_crop_w": int(weight_spec.get("panel_crop_w", 0) or 0),
+                "weight_panel_crop_h": int(weight_spec.get("panel_crop_h", 0) or 0),
             }
             conn.send(status)
             cmd = "stop" if bool(status["stop_requested"]) else ("pause" if is_paused else "resume")
@@ -3507,6 +3724,9 @@ class ViewerIPCServer:
                 metadata={
                     "source": "viewer_ipc_status_loop",
                     "save": self._viewer.shutdown_save(),
+                    "weight_image_mode": int(weight_spec.get("mode", 1) or 1),
+                    "weight_panel_crop_w": int(weight_spec.get("panel_crop_w", 0) or 0),
+                    "weight_panel_crop_h": int(weight_spec.get("panel_crop_h", 0) or 0),
                 },
             )
             conn.send(make_envelope(MESSAGE_TYPE_RUN_CONTROL, run_control).to_dict())
@@ -3572,13 +3792,6 @@ class ViewerIPCServer:
             v.set_checkpoint_backup_dir(msg["path"])
         elif t == "trim_graph":
             v.trim_graph_to_first_checkpoint()
-        elif t == "weight_map_rgb":
-            # Training side pre-rendered the weight map image; paste it directly.
-            v._weight_map_rgb = msg["rgb"]
-            v._sidebar_dirty = True
-        elif t == "weight_snapshot":
-            v._weight_snapshot_deque.append(msg.get("weight_rgb"))
-            v._loss_count_at_snap_deque.append(msg.get("loss_counts"))
         elif t == "exit":
             print("[viewer-ipc] training process exited cleanly", flush=True)
         # -- Pull-model: notifications from SaveRestoreNode ----------------
@@ -3700,10 +3913,11 @@ class ViewerIPCProxy:
         # Set via set_save_restore_node() after construction.
         self._save_restore_node: Optional[Any] = None
 
-        # Stub attributes that pipeline code may touch
-        self._weight_snap_stride = 128
-        self._weight_state_sparse_deque: deque = deque(maxlen=4)
         self._preview_work_queue_ref: Optional[Any] = None
+        self._weight_image_mode: int = 1
+        self._weight_panel_crop_w: int = max(8, int(self.image_w))
+        self._weight_panel_crop_h: int = max(8, int(self.image_h))
+        self._last_applied_weight_image_spec: Optional[Tuple[int, int, int]] = None
 
         if not self.enabled:
             return
@@ -3796,6 +4010,7 @@ class ViewerIPCProxy:
             self._paused = False
             self._preview_enabled = True
             self._scrub_editor_enabled = True
+            self._last_applied_weight_image_spec = None
             self._last_connected_port = int(actual_port)
             self._next_reconnect_t = 0.0
             label = "reconnected" if reconnect else "connected"
@@ -3849,6 +4064,56 @@ class ViewerIPCProxy:
             except Exception:
                 pass
 
+    def _update_weight_image_spec(
+        self,
+        *,
+        mode: Any = None,
+        panel_crop_w: Any = None,
+        panel_crop_h: Any = None,
+    ) -> None:
+        try:
+            if mode is not None:
+                self._weight_image_mode = int(mode)
+        except Exception:
+            pass
+        try:
+            if panel_crop_w is not None:
+                self._weight_panel_crop_w = max(8, int(panel_crop_w))
+        except Exception:
+            pass
+        try:
+            if panel_crop_h is not None:
+                self._weight_panel_crop_h = max(8, int(panel_crop_h))
+        except Exception:
+            pass
+
+    def _sync_weight_image_spec_to_store(self) -> None:
+        node = self._save_restore_node
+        if node is None:
+            return
+        spec_sig = (
+            int(self._weight_image_mode),
+            int(self._weight_panel_crop_w),
+            int(self._weight_panel_crop_h),
+        )
+        if spec_sig == self._last_applied_weight_image_spec:
+            return
+        fn = getattr(node, "configure_runtime_weight_image", None)
+        if not callable(fn):
+            self._last_applied_weight_image_spec = spec_sig
+            return
+        try:
+            applied = fn(
+                mode=int(self._weight_image_mode),
+                target_width=int(self._weight_panel_crop_w),
+                target_height=int(self._weight_panel_crop_h),
+            )
+        except Exception:
+            return
+        if applied is None:
+            return
+        self._last_applied_weight_image_spec = spec_sig
+
     def _drain_status(self) -> None:
         """Non-blocking read of all available status messages from the GUI."""
         if not self.enabled:
@@ -3875,6 +4140,12 @@ class ViewerIPCProxy:
                         meta = getattr(payload, "metadata", {}) or {}
                         if self._stop_flag and "save" in meta:
                             self._shutdown_save = meta["save"]
+                        self._update_weight_image_spec(
+                            mode=meta.get("weight_image_mode"),
+                            panel_crop_w=meta.get("weight_panel_crop_w"),
+                            panel_crop_h=meta.get("weight_panel_crop_h"),
+                        )
+                        self._sync_weight_image_spec_to_store()
                         if payload.selected_cycle_ids:
                             max_cycle = max(payload.selected_cycle_ids)
                             selected = [False] * max(max_cycle, len(self._cycle_selected))
@@ -3897,14 +4168,25 @@ class ViewerIPCProxy:
                     cs = msg.get("cycle_selected")
                     if cs is not None:
                         self._cycle_selected = list(cs)
+                    self._update_weight_image_spec(
+                        mode=msg.get("weight_image_mode"),
+                        panel_crop_w=msg.get("weight_panel_crop_w"),
+                        panel_crop_h=msg.get("weight_panel_crop_h"),
+                    )
                     self._last_run_control = RunControlPayload(
                         command="stop" if bool(self._stop_flag) else ("pause" if bool(self._paused) else "resume"),
                         selected_cycle_ids=self.selected_cycle_ids(),
                         gate_override=bool(self._gate_override),
                         preview_enabled=bool(self._preview_enabled),
                         scrub_editor_enabled=bool(self._scrub_editor_enabled),
-                        metadata={"source": "legacy_status"},
+                        metadata={
+                            "source": "legacy_status",
+                            "weight_image_mode": int(self._weight_image_mode),
+                            "weight_panel_crop_w": int(self._weight_panel_crop_w),
+                            "weight_panel_crop_h": int(self._weight_panel_crop_h),
+                        },
                     )
+                    self._sync_weight_image_spec_to_store()
                 elif t == "restore":
                     request_restore = getattr(self._save_restore_node, "request_restore", None)
                     if (
@@ -3934,6 +4216,7 @@ class ViewerIPCProxy:
     def set_save_restore_node(self, node: Any) -> None:
         """Inject the SaveRestoreNode reference for pull-model query routing."""
         self._save_restore_node = node
+        self._sync_weight_image_spec_to_store()
 
     def _handle_gui_query(self, query: dict) -> None:
         """Route a query_* message from the GUI to the SaveRestoreNode."""
@@ -3970,29 +4253,6 @@ class ViewerIPCProxy:
         # The GUI pulls them via the IPC query protocol; no direct push.
         pass
 
-    def _current_weight_thumb_tiles(self) -> Tuple[Optional[Tuple[np.ndarray, ...]], Optional[str]]:
-        node = self._save_restore_node
-        if node is None:
-            return None, None
-        getter = getattr(node, "current_weight_thumb_tiles", None)
-        if not callable(getter):
-            return None, None
-        try:
-            payload = getter()
-        except Exception:
-            return None, None
-        if not isinstance(payload, dict):
-            return None, None
-        tiles = payload.get("tiles")
-        if not isinstance(tiles, tuple) and not isinstance(tiles, list):
-            return None, None
-        if len(tiles) != SCRUB_NUM_THUMBS:
-            return None, None
-        return (
-            tuple(np.ascontiguousarray(np.asarray(tile, dtype=np.uint8)) for tile in tiles),
-            (str(payload.get("model", "")).strip() or None),
-        )
-
     def enqueue_frame(self, frame_dict: dict):
         """Push images to scrub ring if present, send text metadata via IPC."""
         if not self.preview_enabled():
@@ -4005,11 +4265,8 @@ class ViewerIPCProxy:
             target_rgb = np.asarray(images[0], dtype=np.uint8)
             input_rgb = np.asarray(images[1], dtype=np.uint8)
             output_rgb = np.asarray(images[2], dtype=np.uint8)
-            weight_tiles, _weight_model = self._current_weight_thumb_tiles()
             h, w = target_rgb.shape[0], target_rgb.shape[1]
             flags = SCRUB_FLAG_HAS_IMAGE | SCRUB_FLAG_HAS_TARGET | SCRUB_FLAG_HAS_OUTPUT
-            if weight_tiles is not None:
-                flags |= SCRUB_FLAG_HAS_THUMBS
             ring_cursor = ring.push(
                 step=0, round_id=0, ts=time.time(), loss=0.0,
                 channel_key="preview", flags=flags,
@@ -4017,9 +4274,9 @@ class ViewerIPCProxy:
                 training_image=input_rgb,
                 output_image=output_rgb,
                 target_data=target_rgb,
-                thumb0=(weight_tiles[0] if weight_tiles is not None else None),
-                thumb1=(weight_tiles[1] if weight_tiles is not None else None),
-                thumb2=(weight_tiles[2] if weight_tiles is not None else None),
+                thumb0=None,
+                thumb1=None,
+                thumb2=None,
             )
         self._send({
             "type": "frame_signal",
@@ -4046,12 +4303,9 @@ class ViewerIPCProxy:
         target_rgb = _tensor_to_rgb_u8_image(clean_img)
         input_rgb = _tensor_to_rgb_u8_image(input_img)
         output_rgb = _tensor_to_rgb_u8_image(output_img)
-        weight_tiles, _weight_model = self._current_weight_thumb_tiles()
         h, w = target_rgb.shape[0], target_rgb.shape[1]
 
         flags = SCRUB_FLAG_HAS_IMAGE | SCRUB_FLAG_HAS_TARGET | SCRUB_FLAG_HAS_OUTPUT
-        if weight_tiles is not None:
-            flags |= SCRUB_FLAG_HAS_THUMBS
         ring_cursor = ring.push(
             step=0,
             round_id=0,
@@ -4064,9 +4318,9 @@ class ViewerIPCProxy:
             training_image=input_rgb,
             output_image=output_rgb,
             target_data=target_rgb,
-            thumb0=(weight_tiles[0] if weight_tiles is not None else None),
-            thumb1=(weight_tiles[1] if weight_tiles is not None else None),
-            thumb2=(weight_tiles[2] if weight_tiles is not None else None),
+            thumb0=None,
+            thumb1=None,
+            thumb2=None,
         )
         titles = list(panel_titles) if panel_titles else ["target", "input", "output"]
         rows = [list(r) for r in panel_rows] if panel_rows else [[], [], []]
@@ -4092,14 +4346,8 @@ class ViewerIPCProxy:
     def set_queue_refs(self, work_queue) -> None:
         self._preview_work_queue_ref = work_queue
 
-    def set_weight_model_refs(self, models, disk_states=None, ckpt_states=None) -> None:
-        pass  # Weight map rendering not yet supported in IPC mode
-
     def set_restore_state_callback(self, fn) -> None:
         self._on_restore = fn
-
-    def set_weight_snap_dir(self, path) -> None:
-        pass  # Managed by the GUI side
 
     def set_checkpoint_backup_dir(self, path) -> None:
         self._send({"type": "checkpoint_backup_dir", "path": str(path)})
@@ -4128,6 +4376,18 @@ class ViewerIPCProxy:
         self._drain_status()
         return self._scrub_editor_enabled
 
+    def gui_connected(self) -> bool:
+        self._drain_status()
+        return bool(self.enabled and self._conn is not None)
+
+    def weight_image_spec(self) -> Dict[str, int]:
+        self._drain_status()
+        return {
+            "mode": int(self._weight_image_mode),
+            "panel_crop_w": int(self._weight_panel_crop_w),
+            "panel_crop_h": int(self._weight_panel_crop_h),
+        }
+
     def selected_cycle_ids(self) -> List[int]:
         return [int(i + 1) for i, v in enumerate(self._cycle_selected) if bool(v)]
 
@@ -4141,9 +4401,6 @@ class ViewerIPCProxy:
         payload = self._pending_plan_apply
         self._pending_plan_apply = None
         return payload
-
-    def get_restore_state_dicts(self, offset: int):
-        return None  # Cross-process restore not yet implemented
 
     def send_worker_hello(
         self,

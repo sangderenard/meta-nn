@@ -484,6 +484,247 @@ NODUS_API int32_t nodus_composite_cache_copy_panel(
         const NodusCompositeCache *cache, int32_t index, int panel_idx,
         uint8_t *out_buf, uint32_t buf_size);
 
+/* ================================================================== */
+/*  Weight State Store + Rendered Image Cache                         */
+/* ================================================================== */
+
+#define NODUS_WEIGHT_STORE_NAME_MAX          64
+#define NODUS_WEIGHT_STORE_BLOB_NAME_MAX     128
+#define NODUS_WEIGHT_STATE_REGISTRY_CAPACITY 64
+#define NODUS_WEIGHT_IMAGE_CACHE_CAPACITY    256
+#define NODUS_WEIGHT_IMAGE_DEFAULT_MAX_BYTES ((uint64_t)256u * 1024u * 1024u)
+
+#define NODUS_WEIGHT_IMAGE_FLAG_CHECKPOINT   0x01
+
+typedef struct NodusWeightStateStore NodusWeightStateStore;
+typedef struct NodusWeightImageStore NodusWeightImageStore;
+
+/* ------------------------------------------------------------------ */
+/*  Weight state store                                                */
+/* ------------------------------------------------------------------ */
+
+/* Global cross-process store that retains the latest published state-dict
+   snapshot for the actively training model. The payload itself lives in a
+   versioned shared-memory blob so it can resize when model shapes change. */
+NODUS_API NodusWeightStateStore* nodus_weight_state_store_get_global(void);
+
+/* Publish a flattened float32 state-dict into the cross-process store.
+   The layout matches nodus_weight_image_from_state_dict(): each parameter is
+   identified by name and described by a flat float pointer, element count,
+   and shape0 (dimension-0 size).
+   Returns 0 on success, -1 on error. */
+NODUS_API int nodus_weight_state_store_publish_flat(
+        NodusWeightStateStore *store,
+        const char            *model_name,
+        const char            *node_id,
+        int32_t                round_id,
+        int32_t                cycle,
+        int32_t                step,
+        uint64_t               generation,
+        uint64_t               architecture_version,
+        uint64_t               publish_seq,
+        const char *const     *param_names,
+        const float *const    *param_data,
+        const int32_t         *param_numel,
+        const int32_t         *param_shape0,
+        int32_t                num_params);
+
+/* Read the latest published metadata. Any output pointer may be NULL.
+   Returns 0 on success, -1 if no snapshot has been published yet. */
+NODUS_API int nodus_weight_state_store_get_meta(
+        const NodusWeightStateStore *store,
+        uint64_t                    *out_publish_seq,
+        uint64_t                    *out_generation,
+        uint64_t                    *out_architecture_version,
+        int32_t                     *out_round_id,
+        int32_t                     *out_cycle,
+        int32_t                     *out_step,
+        int32_t                     *out_param_count,
+        uint64_t                    *out_blob_bytes,
+        char                        *out_model_name,
+        int                          out_model_name_buflen,
+        char                        *out_node_id,
+        int                          out_node_id_buflen,
+        char                        *out_blob_name,
+        int                          out_blob_name_buflen);
+
+/* Enumerate the keyed latest-state registry. Index 0 = oldest retained model,
+   count-1 = most recently published model entry. */
+NODUS_API int32_t nodus_weight_state_store_count(const NodusWeightStateStore *store);
+
+NODUS_API int nodus_weight_state_store_get_meta_at(
+        const NodusWeightStateStore *store,
+        int32_t                      index,
+        uint64_t                    *out_publish_seq,
+        uint64_t                    *out_generation,
+        uint64_t                    *out_architecture_version,
+        int32_t                     *out_round_id,
+        int32_t                     *out_cycle,
+        int32_t                     *out_step,
+        int32_t                     *out_param_count,
+        uint64_t                    *out_blob_bytes,
+        char                        *out_model_name,
+        int                          out_model_name_buflen,
+        char                        *out_node_id,
+        int                          out_node_id_buflen,
+        char                        *out_blob_name,
+        int                          out_blob_name_buflen);
+
+NODUS_API int nodus_weight_state_store_get_meta_for(
+        const NodusWeightStateStore *store,
+        const char                  *model_name,
+        const char                  *node_id,
+        uint64_t                    *out_publish_seq,
+        uint64_t                    *out_generation,
+        uint64_t                    *out_architecture_version,
+        int32_t                     *out_round_id,
+        int32_t                     *out_cycle,
+        int32_t                     *out_step,
+        int32_t                     *out_param_count,
+        uint64_t                    *out_blob_bytes,
+        char                        *out_blob_name,
+        int                          out_blob_name_buflen);
+
+/* ------------------------------------------------------------------ */
+/*  Weight image cache                                                */
+/* ------------------------------------------------------------------ */
+
+/* Global cross-process rendered-image cache. The GUI is the sole writer. */
+NODUS_API NodusWeightImageStore* nodus_weight_image_store_get_global(void);
+
+NODUS_API int32_t nodus_weight_image_store_length(const NodusWeightImageStore *store);
+NODUS_API int32_t nodus_weight_image_store_capacity(const NodusWeightImageStore *store);
+
+/* Set the effective image-cache limits.
+   max_entries is clamped to [1, NODUS_WEIGHT_IMAGE_CACHE_CAPACITY].
+   max_total_bytes == 0 selects NODUS_WEIGHT_IMAGE_DEFAULT_MAX_BYTES.
+   Oldest non-checkpoint images are evicted first to satisfy the new limits.
+   Returns 0 on success, -1 on error. */
+NODUS_API int nodus_weight_image_store_set_limits(
+        NodusWeightImageStore *store,
+        int32_t                max_entries,
+        uint64_t               max_total_bytes);
+
+/* Read the current effective image-cache limits and usage. */
+NODUS_API int nodus_weight_image_store_get_stats(
+        const NodusWeightImageStore *store,
+        int32_t                     *out_max_entries,
+        int32_t                     *out_entry_count,
+        uint64_t                    *out_max_total_bytes,
+        uint64_t                    *out_total_bytes);
+
+/* Configure the active GUI-owned render contract for the latest state snapshot.
+   Measures the exact rendered size for (mode, target_w, target_h) and records
+   that configuration in the image store control block.
+   Returns 0 on success, -1 on error. */
+NODUS_API int nodus_weight_image_store_configure_latest(
+        NodusWeightStateStore *state_store,
+        NodusWeightImageStore *image_store,
+        int                    mode,
+        int32_t                target_w,
+        int32_t                target_h);
+
+/* Read the active image configuration. Returns 0 on success, -1 if unset. */
+NODUS_API int nodus_weight_image_store_get_active_config(
+        const NodusWeightImageStore *store,
+        uint64_t                    *out_state_publish_seq,
+        uint64_t                    *out_generation,
+        uint64_t                    *out_architecture_version,
+        int32_t                     *out_round_id,
+        int32_t                     *out_cycle,
+        int32_t                     *out_step,
+        int32_t                     *out_mode,
+        int32_t                     *out_target_w,
+        int32_t                     *out_target_h,
+        int32_t                     *out_render_w,
+        int32_t                     *out_render_h,
+        int32_t                     *out_render_c,
+        int32_t                     *out_render_stride_bytes,
+        char                        *out_model_name,
+        int                          out_model_name_buflen,
+        char                        *out_node_id,
+        int                          out_node_id_buflen);
+
+/* Render the latest published weight snapshot into the image cache.
+   The state store is read, rendered entirely in C, and the resulting RGB
+   image is published into the image cache as the newest entry.
+   Returns 0 on success, -1 on error. */
+NODUS_API int nodus_weight_image_store_render_latest(
+        NodusWeightStateStore *state_store,
+        NodusWeightImageStore *image_store,
+        int                    mode,
+        int32_t                target_w,
+        int32_t                target_h);
+
+/* Measure/render a specific keyed model entry from the multi-model state store. */
+NODUS_API int nodus_weight_image_store_measure_for(
+        const NodusWeightStateStore *state_store,
+        const char                  *model_name,
+        const char                  *node_id,
+        int                          mode,
+        int32_t                      target_w,
+        int32_t                      target_h,
+        uint64_t                    *out_state_publish_seq,
+        uint64_t                    *out_generation,
+        uint64_t                    *out_architecture_version,
+        int32_t                     *out_round_id,
+        int32_t                     *out_cycle,
+        int32_t                     *out_step,
+        int32_t                     *out_render_w,
+        int32_t                     *out_render_h,
+        int32_t                     *out_render_c,
+        int32_t                     *out_render_stride_bytes);
+
+NODUS_API int nodus_weight_image_store_render_for(
+        NodusWeightStateStore *state_store,
+        NodusWeightImageStore *image_store,
+        const char            *model_name,
+        const char            *node_id,
+        int                    mode,
+        int32_t                target_w,
+        int32_t                target_h);
+
+/* Read image-entry metadata at logical index (0 = oldest, length-1 = newest).
+   Any output pointer may be NULL. Returns 0 on success, -1 on error. */
+NODUS_API int nodus_weight_image_store_get_meta(
+        const NodusWeightImageStore *store,
+        int32_t                      index,
+        uint64_t                    *out_image_seq,
+        uint64_t                    *out_state_publish_seq,
+        uint64_t                    *out_generation,
+        uint64_t                    *out_architecture_version,
+        int32_t                     *out_round_id,
+        int32_t                     *out_cycle,
+        int32_t                     *out_step,
+        int32_t                     *out_w,
+        int32_t                     *out_h,
+        int32_t                     *out_c,
+        int32_t                     *out_stride_bytes,
+        uint64_t                    *out_byte_count,
+        uint32_t                    *out_flags,
+        char                        *out_model_name,
+        int                          out_model_name_buflen,
+        char                        *out_node_id,
+        int                          out_node_id_buflen,
+        char                        *out_blob_name,
+        int                          out_blob_name_buflen);
+
+/* Copy the rendered RGB bytes for an image-cache entry into out_buf.
+   Returns bytes copied, or -1 on error. */
+NODUS_API int32_t nodus_weight_image_store_copy_image(
+        const NodusWeightImageStore *store,
+        int32_t                      index,
+        uint8_t                     *out_buf,
+        uint64_t                     buf_size);
+
+/* Mark the rendered image associated with state_publish_seq as checkpoint-backed.
+   Returns 0 on success, -1 if the image is not present in the cache. */
+NODUS_API int nodus_weight_image_store_mark_checkpoint(
+        NodusWeightImageStore *store,
+        uint64_t               state_publish_seq,
+        int32_t                round_id,
+        int32_t                cycle);
+
 #ifdef __cplusplus
 }
 #endif

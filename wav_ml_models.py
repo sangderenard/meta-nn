@@ -1553,6 +1553,7 @@ def train_conditional_generator_discriminator(
     log_every_steps: int = 0,
     step_preview_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
     stop_requested: Optional[Callable[[], bool]] = None,
+    generator_step_callback: Optional[Callable[[int], None]] = None,
     amp: bool = False,
     amp_dtype: str = "float16",
     channels_last: bool = False,
@@ -1662,6 +1663,7 @@ def train_conditional_generator_discriminator(
     history: List[Dict[str, float]] = []
 
     stop_now = False
+    generator_step_count = 0
     for epoch in range(1, max(1, int(epochs)) + 1):
         generator.train()
         discriminator.train()
@@ -1979,6 +1981,12 @@ def train_conditional_generator_discriminator(
                 scaler_g.update()
             else:
                 g_opt.step()
+            generator_step_count += 1
+            if generator_step_callback is not None:
+                try:
+                    generator_step_callback(int(generator_step_count))
+                except Exception:
+                    pass
 
             run_d += float(d_loss_step)
             run_g += float(g_loss_step)
@@ -2152,6 +2160,7 @@ def train_classifier(
     log_every_steps: int = 0,
     step_preview_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
     stop_requested: Optional[Callable[[], bool]] = None,
+    weight_update_callback: Optional[Callable[[int], None]] = None,
     semantic_mix_noise_prob: float = 0.0,
     semantic_mix_noise_std: float = 0.0,
     semantic_mix_blend_min: float = 0.10,
@@ -2214,6 +2223,7 @@ def train_classifier(
     best_val = -math.inf
 
     stop_now = False
+    optimizer_step_count = 0
     for epoch in range(1, epochs + 1):
         model.train()
         total_loss = 0.0
@@ -2294,6 +2304,12 @@ def train_classifier(
                     scaler.update()
                 else:
                     opt.step()
+                optimizer_step_count += 1
+                if weight_update_callback is not None:
+                    try:
+                        weight_update_callback(int(optimizer_step_count))
+                    except Exception:
+                        pass
                 lr_ctl.step()
                 opt.zero_grad(set_to_none=True)
             total_loss += float(loss.item()) * int(xb.shape[0])
@@ -3361,6 +3377,7 @@ def train_transformer_feature_metric(
     log_every_steps: int = 0,
     step_preview_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
     stop_requested: Optional[Callable[[], bool]] = None,
+    weight_update_callback: Optional[Callable[[int], None]] = None,
     aux_filter_input_builder: Optional[Callable[[Dict[str, Any]], Dict[str, Dict[str, Any]]]] = None,
     cache_eval_batches: bool = True,
     visualize_status: bool = False,
@@ -3556,6 +3573,7 @@ def train_transformer_feature_metric(
         )
 
     stop_now = False
+    optimizer_step_count = 0
     for epoch in range(1, epochs + 1):
         transformer.train()
         running_loss = torch.zeros((), dtype=torch.float32, device=device)
@@ -4051,6 +4069,12 @@ def train_transformer_feature_metric(
                     scaler.update()
                 else:
                     opt.step()
+                optimizer_step_count += 1
+                if weight_update_callback is not None:
+                    try:
+                        weight_update_callback(int(optimizer_step_count))
+                    except Exception:
+                        pass
                 lr_ctl.step()
                 opt.zero_grad(set_to_none=True)
             step_t3 = time.perf_counter()

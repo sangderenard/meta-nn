@@ -51,6 +51,7 @@ from pipeline.nodes.base import (
     IRTrainingNode,
     IRTensorPortSpec,
     autocast_context,
+    make_runtime_weight_publish_callback,
     make_grad_scaler,
     resolve_amp_dtype,
 )
@@ -472,6 +473,12 @@ class TransformerTrainNode(IRTrainingNode):
 
     def execute(self, ctx: PipelineContext) -> None:
         from wav_ml_models import train_transformer_feature_metric
+        weight_update_callback = make_runtime_weight_publish_callback(
+            ctx,
+            model_name="transformer",
+            model=ctx.transformer,
+            node_id=self.node_id,
+        )
 
         # Compute current degrade probability from curriculum schedule
         degrade_prob = _degrade_prob(
@@ -517,6 +524,7 @@ class TransformerTrainNode(IRTrainingNode):
             high_bit_penalty_weight=self.cfg.high_bit_weight,
             low_bit_penalty_weight=self.cfg.low_bit_weight,
             wave_l1_weight=self.cfg.wave_l1_weight,
+            weight_update_callback=weight_update_callback,
         )
 
         ctx.transformer = trained_transformer

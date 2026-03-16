@@ -174,6 +174,61 @@ static void nn_upscale(const uint8_t *src, int src_w, int src_h,
     }
 }
 
+static int measure_parameter_groups_dims(
+        int32_t num_nodes,
+        int32_t target_w,
+        int32_t target_h,
+        int32_t *out_w,
+        int32_t *out_h)
+{
+    int side_px;
+    if (!out_w || !out_h || num_nodes <= 0) return -1;
+    side_px = maxi(8, maxi(target_w, target_h));
+    *out_w = side_px;
+    *out_h = side_px;
+    return 0;
+}
+
+static int measure_architectural_dims(
+        const int32_t *unit_counts,
+        int32_t num_layers,
+        int32_t target_w,
+        int32_t target_h,
+        int transpose,
+        int32_t *out_w,
+        int32_t *out_h)
+{
+    int footer_h = 18;
+    int max_unit_count = 1;
+    int raw_h, raw_w = 0;
+    int ori_w, ori_h;
+    int eff_w, eff_h;
+    int li;
+    if (!unit_counts || num_layers <= 0 || !out_w || !out_h) return -1;
+    for (li = 0; li < num_layers; li++) {
+        if (unit_counts[li] > max_unit_count) max_unit_count = unit_counts[li];
+    }
+    raw_h = (max_unit_count % 2 == 1) ? max_unit_count : (max_unit_count + 1);
+    for (li = 0; li < num_layers; li++) {
+        int uc = maxi(1, unit_counts[li]);
+        int cols = maxi(1, (int)ceilf((float)uc / (float)raw_h));
+        raw_w += cols;
+    }
+    raw_w = maxi(1, raw_w);
+    if (transpose) {
+        ori_w = raw_h;
+        ori_h = raw_w;
+    } else {
+        ori_w = raw_w;
+        ori_h = raw_h;
+    }
+    eff_w = maxi(target_w, ori_w);
+    eff_h = maxi(target_h, ori_h + footer_h);
+    *out_w = eff_w;
+    *out_h = eff_h;
+    return 0;
+}
+
 /* ------------------------------------------------------------------ */
 /*  parameter_groups mode                                             */
 /* ------------------------------------------------------------------ */
@@ -509,6 +564,53 @@ NODUS_API int nodus_weight_image_render(
     }
 }
 
+NODUS_API int nodus_weight_image_measure(
+        int                         mode,
+        const NodusWeightLayer     *layers,
+        int32_t                     num_layers,
+        const NodusWeightNodeGroup *nodes,
+        int32_t                     num_nodes,
+        int32_t                     target_w,
+        int32_t                     target_h,
+        int32_t                    *out_w,
+        int32_t                    *out_h)
+{
+    target_w = maxi(8, target_w);
+    target_h = maxi(8, target_h);
+    switch (mode) {
+    case NODUS_WEIGHT_MODE_PARAMETER_GROUPS:
+        if (!nodes || num_nodes <= 0) return -1;
+        return measure_parameter_groups_dims(num_nodes, target_w, target_h, out_w, out_h);
+
+    case NODUS_WEIGHT_MODE_ARCHITECTURAL_TALL: {
+        int32_t *unit_counts = NULL;
+        int rc;
+        if (!layers || num_layers <= 0) return -1;
+        unit_counts = (int32_t *)calloc((size_t)num_layers, sizeof(int32_t));
+        if (!unit_counts) return -1;
+        for (int32_t i = 0; i < num_layers; i++) unit_counts[i] = layers[i].unit_count;
+        rc = measure_architectural_dims(unit_counts, num_layers, target_w, target_h, 0, out_w, out_h);
+        free(unit_counts);
+        return rc;
+    }
+
+    case NODUS_WEIGHT_MODE_ARCHITECTURAL_WIDE: {
+        int32_t *unit_counts = NULL;
+        int rc;
+        if (!layers || num_layers <= 0) return -1;
+        unit_counts = (int32_t *)calloc((size_t)num_layers, sizeof(int32_t));
+        if (!unit_counts) return -1;
+        for (int32_t i = 0; i < num_layers; i++) unit_counts[i] = layers[i].unit_count;
+        rc = measure_architectural_dims(unit_counts, num_layers, target_w, target_h, 1, out_w, out_h);
+        free(unit_counts);
+        return rc;
+    }
+
+    default:
+        return -1;
+    }
+}
+
 /* ================================================================== */
 /*  State-dict intake — raw tensors in, image out, all work in C      */
 /* ================================================================== */
@@ -568,6 +670,91 @@ static int choose_unit_count(const int32_t *shape0_vals, int count) {
         }
     }
     return best_val > 0 ? best_val : 1;
+}
+
+NODUS_API int nodus_weight_image_measure_from_state_dict(
+        const char *const  *param_names,
+        const float *const *param_data,
+        const int32_t      *param_numel,
+        const int32_t      *param_shape0,
+        int32_t             num_params,
+        int                 mode,
+        int32_t             target_w,
+        int32_t             target_h,
+        int32_t            *out_w,
+        int32_t            *out_h)
+{
+    NodeAccum *nodes_acc = NULL;
+    int num_groups = 0;
+    int32_t *shape0_buf = NULL;
+    int32_t *unit_counts = NULL;
+    int rc = -1;
+
+    if (!param_names || !param_data || !param_numel || !param_shape0 || num_params <= 0 || !out_w || !out_h) {
+        return -1;
+    }
+    (void)param_data;
+    (void)param_numel;
+
+    target_w = maxi(8, target_w);
+    target_h = maxi(8, target_h);
+
+    nodes_acc = (NodeAccum *)calloc((size_t)num_params, sizeof(NodeAccum));
+    if (!nodes_acc) return -1;
+
+    for (int pi = 0; pi < num_params; pi++) {
+        char key[256];
+        int gi = -1;
+        param_node_key(param_names[pi], key, 256);
+        for (int g = 0; g < num_groups; g++) {
+            if (strcmp(nodes_acc[g].name, key) == 0) {
+                gi = g;
+                break;
+            }
+        }
+        if (gi < 0) {
+            gi = num_groups++;
+            memcpy(nodes_acc[gi].name, key, 256);
+            nodes_acc[gi].num_params = 0;
+        }
+        if (nodes_acc[gi].num_params < 4096) {
+            nodes_acc[gi].param_indices[nodes_acc[gi].num_params++] = pi;
+        }
+    }
+
+    if (mode == NODUS_WEIGHT_MODE_PARAMETER_GROUPS) {
+        rc = measure_parameter_groups_dims(num_groups, target_w, target_h, out_w, out_h);
+        free(nodes_acc);
+        return rc;
+    }
+
+    shape0_buf = (int32_t *)malloc((size_t)num_params * sizeof(int32_t));
+    unit_counts = (int32_t *)calloc((size_t)num_groups, sizeof(int32_t));
+    if (!shape0_buf || !unit_counts) goto cleanup;
+
+    for (int g = 0; g < num_groups; g++) {
+        int np = nodes_acc[g].num_params;
+        for (int j = 0; j < np; j++) {
+            shape0_buf[j] = param_shape0[nodes_acc[g].param_indices[j]];
+        }
+        unit_counts[g] = choose_unit_count(shape0_buf, np);
+    }
+
+    rc = measure_architectural_dims(
+        unit_counts,
+        num_groups,
+        target_w,
+        target_h,
+        (mode == NODUS_WEIGHT_MODE_ARCHITECTURAL_WIDE) ? 1 : 0,
+        out_w,
+        out_h
+    );
+
+cleanup:
+    free(unit_counts);
+    free(shape0_buf);
+    free(nodes_acc);
+    return rc;
 }
 
 NODUS_API int nodus_weight_image_from_state_dict(

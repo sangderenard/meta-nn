@@ -2,8 +2,8 @@
 """Standalone GUI viewer for nodus training visualization.
 
 Launch this *before* the training pipeline to get an immediate viewer window
-with historical loss graphs, checkpoint markers, and weight-backup scans loaded
-from leftover files.  The training process connects via IPC to deliver live
+with historical loss graphs and checkpoint markers loaded from leftover files.
+The training process connects via IPC to deliver live
 updates (loss values, preview frames, checkpoint notifications).
 
 Usage (manual):
@@ -198,7 +198,7 @@ def _load_history(viewer, out_dir: Path, loss_store=None) -> None:
     if seen_times:
         print(f"[gui] placed {len(seen_times)} checkpoint marker(s) on graph", flush=True)
 
-    # ── Batch-launcher weight backup directory ────────────────────────────
+    # ── Batch-launcher checkpoint backup directory ────────────────────────
     bk_dir = out_dir / "_weight_backup"
     if bk_dir.is_dir():
         viewer.set_checkpoint_backup_dir(bk_dir)

@@ -343,6 +343,234 @@ def _setup_signatures(lib: ctypes.CDLL) -> None:
     ]
     lib.nodus_composite_cache_copy_panel.restype = ctypes.c_int32
 
+    # -- Weight state store ----------------------------------------------
+
+    c_weight_state_p = ctypes.c_void_p
+    c_weight_image_p = ctypes.c_void_p
+    c_char_pp = ctypes.POINTER(ctypes.c_char_p)
+    c_float_p = ctypes.POINTER(ctypes.c_float)
+    c_float_pp = ctypes.POINTER(c_float_p)
+    c_i32_p = ctypes.POINTER(ctypes.c_int32)
+
+    lib.nodus_weight_state_store_get_global.argtypes = []
+    lib.nodus_weight_state_store_get_global.restype = c_weight_state_p
+
+    lib.nodus_weight_state_store_publish_flat.argtypes = [
+        c_weight_state_p,
+        c_char_p,
+        c_char_p,
+        ctypes.c_int32,
+        ctypes.c_int32,
+        ctypes.c_int32,
+        ctypes.c_uint64,
+        ctypes.c_uint64,
+        ctypes.c_uint64,
+        c_char_pp,
+        c_float_pp,
+        c_i32_p,
+        c_i32_p,
+        ctypes.c_int32,
+    ]
+    lib.nodus_weight_state_store_publish_flat.restype = ctypes.c_int
+
+    lib.nodus_weight_state_store_get_meta.argtypes = [
+        c_weight_state_p,
+        ctypes.POINTER(ctypes.c_uint64),
+        ctypes.POINTER(ctypes.c_uint64),
+        ctypes.POINTER(ctypes.c_uint64),
+        ctypes.POINTER(ctypes.c_int32),
+        ctypes.POINTER(ctypes.c_int32),
+        ctypes.POINTER(ctypes.c_int32),
+        ctypes.POINTER(ctypes.c_int32),
+        ctypes.POINTER(ctypes.c_uint64),
+        c_char_p,
+        ctypes.c_int,
+        c_char_p,
+        ctypes.c_int,
+        c_char_p,
+        ctypes.c_int,
+    ]
+    lib.nodus_weight_state_store_get_meta.restype = ctypes.c_int
+
+    lib.nodus_weight_state_store_count.argtypes = [c_weight_state_p]
+    lib.nodus_weight_state_store_count.restype = ctypes.c_int32
+
+    lib.nodus_weight_state_store_get_meta_at.argtypes = [
+        c_weight_state_p,
+        ctypes.c_int32,
+        ctypes.POINTER(ctypes.c_uint64),
+        ctypes.POINTER(ctypes.c_uint64),
+        ctypes.POINTER(ctypes.c_uint64),
+        ctypes.POINTER(ctypes.c_int32),
+        ctypes.POINTER(ctypes.c_int32),
+        ctypes.POINTER(ctypes.c_int32),
+        ctypes.POINTER(ctypes.c_int32),
+        ctypes.POINTER(ctypes.c_uint64),
+        c_char_p,
+        ctypes.c_int,
+        c_char_p,
+        ctypes.c_int,
+        c_char_p,
+        ctypes.c_int,
+    ]
+    lib.nodus_weight_state_store_get_meta_at.restype = ctypes.c_int
+
+    lib.nodus_weight_state_store_get_meta_for.argtypes = [
+        c_weight_state_p,
+        c_char_p,
+        c_char_p,
+        ctypes.POINTER(ctypes.c_uint64),
+        ctypes.POINTER(ctypes.c_uint64),
+        ctypes.POINTER(ctypes.c_uint64),
+        ctypes.POINTER(ctypes.c_int32),
+        ctypes.POINTER(ctypes.c_int32),
+        ctypes.POINTER(ctypes.c_int32),
+        ctypes.POINTER(ctypes.c_int32),
+        ctypes.POINTER(ctypes.c_uint64),
+        c_char_p,
+        ctypes.c_int,
+    ]
+    lib.nodus_weight_state_store_get_meta_for.restype = ctypes.c_int
+
+    # -- Weight image store ----------------------------------------------
+
+    lib.nodus_weight_image_store_get_global.argtypes = []
+    lib.nodus_weight_image_store_get_global.restype = c_weight_image_p
+
+    lib.nodus_weight_image_store_length.argtypes = [c_weight_image_p]
+    lib.nodus_weight_image_store_length.restype = ctypes.c_int32
+
+    lib.nodus_weight_image_store_capacity.argtypes = [c_weight_image_p]
+    lib.nodus_weight_image_store_capacity.restype = ctypes.c_int32
+
+    lib.nodus_weight_image_store_set_limits.argtypes = [
+        c_weight_image_p,
+        ctypes.c_int32,
+        ctypes.c_uint64,
+    ]
+    lib.nodus_weight_image_store_set_limits.restype = ctypes.c_int
+
+    lib.nodus_weight_image_store_get_stats.argtypes = [
+        c_weight_image_p,
+        ctypes.POINTER(ctypes.c_int32),
+        ctypes.POINTER(ctypes.c_int32),
+        ctypes.POINTER(ctypes.c_uint64),
+        ctypes.POINTER(ctypes.c_uint64),
+    ]
+    lib.nodus_weight_image_store_get_stats.restype = ctypes.c_int
+
+    lib.nodus_weight_image_store_configure_latest.argtypes = [
+        c_weight_state_p,
+        c_weight_image_p,
+        ctypes.c_int,
+        ctypes.c_int32,
+        ctypes.c_int32,
+    ]
+    lib.nodus_weight_image_store_configure_latest.restype = ctypes.c_int
+
+    lib.nodus_weight_image_store_get_active_config.argtypes = [
+        c_weight_image_p,
+        ctypes.POINTER(ctypes.c_uint64),
+        ctypes.POINTER(ctypes.c_uint64),
+        ctypes.POINTER(ctypes.c_uint64),
+        ctypes.POINTER(ctypes.c_int32),
+        ctypes.POINTER(ctypes.c_int32),
+        ctypes.POINTER(ctypes.c_int32),
+        ctypes.POINTER(ctypes.c_int32),
+        ctypes.POINTER(ctypes.c_int32),
+        ctypes.POINTER(ctypes.c_int32),
+        ctypes.POINTER(ctypes.c_int32),
+        ctypes.POINTER(ctypes.c_int32),
+        ctypes.POINTER(ctypes.c_int32),
+        ctypes.POINTER(ctypes.c_int32),
+        c_char_p,
+        ctypes.c_int,
+        c_char_p,
+        ctypes.c_int,
+    ]
+    lib.nodus_weight_image_store_get_active_config.restype = ctypes.c_int
+
+    lib.nodus_weight_image_store_render_latest.argtypes = [
+        c_weight_state_p,
+        c_weight_image_p,
+        ctypes.c_int,
+        ctypes.c_int32,
+        ctypes.c_int32,
+    ]
+    lib.nodus_weight_image_store_render_latest.restype = ctypes.c_int
+
+    lib.nodus_weight_image_store_measure_for.argtypes = [
+        c_weight_state_p,
+        c_char_p,
+        c_char_p,
+        ctypes.c_int,
+        ctypes.c_int32,
+        ctypes.c_int32,
+        ctypes.POINTER(ctypes.c_uint64),
+        ctypes.POINTER(ctypes.c_uint64),
+        ctypes.POINTER(ctypes.c_uint64),
+        ctypes.POINTER(ctypes.c_int32),
+        ctypes.POINTER(ctypes.c_int32),
+        ctypes.POINTER(ctypes.c_int32),
+        ctypes.POINTER(ctypes.c_int32),
+        ctypes.POINTER(ctypes.c_int32),
+        ctypes.POINTER(ctypes.c_int32),
+        ctypes.POINTER(ctypes.c_int32),
+    ]
+    lib.nodus_weight_image_store_measure_for.restype = ctypes.c_int
+
+    lib.nodus_weight_image_store_render_for.argtypes = [
+        c_weight_state_p,
+        c_weight_image_p,
+        c_char_p,
+        c_char_p,
+        ctypes.c_int,
+        ctypes.c_int32,
+        ctypes.c_int32,
+    ]
+    lib.nodus_weight_image_store_render_for.restype = ctypes.c_int
+
+    lib.nodus_weight_image_store_get_meta.argtypes = [
+        c_weight_image_p,
+        ctypes.c_int32,
+        ctypes.POINTER(ctypes.c_uint64),
+        ctypes.POINTER(ctypes.c_uint64),
+        ctypes.POINTER(ctypes.c_uint64),
+        ctypes.POINTER(ctypes.c_uint64),
+        ctypes.POINTER(ctypes.c_int32),
+        ctypes.POINTER(ctypes.c_int32),
+        ctypes.POINTER(ctypes.c_int32),
+        ctypes.POINTER(ctypes.c_int32),
+        ctypes.POINTER(ctypes.c_int32),
+        ctypes.POINTER(ctypes.c_int32),
+        ctypes.POINTER(ctypes.c_int32),
+        ctypes.POINTER(ctypes.c_uint64),
+        ctypes.POINTER(ctypes.c_uint32),
+        c_char_p,
+        ctypes.c_int,
+        c_char_p,
+        ctypes.c_int,
+        c_char_p,
+        ctypes.c_int,
+    ]
+    lib.nodus_weight_image_store_get_meta.restype = ctypes.c_int
+
+    lib.nodus_weight_image_store_copy_image.argtypes = [
+        c_weight_image_p,
+        ctypes.c_int32,
+        c_uint8_p,
+        ctypes.c_uint64,
+    ]
+    lib.nodus_weight_image_store_copy_image.restype = ctypes.c_int32
+
+    lib.nodus_weight_image_store_mark_checkpoint.argtypes = [
+        c_weight_image_p,
+        ctypes.c_uint64,
+        ctypes.c_int32,
+        ctypes.c_int32,
+    ]
+    lib.nodus_weight_image_store_mark_checkpoint.restype = ctypes.c_int
+
 
 # -- Python dataclass for query results --
 
@@ -1301,3 +1529,679 @@ class NodusCompositeCache:
                 return None
             panels.append(p)
         return panels
+
+
+# ====================================================================
+#  Weight State Store + Rendered Image Cache
+# ====================================================================
+
+WEIGHT_IMAGE_FLAG_CHECKPOINT = 0x01
+
+
+@dataclass(slots=True)
+class WeightStateMeta:
+    publish_seq: int = 0
+    generation: int = 0
+    architecture_version: int = 0
+    round_id: int = 0
+    cycle: int = 0
+    step: int = 0
+    param_count: int = 0
+    blob_bytes: int = 0
+    model_name: str = ""
+    node_id: str = ""
+    blob_name: str = ""
+
+
+@dataclass(slots=True)
+class WeightImageMeta:
+    image_seq: int = 0
+    state_publish_seq: int = 0
+    generation: int = 0
+    architecture_version: int = 0
+    round_id: int = 0
+    cycle: int = 0
+    step: int = 0
+    width: int = 0
+    height: int = 0
+    channels: int = 0
+    stride_bytes: int = 0
+    byte_count: int = 0
+    flags: int = 0
+    model_name: str = ""
+    node_id: str = ""
+    blob_name: str = ""
+
+
+@dataclass(slots=True)
+class WeightImageConfig:
+    state_publish_seq: int = 0
+    generation: int = 0
+    architecture_version: int = 0
+    round_id: int = 0
+    cycle: int = 0
+    step: int = 0
+    mode: int = 0
+    target_width: int = 0
+    target_height: int = 0
+    render_width: int = 0
+    render_height: int = 0
+    render_channels: int = 0
+    render_stride_bytes: int = 0
+    model_name: str = ""
+    node_id: str = ""
+
+
+@dataclass(slots=True)
+class WeightImageStoreStats:
+    max_entries: int = 0
+    entry_count: int = 0
+    max_total_bytes: int = 0
+    total_bytes: int = 0
+
+
+def _pack_weight_state_dict(
+    state_dict: Dict[str, object],
+    *,
+    parameter_keys: Optional[List[str]] = None,
+) -> Tuple[List[bytes], List["numpy.ndarray"], List[int], List[int]]:
+    import numpy as np
+    import torch
+
+    if parameter_keys is None:
+        keys = [str(k) for k, v in state_dict.items() if torch.is_tensor(v) and torch.is_floating_point(v)]
+    else:
+        keys = [str(k) for k in parameter_keys]
+
+    packed_names: List[bytes] = []
+    packed_arrays: List[np.ndarray] = []
+    packed_numel: List[int] = []
+    packed_shape0: List[int] = []
+
+    for key in keys:
+        value = state_dict.get(key)
+        if value is None or (not torch.is_tensor(value)) or (not torch.is_floating_point(value)):
+            continue
+        tensor = value.detach().to(device="cpu", dtype=torch.float32).contiguous()
+        flat = tensor.reshape(-1)
+        if int(flat.numel()) <= 0:
+            continue
+        arr = flat.numpy()
+        packed_names.append(key.encode("utf-8", errors="ignore"))
+        packed_arrays.append(arr)
+        packed_numel.append(int(arr.size))
+        packed_shape0.append(int(tensor.shape[0]) if int(tensor.ndim) > 0 else 1)
+
+    return packed_names, packed_arrays, packed_numel, packed_shape0
+
+
+class NodusWeightStateStore:
+    """Cross-process store for the latest published floating-point model state."""
+
+    def __init__(self, _raw_handle: ctypes.c_void_p):
+        self._lib = _get_lib()
+        self._handle = _raw_handle
+
+    @classmethod
+    def get_global(cls) -> "NodusWeightStateStore":
+        lib = _get_lib()
+        handle = lib.nodus_weight_state_store_get_global()
+        if not handle:
+            raise MemoryError("nodus_weight_state_store_get_global returned NULL")
+        return cls(_raw_handle=handle)
+
+    def publish_state_dict(
+        self,
+        state_dict: Dict[str, object],
+        *,
+        model_name: str,
+        node_id: str = "",
+        round_id: int = 0,
+        cycle: int = 0,
+        step: int = 0,
+        generation: int = 0,
+        architecture_version: int = 0,
+        publish_seq: int = 0,
+        parameter_keys: Optional[List[str]] = None,
+    ) -> Optional[WeightStateMeta]:
+        packed_names, packed_arrays, packed_numel, packed_shape0 = _pack_weight_state_dict(
+            state_dict,
+            parameter_keys=parameter_keys,
+        )
+        count = len(packed_arrays)
+        if count <= 0:
+            return None
+
+        c_char_p_arr = ctypes.c_char_p * count
+        c_float_p = ctypes.POINTER(ctypes.c_float)
+        c_float_p_arr = c_float_p * count
+        c_i32_arr = ctypes.c_int32 * count
+
+        names_arr = c_char_p_arr(*packed_names)
+        data_arr = c_float_p_arr(*[arr.ctypes.data_as(c_float_p) for arr in packed_arrays])
+        numel_arr = c_i32_arr(*packed_numel)
+        shape0_arr = c_i32_arr(*packed_shape0)
+
+        rc = self._lib.nodus_weight_state_store_publish_flat(
+            self._handle,
+            str(model_name).encode("utf-8"),
+            str(node_id).encode("utf-8"),
+            ctypes.c_int32(int(round_id)),
+            ctypes.c_int32(int(cycle)),
+            ctypes.c_int32(int(step)),
+            ctypes.c_uint64(int(generation)),
+            ctypes.c_uint64(int(architecture_version)),
+            ctypes.c_uint64(int(publish_seq)),
+            names_arr,
+            data_arr,
+            numel_arr,
+            shape0_arr,
+            ctypes.c_int32(count),
+        )
+        if int(rc) != 0:
+            return None
+        return self.get_meta()
+
+    def _decode_meta(
+        self,
+        *,
+        publish_seq: ctypes.c_uint64,
+        generation: ctypes.c_uint64,
+        architecture_version: ctypes.c_uint64,
+        round_id: ctypes.c_int32,
+        cycle: ctypes.c_int32,
+        step: ctypes.c_int32,
+        param_count: ctypes.c_int32,
+        blob_bytes: ctypes.c_uint64,
+        model_name,
+        node_id,
+        blob_name,
+    ) -> WeightStateMeta:
+        return WeightStateMeta(
+            publish_seq=int(publish_seq.value),
+            generation=int(generation.value),
+            architecture_version=int(architecture_version.value),
+            round_id=int(round_id.value),
+            cycle=int(cycle.value),
+            step=int(step.value),
+            param_count=int(param_count.value),
+            blob_bytes=int(blob_bytes.value),
+            model_name=model_name.value.decode("utf-8", errors="replace"),
+            node_id=node_id.value.decode("utf-8", errors="replace"),
+            blob_name=blob_name.value.decode("utf-8", errors="replace"),
+        )
+
+    def get_meta(self) -> Optional[WeightStateMeta]:
+        publish_seq = ctypes.c_uint64(0)
+        generation = ctypes.c_uint64(0)
+        architecture_version = ctypes.c_uint64(0)
+        round_id = ctypes.c_int32(0)
+        cycle = ctypes.c_int32(0)
+        step = ctypes.c_int32(0)
+        param_count = ctypes.c_int32(0)
+        blob_bytes = ctypes.c_uint64(0)
+        model_name = ctypes.create_string_buffer(64)
+        node_id = ctypes.create_string_buffer(64)
+        blob_name = ctypes.create_string_buffer(128)
+        rc = self._lib.nodus_weight_state_store_get_meta(
+            self._handle,
+            ctypes.byref(publish_seq),
+            ctypes.byref(generation),
+            ctypes.byref(architecture_version),
+            ctypes.byref(round_id),
+            ctypes.byref(cycle),
+            ctypes.byref(step),
+            ctypes.byref(param_count),
+            ctypes.byref(blob_bytes),
+            model_name,
+            len(model_name),
+            node_id,
+            len(node_id),
+            blob_name,
+            len(blob_name),
+        )
+        if int(rc) != 0:
+            return None
+        return self._decode_meta(
+            publish_seq=publish_seq,
+            generation=generation,
+            architecture_version=architecture_version,
+            round_id=round_id,
+            cycle=cycle,
+            step=step,
+            param_count=param_count,
+            blob_bytes=blob_bytes,
+            model_name=model_name,
+            node_id=node_id,
+            blob_name=blob_name,
+        )
+
+    def count(self) -> int:
+        return int(self._lib.nodus_weight_state_store_count(self._handle))
+
+    def get_meta_at(self, index: int) -> Optional[WeightStateMeta]:
+        publish_seq = ctypes.c_uint64(0)
+        generation = ctypes.c_uint64(0)
+        architecture_version = ctypes.c_uint64(0)
+        round_id = ctypes.c_int32(0)
+        cycle = ctypes.c_int32(0)
+        step = ctypes.c_int32(0)
+        param_count = ctypes.c_int32(0)
+        blob_bytes = ctypes.c_uint64(0)
+        model_name = ctypes.create_string_buffer(64)
+        node_id = ctypes.create_string_buffer(64)
+        blob_name = ctypes.create_string_buffer(128)
+        rc = self._lib.nodus_weight_state_store_get_meta_at(
+            self._handle,
+            ctypes.c_int32(int(index)),
+            ctypes.byref(publish_seq),
+            ctypes.byref(generation),
+            ctypes.byref(architecture_version),
+            ctypes.byref(round_id),
+            ctypes.byref(cycle),
+            ctypes.byref(step),
+            ctypes.byref(param_count),
+            ctypes.byref(blob_bytes),
+            model_name,
+            len(model_name),
+            node_id,
+            len(node_id),
+            blob_name,
+            len(blob_name),
+        )
+        if int(rc) != 0:
+            return None
+        return self._decode_meta(
+            publish_seq=publish_seq,
+            generation=generation,
+            architecture_version=architecture_version,
+            round_id=round_id,
+            cycle=cycle,
+            step=step,
+            param_count=param_count,
+            blob_bytes=blob_bytes,
+            model_name=model_name,
+            node_id=node_id,
+            blob_name=blob_name,
+        )
+
+    def get_meta_for(self, *, model_name: str, node_id: str = "") -> Optional[WeightStateMeta]:
+        publish_seq = ctypes.c_uint64(0)
+        generation = ctypes.c_uint64(0)
+        architecture_version = ctypes.c_uint64(0)
+        round_id = ctypes.c_int32(0)
+        cycle = ctypes.c_int32(0)
+        step = ctypes.c_int32(0)
+        param_count = ctypes.c_int32(0)
+        blob_bytes = ctypes.c_uint64(0)
+        blob_name = ctypes.create_string_buffer(128)
+        rc = self._lib.nodus_weight_state_store_get_meta_for(
+            self._handle,
+            str(model_name).encode("utf-8"),
+            str(node_id).encode("utf-8"),
+            ctypes.byref(publish_seq),
+            ctypes.byref(generation),
+            ctypes.byref(architecture_version),
+            ctypes.byref(round_id),
+            ctypes.byref(cycle),
+            ctypes.byref(step),
+            ctypes.byref(param_count),
+            ctypes.byref(blob_bytes),
+            blob_name,
+            len(blob_name),
+        )
+        if int(rc) != 0:
+            return None
+        return WeightStateMeta(
+            publish_seq=int(publish_seq.value),
+            generation=int(generation.value),
+            architecture_version=int(architecture_version.value),
+            round_id=int(round_id.value),
+            cycle=int(cycle.value),
+            step=int(step.value),
+            param_count=int(param_count.value),
+            blob_bytes=int(blob_bytes.value),
+            model_name=str(model_name),
+            node_id=str(node_id),
+            blob_name=blob_name.value.decode("utf-8", errors="replace"),
+        )
+
+    def list_meta(self) -> List[WeightStateMeta]:
+        return [
+            meta
+            for meta in (self.get_meta_at(i) for i in range(max(0, int(self.count()))))
+            if meta is not None
+        ]
+
+
+class NodusWeightImageStore:
+    """Cross-process cache of GUI-rendered weight images."""
+
+    def __init__(self, _raw_handle: ctypes.c_void_p):
+        self._lib = _get_lib()
+        self._handle = _raw_handle
+
+    @classmethod
+    def get_global(cls) -> "NodusWeightImageStore":
+        lib = _get_lib()
+        handle = lib.nodus_weight_image_store_get_global()
+        if not handle:
+            raise MemoryError("nodus_weight_image_store_get_global returned NULL")
+        return cls(_raw_handle=handle)
+
+    def length(self) -> int:
+        return int(self._lib.nodus_weight_image_store_length(self._handle))
+
+    def capacity(self) -> int:
+        return int(self._lib.nodus_weight_image_store_capacity(self._handle))
+
+    def set_limits(self, *, max_entries: int, max_total_bytes: int) -> bool:
+        rc = self._lib.nodus_weight_image_store_set_limits(
+            self._handle,
+            ctypes.c_int32(int(max_entries)),
+            ctypes.c_uint64(int(max_total_bytes)),
+        )
+        return int(rc) == 0
+
+    def stats(self) -> Optional[WeightImageStoreStats]:
+        max_entries = ctypes.c_int32(0)
+        entry_count = ctypes.c_int32(0)
+        max_total_bytes = ctypes.c_uint64(0)
+        total_bytes = ctypes.c_uint64(0)
+        rc = self._lib.nodus_weight_image_store_get_stats(
+            self._handle,
+            ctypes.byref(max_entries),
+            ctypes.byref(entry_count),
+            ctypes.byref(max_total_bytes),
+            ctypes.byref(total_bytes),
+        )
+        if int(rc) != 0:
+            return None
+        return WeightImageStoreStats(
+            max_entries=int(max_entries.value),
+            entry_count=int(entry_count.value),
+            max_total_bytes=int(max_total_bytes.value),
+            total_bytes=int(total_bytes.value),
+        )
+
+    def configure_latest(
+        self,
+        state_store: NodusWeightStateStore,
+        *,
+        mode: int = 1,
+        target_width: int = 256,
+        target_height: int = 256,
+    ) -> Optional[WeightImageConfig]:
+        rc = self._lib.nodus_weight_image_store_configure_latest(
+            state_store._handle,
+            self._handle,
+            ctypes.c_int(int(mode)),
+            ctypes.c_int32(int(target_width)),
+            ctypes.c_int32(int(target_height)),
+        )
+        if int(rc) != 0:
+            return None
+        return self.get_active_config()
+
+    def get_active_config(self) -> Optional[WeightImageConfig]:
+        state_publish_seq = ctypes.c_uint64(0)
+        generation = ctypes.c_uint64(0)
+        architecture_version = ctypes.c_uint64(0)
+        round_id = ctypes.c_int32(0)
+        cycle = ctypes.c_int32(0)
+        step = ctypes.c_int32(0)
+        mode = ctypes.c_int32(0)
+        target_width = ctypes.c_int32(0)
+        target_height = ctypes.c_int32(0)
+        render_width = ctypes.c_int32(0)
+        render_height = ctypes.c_int32(0)
+        render_channels = ctypes.c_int32(0)
+        render_stride_bytes = ctypes.c_int32(0)
+        model_name = ctypes.create_string_buffer(64)
+        node_id = ctypes.create_string_buffer(64)
+        rc = self._lib.nodus_weight_image_store_get_active_config(
+            self._handle,
+            ctypes.byref(state_publish_seq),
+            ctypes.byref(generation),
+            ctypes.byref(architecture_version),
+            ctypes.byref(round_id),
+            ctypes.byref(cycle),
+            ctypes.byref(step),
+            ctypes.byref(mode),
+            ctypes.byref(target_width),
+            ctypes.byref(target_height),
+            ctypes.byref(render_width),
+            ctypes.byref(render_height),
+            ctypes.byref(render_channels),
+            ctypes.byref(render_stride_bytes),
+            model_name,
+            len(model_name),
+            node_id,
+            len(node_id),
+        )
+        if int(rc) != 0:
+            return None
+        return WeightImageConfig(
+            state_publish_seq=int(state_publish_seq.value),
+            generation=int(generation.value),
+            architecture_version=int(architecture_version.value),
+            round_id=int(round_id.value),
+            cycle=int(cycle.value),
+            step=int(step.value),
+            mode=int(mode.value),
+            target_width=int(target_width.value),
+            target_height=int(target_height.value),
+            render_width=int(render_width.value),
+            render_height=int(render_height.value),
+            render_channels=int(render_channels.value),
+            render_stride_bytes=int(render_stride_bytes.value),
+            model_name=model_name.value.decode("utf-8", errors="replace"),
+            node_id=node_id.value.decode("utf-8", errors="replace"),
+        )
+
+    def render_latest(
+        self,
+        state_store: NodusWeightStateStore,
+        *,
+        mode: int = 1,
+        target_width: int = 256,
+        target_height: int = 256,
+    ) -> bool:
+        rc = self._lib.nodus_weight_image_store_render_latest(
+            state_store._handle,
+            self._handle,
+            ctypes.c_int(int(mode)),
+            ctypes.c_int32(int(target_width)),
+            ctypes.c_int32(int(target_height)),
+        )
+        return int(rc) == 0
+
+    def measure_for(
+        self,
+        state_store: NodusWeightStateStore,
+        *,
+        model_name: str,
+        node_id: str = "",
+        mode: int = 1,
+        target_width: int = 256,
+        target_height: int = 256,
+    ) -> Optional[WeightImageConfig]:
+        state_publish_seq = ctypes.c_uint64(0)
+        generation = ctypes.c_uint64(0)
+        architecture_version = ctypes.c_uint64(0)
+        round_id = ctypes.c_int32(0)
+        cycle = ctypes.c_int32(0)
+        step = ctypes.c_int32(0)
+        render_width = ctypes.c_int32(0)
+        render_height = ctypes.c_int32(0)
+        render_channels = ctypes.c_int32(0)
+        render_stride_bytes = ctypes.c_int32(0)
+        rc = self._lib.nodus_weight_image_store_measure_for(
+            state_store._handle,
+            str(model_name).encode("utf-8"),
+            str(node_id).encode("utf-8"),
+            ctypes.c_int(int(mode)),
+            ctypes.c_int32(int(target_width)),
+            ctypes.c_int32(int(target_height)),
+            ctypes.byref(state_publish_seq),
+            ctypes.byref(generation),
+            ctypes.byref(architecture_version),
+            ctypes.byref(round_id),
+            ctypes.byref(cycle),
+            ctypes.byref(step),
+            ctypes.byref(render_width),
+            ctypes.byref(render_height),
+            ctypes.byref(render_channels),
+            ctypes.byref(render_stride_bytes),
+        )
+        if int(rc) != 0:
+            return None
+        return WeightImageConfig(
+            state_publish_seq=int(state_publish_seq.value),
+            generation=int(generation.value),
+            architecture_version=int(architecture_version.value),
+            round_id=int(round_id.value),
+            cycle=int(cycle.value),
+            step=int(step.value),
+            mode=int(mode),
+            target_width=int(target_width),
+            target_height=int(target_height),
+            render_width=int(render_width.value),
+            render_height=int(render_height.value),
+            render_channels=int(render_channels.value),
+            render_stride_bytes=int(render_stride_bytes.value),
+            model_name=str(model_name),
+            node_id=str(node_id),
+        )
+
+    def render_for(
+        self,
+        state_store: NodusWeightStateStore,
+        *,
+        model_name: str,
+        node_id: str = "",
+        mode: int = 1,
+        target_width: int = 256,
+        target_height: int = 256,
+    ) -> bool:
+        rc = self._lib.nodus_weight_image_store_render_for(
+            state_store._handle,
+            self._handle,
+            str(model_name).encode("utf-8"),
+            str(node_id).encode("utf-8"),
+            ctypes.c_int(int(mode)),
+            ctypes.c_int32(int(target_width)),
+            ctypes.c_int32(int(target_height)),
+        )
+        return int(rc) == 0
+
+    def get_meta(self, index: int) -> Optional[WeightImageMeta]:
+        image_seq = ctypes.c_uint64(0)
+        state_publish_seq = ctypes.c_uint64(0)
+        generation = ctypes.c_uint64(0)
+        architecture_version = ctypes.c_uint64(0)
+        round_id = ctypes.c_int32(0)
+        cycle = ctypes.c_int32(0)
+        step = ctypes.c_int32(0)
+        width = ctypes.c_int32(0)
+        height = ctypes.c_int32(0)
+        channels = ctypes.c_int32(0)
+        stride_bytes = ctypes.c_int32(0)
+        byte_count = ctypes.c_uint64(0)
+        flags = ctypes.c_uint32(0)
+        model_name = ctypes.create_string_buffer(64)
+        node_id = ctypes.create_string_buffer(64)
+        blob_name = ctypes.create_string_buffer(128)
+        rc = self._lib.nodus_weight_image_store_get_meta(
+            self._handle,
+            ctypes.c_int32(int(index)),
+            ctypes.byref(image_seq),
+            ctypes.byref(state_publish_seq),
+            ctypes.byref(generation),
+            ctypes.byref(architecture_version),
+            ctypes.byref(round_id),
+            ctypes.byref(cycle),
+            ctypes.byref(step),
+            ctypes.byref(width),
+            ctypes.byref(height),
+            ctypes.byref(channels),
+            ctypes.byref(stride_bytes),
+            ctypes.byref(byte_count),
+            ctypes.byref(flags),
+            model_name,
+            len(model_name),
+            node_id,
+            len(node_id),
+            blob_name,
+            len(blob_name),
+        )
+        if int(rc) != 0:
+            return None
+        return WeightImageMeta(
+            image_seq=int(image_seq.value),
+            state_publish_seq=int(state_publish_seq.value),
+            generation=int(generation.value),
+            architecture_version=int(architecture_version.value),
+            round_id=int(round_id.value),
+            cycle=int(cycle.value),
+            step=int(step.value),
+            width=int(width.value),
+            height=int(height.value),
+            channels=int(channels.value),
+            stride_bytes=int(stride_bytes.value),
+            byte_count=int(byte_count.value),
+            flags=int(flags.value),
+            model_name=model_name.value.decode("utf-8", errors="replace"),
+            node_id=node_id.value.decode("utf-8", errors="replace"),
+            blob_name=blob_name.value.decode("utf-8", errors="replace"),
+        )
+
+    def copy_image(self, index: int) -> "Optional[numpy.ndarray]":
+        import numpy as np
+
+        meta = self.get_meta(index)
+        if meta is None or meta.byte_count <= 0:
+            return None
+        buf = (ctypes.c_uint8 * int(meta.byte_count))()
+        n = self._lib.nodus_weight_image_store_copy_image(
+            self._handle,
+            ctypes.c_int32(int(index)),
+            buf,
+            ctypes.c_uint64(int(meta.byte_count)),
+        )
+        if int(n) <= 0:
+            return None
+        row_bytes = int(meta.stride_bytes) if int(meta.stride_bytes) > 0 else int(meta.width) * int(meta.channels)
+        expected = int(meta.height) * row_bytes
+        if int(n) < expected:
+            return None
+        flat = np.ctypeslib.as_array(buf)[:expected].copy()
+        if row_bytes == int(meta.width) * int(meta.channels):
+            return flat.reshape(int(meta.height), int(meta.width), int(meta.channels))
+        rows = flat.reshape(int(meta.height), row_bytes)
+        packed = rows[:, : int(meta.width) * int(meta.channels)]
+        return packed.reshape(int(meta.height), int(meta.width), int(meta.channels))
+
+    def latest_meta(self) -> Optional[WeightImageMeta]:
+        length = self.length()
+        if length <= 0:
+            return None
+        return self.get_meta(length - 1)
+
+    def latest_image(self) -> "Optional[tuple[WeightImageMeta, numpy.ndarray]]":
+        meta = self.latest_meta()
+        if meta is None:
+            return None
+        rgb = self.copy_image(self.length() - 1)
+        if rgb is None:
+            return None
+        return meta, rgb
+
+    def mark_checkpoint(self, state_publish_seq: int, *, round_id: int, cycle: int) -> bool:
+        rc = self._lib.nodus_weight_image_store_mark_checkpoint(
+            self._handle,
+            ctypes.c_uint64(int(state_publish_seq)),
+            ctypes.c_int32(int(round_id)),
+            ctypes.c_int32(int(cycle)),
+        )
+        return int(rc) == 0

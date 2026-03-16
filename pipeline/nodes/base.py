@@ -426,6 +426,75 @@ def make_training_progress_callback(
     return _callback
 
 
+def _viewer_has_gui_connection(viewer: object) -> bool:
+    if viewer is None:
+        return False
+    for attr in ("gui_connected", "has_training_connection"):
+        fn = getattr(viewer, attr, None)
+        if callable(fn):
+            try:
+                return bool(fn())
+            except Exception:
+                return False
+    return bool(getattr(viewer, "enabled", False))
+
+
+def _viewer_weight_image_spec(viewer: object) -> Dict[str, Any]:
+    if viewer is None:
+        return {}
+    fn = getattr(viewer, "weight_image_spec", None)
+    if not callable(fn):
+        return {}
+    try:
+        spec = fn()
+    except Exception:
+        return {}
+    return dict(spec) if isinstance(spec, dict) else {}
+
+
+def make_runtime_weight_publish_callback(
+    ctx: "PipelineContext",
+    *,
+    model_name: str,
+    model: Any,
+    node_id: str,
+) -> Optional[Callable[[int], None]]:
+    save_restore = getattr(ctx, "save_restore_node", None)
+    viewer = getattr(ctx, "viewer_proxy", None)
+    publish_fn = getattr(save_restore, "publish_runtime_weight_state", None) if save_restore is not None else None
+    send_fn = getattr(viewer, "send_notification", None) if viewer is not None else None
+    if not callable(publish_fn):
+        return None
+
+    def _callback(step: int = 0) -> None:
+        if model is None or not _viewer_has_gui_connection(viewer):
+            return
+        image_spec = _viewer_weight_image_spec(viewer)
+        notification = None
+        try:
+            notification = publish_fn(
+                str(model_name),
+                model,
+                node_id=str(node_id or ""),
+                round_id=int(getattr(ctx, "round_id", 0) or 0),
+                cycle=int(getattr(ctx, "cycle", 0) or 0),
+                step=int(step),
+                image_mode=image_spec.get("mode"),
+                image_target_width=image_spec.get("panel_crop_w"),
+                image_target_height=image_spec.get("panel_crop_h"),
+            )
+        except Exception:
+            notification = None
+        if notification is None or not callable(send_fn):
+            return
+        try:
+            send_fn(notification)
+        except Exception:
+            pass
+
+    return _callback
+
+
 @contextmanager
 def gpu_resident(
     ctx: "PipelineContext",

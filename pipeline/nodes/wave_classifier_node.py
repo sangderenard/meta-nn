@@ -58,6 +58,7 @@ from pipeline.nodes.base import (
     IRStateSpec,
     IRTrainingNode,
     IRTensorPortSpec,
+    make_runtime_weight_publish_callback,
     make_grad_scaler,
 )
 from pipeline.nodes.label_embedding_node import _normalize_l2_rows_np
@@ -396,6 +397,12 @@ class WaveClassifierTrainNode(IRTrainingNode):
             _rebuild_wave_classifier(ctx, self.cfg, n_classes)
 
         # -- Train --------------------------------------------------------
+        weight_update_callback = make_runtime_weight_publish_callback(
+            ctx,
+            model_name="wave_classifier",
+            model=ctx.wave_classifier,
+            node_id=self.node_id,
+        )
         train_classifier(
             classifier=ctx.wave_classifier,
             optimizer=ctx.wave_classifier_optimizer,
@@ -406,6 +413,7 @@ class WaveClassifierTrainNode(IRTrainingNode):
             amp_dtype=ctx.amp_dtype,
             grad_clip=self.cfg.grad_clip,
             grad_scaler=ctx.wave_classifier_grad_scaler,
+            weight_update_callback=weight_update_callback,
             args=ctx.args,
         )
 
