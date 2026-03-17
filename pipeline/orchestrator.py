@@ -508,41 +508,27 @@ def _build_condition_blobs() -> dict:
         # so the callbacks only fire when a cache rebuild is actually due.
         _CONDITION_ID_PREG_REBUILD: {
             "label": "Pregestation rebuild due",
-            "description": (
-                "True on the first round or when preg_cfg.rebuild_every_n_rounds have elapsed "
-                "since the last pregestation cache build."
-            ),
+            "description": "True when pregestation data has never been built or has since expired.",
             "callable": "_pregestation_rebuild_due",
-            "condition_expr": (
-                "data._preg_last_build_round < 0 OR "
-                "(ctx.total_rounds_completed - data._preg_last_build_round) >= preg_cfg.rebuild_every_n_rounds"
-            ),
+            "condition_expr": "data._preg_needs_rebuild",
         },
         _CONDITION_ID_GEST_REBUILD: {
             "label": "Gestation rebuild due (gated)",
             "description": (
                 "True when pregestation gate has cleared AND "
-                "gest_cfg.rebuild_every_n_rounds have elapsed since the last gestation cache build."
+                "gestation data has never been built or has since expired."
             ),
             "callable": "_gestation_rebuild_due",
-            "condition_expr": (
-                "(GATE_OVERRIDE OR gate_pregestation.passed) AND "
-                "(data._gest_last_build_round < 0 OR "
-                "(ctx.total_rounds_completed - data._gest_last_build_round) >= gest_cfg.rebuild_every_n_rounds)"
-            ),
+            "condition_expr": "(GATE_OVERRIDE OR gate_pregestation.passed) AND data._gest_needs_rebuild",
         },
         _CONDITION_ID_BERKELEY_REFRESH: {
             "label": "Berkeley data refresh due (gated)",
             "description": (
                 "True when early gates have cleared AND "
-                "bdata_cfg.rebuild_every_n_rounds have elapsed since the last Berkeley data refresh."
+                "Berkeley data has never been built or has since expired."
             ),
             "callable": "_berkeley_refresh_due",
-            "condition_expr": (
-                "(GATE_OVERRIDE OR early_gates_passed) AND "
-                "(data._bdata_last_build_round < 0 OR "
-                "(ctx.total_rounds_completed - data._bdata_last_build_round) >= bdata_cfg.rebuild_every_n_rounds)"
-            ),
+            "condition_expr": "(GATE_OVERRIDE OR early_gates_passed) AND data._bdata_needs_rebuild",
         },
     }
 
@@ -603,11 +589,7 @@ def _build_plan_predicate_graphs() -> list[PredicateGraph]:
             PredicateNode(
                 node_id="check_rebuild",
                 kind="condition",
-                condition_expr=(
-                    "data._bdata_last_build_round < 0 OR "
-                    "(ctx.total_rounds_completed - data._bdata_last_build_round) "
-                    ">= bdata_cfg.rebuild_every_n_rounds"
-                ),
+                condition_expr="data._bdata_needs_rebuild",
                 branches={"true": "rebuild", "false": "pass_cached"},
             ),
             PredicateNode(node_id="hold", kind="terminal", output_pin="hold"),
@@ -634,11 +616,7 @@ def _build_plan_predicate_graphs() -> list[PredicateGraph]:
             PredicateNode(
                 node_id="check_rebuild",
                 kind="condition",
-                condition_expr=(
-                    "data._bdata_last_build_round < 0 OR "
-                    "(ctx.total_rounds_completed - data._bdata_last_build_round) "
-                    ">= bdata_cfg.rebuild_every_n_rounds"
-                ),
+                condition_expr="data._bdata_needs_rebuild",
                 branches={"true": "rebuild", "false": "pass_cached"},
             ),
             PredicateNode(node_id="hold", kind="terminal", output_pin="hold"),
@@ -1471,41 +1449,29 @@ def _shutdown_save_pending(ctx: PipelineContext) -> bool:
     return bool(getattr(ctx, "shutdown_save_pending", False))
 
 def _make_preg_rebuild_cond(data_node):
-    """Return an edge condition that fires when pregestation data is missing or rebuild period has elapsed."""
+    """Return an edge condition that fires when pregestation data needs a (re)build."""
     def _cond(ctx: PipelineContext) -> bool:
-        return (
-            data_node._preg_last_build_round < 0
-            or (ctx.total_rounds_completed - data_node._preg_last_build_round)
-               >= data_node.preg_cfg.rebuild_every_n_rounds
-        )
+        return data_node._preg_needs_rebuild
     _cond.__name__ = "_pregestation_rebuild_due"
     return _cond
 
 
 def _make_gest_rebuild_cond(data_node):
-    """Return an edge condition that fires when pregestation gate has cleared AND gestation data rebuild is due."""
+    """Return an edge condition that fires when pregestation gate has cleared AND gestation data needs a (re)build."""
     def _cond(ctx: PipelineContext) -> bool:
         if not _gate_pregestation_passed(ctx):
             return False
-        return (
-            data_node._gest_last_build_round < 0
-            or (ctx.total_rounds_completed - data_node._gest_last_build_round)
-               >= data_node.gest_cfg.rebuild_every_n_rounds
-        )
+        return data_node._gest_needs_rebuild
     _cond.__name__ = "_gestation_rebuild_due"
     return _cond
 
 
 def _make_berk_refresh_cond(data_node):
-    """Return an edge condition that fires when early gates have cleared AND berkeley data refresh is due."""
+    """Return an edge condition that fires when early gates have cleared AND berkeley data needs a (re)build."""
     def _cond(ctx: PipelineContext) -> bool:
         if not _early_gates_passed(ctx):
             return False
-        return (
-            data_node._bdata_last_build_round < 0
-            or (ctx.total_rounds_completed - data_node._bdata_last_build_round)
-               >= data_node.bdata_cfg.rebuild_every_n_rounds
-        )
+        return data_node._bdata_needs_rebuild
     _cond.__name__ = "_berkeley_refresh_due"
     return _cond
 
@@ -1542,10 +1508,6 @@ def build_pipeline_graph(
     All nodes are registered; all edges with their conditions are defined here.
     The returned graph is stateless — the context carries all mutable state.
     """
-    # berkeley_refresh_every_n_rounds is the authoritative override; apply it to the config
-    # so the edge condition closures (which read bdata_cfg directly) stay in sync.
-    berkeley_data_cfg.rebuild_every_n_rounds = int(berkeley_refresh_every_n_rounds)
-
     g = PipelineGraph(name="wav_ml_pipeline")
 
     # ---------------------------------------------------------------
@@ -2231,7 +2193,7 @@ def _build_configs_from_args(args) -> dict:
         stage0_batch_size=int(_g("pregestation_stage_batch_size", "pregestation_batch_size", default=32)),
         stage0_loss_target=float(_g("gate_pregestation_loss_target", "pregestation_loss_target", default=0.80)),
         stage0_required_consecutive=int(_g("gate_pregestation_maintain_rounds", "pregestation_required_consecutive", default=2)),
-        stage1_epochs=int(_g("gestation_epochs", default=1)),
+        stage1_epochs=int(_g("gestation_epochs", default=3)),
         stage1_batch_size=int(_g("gate_gestation_batch_size", "gestation_batch_size", default=32)),
         stage1_loss_target=float(_g("gate_gestation_loss_target", "gestation_loss_target", default=0.80)),
         stage1_required_consecutive=int(_g("gate_gestation_maintain_rounds", "gestation_required_consecutive", default=2)),
@@ -2407,7 +2369,8 @@ def _build_configs_from_args(args) -> dict:
     gestation = GestationDataConfig(
         image_size=int(_g("image_size", default=128)),
         batch_size=int(_g("gate_gestation_batch_size", "gestation_batch_size", default=32)),
-        samples_per_term=int(_g("semantic_vocab_symbol_samples_per_term", "gestation_samples_per_term", default=32)),
+        samples_per_term=int(_g("semantic_vocab_symbol_samples_per_term", "gestation_samples_per_term", default=64)),
+        deformations_per_clean=int(_g("gestation_deformations_per_clean", default=4)),
         cache_mb=int(
             _resolve_semantic_stage_cache_cap_mb(
                 global_cap_mb=int(global_stage_cache_mb),
@@ -2434,16 +2397,17 @@ def _build_configs_from_args(args) -> dict:
         image_size=int(_g("berkeley_image_size", "image_size", default=128)),
         batch_size=int(_g("berkeley_refresh_batch_size", "berkeley_batch_size", default=16)),
         num_workers=int(_g("berkeley_refresh_workers", "num_workers", default=0)),
+        max_train=int(_g("berkeley_refresh_max_train", default=0)),
         prefetch_factor=int(_g("loader_prefetch_factor", default=0)),
         prebuild_batches=int(_g("berkeley_refresh_cache_batches", default=0)),
         cache_device=str(_g("berkeley_refresh_cache_device", default="auto") or "auto"),
         seed=int(_g("seed", default=42)),
         wheel_max_bytes=int(max(0, int(_g("berkeley_wheel_max_mb", default=0)))) * 1024 * 1024,
-        wheel_sanity_cap_bytes=int(max(1, int(_g("berkeley_wheel_sanity_cap_mb", default=8192)))) * 1024 * 1024,
+        wheel_sanity_cap_bytes=int(max(1, int(_g("berkeley_wheel_sanity_cap_mb", default=30720)))) * 1024 * 1024,
         wheel_allow_large_override=bool(_g("berkeley_wheel_allow_large_override", default=False)),
         wheel_lookahead_batches=int(_g("berkeley_wheel_lookahead_batches", default=0)),
         wheel_use_rare_term_deck=bool(_g("berkeley_wheel_use_rare_term_deck", default=True)),
-        refresh_deformations_per_clean=int(_g("berkeley_refresh_deformations_per_clean", default=2)),
+        refresh_deformations_per_clean=int(_g("berkeley_refresh_deformations_per_clean", default=1)),
         refresh_include_clean=bool(_g("berkeley_refresh_include_clean", default=True)),
         gpu_preprocess=bool(_g("semantic_gpu_preprocess", default=False)),
         preload_workers=int(_g("semantic_preload_workers", default=0)),

@@ -413,9 +413,39 @@ def _build_clean_entries_batch(
         [np.asarray(row.label_vec, dtype=np.float32).reshape(-1) for row in rows],
         axis=0,
     ).astype(np.float32, copy=False)
+
+    # Enrich each row with tonal/color terms using the same function pregestation uses,
+    # then update label_batch so build_term_mask_stacks_from_images generates spatial
+    # masks for those terms.
+    _tonal_enrich = None
+    try:
+        from pipeline.nodes.vocab_node import _semantic_terms_with_tonal_masks as _tonal_enrich
+    except Exception:
+        pass
+    term_to_idx: Dict[str, int] = {str(v).strip().lower(): int(k) for k, v in idx_to_term.items()}
+    tonal_masks_per_row: List[Dict[str, np.ndarray]] = [{} for _ in rows]
+    enriched_terms_per_row: List[List[str]] = [list(row.terms) for row in rows]
+    if _tonal_enrich is not None:
+        for _ri, _row in enumerate(rows):
+            try:
+                _enriched, _tmasks = _tonal_enrich(
+                    terms=list(_row.terms),
+                    image=image_u8_batch[int(_ri)],
+                    image_size=size,
+                )
+                enriched_terms_per_row[int(_ri)] = list(_enriched)
+                tonal_masks_per_row[int(_ri)] = dict(_tmasks)
+                for _term in _enriched:
+                    _t = str(_term).strip().lower()
+                    _tidx = int(term_to_idx.get(_t, -1))
+                    if 0 <= _tidx < int(label_batch.shape[1]):
+                        label_batch[int(_ri), _tidx] = 1.0
+            except Exception:
+                pass
+
     fallback_masks = infer_semantic_support_masks(
         images=image_batch,
-        terms_batch=[list(row.terms) for row in rows],
+        terms_batch=enriched_terms_per_row,
         processing_device=processing_device,
     )
     heuristic_stacks, heuristic_indices = build_term_mask_stacks_from_images(
@@ -440,11 +470,31 @@ def _build_clean_entries_batch(
                 creation_mask=np.asarray(creation_mask, dtype=np.float32),
                 processing_device=processing_device,
             )
+        # Build tonal mask stack from per-image color/tonal detections
+        _tmasks = tonal_masks_per_row[int(row_idx)]
+        _tonal_slices: List[np.ndarray] = []
+        _tonal_idxs: List[int] = []
+        for _tterm, _tmask in _tmasks.items():
+            _t = str(_tterm).strip().lower()
+            _tidx = int(term_to_idx.get(_t, -1))
+            if _tidx < 0:
+                continue
+            _tmask_np = np.asarray(_tmask, dtype=np.float32)
+            if int(_tmask_np.ndim) == 2 and int(_tmask_np.size) > 0:
+                _tonal_slices.append(_tmask_np)
+                _tonal_idxs.append(_tidx)
+        if _tonal_slices:
+            tonal_stack = np.stack(_tonal_slices, axis=0).astype(np.float32, copy=False)
+            tonal_idx = np.asarray(_tonal_idxs, dtype=np.int64)
+        else:
+            tonal_stack = np.zeros((0, size, size), dtype=np.float32)
+            tonal_idx = np.zeros((0,), dtype=np.int64)
         heuristic_stack = np.asarray(heuristic_stacks[int(row_idx)], dtype=np.float32)
         heuristic_idx = np.asarray(heuristic_indices[int(row_idx)], dtype=np.int64)
         mask_stack, mask_indices = combine_label_mask_stacks(
             label_vec,
             (creation_stack, creation_idx),
+            (tonal_stack, tonal_idx),
             (heuristic_stack, heuristic_idx),
             height=size,
             width=size,
@@ -465,7 +515,7 @@ def _build_clean_entries_batch(
                 "mixed_mask": np.clip(np.asarray(mixed_mask, dtype=np.float32), 0.0, 1.0),
                 "mask_stack": np.asarray(mask_stack, dtype=np.float32),
                 "mask_indices": np.asarray(mask_indices, dtype=np.int32).reshape(-1),
-                "terms": list(normalize_vocab_terms([str(x) for x in list(row.terms)])),
+                "terms": list(normalize_vocab_terms(enriched_terms_per_row[int(row_idx)])),
             }
         )
     return out
@@ -930,6 +980,12 @@ def ensure_semantic_candidate_cache(
         "deformations_per_clean": int(config.deformations_per_clean),
         "include_clean": bool(config.include_clean),
         "label_dim": int(label_dim),
+        "explicit_max_bytes": int(config.explicit_max_bytes),
+        "sanity_cap_bytes": int(config.sanity_cap_bytes),
+        "allow_large_override": bool(config.allow_large_override),
+        "max_base_rows": int(config.max_base_rows),
+        "seed": int(config.seed),
+        "use_rare_term_deck": bool(config.use_rare_term_deck),
     }
     signature = _wheel_signature(build_config)
     wheel_dir = cache_root / f"{purpose_key}_{str(signature)[:24]}"

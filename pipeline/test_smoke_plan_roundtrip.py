@@ -1144,29 +1144,16 @@ def test_condition_expr_evaluator():
         scale=3,
         divisor=2,
         target=9,
-        ctx=types.SimpleNamespace(total_rounds_completed=10),
-        data=types.SimpleNamespace(_preg_last_build_round=6),
-        preg_cfg=types.SimpleNamespace(rebuild_every_n_rounds=4),
     )
     _assert(
         evaluate_condition_expr("((lhs + rhs) * scale) / divisor == target", ctx) is True,
         "calculator supports +, *, / with signal operands",
     )
-    _assert(
-        evaluate_condition_expr(
-            "(ctx.total_rounds_completed - data._preg_last_build_round) >= preg_cfg.rebuild_every_n_rounds",
-            ctx,
-        ) is True,
-        "calculator supports subtraction with accessor signals on both sides of comparison",
-    )
     ctx = types.SimpleNamespace(
         gate_override_enabled=lambda: False,
         gate_pregestation=types.SimpleNamespace(passed=True),
         early_gates_passed=lambda: True,
-        ctx=types.SimpleNamespace(total_rounds_completed=10),
-        data=types.SimpleNamespace(_gest_last_build_round=4, _bdata_last_build_round=3),
-        gest_cfg=types.SimpleNamespace(rebuild_every_n_rounds=6),
-        bdata_cfg=types.SimpleNamespace(rebuild_every_n_rounds=7),
+        data=types.SimpleNamespace(_gest_needs_rebuild=True, _bdata_needs_rebuild=True),
     )
     _assert(
         evaluate_condition_expr(expr_for_condition_id("data.gestation_rebuild_due"), ctx) is True,

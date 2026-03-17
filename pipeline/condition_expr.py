@@ -594,16 +594,11 @@ def expr_for_condition_id(condition_id: str) -> str:
         "runtime.shutdown_save_pending":
             "ctx.shutdown_save_pending",
         "data.pregestation_rebuild_due":
-            "data._preg_last_build_round < 0 OR "
-            "(ctx.total_rounds_completed - data._preg_last_build_round) >= preg_cfg.rebuild_every_n_rounds",
+            "data._preg_needs_rebuild",
         "data.gestation_rebuild_due":
-            "(GATE_OVERRIDE OR gate_pregestation.passed) AND "
-            "(data._gest_last_build_round < 0 OR "
-            "(ctx.total_rounds_completed - data._gest_last_build_round) >= gest_cfg.rebuild_every_n_rounds)",
+            "(GATE_OVERRIDE OR gate_pregestation.passed) AND data._gest_needs_rebuild",
         "data.berkeley_refresh_due":
-            "(GATE_OVERRIDE OR early_gates_passed) AND "
-            "(data._bdata_last_build_round < 0 OR "
-            "(ctx.total_rounds_completed - data._bdata_last_build_round) >= bdata_cfg.rebuild_every_n_rounds)",
+            "(GATE_OVERRIDE OR early_gates_passed) AND data._bdata_needs_rebuild",
     }
     return _MAP.get(str(condition_id or "").strip(), "")
 

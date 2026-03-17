@@ -9,10 +9,11 @@ from pipeline.nodes.data_nodes import _build_stage_loader_pair
 from pipeline.semantic_wheel_cache import StatefulSequentialDeckSampler
 from pipeline.nodes.vocab_node import (
     _build_pregestation_logic_rows,
-    _semantic_terms_with_tonal_tags,
+    _semantic_terms_with_tonal_masks,
 )
 from semantic_dataset_loaders import (
     StageDatasetManifest,
+    _build_special_label_mask_stack,
     assemble_semantic_mask_layers,
     build_label_mask_stack,
     build_loader_from_manifest,
@@ -50,16 +51,14 @@ def test_pregestation_targets_include_observed_terms() -> None:
     )
     chosen = next((i for i, row in enumerate(term_rows) if "white" in row), -1)
     assert chosen >= 0, "expected a white pregestation row"
-    enriched_terms = _semantic_terms_with_tonal_tags(
+    # _semantic_terms_with_tonal_masks returns BOTH enriched terms AND spatial masks
+    # for the newly-added tonal observations — no masks are stripped from the pipeline.
+    enriched_terms, tonal_masks = _semantic_terms_with_tonal_masks(
         terms=term_rows[int(chosen)],
         image=images[int(chosen)],
         image_size=32,
     )
-    added_terms = [
-        str(term)
-        for term in enriched_terms
-        if str(term) not in {str(x) for x in term_rows[int(chosen)]}
-    ]
+    added_terms = list(tonal_masks.keys())
     assert len(added_terms) > 0, (term_rows[int(chosen)], enriched_terms)
     _ok("pregestation target rows include image-observed tonal terms")
 
@@ -86,30 +85,50 @@ def test_pregestation_targets_include_observed_terms() -> None:
         idx = int(term_to_idx.get(str(term).strip().lower(), -1))
         if idx >= 0:
             y[int(idx)] = 1.0
+    # Geometric elem_stacks cover all base terms (dark, signal, shape, color, direction).
     explicit_stack, explicit_idx = elem_stacks_to_label_stacks(
         elem_stack=mask_stacks[int(chosen)],
         elem_term_lists=elem_term_lists[int(chosen)],
         label_vec=y,
         term_to_idx=term_to_idx,
     )
-    fallback_stack, fallback_idx = build_label_mask_stack(
-        mixed_mask=np.asarray(masks[int(chosen)], dtype=np.float32),
-        label_vec=y,
+    # Tonal additions each come with their spatial mask — build the tonal stack.
+    _tonal_slices, _tonal_idxs = [], []
+    for _tterm, _tmask in tonal_masks.items():
+        _tidx = int(term_to_idx.get(str(_tterm).strip().lower(), -1))
+        if _tidx >= 0:
+            _tonal_slices.append(np.asarray(_tmask, dtype=np.float32))
+            _tonal_idxs.append(_tidx)
+    if _tonal_slices:
+        tonal_stack = np.stack(_tonal_slices, axis=0)
+        tonal_idx = np.asarray(_tonal_idxs, dtype=np.int64)
+    else:
+        h_, w_ = int(masks[int(chosen)].shape[0]), int(masks[int(chosen)].shape[1])
+        tonal_stack = np.zeros((0, h_, w_), dtype=np.float32)
+        tonal_idx = np.zeros((0,), dtype=np.int64)
+    # _build_special_label_mask_stack gives signal/object with the creation mask
+    # and dataset-label terms full-frame — no internal combine, no fallbacks added.
+    h_, w_ = int(masks[int(chosen)].shape[0]), int(masks[int(chosen)].shape[1])
+    special_stack, special_idx = _build_special_label_mask_stack(
+        y,
         idx_to_term=idx_to_term,
-        treat_mixed_mask_as_creation=True,
+        height=h_,
+        width=w_,
+        creation_mask=np.asarray(masks[int(chosen)], dtype=np.float32),
     )
     merged_stack, merged_idx = combine_label_mask_stacks(
         y,
         (explicit_stack, explicit_idx),
-        (fallback_stack, fallback_idx),
-        height=int(masks[int(chosen)].shape[0]),
-        width=int(masks[int(chosen)].shape[1]),
+        (tonal_stack, tonal_idx),
+        (special_stack, special_idx),
+        height=h_,
+        width=w_,
         fallback_creation_mask=np.asarray(masks[int(chosen)], dtype=np.float32),
     )
     merged_idx_set = set(np.asarray(merged_idx, dtype=np.int64).tolist())
     assert int(term_to_idx["signal"]) in merged_idx_set
     assert int(term_to_idx["object"]) in merged_idx_set
-    assert set(np.asarray(fallback_idx, dtype=np.int64).tolist()) == {int(term_to_idx["signal"]), int(term_to_idx["object"])}
+    assert set(np.asarray(special_idx, dtype=np.int64).tolist()) == {int(term_to_idx["signal"]), int(term_to_idx["object"])}
     _ok("pregestation fallback masks retain ingested-item coverage for signal/object")
 
 

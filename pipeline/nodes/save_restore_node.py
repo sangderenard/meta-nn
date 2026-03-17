@@ -878,7 +878,6 @@ class SaveRestoreNode(PipelineNode):
             "vocab_lora_pending_terms": list(getattr(ctx, "vocab_lora_pending_terms", []) or []),
             "vocab_lora_active_signature": str(getattr(ctx, "vocab_lora_active_signature", "") or ""),
             "vocab_lora_active_terms": list(getattr(ctx, "vocab_lora_active_terms", []) or []),
-            "vocab_lora_locked_terms": list(getattr(ctx, "vocab_lora_locked_terms", []) or []),
             "vocab_lora_max_terms": int(getattr(ctx, "vocab_lora_max_terms", 0) or 0),
             # vocab_lora_latest_plan_signature and vocab_lora_plan_slot_cursor are intentionally
             # NOT saved: data nodes re-register their requirements fresh each run, so the active
@@ -1155,7 +1154,6 @@ class SaveRestoreNode(PipelineNode):
         ctx.vocab_lora_pending_terms = list(ckpt.get("vocab_lora_pending_terms", []) or [])
         ctx.vocab_lora_active_signature = str(ckpt.get("vocab_lora_active_signature", "") or "")
         ctx.vocab_lora_active_terms = list(ckpt.get("vocab_lora_active_terms", []) or [])
-        ctx.vocab_lora_locked_terms = list(ckpt.get("vocab_lora_locked_terms", []) or [])
         ctx.vocab_lora_max_terms = int(ckpt.get("vocab_lora_max_terms", getattr(ctx, "vocab_lora_max_terms", 0)) or 0)
         # vocab_lora_latest_plan_signature and vocab_lora_plan_slot_cursor are not restored;
         # they start empty each run so churn only activates once this round's data nodes

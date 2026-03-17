@@ -153,7 +153,6 @@ def test_voc20_terms_enter_only_via_churn() -> None:
     fixed_supervised = [f"fixed-{i}" for i in range(151)]
     ctx = PipelineContext()
     ctx.supervised_class_names = list(fixed_supervised)
-    ctx.core_terms = ["object", "signal"]
     ctx.active_extra_terms = ["object", "signal", "semantic slot 3", "semantic slot 4"]
     ctx.class_names = list(ctx.supervised_class_names) + list(ctx.active_extra_terms)
     node = VocabChurnNode(VocabConfig(churn_n=2, churn_every_n_cycles=1, seed=0))

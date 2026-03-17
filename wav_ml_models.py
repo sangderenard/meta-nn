@@ -1,6 +1,7 @@
 import copy
 import math
 import random
+import time
 from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
@@ -52,10 +53,14 @@ def configure_torch_runtime(
 
 
 def _resolve_amp_dtype(amp_dtype: str) -> torch.dtype:
+    if isinstance(amp_dtype, torch.dtype):
+        if amp_dtype in (torch.float16, torch.bfloat16):
+            return amp_dtype
+        raise ValueError(f"Unsupported amp dtype: {amp_dtype!r}. Expected float16/fp16 or bfloat16/bf16.")
     key = str(amp_dtype).strip().lower()
-    if key in ("fp16", "float16", "half"):
+    if key in ("fp16", "float16", "half", "torch.float16"):
         return torch.float16
-    if key in ("bf16", "bfloat16"):
+    if key in ("bf16", "bfloat16", "torch.bfloat16"):
         return torch.bfloat16
     raise ValueError(f"Unsupported amp dtype: {amp_dtype!r}. Expected float16/fp16 or bfloat16/bf16.")
 
@@ -2581,6 +2586,8 @@ def _sample_wave_batch(
                 )
             yb[i, :] = arr
         s = streams[idx]
+        if s.ndim > 1:
+            s = s.reshape(-1)
         start = int(rng.integers(0, s.size - chunk_samples + 1))
         xb[i, :] = s[start : start + chunk_samples]
     return xb, yb
@@ -2741,6 +2748,8 @@ def _sample_wave_batch_unlabeled(
         pick = int(rng.integers(0, int(eligible.size)))
         idx = int(eligible[pick])
         s = streams[idx]
+        if s.ndim > 1:
+            s = s.reshape(-1)
         start = int(rng.integers(0, s.size - chunk_samples + 1))
         xb[i, :] = s[start : start + chunk_samples]
     return xb

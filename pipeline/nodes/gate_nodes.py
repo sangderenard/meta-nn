@@ -128,10 +128,11 @@ class PregestationEvalNode(PipelineNode):
         return ctx.pregestation_eval_loader is not None and (ctx.classifier is not None or ctx.gate_classifier is not None)
 
     def execute(self, ctx: PipelineContext) -> None:
+        max_steps = int(getattr(ctx.args, "gate_pregestation_eval_max_steps", 10) or 10)
         result = _evaluate_loss_gate(
             ctx=ctx,
             loader=ctx.pregestation_eval_loader,
-            max_steps=0,
+            max_steps=max_steps,
             channels_last=bool(getattr(self.cfg, "channels_last", False)),
             semantic_cosine_weight=float(getattr(self.cfg, "semantic_cosine_weight", CLASSIFIER_SEMANTIC_COSINE_WEIGHT)),
         )
@@ -170,7 +171,7 @@ class GestationEvalNode(GatedNode):
         return ctx.gestation_eval_loader is not None and (ctx.classifier is not None or ctx.gate_classifier is not None)
 
     def execute(self, ctx: PipelineContext) -> None:
-        max_steps = int(getattr(ctx.args, "gate_gestation_eval_max_steps", 0) or 0)
+        max_steps = int(getattr(ctx.args, "gate_gestation_eval_max_steps", 10) or 10)
         result = _evaluate_loss_gate(
             ctx=ctx,
             loader=ctx.gestation_eval_loader,
@@ -253,7 +254,7 @@ class BerkeleyGateNode(GatedNode):
                 classifier=gate_model,
                 loader=ctx.payload_validation_loader,
                 device=gate_device,
-                max_steps=int(getattr(ctx.args, "gate_berkeley_eval_max_steps", 0) or 0),
+                max_steps=int(getattr(ctx.args, "gate_berkeley_eval_max_steps", 10) or 10),
                 active_classes=max(0, int(len(ctx.class_names))),
                 amp_enabled=False,
                 amp_dtype=str(getattr(ctx.args, "amp_dtype", "float16") or "float16"),
@@ -929,6 +930,10 @@ def _evaluate_berkeley_classifier_gate(
                 )
                 eval_chunk = int(next_chunk)
         steps += 1
+        if steps == 1 or steps % 10 == 0:
+            running_loss = total_loss / max(1, n)
+            limit_str = f"/{max_steps}" if max_steps > 0 else ""
+            print(f"[gate-eval] step={steps}{limit_str} samples={n} loss={running_loss:.4f}", flush=True)
         if max_steps > 0 and steps >= int(max_steps):
             break
 

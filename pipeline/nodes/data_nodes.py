@@ -70,6 +70,7 @@ from pipeline.nodes.vocab_node import (
 from semantic_dataset_loaders import (
     BootstrapDynamicDataset,
     DiskSemanticRowsDataset,
+    _build_special_label_mask_stack,
     _composite_non_dataset_label_stack,
     _composite_mask_stack,
     build_label_mask_stack,
@@ -331,7 +332,8 @@ class GestationDataConfig:
     image_size: int = 128
     batch_size: int = 32
     num_workers: int = 0
-    samples_per_term: int = 32
+    samples_per_term: int = 64
+    deformations_per_clean: int = 4   # augmentation multiplier per base image
     cache_mb: int = 128
     gpu_preprocess: bool = False
 
@@ -394,7 +396,7 @@ class BerkeleyDataConfig:
     wheel_allow_large_override: bool = False
     wheel_lookahead_batches: int = 0
     wheel_use_rare_term_deck: bool = True
-    refresh_deformations_per_clean: int = 2
+    refresh_deformations_per_clean: int = 1
     refresh_include_clean: bool = True
     gpu_preprocess: bool = False
     preload_workers: int = 0
@@ -504,6 +506,24 @@ class DataNode(PipelineNode):
         if sampler is None:
             return False
         return sampler.all_items_seen
+
+    @property
+    def _preg_needs_rebuild(self) -> bool:
+        """True when pregestation data has never been built or has since expired."""
+        poss = self.possessions.get("pregestation")
+        return self._preg_last_build_round < 0 or (poss is not None and not poss.built)
+
+    @property
+    def _gest_needs_rebuild(self) -> bool:
+        """True when gestation data has never been built or has since expired."""
+        poss = self.possessions.get("gestation")
+        return self._gest_last_build_round < 0 or (poss is not None and not poss.built)
+
+    @property
+    def _bdata_needs_rebuild(self) -> bool:
+        """True when berkeley data has never been built or has since expired."""
+        poss = self.possessions.get("berkeley")
+        return self._bdata_last_build_round < 0 or (poss is not None and not poss.built)
 
     def _estimate_possession_bytes(self, name: str) -> int:
         """Rough byte estimate for a possession (best-effort, not authoritative)."""
@@ -665,8 +685,9 @@ class DataNode(PipelineNode):
 
         from pipeline.nodes.vocab_node import (
             _build_pregestation_logic_rows,
-            _semantic_terms_with_tonal_tags,
-            _semantic_terms_with_tonal_masks,
+            _enrich_pregestation_stack_with_observed_color_masks,
+            _PREGESTATION_OBSERVED_COLOR_TERMS,
+            _normalize_vocab_terms as _preg_normalize_vocab_terms,
         )
 
         target_dim = max(1, int(len(ctx.class_names)))
@@ -681,7 +702,7 @@ class DataNode(PipelineNode):
             "samples_per_combo": self.preg_cfg.samples_per_combo,
             "mode_sequence": sorted(_mode_seq),
             "image_size": self.preg_cfg.image_size,
-            "mask_semantics_version": 2,
+            "mask_semantics_version": 4,
         })
         _raw_cached = _load_raw_stage_cache(_raw_cache_dir, _raw_cache_key)
         if _raw_cached is not None:
@@ -712,26 +733,31 @@ class DataNode(PipelineNode):
                     circle_displacement_temperature=self.preg_cfg.displacement_temperature * _temp_scale,
                     mode=mode,
                 )
-                all_images.extend(imgs)
-                all_masks.extend(masks)
-                all_mask_stacks.extend(mask_stacks)
-                all_elem_term_lists.extend(elem_term_lists)
-                for row_idx, term_row in enumerate(term_rows):
-                    img_ref = imgs[int(row_idx)] if int(row_idx) < int(len(imgs)) else None
-                    if img_ref is not None:
-                        enriched_terms, tonal_masks_dict = _semantic_terms_with_tonal_masks(
-                            terms=term_row,
-                            image=img_ref,
-                            image_size=int(self.preg_cfg.image_size),
-                        )
-                        pass  # tonal enrichment terms left as-is for diagnostic visibility
-                    else:
-                        enriched_terms = list(term_row)
-                        tonal_masks_dict = {}
-                    all_term_rows.append(list(enriched_terms))
-                    all_tonal_masks.append(tonal_masks_dict)
+                for img_np, comp_mask, elem_stk, elem_tl, term_row in zip(
+                    imgs, masks, mask_stacks, elem_term_lists, term_rows
+                ):
+                    # Enrich the geometric elem_stack with pixel-observed color masks.
+                    # This is the correct heuristic: the color observation maps provide
+                    # spatial evidence directly from rendered pixels, covering color terms
+                    # (red, black, gray, etc.) that appear in elem_term_lists but whose
+                    # geometric masks (disk/bg) are only approximate.
+                    enr_stk, enr_comp = _enrich_pregestation_stack_with_observed_color_masks(
+                        image_chw01=img_np,
+                        elem_stack=elem_stk,
+                        term_row=term_row,
+                    )
+                    norm_set = {re.sub(r"\s+", " ", str(t)).strip().lower() for t in term_row}
+                    enr_tl = list(elem_tl) + [
+                        [str(c)] for c in _PREGESTATION_OBSERVED_COLOR_TERMS if str(c) in norm_set
+                    ]
+                    all_images.append(img_np)
+                    all_masks.append(enr_comp)
+                    all_mask_stacks.append(enr_stk)
+                    all_elem_term_lists.append(enr_tl)
+                    all_term_rows.append(_preg_normalize_vocab_terms(list(term_row)))
+                    all_tonal_masks.append({})  # color coverage handled by enrichment above
                     y = np.zeros((target_dim,), dtype=np.float32)
-                    for term in enriched_terms:
+                    for term in term_row:
                         idx = ctx.semantic_term_to_idx.get(str(term).strip().lower(), -1)
                         if int(idx) >= 0:
                             y[int(idx)] = 1.0
@@ -783,11 +809,15 @@ class DataNode(PipelineNode):
                 creation_mask_np = np.asarray(base_mask_np, dtype=np.float32)
                 if float(np.max(creation_mask_np)) <= 1e-8 and int(np.asarray(explicit_stack).shape[0]) > 0:
                     creation_mask_np = _composite_mask_stack(np.asarray(explicit_stack, dtype=np.float32))
-                special_stack, special_idx = build_label_mask_stack(
-                    mixed_mask=creation_mask_np,
-                    label_vec=all_targets[i],
+                # Use _build_special_label_mask_stack directly — avoids the internal
+                # combine_label_mask_stacks call inside build_label_mask_stack, which
+                # would warn about all non-signal/object terms it doesn't know about.
+                special_stack, special_idx = _build_special_label_mask_stack(
+                    all_targets[i],
                     idx_to_term=idx_to_term,
-                    treat_mixed_mask_as_creation=True,
+                    height=int(creation_mask_np.shape[0]),
+                    width=int(creation_mask_np.shape[1]),
+                    creation_mask=creation_mask_np,
                 )
                 merged_stack, merged_idx = combine_label_mask_stacks(
                     all_targets[i],
@@ -797,6 +827,7 @@ class DataNode(PipelineNode):
                     height=int(base_mask_np.shape[0]),
                     width=int(base_mask_np.shape[1]),
                     strict=True,
+                    idx_to_term=idx_to_term,
                 )
                 if i < len(all_masks):
                     all_masks[i] = (
@@ -1032,6 +1063,7 @@ class DataNode(PipelineNode):
                         width=int(base_mask.shape[1]),
                         processing_device=_processing_device,
                         strict=True,
+                        idx_to_term=idx_to_term,
                     )
                     mixed_mask = (
                         _composite_non_dataset_label_stack(
@@ -1085,6 +1117,7 @@ class DataNode(PipelineNode):
                 target_dim=max(1, int(len(ctx.class_names))),
                 semantic_term_to_idx=ctx.semantic_term_to_idx,
                 stage_cache_mb=int(self.gest_cfg.cache_mb),
+                deformations_per_clean=max(0, int(self.gest_cfg.deformations_per_clean)),
                 processing_device=_processing_device,
                 force_rebuild=bool(self.possessions["gestation"].force_next_rebuild),
             )
@@ -1196,7 +1229,10 @@ class DataNode(PipelineNode):
                 force_rebuild=_berk_force,
             )
         self.possessions["berkeley"].force_next_rebuild = False
-        if self.bdata_cfg.prebuild_batches > 0 and loader is not None:
+        if loader is None:
+            _log("[data-node] WARNING: berkeley refresh loader is None — will retry next round")
+            return
+        if self.bdata_cfg.prebuild_batches > 0:
             ctx.berkeley_cache = _build_berkeley_refresh_cache(
                 loader=loader, device=ctx.device,
                 cache_batches=self.bdata_cfg.prebuild_batches,
@@ -1877,7 +1913,7 @@ def _semantic_stage_cache_args(ctx: PipelineContext, stage_cache_mb: int) -> Dic
         "rebuild": bool(getattr(args, "semantic_stage_cache_rebuild", False)),
         "slot_lifespan": int(getattr(args, "semantic_stage_cache_slot_lifespan", 0) or 0),
         "lookahead_batches": max(0, int(getattr(args, "semantic_stage_cache_lookahead_batches", 0) or 0)),
-        "sanity_cap_bytes": max(1, int(getattr(args, "semantic_stage_cache_sanity_cap_mb", 8192) or 8192)) * 1024 * 1024,
+        "sanity_cap_bytes": max(1, int(getattr(args, "semantic_stage_cache_sanity_cap_mb", 30720) or 30720)) * 1024 * 1024,
         "allow_large_override": bool(getattr(args, "semantic_stage_cache_allow_large_override", False)),
         "use_rare_term_deck": bool(getattr(args, "semantic_stage_cache_use_rare_term_deck", True)),
         "explicit_max_bytes": max(0, int(stage_cache_mb)) * 1024 * 1024,
@@ -2153,7 +2189,7 @@ def _build_semantic_stage_cache_dataset(
             deformations_per_clean=max(0, int(deformations_per_clean)),
             include_clean=bool(include_clean),
             explicit_max_bytes=int(explicit_max_bytes),
-            sanity_cap_bytes=int(cache_args.get("sanity_cap_bytes", 8 * 1024 * 1024 * 1024)),
+            sanity_cap_bytes=int(cache_args.get("sanity_cap_bytes", 30 * 1024 * 1024 * 1024)),
             allow_large_override=bool(cache_args.get("allow_large_override", False)),
             expiry_uses=int(slot_lifespan),
             max_base_rows=int(max_rows),

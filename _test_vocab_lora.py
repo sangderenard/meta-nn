@@ -70,8 +70,6 @@ def test_vocab_plan_select_and_activate() -> None:
     print("\n--- test_vocab_plan_select_and_activate ---")
     ctx = PipelineContext(args=SimpleNamespace())
     ctx.supervised_class_names = ["signal", "object"]
-    ctx.core_terms = ["warm", "cool"]
-    ctx.vocab_lora_locked_terms = list(ctx.core_terms)
     ctx.active_extra_terms = ["warm", "cool", "legacy a", "legacy b", "legacy c"]
     ctx.class_names = list(ctx.supervised_class_names) + list(ctx.active_extra_terms)
     ctx.vocab_lora_max_terms = 5
@@ -96,7 +94,7 @@ def test_vocab_plan_select_and_activate() -> None:
     info = activate_vocab_lora_slot(ctx, slot)
     assert str(info["signature"]) == str(slot["signature"]), info
     assert int(len(ctx.active_extra_terms)) == 5, ctx.active_extra_terms
-    assert set(["warm", "cool"]).issubset(set(ctx.active_extra_terms)), ctx.active_extra_terms
+    assert set(slot.get("terms", [])).issubset(set(ctx.active_extra_terms)), ctx.active_extra_terms
     _ok("Churn plan splits oversized vocab requirement into activatable slots")
 
 

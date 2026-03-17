@@ -8,6 +8,7 @@ import re
 import shutil
 import threading
 import time
+import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import lru_cache
 from dataclasses import dataclass
@@ -731,6 +732,7 @@ def combine_label_mask_stacks(
     fallback_creation_mask: Optional[Any] = None,
     processing_device: Optional[Any] = None,
     strict: bool = False,
+    idx_to_term: Optional[dict] = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
     positive_idx = _positive_label_indices(label_vec)
     if int(positive_idx.size) <= 0:
@@ -775,11 +777,23 @@ def combine_label_mask_stacks(
             covered.add(cls_idx)
 
     missing = [int(ci) for ci in positive_idx.tolist() if int(ci) not in covered]
-    if missing and bool(strict):
-        raise ValueError(
-            f"combine_label_mask_stacks: {len(missing)} positive label(s) have no spatial mask. "
-            f"Missing label indices: {missing[:8]}{'…' if len(missing) > 8 else ''}"
-        )
+    if missing:
+        _h = int(max(1, height))
+        _w = int(max(1, width))
+        for ci in missing:
+            word = str((idx_to_term or {}).get(int(ci), f"<unknown idx {ci}>"))
+            warnings.warn(
+                f"combine_label_mask_stacks: label idx={ci} ('{word}') has no spatial mask — "
+                f"assigning whole-image fallback mask",
+                stacklevel=2,
+            )
+            print(
+                f"[mask-stack] WARNING: label idx={ci} ('{word}') has no spatial mask — "
+                f"assigning whole-image fallback mask",
+                flush=True,
+            )
+            rows.append(np.ones((_h, _w), dtype=np.float32))
+            indices.append(ci)
     if len(rows) <= 0:
         return np.zeros((0, int(max(0, height)), int(max(0, width))), dtype=np.float32), np.zeros((0,), dtype=np.int64)
     return np.stack(rows, axis=0).astype(np.float32, copy=False), np.asarray(indices, dtype=np.int64)
@@ -1041,6 +1055,7 @@ def build_label_mask_stack(
             height=int(h),
             width=int(w),
             processing_device=processing_device,
+            idx_to_term=idx_to_term,
         )
         if int(out_stack.shape[0]) > 0 and int(out_idx.size) > 0:
             return out_stack, out_idx
@@ -3770,7 +3785,7 @@ def collect_semantic_disk_rows(
                 "Berkeley image/label row mismatch for disk rows: "
                 f"split={split_name} images={int(len(_split_images))} labels={int(labels_split.shape[0])}"
             )
-        split_specs_rows: List[Tuple[Path, np.ndarray, str, str, str]] = []
+        split_specs_rows: List[Tuple[Path, np.ndarray, str, str, str, List[str]]] = []
         split_missing = 0
         for i, img_path in enumerate(_split_images):
             ip = Path(str(img_path))
@@ -3779,10 +3794,13 @@ def collect_semantic_disk_rows(
                 continue
             yv = np.zeros((int(n_classes),), dtype=np.float32)
             voc_vec = np.asarray(labels_split[int(i)], dtype=np.float32).reshape(-1)
+            positive_voc20: List[str] = []
             for voc_idx in np.flatnonzero(voc_vec > 0.5):
                 cls_idx = int(voc20_to_class_idx.get(int(voc_idx), -1))
                 if 0 <= int(cls_idx) < int(n_classes):
                     yv[int(cls_idx)] = 1.0
+                if 0 <= int(voc_idx) < int(len(voc20_names)):
+                    positive_voc20.append(str(voc20_names[int(voc_idx)]))
             if int(berkeley_dataset_idx) >= 0:
                 yv[int(berkeley_dataset_idx)] = 1.0
             if int(object_idx) >= 0:
@@ -3796,6 +3814,7 @@ def collect_semantic_disk_rows(
                     str(_mask_paths[int(i)]) if int(i) < int(len(_mask_paths)) else "",
                     str(source_key),
                     str(split_name),
+                    positive_voc20,
                 )
             )
         missing_images += int(split_missing)
@@ -3803,12 +3822,13 @@ def collect_semantic_disk_rows(
         split_workers = _resolve_semantic_startup_threads(len(split_specs_rows))
         startup_row_threads = max(int(startup_row_threads), int(split_workers))
 
-        def _build_berkeley_row(spec: Tuple[Path, np.ndarray, str, str, str]) -> SemanticDiskRow:
-            ip, yv_base, mask_path_local, source_key_local, _ = spec
+        def _build_berkeley_row(spec: Tuple[Path, np.ndarray, str, str, str, List[str]]) -> SemanticDiskRow:
+            ip, yv_base, mask_path_local, source_key_local, _, voc_terms = spec
+            base_terms = ["berkeley sbd dataset", "object", "signal"] + [str(t) for t in voc_terms]
             yv_local, row_terms = _augment_row_with_auto_color_terms(
                 image_path=ip,
                 label_vec=yv_base,
-                terms_in=["berkeley sbd dataset", "object", "signal"],
+                terms_in=base_terms,
                 mask_path=str(mask_path_local),
             )
             pos = np.where(np.asarray(yv_local, dtype=np.float32) > 0.5)[0].astype(np.int64).tolist()

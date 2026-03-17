@@ -10,8 +10,8 @@ The classifier is trained against a fixed-width multi-hot target vector.
 Each dimension corresponds to a semantic "class name" (e.g. "white noise",
 "red", "front", "edge").  The vocabulary is partitioned into:
 
-  core_terms     — always-present, locked terms (noise colour profiles, etc.)
-  extra_terms    — rotating pool of richer semantic concepts
+  supervised_class_names  — fixed 101 supervised classes
+  active_extra_terms      — 50 churn-managed extra slots negotiated by vocab/lora
 
 The VocabChurnNode rotates the extra_terms pool on a configurable cycle so the
 classifier is exposed to a wider range of semantic concepts over a long run
@@ -20,7 +20,7 @@ without exceeding the fixed target-vector width.
 Responsibilities owned here
 -----------------------------
   * Loading vocab terms from JSON files or defaults
-  * Merging core + extra terms into the active class_names list
+  * Merging supervised + extra terms into the active class_names list
   * Per-cycle churn: replace N extra terms with fresh candidates from the pool
   * Rebuilding the label embedding bank after each churn event
   * Propagating updated class_names → ctx.semantic_term_to_idx
@@ -113,8 +113,7 @@ class InitVocabNode(OneTimeNode):
     """Load and assemble the initial vocabulary at pipeline start.
 
     Merges defaults + JSON file + inline terms, trims to total_slots,
-    and populates ctx.class_names, ctx.core_terms, ctx.active_extra_terms,
-    and ctx.semantic_term_to_idx.
+    and populates ctx.class_names, ctx.active_extra_terms, and ctx.semantic_term_to_idx.
     """
 
     node_id = "init_vocab"
@@ -129,7 +128,6 @@ class InitVocabNode(OneTimeNode):
     def _execute_once(self, ctx: PipelineContext) -> None:
 
         supervised = _resolve_supervised_class_names(ctx)
-        core = _default_semantic_core_terms()
 
         extra: List[str] = list(self.cfg.extra_terms_inline)
         if str(self.cfg.extra_terms_json).strip():
@@ -144,18 +142,15 @@ class InitVocabNode(OneTimeNode):
         if str(cli_extra).strip():
             extra = extra + _parse_label_query_texts(cli_extra)
 
-        active_extra = _normalize_active_extra_terms_with_core(
+        active_extra = _normalize_extra_terms(
             active_terms=extra,
-            core_terms=core,
             total_slots=self.cfg.total_slots,
         )
 
         ctx.supervised_class_names = list(supervised)
-        ctx.core_terms = list(core)
         ctx.active_extra_terms = list(active_extra)
         ctx.class_names = list(supervised) + list(active_extra)
         ctx.semantic_term_to_idx = _semantic_term_index_map(ctx.class_names)
-        ctx.vocab_lora_locked_terms = list(core)
         ctx.vocab_lora_max_terms = max(1, int(getattr(ctx.args, "stage_c_lora_max_terms", len(active_extra)) or len(active_extra)))
 
         _log(
@@ -200,12 +195,23 @@ class VocabChurnNode(PipelineNode):
 
     def execute(self, ctx: PipelineContext) -> None:
         # Activate a slot only when an activating source (berkeley, payload, etc.)
-        # explicitly raised the pending flag this round.  The flag is consumed here
-        # so it cannot carry over into a subsequent node execution.
+        # explicitly raised the pending flag this round.
         pending = bool(getattr(ctx, "vocab_churn_activation_pending", False))
-        ctx.vocab_churn_activation_pending = False  # consume unconditionally
 
-        selected_slot = select_active_vocab_lora_slot(ctx) if pending else None
+        if pending:
+            # Guard: if the plan was registered in a later round of a multi-round cycle,
+            # hold the flag — don't consume it — until the current round catches up.
+            registered_round = int(getattr(ctx, "vocab_lora_plan_registered_round", -1))
+            current_round = int(getattr(ctx, "round_id", -1))
+            if registered_round > 0 and current_round > 0 and registered_round > current_round:
+                # Too early in the cycle — wait for the right round.
+                selected_slot = None
+            else:
+                ctx.vocab_churn_activation_pending = False  # consume
+                selected_slot = select_active_vocab_lora_slot(ctx)
+        else:
+            ctx.vocab_churn_activation_pending = False  # clear
+            selected_slot = None
         if isinstance(selected_slot, dict) and selected_slot:
             info = activate_vocab_lora_slot(ctx, selected_slot)
             ctx.vocab_rotation_cycle += 1
@@ -383,15 +389,10 @@ def _build_reference_flashcard_payload_rows(
     if not callable(condition_vector_builder):
         raise RuntimeError("Flashcard condition builder is required; non-embedding fallback is disabled.")
 
-    class_term_keys = {
-        re.sub(r"\s+", " ", str(t)).strip().lower()
-        for t in class_names
-        if str(t).strip()
-    }
-    target_terms = [t for t in _default_semantic_core_terms() if str(t).strip().lower() in class_term_keys]
+    target_terms = [str(t) for t in class_names if str(t).strip()]
     if len(target_terms) <= 0:
-        return [], [], {"enabled": False, "rows_added": 0, "reason": "no_core_terms_in_vocab"}
-    berkeley_idx = int(_find_semantic_term_index(class_names, "berkeley sbd dataset"))
+        return [], [], {"enabled": False, "rows_added": 0, "reason": "no_class_names"}
+    berkeley_idx = int(_semantic_term_index_map(class_names).get("berkeley sbd dataset", -1))
 
     size = max(8, int(image_size))
     if int(size) <= 0:
@@ -801,7 +802,7 @@ def plan_vocab_lora_requirements(
     required_key_set = {_vocab_term_key(term) for term in normalized_required}
     supervised_terms = _normalize_vocab_terms(getattr(ctx, "supervised_class_names", []))
     supervised_set = {_vocab_term_key(term) for term in supervised_terms}
-    locked_terms = _normalize_vocab_terms(getattr(ctx, "vocab_lora_locked_terms", []) or getattr(ctx, "core_terms", []))
+    locked_terms: List[str] = []
     locked_set = {_vocab_term_key(term) for term in locked_terms}
     current_extra = _normalize_vocab_terms(getattr(ctx, "active_extra_terms", []))
     current_extra_set = {_vocab_term_key(term) for term in current_extra}
@@ -916,6 +917,7 @@ def register_churn_requirement(
                 ctx.vocab_lora_plan_slot_cursor = 0
             ctx.vocab_lora_latest_plan_signature = str(plan_signature)
             ctx.vocab_lora_plan_registered_cycle = int(getattr(ctx, "cycle", -1))
+            ctx.vocab_lora_plan_registered_round = int(getattr(ctx, "round_id", -1))
             ctx.vocab_churn_activation_pending = True
     for slot in list(plan.get("slots") or []):
         signature = str(slot.get("signature", "")).strip()
@@ -966,7 +968,10 @@ def _source_should_drive_vocab_activation(source: str, stage_label: str) -> bool
     key = " ".join([str(source or "").strip().lower(), str(stage_label or "").strip().lower()]).strip()
     if not key:
         return False
-    return any(token in key for token in ("berkeley", "payload", "refresh", "stage2", "stage c", "stagec"))
+    return any(token in key for token in (
+        "berkeley", "payload", "refresh", "stage2", "stage c", "stagec",
+        "gestation", "stage1", "flashcard", "symbol_pool",
+    ))
 
 
 def select_active_vocab_lora_slot(ctx: PipelineContext) -> Optional[Dict[str, Any]]:
@@ -1010,9 +1015,8 @@ def activate_vocab_lora_slot(ctx: PipelineContext, slot: Dict[str, Any]) -> Dict
 
     slot_terms = _normalize_vocab_terms(slot.get("terms") or [])
     total_slots = max(1, int(getattr(ctx, "vocab_lora_max_terms", 0) or len(getattr(ctx, "active_extra_terms", [])) or len(slot_terms) or 1))
-    active_extra = _normalize_active_extra_terms_with_core(
+    active_extra = _normalize_extra_terms(
         active_terms=slot_terms,
-        core_terms=getattr(ctx, "core_terms", []),
         total_slots=int(total_slots),
     )
     ctx.active_extra_terms = list(active_extra)
@@ -1100,19 +1104,6 @@ PREGESTATION_MODE_CONFIGS: Dict[str, Dict[str, Any]] = {
         "depth_labels": ("front", "behind"),
     },
 }
-
-_DEFAULT_SEMANTIC_CORE_TERMS: List[str] = [
-    "noise",
-    "white noise",
-    "pink noise",
-    "brown noise",
-    "red noise",
-    "blue noise",
-    "violet noise",
-    "grey noise",
-    "gaussian white noise",
-    "uniform white noise",
-]
 
 _REMOVED_SEMANTIC_SEED_TERMS = [
     "none",
@@ -1207,24 +1198,12 @@ def _normalize_vocab_terms(terms: Sequence[str]) -> List[str]:
     return out
 
 
-def _normalize_active_extra_terms_with_core(
-    active_terms: Sequence[str],
-    core_terms: Sequence[str],
-    total_slots: int,
-) -> List[str]:
-    core = _normalize_vocab_terms(core_terms)
-    active = _normalize_vocab_terms(active_terms)
-    core_lc = {str(x).strip().lower() for x in core}
-    tail = [t for t in active if str(t).strip().lower() not in core_lc]
-    slots = max(int(len(core)), max(0, int(total_slots)))
-    out = list(core) + list(tail)
-    while len(out) < int(slots):
+def _normalize_extra_terms(active_terms: Sequence[str], total_slots: int) -> List[str]:
+    out = _normalize_vocab_terms(active_terms)
+    slots = max(0, int(total_slots))
+    while len(out) < slots:
         out.append(f"semantic slot {int(len(out)) + 1}")
-    return out[: int(slots)]
-
-
-def _default_semantic_core_terms() -> List[str]:
-    return [str(x) for x in _DEFAULT_SEMANTIC_CORE_TERMS]
+    return out[:slots]
 
 
 def _removed_semantic_seed_terms() -> List[str]:
@@ -1232,127 +1211,15 @@ def _removed_semantic_seed_terms() -> List[str]:
 
 
 def _default_bootstrap_primitive_terms() -> List[str]:
-    # Bootstrap/gestation vocabulary is strictly primitive internal semantics only:
-    # no dataset marker terms.
-    core_terms = _normalize_vocab_terms(_default_semantic_core_terms())
-    color_terms = _normalize_vocab_terms(
-        ["red", "green", "blue", "yellow", "cyan", "magenta", "brown", "gray", "edge"]
-    )
-    direction_terms = _normalize_vocab_terms(
-        ["front", "back", "left", "right", "top", "bottom"]
-    )
-    structure_terms = _normalize_vocab_terms(
-        ["pattern", "edge", "shape", "texture", "bright", "dark", "smooth", "rough", "object", "signal"]
-    )
-    dataset_terms = {
-        "berkeley sbd dataset",
-        "mnist dataset",
-        "emnist dataset",
-        "kmnist dataset",
-    }
-    out: List[str] = []
-    for term in core_terms:
-        key = re.sub(r"\s+", " ", str(term)).strip().lower()
-        if not key:
-            continue
-        if key in dataset_terms:
-            continue
-        out.append(str(term))
-    out.extend([str(t) for t in color_terms])
-    out.extend([str(t) for t in direction_terms])
-    out.extend([str(t) for t in structure_terms])
-    return _normalize_vocab_terms(out)
-
-
-def _semantic_kind_keys_for_class_names(class_names: Sequence[str]) -> List[str]:
-    present = {
-        re.sub(r"\s+", " ", str(name)).strip().lower()
-        for name in class_names
-        if str(name).strip()
-    }
-    alias_groups: Dict[str, List[str]] = {
-        "none": ["none"],
-        "noise": ["noise"],
-        "white noise": ["white noise", "gaussian white noise", "uniform white noise"],
-        "pink noise": ["pink noise"],
-        "brown noise": ["brown noise"],
-        "red noise": ["red noise"],
-        "blue noise": ["blue noise"],
-        "violet noise": ["violet noise"],
-        "grey noise": ["grey noise", "gray noise"],
-        "gaussian white noise": ["gaussian white noise", "white noise"],
-        "uniform white noise": ["uniform white noise", "white noise"],
-        "signal": ["signal"],
-        "object": ["object"],
-        "mix": ["mixed noise and signal", "mix"],
-        "mixed noise and signal": ["mixed noise and signal", "mix"],
-        "white": ["white"],
-        "black": ["black"],
-        "blur damage": ["blur damage"],
-        "noise damage": ["noise damage"],
-        "dropout damage": ["dropout damage"],
-        "quantization damage": ["quantization damage"],
-        "stride skew damage": ["stride skew damage"],
-        "edge highlight": ["edge highlight", "edge"],
-        "edge blur": ["edge blur", "edge"],
-        "gan image": ["gan image"],
-        "regurgitated content": ["regurgitated content"],
-        "berkeley sbd dataset": ["berkeley sbd dataset"],
-        "mnist dataset": ["mnist dataset"],
-        "emnist dataset": ["emnist dataset"],
-        "kmnist dataset": ["kmnist dataset"],
-    }
-    out: List[str] = []
-    for key, candidates in alias_groups.items():
-        for cand in candidates:
-            if str(cand).strip().lower() in present:
-                out.append(str(key))
-                break
-    return out
-
-
-def _find_semantic_term_index(class_names: Sequence[str], term: str) -> int:
-    key = re.sub(r"\s+", " ", str(term)).strip().lower()
-    if not key:
-        return -1
-    for i, name in enumerate(class_names):
-        k = re.sub(r"\s+", " ", str(name)).strip().lower()
-        if k == key:
-            return int(i)
-    _REMOVED_SEMANTIC_SEED_TERMS = [
-        "none",
-        "noise",
-        "signal",
-        "object",
-        "mixed noise and signal",
-        "white",
-        "black",
-        "blur damage",
-        "noise damage",
-        "dropout damage",
-        "quantization damage",
-        "stride skew damage",
-        "edge highlight",
-        "edge blur",
-        "gan image",
-        "regurgitated content",
-        "berkeley sbd dataset",
-        "mnist dataset",
-        "emnist dataset",
-        "kmnist dataset",
+    # Bootstrap/gestation vocabulary is strictly primitive internal semantics only.
+    noise_profile_terms = [
+        "noise", "white noise", "pink noise", "brown noise", "red noise",
+        "blue noise", "violet noise", "grey noise", "gaussian white noise", "uniform white noise",
     ]
-
-
-    _DEFAULT_SEMANTIC_CORE_TERMS: List[str] = []
-
-
-    def _default_semantic_core_terms() -> List[str]:
-        return [str(x) for x in _DEFAULT_SEMANTIC_CORE_TERMS]
-
-
-    def _removed_semantic_seed_terms() -> List[str]:
-        return [str(x) for x in _REMOVED_SEMANTIC_SEED_TERMS]
-    return -1
+    color_terms = ["red", "green", "blue", "yellow", "cyan", "magenta", "brown", "gray", "edge"]
+    direction_terms = ["front", "back", "left", "right", "top", "bottom"]
+    structure_terms = ["pattern", "edge", "shape", "texture", "bright", "dark", "smooth", "rough", "object", "signal"]
+    return _normalize_vocab_terms(noise_profile_terms + color_terms + direction_terms + structure_terms)
 
 
 def _semantic_term_index_map(class_names: Sequence[str]) -> Dict[str, int]:
@@ -2459,9 +2326,12 @@ def _build_synthetic_semantic_symbol_pool(
             g = _signal_pattern(phase=phase)
         return _to_rgb(g)
 
-    terms = _normalize_vocab_terms(_default_semantic_core_terms())
+    noise_profile_terms = _normalize_vocab_terms([
+        "noise", "white noise", "pink noise", "brown noise", "red noise",
+        "blue noise", "violet noise", "grey noise", "gaussian white noise", "uniform white noise",
+    ])
     pool: Dict[str, List[np.ndarray]] = {}
-    for term in terms:
+    for term in noise_profile_terms:
         key = re.sub(r"\s+", " ", str(term)).strip().lower()
         if not key:
             continue
@@ -2872,7 +2742,10 @@ def _build_internal_bootstrap_symbol_pool(
             return np.clip((0.62 * _circle_object()) + (0.38 * _signal_pattern(phase=phase + 0.3)), 0.0, 1.0)
         return _signal_pattern(phase=phase)
 
-    core_terms = _normalize_vocab_terms(_default_semantic_core_terms())
+    noise_profile_terms = _normalize_vocab_terms([
+        "noise", "white noise", "pink noise", "brown noise", "red noise",
+        "blue noise", "violet noise", "grey noise", "gaussian white noise", "uniform white noise",
+    ])
     try:
         from pipeline.utils import _default_class_names
         berkeley_terms = _normalize_vocab_terms(_default_class_names())
@@ -2894,7 +2767,7 @@ def _build_internal_bootstrap_symbol_pool(
         "image_size": int(size),
         "max_samples_per_term": int(cap),
         "primary_terms": list(primary_terms),
-        "core_terms": list(core_terms),
+        "noise_profile_terms": list(noise_profile_terms),
         "bootstrap_primitive_terms": list(bootstrap_primitive_terms),
         "berkeley_terms": list(berkeley_terms),
         "origin_label": str(origin_label).strip(),

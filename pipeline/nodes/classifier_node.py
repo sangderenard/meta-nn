@@ -79,6 +79,7 @@ from pipeline.preview import make_classifier_step_preview_callback
 from pipeline.utils import (
     _classifier_supervision_loss,
     _cuda_mem_diag,
+    _default_class_names,
     _refresh_cache_is_staging_safe,
     _unwrap_module_for_replica,
 )
@@ -651,7 +652,10 @@ class BerkeleyRefreshTrainNode(IRTrainingNode):
             args=ctx.args,
             remap_targets_from_terms=True,
             active_class_names=list(ctx.class_names),
-            source_class_names=list(ctx.supervised_class_names),
+            # Berkeley wheel is always built with _default_class_names() — use that
+            # as source vocab regardless of ctx.supervised_class_names so wheel mask
+            # indices translate correctly into active vocab space.
+            source_class_names=list(_default_class_names()),
         )
 
         loss = float(result.get("loss", float("inf")))
@@ -1089,17 +1093,27 @@ def ensure_vocab_lora_active(ctx: PipelineContext, cfg: ClassifierConfig) -> Dic
         )
         _log("[lora-guard] installed LoRA adapters (extra vocab active)")
 
-    # Step 2: determine which slot should be active
-    signature = str(getattr(ctx, "vocab_lora_active_signature", "") or "").strip()
-    if not signature:
-        signature = hashlib.sha1(
-            "|".join(str(t) for t in extra_terms).encode("utf-8", errors="ignore")
-        ).hexdigest()[:16]
-        ctx.vocab_lora_active_signature = signature
+    # Step 2: determine which slot should be active.
+    # Always recompute the expected signature from the current extra_terms so
+    # that a vocab change between stages (e.g. gestation → berkeley) is caught
+    # immediately rather than silently reusing the stale gestation slot.
+    expected_signature = hashlib.sha1(
+        "|".join(str(t) for t in sorted(extra_terms)).encode("utf-8", errors="ignore")
+    ).hexdigest()[:16]
+    stored_signature = str(getattr(ctx, "vocab_lora_active_signature", "") or "").strip()
+    if stored_signature and stored_signature != expected_signature:
+        _log(
+            f"[lora-guard] vocab changed (stored={stored_signature[:12]} "
+            f"expected={expected_signature[:12]}) — switching LoRA slot"
+        )
+    signature = expected_signature
+    ctx.vocab_lora_active_signature = signature
 
-    slot_name = str(getattr(ctx, "lora_active_slot", "") or "").strip()
-    if not slot_name:
-        slot_name = f"vocab_{signature}"
+    slot_name = f"vocab_{signature}"
+    stored_slot = str(getattr(ctx, "lora_active_slot", "") or "").strip()
+    if stored_slot and stored_slot == slot_name:
+        # Already on the right slot; keep the existing name (may be custom).
+        slot_name = stored_slot
 
     # Step 3: ensure the slot exists, then load from library if available
     ensure_tiny_classifier_lora_slot(ctx.classifier, slot_name=slot_name)
@@ -1259,6 +1273,7 @@ def _remap_semantic_batch_to_active_vocab(
     }
     stack_list = list(meta.get("mask_stacks") or [])
     index_list = list(meta.get("mask_indices") or [])
+
     out_y_rows: List[torch.Tensor] = []
     out_m_rows: List[torch.Tensor] = []
     out_stack_rows: List[torch.Tensor] = []
@@ -1314,9 +1329,17 @@ def _remap_semantic_batch_to_active_vocab(
         )
         mapped_idx = np.asarray(mapped_idx_rows, dtype=np.int64)
 
+        # Only generate special masks for labels not already covered by the
+        # wheel's mapped_stack — prevents global ones-fallback from overriding
+        # the spatial masks that the wheel already stored for built-in terms.
+        y_needs_special = np.zeros_like(y_active_np, dtype=np.float32)
+        already_mapped = set(int(i) for i in mapped_idx_rows)
+        for _ci in np.where(y_active_np >= 0.5)[0]:
+            if int(_ci) not in already_mapped:
+                y_needs_special[int(_ci)] = 1.0
         special_stack, special_idx = build_label_mask_stack(
             mixed_mask=base_mask_np,
-            label_vec=y_active_np,
+            label_vec=y_needs_special,
             idx_to_term=active_idx_to_term,
             treat_mixed_mask_as_creation=True,
         )
@@ -1347,6 +1370,7 @@ def _remap_semantic_batch_to_active_vocab(
             height=int(height),
             width=int(width),
             strict=True,
+            idx_to_term=active_idx_to_term,
         )
         mixed_mask_np = _composite_non_dataset_label_stack(
             remapped_stack,

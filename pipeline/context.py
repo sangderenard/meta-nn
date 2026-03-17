@@ -256,7 +256,6 @@ class PipelineContext:
     supervised_class_names: List[str] = field(default_factory=list)
     class_names: List[str] = field(default_factory=list)
     active_extra_terms: List[str] = field(default_factory=list)
-    core_terms: List[str] = field(default_factory=list)
     label_embedding_bank: Optional[Any] = None       # np.ndarray [n_classes, embed_dim]
     label_texts: List[str] = field(default_factory=list)
     label_embedding_info: Dict[str, Any] = field(default_factory=dict)
@@ -334,7 +333,6 @@ class PipelineContext:
     vocab_lora_pending_terms: List[str] = field(default_factory=list)
     vocab_lora_active_signature: str = ""
     vocab_lora_active_terms: List[str] = field(default_factory=list)
-    vocab_lora_locked_terms: List[str] = field(default_factory=list)
     vocab_lora_max_terms: int = 0
     vocab_lora_latest_plan_signature: str = ""
     vocab_lora_plan_slot_cursor: int = 0
@@ -350,6 +348,7 @@ class PipelineContext:
     total_rounds_completed: int = 0
     vocab_rotation_cycle: int = 0
     vocab_lora_plan_registered_cycle: int = -1  # orchestrator cycle when plan_signature was last set
+    vocab_lora_plan_registered_round: int = -1   # round_id when plan_signature was last set
     vocab_churn_activation_pending: bool = False  # set by activating sources; consumed+cleared by VocabChurnNode
     last_node_statuses: Dict[str, str] = field(default_factory=dict)
     last_execution_trace: List[Dict[str, Any]] = field(default_factory=list)

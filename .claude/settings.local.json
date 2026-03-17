@@ -10,7 +10,8 @@
       "Bash(xargs -I {} basename {})",
       "Bash(grep \"\\\\.py$\")",
       "Bash(xargs grep:*)",
-      "Bash(grep -n \"save_every_n_rounds\\\\|rebuild_every_n_rounds\" /c/dev/Powershell/meta-nn/pipeline/nodes/*.py)"
+      "Bash(grep -n \"save_every_n_rounds\\\\|rebuild_every_n_rounds\" /c/dev/Powershell/meta-nn/pipeline/nodes/*.py)",
+      "Bash(grep -rn \"combine_label_mask_stacks\\\\|_build_pregestation_logic_rows\\\\|provide_pregestation\" c:devPowershellmeta-nn --include=*.py -l)"
     ]
   }
 }
