@@ -1631,6 +1631,8 @@ def _semantic_color_score_maps_batch(chw_batch: Any) -> Dict[str, np.ndarray]:
     black = _norm01_batch(np.clip(0.22 - vmax, 0.0, 1.0))
     white = _norm01_batch(np.clip(vmin - 0.78, 0.0, 1.0) * np.clip(0.20 - sat, 0.0, 1.0))
     gray = _norm01_batch(np.clip(0.18 - sat, 0.0, 1.0) * np.clip(1.0 - np.abs(vmax - 0.5) * 2.2, 0.0, 1.0))
+    # neutral: desaturated but not black — achromatic mid-tones
+    neutral = _norm01_batch(np.clip(0.25 - sat, 0.0, 1.0) * np.clip(vmax - 0.05, 0.0, 1.0))
     # Fast Sobel-like edge detector across batch
     luma = np.mean(arr[:, :3], axis=1)  # (B, H, W)
     gx = np.zeros_like(luma)
@@ -1650,6 +1652,7 @@ def _semantic_color_score_maps_batch(chw_batch: Any) -> Dict[str, np.ndarray]:
         "black": black,
         "white": white,
         "gray": gray,
+        "neutral": neutral,
         "edge": edge,
     }
 
@@ -1682,7 +1685,7 @@ def detect_semantic_color_terms(
         valid_count = int(np.sum(valid_mask))
 
     out: List[str] = []
-    for term in ["red", "orange", "green", "blue", "yellow", "cyan", "magenta", "brown", "black", "white", "gray", "edge"]:
+    for term in ["red", "orange", "green", "blue", "yellow", "cyan", "magenta", "brown", "black", "white", "gray", "neutral", "edge"]:
         score = np.asarray(maps.get(term), dtype=np.float32)
         if int(score.size) <= 0:
             continue

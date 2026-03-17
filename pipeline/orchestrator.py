@@ -2402,7 +2402,6 @@ def _build_configs_from_args(args) -> dict:
         circle_radius_temperature=float(_g("pregestation_circle_radius_temperature", default=1.0)),
         seed=int(_g("seed", default=42)),
         gpu_preprocess=bool(_g("semantic_gpu_preprocess", default=False)),
-        rebuild_every_n_rounds=int(_g("pregestation_rebuild_every_n_rounds", "pregestation_rebuild_every", default=rounds_per_cycle)),
     )
 
     gestation = GestationDataConfig(
@@ -2416,7 +2415,6 @@ def _build_configs_from_args(args) -> dict:
             )
         ),
         gpu_preprocess=bool(_g("semantic_gpu_preprocess", default=False)),
-        rebuild_every_n_rounds=int(_g("gestation_rebuild_every_n_rounds", "gestation_rebuild_every", default=rounds_per_cycle)),
     )
 
     berkeley_payload = BerkeleyPayloadConfig(
@@ -2443,14 +2441,12 @@ def _build_configs_from_args(args) -> dict:
         wheel_max_bytes=int(max(0, int(_g("berkeley_wheel_max_mb", default=0)))) * 1024 * 1024,
         wheel_sanity_cap_bytes=int(max(1, int(_g("berkeley_wheel_sanity_cap_mb", default=8192)))) * 1024 * 1024,
         wheel_allow_large_override=bool(_g("berkeley_wheel_allow_large_override", default=False)),
-        wheel_expiry_uses=int(_g("berkeley_wheel_expiry_uses", default=1)),
         wheel_lookahead_batches=int(_g("berkeley_wheel_lookahead_batches", default=0)),
         wheel_use_rare_term_deck=bool(_g("berkeley_wheel_use_rare_term_deck", default=True)),
         refresh_deformations_per_clean=int(_g("berkeley_refresh_deformations_per_clean", default=2)),
         refresh_include_clean=bool(_g("berkeley_refresh_include_clean", default=True)),
         gpu_preprocess=bool(_g("semantic_gpu_preprocess", default=False)),
         preload_workers=int(_g("semantic_preload_workers", default=0)),
-        rebuild_every_n_rounds=int(_g("berkeley_refresh_round_every", "berkeley_refresh_every", default=rounds_per_cycle)),
         gate_val_batch_size=int(_g("gate_berkeley_batch_size", default=32)),
         gate_val_num_workers=int(_g("berkeley_refresh_workers", "num_workers", default=0)),
         gate_val_max_val=int(_g("gate_berkeley_max_val", default=0)),

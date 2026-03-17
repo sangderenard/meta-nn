@@ -463,7 +463,7 @@ class _TransformerStatusOpenGLViewer:
         self._pending_checkpoint_weight_marks: Dict[int, Tuple[int, int]] = {}
         self._checkpoint_backup_dir: Optional[Path] = None
         self._checkpoint_live_dir: Optional[Path] = None
-        self._weight_image_mode: int = 1
+        self._weight_image_mode: int = 3
         self._weight_model_order: List[str] = []
         self._weight_snapshot_deques_by_model: Dict[str, deque] = {}
         self._weight_current_rgb_by_model: Dict[str, np.ndarray] = {}
@@ -4127,7 +4127,7 @@ class ViewerIPCProxy:
         self._save_restore_node: Optional[Any] = None
 
         self._preview_work_queue_ref: Optional[Any] = None
-        self._weight_image_mode: int = 1
+        self._weight_image_mode: int = 3
         self._weight_panel_crop_w: int = max(8, int(self.image_w))
         self._weight_panel_crop_h: int = max(8, int(self.image_h))
         self._last_applied_weight_image_spec: Optional[Tuple[int, int, int]] = None

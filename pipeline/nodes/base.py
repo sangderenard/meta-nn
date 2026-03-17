@@ -559,6 +559,8 @@ class GatedNode(PipelineNode):
         return ("gated", {"gate_ids": list(self.required_gates)})
 
     def should_run(self, ctx: PipelineContext) -> bool:
+        if ctx.gate_override_enabled():
+            return True
         for gate_attr in self.required_gates:
             gate: GateState = getattr(ctx, gate_attr, None)
             if gate is None or not gate.passed:

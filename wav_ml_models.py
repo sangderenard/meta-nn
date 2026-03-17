@@ -856,6 +856,64 @@ def restore_tiny_classifier_lora_snapshot(model: TinyConvClassifier, snapshot: O
     }
 
 
+def save_lora_slot_to_file(model: TinyConvClassifier, slot_name: str, path) -> bool:
+    """Save a single named LoRA slot's weights to a .pt file.
+
+    Only the slot-specific low-rank matrices are stored — the base model weights
+    are not included.  Returns True on success.
+    """
+    mods = tiny_classifier_lora_named_modules(model)
+    if not mods:
+        return False
+    key = str(slot_name).strip()
+    if not key:
+        return False
+    weights: Dict[str, Any] = {}
+    for mod_name, mod in mods:
+        if key in mod.slots:
+            weights[str(mod_name)] = _clone_lora_slot_state(mod.slots[key])
+    if not weights:
+        return False
+    rank = int(getattr(mods[0][1], "rank", 8))
+    alpha = float(getattr(mods[0][1], "alpha", 16.0))
+    try:
+        torch.save({"slot_name": key, "rank": rank, "alpha": alpha, "weights": weights}, path)
+        return True
+    except Exception:
+        return False
+
+
+def load_lora_slot_from_file(model: TinyConvClassifier, slot_name: str, path) -> bool:
+    """Load a single named LoRA slot's weights from a .pt file into the model.
+
+    Installs LoRA adapters if not already present.  Returns True on success.
+    """
+    try:
+        data = torch.load(path, map_location="cpu", weights_only=False)
+    except Exception:
+        return False
+    if not isinstance(data, dict):
+        return False
+    key = str(slot_name).strip()
+    if not key:
+        return False
+    rank = max(1, int(data.get("rank", 8)))
+    alpha = float(max(1.0, float(data.get("alpha", 16.0))))
+    if not tiny_classifier_lora_modules(model):
+        install_tiny_classifier_lora(model, rank=int(rank), alpha=float(alpha))
+    ensure_tiny_classifier_lora_slot(model, key)
+    weights = data.get("weights", {})
+    loaded = 0
+    for mod_name, mod in tiny_classifier_lora_named_modules(model):
+        if str(mod_name) in weights and key in mod.slots:
+            try:
+                mod.slots[key].load_state_dict(weights[str(mod_name)], strict=False)
+                loaded += 1
+            except Exception:
+                pass
+    return loaded > 0
+
+
 class DeskewFilterBundle(nn.Module):
     def __init__(self, d_model: int, max_skew: float = 0.25):
         super().__init__()

@@ -63,7 +63,9 @@ _default_berkeley_class_names = _default_class_names
 from pipeline.nodes.vocab_node import (
     _normalize_vocab_terms,
     _semantic_term_index_map,
+    activate_vocab_lora_slot,
     register_churn_requirement,
+    select_active_vocab_lora_slot,
 )
 from semantic_dataset_loaders import (
     BootstrapDynamicDataset,
@@ -111,6 +113,9 @@ class DataPossession:
     # Validation reserve tracking
     val_indices: List[int] = field(default_factory=list)
     train_indices: List[int] = field(default_factory=list)
+    # Per-item consumption tracking
+    deck_is_bounded: bool = False
+    force_next_rebuild: bool = False
 
     def mark_built(self) -> None:
         self.built = True
@@ -314,13 +319,6 @@ class PregestationDataConfig:
     # GPU-accelerated semantic preprocessing (deformations, mask ops)
     gpu_preprocess: bool = False
 
-    # How many rounds to keep pregestation data before rebuilding.
-    # Vocab churns every round, but rebuilding pregestation for each small
-    # vocab change is wasteful — the disk cache absorbs re-use when the same
-    # vocab recurs, but the wheel still needs rebuilding when it changes.
-    # 20 rounds is a reasonable balance between freshness and build cost.
-    rebuild_every_n_rounds: int = 2
-
 
 # ---------------------------------------------------------------------------
 # Gestation data node  (Stage 1)
@@ -336,9 +334,6 @@ class GestationDataConfig:
     samples_per_term: int = 32
     cache_mb: int = 128
     gpu_preprocess: bool = False
-
-    # How many rounds to keep gestation data before rebuilding.
-    rebuild_every_n_rounds: int = 2
 
 
 # ---------------------------------------------------------------------------
@@ -397,16 +392,12 @@ class BerkeleyDataConfig:
     wheel_max_bytes: int = 0
     wheel_sanity_cap_bytes: int = 30 * 1024 * 1024 * 1024
     wheel_allow_large_override: bool = False
-    wheel_expiry_uses: int = 1
     wheel_lookahead_batches: int = 0
     wheel_use_rare_term_deck: bool = True
     refresh_deformations_per_clean: int = 2
     refresh_include_clean: bool = True
     gpu_preprocess: bool = False
     preload_workers: int = 0
-
-    # How many rounds between full Berkeley refresh loader rebuilds
-    rebuild_every_n_rounds: int = 2
 
     # Gate 2 validation loader settings
     gate_val_batch_size: int = 32
@@ -473,10 +464,7 @@ class DataNode(PipelineNode):
             name="pregestation",
             tier="ram",
             ctx_attrs=["pregestation_loader", "pregestation_dataset", "pregestation_eval_loader", "pregestation_eval_dataset", "pregestation_logic_rows"],
-            expiry_fn=lambda ctx: (
-                self._preg_last_build_round < 0
-                or (ctx.total_rounds_completed - self._preg_last_build_round) >= self.preg_cfg.rebuild_every_n_rounds
-            ),
+            expiry_fn=lambda ctx: self._check_item_exhaustion("pregestation", getattr(ctx, "pregestation_loader", None)),
             size_fn=lambda: self._estimate_possession_bytes("pregestation"),
             pass_cap=self.preg_cfg.cache_mb * 1024 * 1024,
         )
@@ -484,10 +472,7 @@ class DataNode(PipelineNode):
             name="gestation",
             tier="ram",
             ctx_attrs=["gestation_loader", "gestation_dataset", "gestation_eval_loader", "gestation_eval_dataset"],
-            expiry_fn=lambda ctx: (
-                self._gest_last_build_round < 0
-                or (ctx.total_rounds_completed - self._gest_last_build_round) >= self.gest_cfg.rebuild_every_n_rounds
-            ),
+            expiry_fn=lambda ctx: self._check_item_exhaustion("gestation", getattr(ctx, "gestation_loader", None)),
             size_fn=lambda: self._estimate_possession_bytes("gestation"),
             pass_cap=self.gest_cfg.cache_mb * 1024 * 1024,
         )
@@ -495,11 +480,7 @@ class DataNode(PipelineNode):
             name="berkeley",
             tier="ram",
             ctx_attrs=["berkeley_refresh_loader", "berkeley_gate_val_loader", "berkeley_cache"],
-            expiry_fn=lambda ctx: (
-                ctx.berkeley_refresh_loader is None
-                or (ctx.total_rounds_completed - self._bdata_last_build_round)
-                >= self.bdata_cfg.rebuild_every_n_rounds
-            ),
+            expiry_fn=lambda ctx: self._check_item_exhaustion("berkeley", getattr(ctx, "berkeley_refresh_loader", None)),
             size_fn=lambda: self._estimate_possession_bytes("berkeley"),
         )
         self.possessions["payload"] = DataPossession(
@@ -513,6 +494,16 @@ class DataNode(PipelineNode):
             expiry_fn=lambda ctx: not self._payload_built,
             size_fn=lambda: self._estimate_possession_bytes("payload"),
         )
+
+    def _check_item_exhaustion(self, possession_name: str, loader: Any) -> bool:
+        """Return True when a bounded wheel's sampler has seen every item."""
+        poss = self.possessions.get(possession_name)
+        if poss is None or not poss.built or not poss.deck_is_bounded:
+            return False
+        sampler = _get_deck_sampler(loader)
+        if sampler is None:
+            return False
+        return sampler.all_items_seen
 
     def _estimate_possession_bytes(self, name: str) -> int:
         """Rough byte estimate for a possession (best-effort, not authoritative)."""
@@ -602,12 +593,13 @@ class DataNode(PipelineNode):
                 continue
             # Expiry check
             if poss.expiry_fn is not None and poss.expiry_fn(ctx):
+                poss.force_next_rebuild = True
                 for attr in poss.ctx_attrs:
                     if hasattr(ctx, attr):
                         setattr(ctx, attr, None)
                 poss.mark_expired()
                 any_expired = True
-                _log(f"[data-node] possession '{name}' expired — will rebuild on next traverse")
+                _log(f"[data-node] possession '{name}' expired (all items consumed) — will rebuild on next traverse")
                 continue
             # N-pass cap enforcement (pregestation / gestation)
             if len(poss.pass_row_counts) > 0 and poss.pass_cap > 0:
@@ -732,6 +724,7 @@ class DataNode(PipelineNode):
                             image=img_ref,
                             image_size=int(self.preg_cfg.image_size),
                         )
+                        pass  # tonal enrichment terms left as-is for diagnostic visibility
                     else:
                         enriched_terms = list(term_row)
                         tonal_masks_dict = {}
@@ -862,7 +855,9 @@ class DataNode(PipelineNode):
                 semantic_term_to_idx=ctx.semantic_term_to_idx,
                 stage_cache_mb=int(self.preg_cfg.cache_mb),
                 processing_device=_processing_device,
+                force_rebuild=bool(self.possessions["pregestation"].force_next_rebuild),
             )
+        self.possessions["pregestation"].force_next_rebuild = False
         selected_targets = [np.asarray(all_targets[int(i)], dtype=np.float32).reshape(-1) for i in selected_indices]
 
         ctx.pregestation_logic_rows = {
@@ -919,6 +914,7 @@ class DataNode(PipelineNode):
 
         # N-pass tracking + orphan-free validation reserve
         poss = self.possessions["pregestation"]
+        poss.deck_is_bounded = len(selected_indices) < len(all_images)
         poss.pass_ages.append(0)
         poss.pass_row_counts.append(len(selected_indices))
         poss.train_indices = train_idx
@@ -1090,7 +1086,9 @@ class DataNode(PipelineNode):
                 semantic_term_to_idx=ctx.semantic_term_to_idx,
                 stage_cache_mb=int(self.gest_cfg.cache_mb),
                 processing_device=_processing_device,
+                force_rebuild=bool(self.possessions["gestation"].force_next_rebuild),
             )
+        self.possessions["gestation"].force_next_rebuild = False
         selected_targets = [np.asarray(targets[int(i)], dtype=np.float32).reshape(-1) for i in selected_indices]
         train_idx, val_idx = _orphan_free_split(
             targets=selected_targets, seed=int(getattr(ctx.args, "seed", 0) or 0),
@@ -1130,6 +1128,7 @@ class DataNode(PipelineNode):
 
         # N-pass tracking + orphan-free validation reserve
         poss = self.possessions["gestation"]
+        poss.deck_is_bounded = len(selected_indices) < _n_gest
         poss.pass_ages.append(0)
         poss.pass_row_counts.append(len(selected_indices))
         poss.train_indices = train_idx
@@ -1160,6 +1159,7 @@ class DataNode(PipelineNode):
             str(self.bdata_cfg.berkeley_data_root).strip()
             or getattr(ctx, "berkeley_data_root", "") or ""
         )
+        _berk_force = bool(self.possessions["berkeley"].force_next_rebuild)
         with semantic_processing_device(ctx, enabled=bool(self.bdata_cfg.gpu_preprocess)) as _processing_device:
             loader, _n_refresh = _build_berkeley_refresh_loader(
                 data_root=data_root, image_size=self.bdata_cfg.image_size,
@@ -1171,13 +1171,13 @@ class DataNode(PipelineNode):
                 wheel_max_bytes=self.bdata_cfg.wheel_max_bytes,
                 wheel_sanity_cap_bytes=self.bdata_cfg.wheel_sanity_cap_bytes,
                 wheel_allow_large_override=self.bdata_cfg.wheel_allow_large_override,
-                wheel_expiry_uses=self.bdata_cfg.wheel_expiry_uses,
                 wheel_lookahead_batches=self.bdata_cfg.wheel_lookahead_batches,
                 wheel_use_rare_term_deck=self.bdata_cfg.wheel_use_rare_term_deck,
                 deformations_per_clean=self.bdata_cfg.refresh_deformations_per_clean,
                 include_clean=self.bdata_cfg.refresh_include_clean,
                 processing_device=_processing_device,
                 preload_workers=self.bdata_cfg.preload_workers,
+                force_rebuild=_berk_force,
             )
             gate_val_loader, _n_gate_val = _build_berkeley_gate_val_loader(
                 data_root=data_root, image_size=self.bdata_cfg.image_size,
@@ -1189,12 +1189,13 @@ class DataNode(PipelineNode):
                 wheel_max_bytes=self.bdata_cfg.wheel_max_bytes,
                 wheel_sanity_cap_bytes=self.bdata_cfg.wheel_sanity_cap_bytes,
                 wheel_allow_large_override=self.bdata_cfg.wheel_allow_large_override,
-                wheel_expiry_uses=self.bdata_cfg.wheel_expiry_uses,
                 wheel_lookahead_batches=self.bdata_cfg.wheel_lookahead_batches,
                 wheel_use_rare_term_deck=self.bdata_cfg.wheel_use_rare_term_deck,
                 processing_device=_processing_device,
                 preload_workers=self.bdata_cfg.preload_workers,
+                force_rebuild=_berk_force,
             )
+        self.possessions["berkeley"].force_next_rebuild = False
         if self.bdata_cfg.prebuild_batches > 0 and loader is not None:
             ctx.berkeley_cache = _build_berkeley_refresh_cache(
                 loader=loader, device=ctx.device,
@@ -1224,6 +1225,8 @@ class DataNode(PipelineNode):
 
         # Possession tracking
         poss = self.possessions["berkeley"]
+        _refresh_wheel_info = getattr(loader, "_semantic_wheel_info", {}) if loader is not None else {}
+        poss.deck_is_bounded = bool(_refresh_wheel_info.get("deck_is_bounded", False))
         poss.mark_built()
         _log(f"[data-node] berkeley refresh loader built at round {ctx.total_rounds_completed}")
 
@@ -1253,7 +1256,6 @@ class DataNode(PipelineNode):
                 wheel_max_bytes=self.bdata_cfg.wheel_max_bytes,
                 wheel_sanity_cap_bytes=self.bdata_cfg.wheel_sanity_cap_bytes,
                 wheel_allow_large_override=self.bdata_cfg.wheel_allow_large_override,
-                wheel_expiry_uses=self.bdata_cfg.wheel_expiry_uses,
                 wheel_lookahead_batches=self.bdata_cfg.wheel_lookahead_batches,
                 wheel_use_rare_term_deck=self.bdata_cfg.wheel_use_rare_term_deck,
                 processing_device=_processing_device,
@@ -1301,7 +1303,6 @@ class DataNode(PipelineNode):
                 wheel_max_bytes=self.bdata_cfg.wheel_max_bytes,
                 wheel_sanity_cap_bytes=self.bdata_cfg.wheel_sanity_cap_bytes,
                 wheel_allow_large_override=self.bdata_cfg.wheel_allow_large_override,
-                wheel_expiry_uses=self.bdata_cfg.wheel_expiry_uses,
                 wheel_lookahead_batches=self.bdata_cfg.wheel_lookahead_batches,
                 wheel_use_rare_term_deck=self.bdata_cfg.wheel_use_rare_term_deck,
                 force_rebuild=bool(self.payload_cfg.force_cache_rebuild),
@@ -1767,6 +1768,16 @@ def _flatten_symbol_pool(
     return images, targets
 
 
+def _get_deck_sampler(loader: Any) -> Optional[StatefulSequentialDeckSampler]:
+    """Extract the StatefulSequentialDeckSampler from a DataLoader, if present."""
+    if loader is None:
+        return None
+    sampler = getattr(loader, "sampler", None)
+    if isinstance(sampler, StatefulSequentialDeckSampler):
+        return sampler
+    return None
+
+
 def _log(msg: str) -> None:
     print(msg, flush=True)
 
@@ -2049,6 +2060,7 @@ def _build_semantic_stage_cache_dataset(
     deformations_per_clean: int = 2,
     include_clean: bool = True,
     processing_device: Optional[Any] = None,
+    force_rebuild: bool = False,
 ) -> Tuple[Dataset, List[int], Dict[str, Any]]:
     cache_args = _semantic_stage_cache_args(ctx=ctx, stage_cache_mb=int(stage_cache_mb))
     total_rows = min(
@@ -2122,13 +2134,6 @@ def _build_semantic_stage_cache_dataset(
     slot_lifespan = int(cache_args.get("slot_lifespan", 0))
     explicit_max_bytes = int(cache_args.get("explicit_max_bytes", 0))
     max_rows = int(cache_args.get("max_rows", 0))
-    if int(slot_lifespan) <= 0 and (
-        int(explicit_max_bytes) > 0
-        or (int(max_rows) > 0 and int(max_rows) < int(total_rows))
-    ):
-        # A bounded wheel must rotate through its deck instead of freezing on the
-        # first slice forever, even when no explicit slot lifespan was requested.
-        slot_lifespan = 1
 
     wheel_result = ensure_semantic_candidate_cache(
         candidates=candidates,
@@ -2153,7 +2158,7 @@ def _build_semantic_stage_cache_dataset(
             expiry_uses=int(slot_lifespan),
             max_base_rows=int(max_rows),
             use_rare_term_deck=bool(cache_args.get("use_rare_term_deck", True)),
-            force_rebuild=bool(cache_args.get("rebuild", False)),
+            force_rebuild=bool(force_rebuild) or bool(cache_args.get("rebuild", False)),
             processing_device=processing_device,
         ),
     )
@@ -2249,12 +2254,25 @@ def _register_churn_terms(
         max_terms_per_slot=int(getattr(ctx, "vocab_lora_max_terms", 0) or len(getattr(ctx, "active_extra_terms", [])) or 0),
     )
     extra_count = int(plan.get("required_extra_term_count", 0))
+    fit = bool(plan.get("current_vocab_fit", False))
     if extra_count > 0:
         _log(
             f"[data-node] churn requirement source={str(source)} "
             f"extra_terms={extra_count} slots={int(plan.get('slot_count', 0))} "
-            f"fit={bool(plan.get('current_vocab_fit', False))}"
+            f"fit={fit}"
         )
+    # Immediately activate if terms don't fit current vocab — don't wait
+    # for the next VocabChurnNode cycle which may have already passed.
+    if extra_count > 0 and not fit:
+        slot = select_active_vocab_lora_slot(ctx)
+        if isinstance(slot, dict) and slot:
+            info = activate_vocab_lora_slot(ctx, slot)
+            _log(
+                f"[data-node] churn immediate activation source={str(source)} "
+                f"slot={str(info.get('slot_name', ''))} "
+                f"terms={int(len(info.get('terms') or []))} "
+                f"classes={int(info.get('class_count', 0))}"
+            )
     return plan
 
 
@@ -2316,7 +2334,7 @@ def _ensure_berkeley_semantic_wheel(
         explicit_max_bytes=max(0, int(wheel_max_bytes)),
         sanity_cap_bytes=max(1, int(wheel_sanity_cap_bytes)),
         allow_large_override=bool(wheel_allow_large_override),
-        expiry_uses=max(1, int(wheel_expiry_uses)),
+        expiry_uses=max(0, int(wheel_expiry_uses)),
         max_base_rows=max(0, int(max_base_rows)),
         use_rare_term_deck=bool(wheel_use_rare_term_deck),
         force_rebuild=bool(force_rebuild),
@@ -2333,6 +2351,7 @@ def _ensure_berkeley_semantic_wheel(
     wheel_info["cache_dir"] = str(wheel_result.get("cache_dir", ""))
     wheel_info["cache_manifest"] = str(wheel_result.get("manifest", ""))
     wheel_info["cache_hit"] = bool(wheel_result.get("cache_hit", False))
+    wheel_info["deck_is_bounded"] = int(wheel_info.get("base_row_count", 0)) < len(candidate_indices)
     _log_semantic_wheel_summary(str(purpose), wheel_info)
     return wheel_result, wheel_info
 
@@ -2482,13 +2501,14 @@ def _build_berkeley_refresh_loader(
     wheel_max_bytes: int = 0,
     wheel_sanity_cap_bytes: int = 30 * 1024 * 1024 * 1024,
     wheel_allow_large_override: bool = False,
-    wheel_expiry_uses: int = 1,
+    wheel_expiry_uses: int = 0,
     wheel_lookahead_batches: int = 0,
     wheel_use_rare_term_deck: bool = True,
     deformations_per_clean: int = 2,
     include_clean: bool = True,
     processing_device: Optional[Any] = None,
     preload_workers: int = 0,
+    force_rebuild: bool = False,
 ):
     del auto_install_scipy
     rows, rows_info = collect_semantic_disk_rows(
@@ -2526,6 +2546,7 @@ def _build_berkeley_refresh_loader(
         wheel_expiry_uses=int(wheel_expiry_uses),
         max_base_rows=int(max_train),
         wheel_use_rare_term_deck=bool(wheel_use_rare_term_deck),
+        force_rebuild=bool(force_rebuild),
         processing_device=processing_device,
         preload_workers=int(preload_workers),
     )
@@ -2708,11 +2729,12 @@ def _build_berkeley_gate_val_loader(
     wheel_max_bytes: int = 0,
     wheel_sanity_cap_bytes: int = 30 * 1024 * 1024 * 1024,
     wheel_allow_large_override: bool = False,
-    wheel_expiry_uses: int = 1,
+    wheel_expiry_uses: int = 0,
     wheel_lookahead_batches: int = 0,
     wheel_use_rare_term_deck: bool = True,
     processing_device: Optional[Any] = None,
     preload_workers: int = 0,
+    force_rebuild: bool = False,
 ):
     del auto_install_scipy
     rows, rows_info = collect_semantic_disk_rows(
@@ -2745,6 +2767,7 @@ def _build_berkeley_gate_val_loader(
         wheel_expiry_uses=int(wheel_expiry_uses),
         max_base_rows=int(max_val),
         wheel_use_rare_term_deck=bool(wheel_use_rare_term_deck),
+        force_rebuild=bool(force_rebuild),
         processing_device=processing_device,
         preload_workers=int(preload_workers),
     )
@@ -3327,7 +3350,7 @@ def _build_payload_validation_gate_dataset(
     wheel_max_bytes: int = 0,
     wheel_sanity_cap_bytes: int = 30 * 1024 * 1024 * 1024,
     wheel_allow_large_override: bool = False,
-    wheel_expiry_uses: int = 1,
+    wheel_expiry_uses: int = 0,
     wheel_lookahead_batches: int = 0,
     wheel_use_rare_term_deck: bool = True,
     force_rebuild: bool = False,
@@ -3805,7 +3828,7 @@ def _build_berkeley_payload_bank(
     wheel_max_bytes: int = 0,
     wheel_sanity_cap_bytes: int = 30 * 1024 * 1024 * 1024,
     wheel_allow_large_override: bool = False,
-    wheel_expiry_uses: int = 1,
+    wheel_expiry_uses: int = 0,
     wheel_lookahead_batches: int = 0,
     wheel_use_rare_term_deck: bool = True,
     processing_device: Optional[Any] = None,

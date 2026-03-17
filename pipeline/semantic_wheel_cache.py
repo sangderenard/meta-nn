@@ -721,7 +721,7 @@ class SemanticWheelConfig:
     explicit_max_bytes: int = 0
     sanity_cap_bytes: int = 30 * 1024 * 1024 * 1024
     allow_large_override: bool = False
-    expiry_uses: int = 1
+    expiry_uses: int = 0
     max_base_rows: int = 0
     use_rare_term_deck: bool = True
     degrade_config: Optional[Dict[str, Any]] = None
@@ -883,6 +883,7 @@ class StatefulSequentialDeckSampler(Sampler[int]):
     def __init__(self, length: int):
         self.length = max(0, int(length))
         self.cursor = 0
+        self.items_yielded: int = 0
 
     def __iter__(self):
         start = int(self.cursor)
@@ -890,11 +891,20 @@ class StatefulSequentialDeckSampler(Sampler[int]):
         while int(emitted) < int(self.length):
             idx = int((int(start) + int(emitted)) % max(1, int(self.length)))
             emitted += 1
+            self.items_yielded += 1
             self.cursor = int((idx + 1) % max(1, int(self.length)))
             yield int(idx)
 
     def __len__(self) -> int:
         return int(self.length)
+
+    @property
+    def all_items_seen(self) -> bool:
+        """True when every item has been yielded at least once since last reset."""
+        return int(self.items_yielded) >= int(self.length) and int(self.length) > 0
+
+    def reset_items_yielded(self) -> None:
+        self.items_yielded = 0
 
 
 def ensure_semantic_candidate_cache(
@@ -936,12 +946,8 @@ def ensure_semantic_candidate_cache(
         and int(manifest.get("label_dim", 0)) == int(label_dim)
         and int(manifest.get("image_size", 0)) == int(config.image_size)
     )
-    uses = int(manifest.get("use_count", 0)) if manifest_ok else 0
-    expiry_uses = int(config.expiry_uses)
-    can_reuse = bool(expiry_uses <= 0 or int(uses) < int(expiry_uses))
-    if bool(manifest_ok) and bool(can_reuse):
+    if bool(manifest_ok):
         manifest["cache_hit"] = True
-        manifest["use_count"] = int(uses) + 1
         manifest["lookahead_batches"] = int(config.lookahead_batches)
         _store_json(manifest_path, manifest)
         return {
@@ -1164,8 +1170,6 @@ def ensure_semantic_candidate_cache(
         "include_clean": bool(config.include_clean),
         "entries_per_clean": int(entries_per_clean),
         "cache_hit": False,
-        "use_count": 1,
-        "expiry_uses": int(expiry_uses),
         "explicit_max_bytes": int(config.explicit_max_bytes),
         "effective_max_bytes": int(effective_limit),
         "sanity_cap_bytes": int(config.sanity_cap_bytes),

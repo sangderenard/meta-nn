@@ -847,7 +847,21 @@ class SaveRestoreNode(PipelineNode):
             )
 
         # 2. Build the checkpoint payload
-        snapshot_lora = self._get_lora_snapshot(ctx)
+        # LoRA slots live in lora_library/<slot_name>.pt managed by vocab_node.
+        # At checkpoint time, flush the currently active slot so training progress
+        # since the last activation is not lost.
+        active_slot = str(getattr(ctx, "lora_active_slot", "") or "").strip()
+        if active_slot and ctx.classifier is not None:
+            try:
+                from wav_ml_models import save_lora_slot_to_file
+                from pipeline.nodes.vocab_node import _lora_library_dir
+                lib_dir = _lora_library_dir(ctx)
+                if lib_dir is not None:
+                    saved = save_lora_slot_to_file(ctx.classifier, active_slot, lib_dir / f"{active_slot}.pt")
+                    if saved:
+                        _log(f"[checkpoint] flushed active lora slot to library: {active_slot}")
+            except Exception as exc:
+                _log(f"[checkpoint] WARNING: could not flush lora slot: {exc}")
 
         payload: Dict[str, Any] = {
             "run_tag": ctx.run_tag,
@@ -866,8 +880,11 @@ class SaveRestoreNode(PipelineNode):
             "vocab_lora_active_terms": list(getattr(ctx, "vocab_lora_active_terms", []) or []),
             "vocab_lora_locked_terms": list(getattr(ctx, "vocab_lora_locked_terms", []) or []),
             "vocab_lora_max_terms": int(getattr(ctx, "vocab_lora_max_terms", 0) or 0),
-            "vocab_lora_latest_plan_signature": str(getattr(ctx, "vocab_lora_latest_plan_signature", "") or ""),
-            "vocab_lora_plan_slot_cursor": int(getattr(ctx, "vocab_lora_plan_slot_cursor", 0) or 0),
+            # vocab_lora_latest_plan_signature and vocab_lora_plan_slot_cursor are intentionally
+            # NOT saved: data nodes re-register their requirements fresh each run, so the active
+            # plan pointer should be established by the current round's nodes (e.g. Berkeley),
+            # not inherited from a previous run — otherwise stale Berkeley plans activate during
+            # pregestation which only needs the inbuilt supervised vocabulary.
         }
         if ctx.render_config is not None:
             try:
@@ -886,10 +903,8 @@ class SaveRestoreNode(PipelineNode):
         if ctx.metrics_history:
             payload["metrics_history"] = list(ctx.metrics_history)
             payload["orchestration_history"] = list(ctx.metrics_history)
-        # Lora state
-        if ctx.lora_slot_snapshots:
-            payload["lora_slot_snapshots"] = dict(ctx.lora_slot_snapshots)
-        payload["lora_active_slot"] = ctx.lora_active_slot
+        # LoRA state is saved separately in lora_classifier.pt — not embedded in the
+        # main checkpoint so the classifier state_dict is always a clean base model.
 
         # Model state dicts
         _models = {
@@ -919,7 +934,10 @@ class SaveRestoreNode(PipelineNode):
         }
         for name, model in _models.items():
             if model is not None:
-                payload[f"{name}_state"] = model.state_dict()
+                sd = model.state_dict()
+                if name == "classifier":
+                    sd = self._strip_lora_from_state_dict(model, sd)
+                payload[f"{name}_state"] = sd
         for name, optimizer in _optimizers.items():
             if optimizer is not None:
                 try:
@@ -938,26 +956,24 @@ class SaveRestoreNode(PipelineNode):
                     payload[f"{name}_grad_scaler_state"] = scaler.state_dict()
                 except Exception:
                     pass
-        if snapshot_lora is not None:
-            payload["classifier_lora"] = snapshot_lora
+        # classifier_lora is NOT embedded in the main payload — it lives in lora_classifier.pt
 
         # 3. Atomic write
         _save_pipeline_checkpoint(out_dir / "pipeline_checkpoint.pt", payload)
 
-        # Write per-model files
+        # Write per-model files (classifier always saved as clean base model, no LoRA)
         for name, model in _models.items():
             if model is not None:
                 extra = {}
-                _state_blob = None
-                if name == "classifier" and snapshot_lora is not None:
-                    extra["classifier_lora"] = snapshot_lora
                 try:
                     _state_blob = model.state_dict()
+                    if name == "classifier":
+                        _state_blob = self._strip_lora_from_state_dict(model, _state_blob)
                     extra["weight_render_spec"] = resolve_weight_render_spec(_state_blob)
                 except Exception:
-                    pass
-                if _state_blob is None:
                     _state_blob = model.state_dict()
+                    if name == "classifier":
+                        _state_blob = self._strip_lora_from_state_dict(model, _state_blob)
                 torch.save(
                     {"state_dict": _state_blob, **extra},
                     out_dir / f"{name}.pt",
@@ -1141,10 +1157,14 @@ class SaveRestoreNode(PipelineNode):
         ctx.vocab_lora_active_terms = list(ckpt.get("vocab_lora_active_terms", []) or [])
         ctx.vocab_lora_locked_terms = list(ckpt.get("vocab_lora_locked_terms", []) or [])
         ctx.vocab_lora_max_terms = int(ckpt.get("vocab_lora_max_terms", getattr(ctx, "vocab_lora_max_terms", 0)) or 0)
-        ctx.vocab_lora_latest_plan_signature = str(ckpt.get("vocab_lora_latest_plan_signature", "") or "")
-        ctx.vocab_lora_plan_slot_cursor = int(ckpt.get("vocab_lora_plan_slot_cursor", 0) or 0)
-        ctx.lora_slot_snapshots = dict(ckpt.get("lora_slot_snapshots", {}) or {})
-        ctx.lora_active_slot = str(ckpt.get("lora_active_slot", "") or "")
+        # vocab_lora_latest_plan_signature and vocab_lora_plan_slot_cursor are not restored;
+        # they start empty each run so churn only activates once this round's data nodes
+        # (Berkeley, payload) have re-registered their requirements.
+        # lora_slot_snapshots and lora_active_slot are not restored from the checkpoint;
+        # LoRA weights live in the lora_library/ directory and are loaded on demand
+        # by activate_vocab_lora_slot / ensure_vocab_lora_active when stages need them.
+        ctx.lora_slot_snapshots = {}
+        ctx.lora_active_slot = ""
         try:
             ctx.total_rounds_completed = max(
                 0,
@@ -1188,18 +1208,9 @@ class SaveRestoreNode(PipelineNode):
                     _log(f"[restore] loaded {name} weights")
                 except Exception as exc:
                     _log(f"[restore] WARNING: {name} weight load failed: {exc}")
-        if ctx.classifier is not None and isinstance(ckpt.get("classifier_lora"), dict):
-            try:
-                from wav_ml_models import restore_tiny_classifier_lora_snapshot
-
-                info = restore_tiny_classifier_lora_snapshot(ctx.classifier, ckpt.get("classifier_lora"))
-                if bool(info.get("used", False)):
-                    _log(
-                        f"[restore] restored classifier LoRA "
-                        f"slots={int(info.get('slots', 0))} active={str(info.get('active_slot', ''))}"
-                    )
-            except Exception as exc:
-                _log(f"[restore] WARNING: classifier LoRA restore failed: {exc}")
+        # LoRA weights are NOT restored from the main checkpoint.
+        # Each slot lives in lora_library/<slot_name>.pt and is loaded on demand
+        # by activate_vocab_lora_slot or ensure_vocab_lora_active.
 
         # 2b. Restore optimizer, LR-controller, and grad-scaler state
         for name, optimizer in _optimizers.items():
@@ -1285,6 +1296,42 @@ class SaveRestoreNode(PipelineNode):
             except Exception:
                 pass
         return None
+
+    @staticmethod
+    def _strip_lora_from_state_dict(model: Any, state_dict: Dict[str, Any]) -> Dict[str, Any]:
+        """Return a copy of state_dict with LoRA slot keys removed and .base. keys remapped.
+
+        LoRALinear/LoRAConv2d1x1 wrap base layers: state_dict keys become
+        ``<path>.base.weight`` and ``<path>.slots.<name>.*``.  This strips the
+        slot weights and remaps the base keys back to plain ``<path>.weight``
+        so the checkpoint restores cleanly into a vanilla (no-LoRA) model.
+        """
+        try:
+            from wav_ml_models import LoRALinear, LoRAConv2d1x1
+        except ImportError:
+            return dict(state_dict)
+        lora_prefixes: set = set()
+        for name, mod in model.named_modules():
+            if isinstance(mod, (LoRALinear, LoRAConv2d1x1)):
+                lora_prefixes.add(name + ".")
+        if not lora_prefixes:
+            return dict(state_dict)
+        clean: Dict[str, Any] = {}
+        for k, v in state_dict.items():
+            matched = False
+            for prefix in lora_prefixes:
+                if k.startswith(prefix + "slots."):
+                    matched = True  # drop LoRA slot weights
+                    break
+                if k.startswith(prefix + "base."):
+                    # remap e.g. "semantic_expand.0.base.weight" → "semantic_expand.0.weight"
+                    suffix = k[len(prefix) + len("base."):]
+                    clean[prefix + suffix] = v
+                    matched = True
+                    break
+            if not matched:
+                clean[k] = v
+        return clean
 
     # -- Public API for external callers ----------------------------------
 

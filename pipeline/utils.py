@@ -413,7 +413,7 @@ def _default_class_names() -> List[str]:
         "bright", "dark", "loud", "quiet", "smooth", "rough",
         "near", "far", "inside", "outside",
         "up", "down", "left", "right", "shift", "horizontal flip",
-        "vertical flip", "horizontal center", "vertical center", "center", "eye", "ear", "mouth", "hand",
+        "vertical flip", "horizontal center", "vertical center", "center", "warm", "cool", "neutral", "orange",
         "touch", "voice", "breath", "pain", "comfort",
         "hunger", "edge blur", "alert", "danger", "safety",
         "memory", "familiar", "unfamiliar", "attention", "surprise",

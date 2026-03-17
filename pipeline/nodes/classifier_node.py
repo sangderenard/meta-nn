@@ -1075,8 +1075,9 @@ def ensure_vocab_lora_active(ctx: PipelineContext, cfg: ClassifierConfig) -> Dic
         ensure_tiny_classifier_lora_slot,
         set_tiny_classifier_lora_state,
         tiny_classifier_lora_modules,
-        restore_tiny_classifier_lora_snapshot,
+        load_lora_slot_from_file,
     )
+    from pipeline.nodes.vocab_node import _lora_library_dir
 
     # Step 1: ensure LoRA modules are installed on the classifier
     mods = tiny_classifier_lora_modules(ctx.classifier)
@@ -1100,14 +1101,13 @@ def ensure_vocab_lora_active(ctx: PipelineContext, cfg: ClassifierConfig) -> Dic
     if not slot_name:
         slot_name = f"vocab_{signature}"
 
-    # Step 3: ensure the slot exists and restore any snapshot
+    # Step 3: ensure the slot exists, then load from library if available
     ensure_tiny_classifier_lora_slot(ctx.classifier, slot_name=slot_name)
-    existing_snapshot = (
-        getattr(ctx, "lora_slot_snapshots", {}).get(str(signature))
-        or getattr(ctx, "lora_slot_snapshots", {}).get(str(slot_name))
-    )
-    if isinstance(existing_snapshot, dict):
-        restore_tiny_classifier_lora_snapshot(ctx.classifier, existing_snapshot)
+    lib_dir = _lora_library_dir(ctx)
+    if lib_dir is not None:
+        slot_file = lib_dir / f"{slot_name}.pt"
+        if slot_file.exists():
+            load_lora_slot_from_file(ctx.classifier, slot_name, slot_file)
 
     # Step 4: activate — backbone + LoRA train together
     set_tiny_classifier_lora_state(ctx.classifier, slot_name=slot_name, lora_only=False)
@@ -1158,7 +1158,17 @@ def _sync_gate_classifier_replica(
         created = True
     gate_classifier = gate_classifier.to(device=gate_device, dtype=torch.float32)
     _sync_label_bank_state(source_base, gate_classifier)
-    gate_classifier.load_state_dict(source_base.state_dict(), strict=not bool(created))
+    src_sd = source_base.state_dict()
+    dst_keys = set(gate_classifier.state_dict().keys())
+    if not dst_keys.issubset(src_sd.keys()):
+        collapsed: Dict[str, torch.Tensor] = {}
+        for k, v in src_sd.items():
+            if ".slots." in k:
+                continue
+            plain = k.replace(".base.weight", ".weight").replace(".base.bias", ".bias")
+            collapsed[plain] = v
+        src_sd = collapsed
+    gate_classifier.load_state_dict(src_sd, strict=not bool(created))
     gate_classifier.eval()
     for p in gate_classifier.parameters():
         p.requires_grad_(False)

@@ -349,6 +349,8 @@ class PipelineContext:
     round_id: int = 0
     total_rounds_completed: int = 0
     vocab_rotation_cycle: int = 0
+    vocab_lora_plan_registered_cycle: int = -1  # orchestrator cycle when plan_signature was last set
+    vocab_churn_activation_pending: bool = False  # set by activating sources; consumed+cleared by VocabChurnNode
     last_node_statuses: Dict[str, str] = field(default_factory=dict)
     last_execution_trace: List[Dict[str, Any]] = field(default_factory=list)
     last_program_trace: List[Dict[str, Any]] = field(default_factory=list)

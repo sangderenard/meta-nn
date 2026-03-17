@@ -199,24 +199,32 @@ class VocabChurnNode(PipelineNode):
         return (ctx.vocab_rotation_cycle % max(1, self.cfg.churn_every_n_cycles)) == 0
 
     def execute(self, ctx: PipelineContext) -> None:
-        selected_slot = select_active_vocab_lora_slot(ctx)
+        # Activate a slot only when an activating source (berkeley, payload, etc.)
+        # explicitly raised the pending flag this round.  The flag is consumed here
+        # so it cannot carry over into a subsequent node execution.
+        pending = bool(getattr(ctx, "vocab_churn_activation_pending", False))
+        ctx.vocab_churn_activation_pending = False  # consume unconditionally
+
+        selected_slot = select_active_vocab_lora_slot(ctx) if pending else None
         if isinstance(selected_slot, dict) and selected_slot:
             info = activate_vocab_lora_slot(ctx, selected_slot)
             ctx.vocab_rotation_cycle += 1
+            slot_terms = list(info.get("terms") or [])
             _log(
                 f"[vocab-churn] cycle={ctx.vocab_rotation_cycle} "
                 f"planned slot={str(info.get('slot_name', ''))} "
-                f"terms={int(len(info.get('terms') or []))} "
+                f"terms={int(len(slot_terms))} "
                 f"signature={str(info.get('signature', ''))[:12]}"
             )
+            for _t in slot_terms:
+                _log(f"[vocab-churn]   term: {str(_t)}")
             return
 
-        # No LoRA plan — nothing to rotate.  Churn only manages the LoRA
-        # library; it does not spuriously swap active terms.
+        # No activating source raised a request this round — nothing to rotate.
         ctx.vocab_rotation_cycle += 1
         _log(
             f"[vocab-churn] cycle={ctx.vocab_rotation_cycle} "
-            f"no-op (no lora plan)"
+            f"no-op ({'no pending activation' if not pending else 'no slot selected'})"
         )
 
 
@@ -805,7 +813,12 @@ def plan_vocab_lora_requirements(
     required_extra_set = {_vocab_term_key(term) for term in required_extra}
     current_vocab_fit = bool(required_extra_set.issubset(current_extra_set))
     max_terms = max(1, int(max_terms_per_slot) if int(max_terms_per_slot) > 0 else int(getattr(ctx, "vocab_lora_max_terms", 0) or len(current_extra) or len(required_extra) or 1))
-    fixed_locked_terms = list(locked_terms[: int(max_terms)])
+    # Exclude locked terms already covered by the supervised (inbuilt) set — they
+    # don't need LoRA slot capacity since they're always present in the classifier.
+    locked_terms_non_supervised = [
+        t for t in locked_terms if _vocab_term_key(t) not in supervised_set
+    ]
+    fixed_locked_terms = list(locked_terms_non_supervised[: int(max_terms)])
     variable_terms = [
         str(term)
         for term in required_extra
@@ -902,6 +915,8 @@ def register_churn_requirement(
             if str(getattr(ctx, "vocab_lora_latest_plan_signature", "")) != str(plan_signature):
                 ctx.vocab_lora_plan_slot_cursor = 0
             ctx.vocab_lora_latest_plan_signature = str(plan_signature)
+            ctx.vocab_lora_plan_registered_cycle = int(getattr(ctx, "cycle", -1))
+            ctx.vocab_churn_activation_pending = True
     for slot in list(plan.get("slots") or []):
         signature = str(slot.get("signature", "")).strip()
         if not signature:
@@ -968,7 +983,31 @@ def select_active_vocab_lora_slot(ctx: PipelineContext) -> Optional[Dict[str, An
     return slot
 
 
+def _lora_library_dir(ctx: PipelineContext) -> Optional[Path]:
+    out = getattr(ctx, "output_dir", None)
+    if out is None:
+        return None
+    p = Path(out) / "lora_library"
+    try:
+        p.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        return None
+    return p
+
+
 def activate_vocab_lora_slot(ctx: PipelineContext, slot: Dict[str, Any]) -> Dict[str, Any]:
+    from wav_ml_models import save_lora_slot_to_file, load_lora_slot_from_file
+
+    lib_dir = _lora_library_dir(ctx)
+
+    # Save the outgoing active slot back to the library before switching
+    outgoing_slot = str(getattr(ctx, "lora_active_slot", "") or "").strip()
+    if outgoing_slot and ctx.classifier is not None and lib_dir is not None:
+        slot_path = lib_dir / f"{outgoing_slot}.pt"
+        saved = save_lora_slot_to_file(ctx.classifier, outgoing_slot, slot_path)
+        if saved:
+            _log(f"[lora-library] saved outgoing slot: {outgoing_slot}")
+
     slot_terms = _normalize_vocab_terms(slot.get("terms") or [])
     total_slots = max(1, int(getattr(ctx, "vocab_lora_max_terms", 0) or len(getattr(ctx, "active_extra_terms", [])) or len(slot_terms) or 1))
     active_extra = _normalize_active_extra_terms_with_core(
@@ -981,15 +1020,27 @@ def activate_vocab_lora_slot(ctx: PipelineContext, slot: Dict[str, Any]) -> Dict
     ctx.semantic_term_to_idx = _semantic_term_index_map(ctx.class_names)
     ctx.vocab_lora_active_signature = str(slot.get("signature", "") or "")
     ctx.vocab_lora_active_terms = list(_normalize_vocab_terms(slot.get("terms") or []))
+    incoming_slot_name = str(slot.get("slot_name", f"vocab_{ctx.vocab_lora_active_signature}"))
+    ctx.lora_active_slot = incoming_slot_name
+
+    # Load the incoming slot from the library if it exists
+    if ctx.classifier is not None and lib_dir is not None:
+        slot_path = lib_dir / f"{incoming_slot_name}.pt"
+        if slot_path.exists():
+            loaded = load_lora_slot_from_file(ctx.classifier, incoming_slot_name, slot_path)
+            _log(f"[lora-library] {'loaded' if loaded else 'load failed'} incoming slot: {incoming_slot_name}")
+        else:
+            _log(f"[lora-library] new slot (no file yet): {incoming_slot_name}")
+
     library_entry = dict(ctx.vocab_lora_library.get(str(ctx.vocab_lora_active_signature), {}) or {})
     if library_entry:
         library_entry["activation_count"] = int(library_entry.get("activation_count", 0)) + 1
         library_entry["last_activation_cycle"] = int(getattr(ctx, "vocab_rotation_cycle", 0))
-        library_entry["snapshot_present"] = bool(str(ctx.vocab_lora_active_signature) in getattr(ctx, "lora_slot_snapshots", {}))
+        library_entry["has_library_file"] = bool(lib_dir is not None and (lib_dir / f"{incoming_slot_name}.pt").exists())
         ctx.vocab_lora_library[str(ctx.vocab_lora_active_signature)] = library_entry
     return {
         "signature": str(ctx.vocab_lora_active_signature),
-        "slot_name": str(slot.get("slot_name", f"vocab_{ctx.vocab_lora_active_signature}")),
+        "slot_name": incoming_slot_name,
         "terms": list(ctx.vocab_lora_active_terms),
         "class_count": int(len(ctx.class_names)),
         "extra_count": int(len(ctx.active_extra_terms)),
