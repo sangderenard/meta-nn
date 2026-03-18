@@ -769,7 +769,7 @@ class SemanticWheelConfig:
     deformations_per_clean: int = 0
     include_clean: bool = True
     explicit_max_bytes: int = 0
-    sanity_cap_bytes: int = 30 * 1024 * 1024 * 1024
+    sanity_cap_bytes: int = 8 * 1024 * 1024 * 1024
     allow_large_override: bool = False
     expiry_uses: int = 0
     max_base_rows: int = 0

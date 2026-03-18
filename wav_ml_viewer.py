@@ -770,24 +770,36 @@ class _TransformerStatusOpenGLViewer:
         try:
             from PIL import Image, ImageDraw, ImageFont
 
-            im = Image.fromarray(out).convert("RGB")
-            draw = ImageDraw.Draw(im)
             font = ImageFont.load_default()
+            line_h = 11
+            header_h = 20
+            # Render at the full height required so no line is ever clipped.
+            native_h = max(self.panel_h, header_h + len(list(rows)) * line_h + 4)
 
-            draw.rectangle([(0, 0), (self.panel_w - 1, self.panel_h - 1)], fill=(20, 24, 30))
+            canvas = np.full((native_h, self.panel_w, 3), 16, dtype=np.uint8)
+            im = Image.fromarray(canvas).convert("RGB")
+            draw = ImageDraw.Draw(im)
+
+            draw.rectangle([(0, 0), (self.panel_w - 1, native_h - 1)], fill=(20, 24, 30))
             draw.rectangle([(0, 0), (self.panel_w - 1, 15)], fill=(34, 42, 52))
-            # Right-justify title
             _tw = font.getlength(str(title)) if hasattr(font, 'getlength') else len(str(title)) * 6
             draw.text((max(4, self.panel_w - 4 - int(_tw)), 2), str(title), fill=(255, 225, 70), font=font)
             draw.line([(0, 16), (self.panel_w - 1, 16)], fill=(70, 76, 88), width=1)
-            y = 20
+            y = header_h
             for r in list(rows):
                 txt = str(r)
+                if txt.startswith("!"):
+                    txt = txt[1:]
+                    fill = (255, 210, 60)   # amber highlight for target entries
+                else:
+                    fill = (230, 234, 240)
                 _rw = font.getlength(txt) if hasattr(font, "getlength") else len(txt) * 6
-                draw.text((max(4, self.panel_w - 4 - int(_rw)), y), txt, fill=(230, 234, 240), font=font)
-                y += 11
-                if y >= (self.panel_h - 10):
-                    break
+                draw.text((max(4, self.panel_w - 4 - int(_rw)), y), txt, fill=fill, font=font)
+                y += line_h
+            # Scale down to the fixed panel size only when the content exceeds it,
+            # preserving all text rather than clipping.
+            if native_h > self.panel_h:
+                im = im.resize((self.panel_w, self.panel_h), Image.LANCZOS)
             return np.asarray(im, dtype=np.uint8)
         except Exception:
             return out

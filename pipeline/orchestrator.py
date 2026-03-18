@@ -1863,6 +1863,7 @@ def run(args, output_dir: Path, initial_plan=None) -> None:
     ctx.orchestration_mode = str(plan_hints.get("orchestration_mode", _arg_value(args, "orchestration_mode", default="staged_cgrw")) or "staged_cgrw")
     ctx.orchestration_cycles = cycles
     ctx.orchestration_rounds = rounds_per_cycle
+    ctx.training_preview_topk = int(_arg_value(args, "training_preview_topk", default=6))
     ctx.viewer_proxy = _make_viewer_proxy(args, cycles)
     _initialize_loss_logger(ctx)
     if ctx.viewer_proxy is not None:

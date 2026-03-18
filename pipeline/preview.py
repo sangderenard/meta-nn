@@ -84,17 +84,64 @@ def _format_target_lines(target_vec: Any, class_names: Sequence[str], threshold:
     return hits if hits else ["none"]
 
 
-def _format_top_lines(probs: Any, class_names: Sequence[str], topk: int = 0) -> List[str]:
+# Lines that fit in the text panel at native resolution without any scaling.
+# Derived from the known panel geometry: panel_h=256, header=20px, line=11px.
+_PANEL_NATIVE_LINES: int = (256 - 20) // 11  # = 21
+
+
+def _format_top_lines(
+    probs: Any,
+    class_names: Sequence[str],
+    target_vec: Any = None,
+    panel_lines: int = _PANEL_NATIVE_LINES,
+) -> List[str]:
+    """Return prediction lines for the score panel.
+
+    All active targets (target_vec[i] >= 0.5) are listed first in
+    score-descending order, prefixed with "!" so the viewer highlights them.
+    Every target is shown regardless of its score — zeros and dead elements
+    are the whole point.
+
+    Non-target entries fill the remainder of *panel_lines* that targets did
+    not use.  If targets alone meet or exceed *panel_lines*, no non-target
+    entries are included and the renderer will scale the panel down to fit.
+    Lines with a "!" prefix are rendered in amber by the viewer.
+    """
     if probs is None:
         return []
     arr = _to_np_float(probs).reshape(-1)
     if arr.size <= 0:
         return []
-    order = np.argsort(-arr) if int(topk) <= 0 else np.argsort(-arr)[: max(1, int(topk))]
+    order = np.argsort(-arr)  # all indices, best score first
+
+    target_set: set = set()
+    if target_vec is not None:
+        tvec = _to_np_float(target_vec).reshape(-1)
+        for i, v in enumerate(tvec):
+            if float(v) >= 0.5 and i < int(arr.size):
+                target_set.add(int(i))
+
     lines: List[str] = []
-    for idx in order:
-        label = str(class_names[int(idx)]) if 0 <= int(idx) < len(class_names) else f"class_{int(idx)}"
-        lines.append(f"{label}:{float(arr[int(idx)]):.3f}")
+    if target_set:
+        # ALL targets, score-descending — zero-scoring entries appear at bottom
+        for idx in order:
+            if int(idx) in target_set:
+                label = str(class_names[int(idx)]) if 0 <= int(idx) < len(class_names) else f"class_{int(idx)}"
+                lines.append(f"!{label}:{float(arr[int(idx)]):.3f}")
+        # Non-target budget = lines remaining before scaling would be needed
+        non_target_budget = max(0, int(panel_lines) - len(lines))
+        added = 0
+        for idx in order:
+            if added >= non_target_budget:
+                break
+            if int(idx) not in target_set:
+                label = str(class_names[int(idx)]) if 0 <= int(idx) < len(class_names) else f"class_{int(idx)}"
+                lines.append(f"{label}:{float(arr[int(idx)]):.3f}")
+                added += 1
+    else:
+        for idx in order[:int(panel_lines)]:
+            label = str(class_names[int(idx)]) if 0 <= int(idx) < len(class_names) else f"class_{int(idx)}"
+            lines.append(f"{label}:{float(arr[int(idx)]):.3f}")
     return lines
 
 
@@ -125,6 +172,7 @@ def build_classifier_preview_frames(
     class_names: Sequence[str],
     cycle_id: int,
     round_id: int,
+    panel_lines: int = _PANEL_NATIVE_LINES,
 ) -> Tuple[Optional[float], List[Dict[str, Any]]]:
     if not payload_batch:
         return None, []
@@ -164,7 +212,12 @@ def build_classifier_preview_frames(
         panel_detected = np.concatenate([image_chw, detected_mask[None, :, :]], axis=0)
 
         target_lines = _format_target_lines(payload.get("target_vec", None), class_names=class_names)
-        top_lines = _format_top_lines(payload.get("probs", None), class_names=class_names)
+        top_lines = _format_top_lines(
+            payload.get("probs", None),
+            class_names=class_names,
+            target_vec=payload.get("target_vec", None),
+            panel_lines=panel_lines,
+        )
         top_txt = top_lines[0] if top_lines else "n/a"
 
         loss_rows: List[str] = []
@@ -223,11 +276,17 @@ def make_classifier_step_preview_callback(ctx: Any, node_id: str):
         if callable(preview_check) and not preview_check():
             return
         class_names = list(getattr(ctx, "class_names", []) or [])
+        # Derive the native line capacity from the viewer's actual panel size
+        # so the non-target budget tracks reality when panel dimensions change.
+        _viewer = getattr(ctx, "viewer_proxy", None)
+        _ph = int(getattr(_viewer, "panel_h", 256) or 256)
+        _computed_panel_lines = max(1, (_ph - 20) // 11)
         eff_loss, frames = build_classifier_preview_frames(
             payload_batch,
             class_names=class_names,
             cycle_id=int(getattr(ctx, "cycle", 0)),
             round_id=int(getattr(ctx, "round_id", 0)),
+            panel_lines=_computed_panel_lines,
         )
         for frame in frames:
             # Publish one loss entry per item so the graph ticks at the same

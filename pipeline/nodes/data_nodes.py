@@ -389,7 +389,7 @@ class BerkeleyDataConfig:
     cache_device: str = "auto"
     channels_last: bool = False
     wheel_max_bytes: int = 0
-    wheel_sanity_cap_bytes: int = 30 * 1024 * 1024 * 1024
+    wheel_sanity_cap_bytes: int = 8 * 1024 * 1024 * 1024
     wheel_allow_large_override: bool = False
     wheel_lookahead_batches: int = 0
     wheel_use_rare_term_deck: bool = True
@@ -2194,7 +2194,7 @@ def _build_semantic_stage_cache_dataset(
             deformations_per_clean=max(0, int(deformations_per_clean)),
             include_clean=bool(include_clean),
             explicit_max_bytes=int(explicit_max_bytes),
-            sanity_cap_bytes=int(cache_args.get("sanity_cap_bytes", 30 * 1024 * 1024 * 1024)),
+            sanity_cap_bytes=int(cache_args.get("sanity_cap_bytes", 8 * 1024 * 1024 * 1024)),
             allow_large_override=bool(cache_args.get("allow_large_override", False)),
             expiry_uses=int(slot_lifespan),
             max_base_rows=int(max_rows),
@@ -2543,7 +2543,7 @@ def _build_berkeley_refresh_loader(
     prefetch_factor: int = 2,
     return_mask_stack: bool = True,
     wheel_max_bytes: int = 0,
-    wheel_sanity_cap_bytes: int = 30 * 1024 * 1024 * 1024,
+    wheel_sanity_cap_bytes: int = 8 * 1024 * 1024 * 1024,
     wheel_allow_large_override: bool = False,
     wheel_expiry_uses: int = 0,
     wheel_lookahead_batches: int = 0,
@@ -2775,7 +2775,7 @@ def _build_berkeley_gate_val_loader(
     prefetch_factor: int = 2,
     return_mask_stack: bool = False,
     wheel_max_bytes: int = 0,
-    wheel_sanity_cap_bytes: int = 30 * 1024 * 1024 * 1024,
+    wheel_sanity_cap_bytes: int = 8 * 1024 * 1024 * 1024,
     wheel_allow_large_override: bool = False,
     wheel_expiry_uses: int = 0,
     wheel_lookahead_batches: int = 0,
@@ -3400,7 +3400,7 @@ def _build_payload_validation_gate_dataset(
     return_mask_stack: bool = False,
     chunk_batch_size: int = 32,
     wheel_max_bytes: int = 0,
-    wheel_sanity_cap_bytes: int = 30 * 1024 * 1024 * 1024,
+    wheel_sanity_cap_bytes: int = 8 * 1024 * 1024 * 1024,
     wheel_allow_large_override: bool = False,
     wheel_expiry_uses: int = 0,
     wheel_lookahead_batches: int = 0,
@@ -3882,7 +3882,7 @@ def _build_berkeley_payload_bank(
     source_root: str = "",
     force_cache_rebuild: bool = False,
     wheel_max_bytes: int = 0,
-    wheel_sanity_cap_bytes: int = 30 * 1024 * 1024 * 1024,
+    wheel_sanity_cap_bytes: int = 8 * 1024 * 1024 * 1024,
     wheel_allow_large_override: bool = False,
     wheel_expiry_uses: int = 0,
     wheel_lookahead_batches: int = 0,
