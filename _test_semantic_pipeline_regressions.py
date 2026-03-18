@@ -14,10 +14,10 @@ import pipeline.semantic_wheel_cache as semantic_wheel_cache
 from pipeline.context import PipelineContext
 from pipeline.nodes.classifier_node import _sync_gate_classifier_replica
 from pipeline.nodes.vocab_node import (
-    _default_bootstrap_primitive_terms,
     VocabChurnNode,
     VocabConfig,
 )
+from pipeline.vocabulary_defaults import DEFAULT_VOCABULARY
 from pipeline.semantic_wheel_cache import (
     SemanticWheelCandidate,
     SemanticWheelConfig,
@@ -157,8 +157,7 @@ def test_voc20_terms_enter_only_via_churn() -> None:
     ctx.class_names = list(ctx.supervised_class_names) + list(ctx.active_extra_terms)
     node = VocabChurnNode(VocabConfig(churn_n=2, churn_every_n_cycles=1, seed=0))
 
-    bootstrap_terms = set(_default_bootstrap_primitive_terms())
-    assert "aeroplane" not in bootstrap_terms
+    assert "aeroplane" not in set(DEFAULT_VOCABULARY)
 
     node.execute(ctx)
 

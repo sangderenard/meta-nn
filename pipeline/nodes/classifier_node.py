@@ -79,7 +79,6 @@ from pipeline.preview import make_classifier_step_preview_callback
 from pipeline.utils import (
     _classifier_supervision_loss,
     _cuda_mem_diag,
-    _default_class_names,
     _refresh_cache_is_staging_safe,
     _unwrap_module_for_replica,
 )
@@ -652,10 +651,7 @@ class BerkeleyRefreshTrainNode(IRTrainingNode):
             args=ctx.args,
             remap_targets_from_terms=True,
             active_class_names=list(ctx.class_names),
-            # Berkeley wheel is always built with _default_class_names() — use that
-            # as source vocab regardless of ctx.supervised_class_names so wheel mask
-            # indices translate correctly into active vocab space.
-            source_class_names=list(_default_class_names()),
+            source_class_names=list(ctx.class_names),
         )
 
         loss = float(result.get("loss", float("inf")))

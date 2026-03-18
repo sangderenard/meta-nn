@@ -1,0 +1,38 @@
+{
+  "_comment": "Default vocabulary for a meta network build. This is a program default analogous to image_size — not project data. Edit here to change what a meta network starts knowing. Terms are order-significant: position determines the supervised class index.",
+  "vocabulary": [
+    "noise", "pattern", "signal", "silence",
+    "mixed noise and signal", "berkeley sbd dataset",
+    "blur damage", "noise damage", "dropout damage",
+    "quantization damage", "stride skew damage",
+    "pulse", "rhythm", "change", "stable",
+    "bright", "dark", "loud", "quiet", "smooth", "rough",
+    "near", "far", "inside", "outside",
+    "up", "down", "left", "right", "shift", "horizontal flip",
+    "vertical flip", "horizontal center", "vertical center", "center",
+    "warm", "cool", "neutral", "orange",
+    "touch", "voice", "breath", "pain", "comfort",
+    "hunger", "edge blur", "alert", "danger", "safety",
+    "memory", "familiar", "unfamiliar", "attention", "surprise",
+    "zero", "one", "two", "three", "four",
+    "five", "six", "seven", "eight", "nine",
+    "image", "sound", "motion", "edge highlight", "shape", "texture",
+    "low band", "mid band", "high band", "broadband", "narrowband",
+    "burst", "echo", "object", "layout", "mask", "composite",
+    "red", "green", "blue", "yellow", "cyan", "magenta",
+    "brown", "black", "white", "gray", "edge",
+    "white noise", "pink noise", "brown noise", "red noise",
+    "blue noise", "violet noise", "grey noise",
+    "gaussian white noise", "uniform white noise"
+  ],
+  "noise_spectrum_beta": {
+    "_comment": "Power-law spectral slope exponents for noise colour classification. S(f) proportional to f^(-beta). Physics-derived.",
+    "violet noise": -2.0,
+    "blue noise":   -1.0,
+    "white noise":   0.0,
+    "grey noise":    0.5,
+    "pink noise":    1.0,
+    "red noise":     1.8,
+    "brown noise":   2.0
+  }
+}

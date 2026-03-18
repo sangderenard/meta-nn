@@ -398,37 +398,10 @@ def _classifier_supervision_loss(
 # ---------------------------------------------------------------------------
 
 def _default_class_names() -> List[str]:
-    """Default semantic class vocabulary.
-
-    This is the canonical starting vocabulary for new classifiers. It is
-    intentionally not Berkeley-specific — it covers perceptual primitives,
-    damage types, cardinal concepts, colour terms, and noise profiles.
-    """
-    class_names = [
-        "noise", "pattern", "signal", "silence",
-        "mixed noise and signal", "berkeley sbd dataset",
-        "blur damage", "noise damage", "dropout damage",
-        "quantization damage", "stride skew damage",
-        "pulse", "rhythm", "change", "stable",
-        "bright", "dark", "loud", "quiet", "smooth", "rough",
-        "near", "far", "inside", "outside",
-        "up", "down", "left", "right", "shift", "horizontal flip",
-        "vertical flip", "horizontal center", "vertical center", "center", "warm", "cool", "neutral", "orange",
-        "touch", "voice", "breath", "pain", "comfort",
-        "hunger", "edge blur", "alert", "danger", "safety",
-        "memory", "familiar", "unfamiliar", "attention", "surprise",
-        "zero", "one", "two", "three", "four",
-        "five", "six", "seven", "eight", "nine",
-        "image", "sound", "motion", "edge highlight", "shape", "texture",
-        "low band", "mid band", "high band", "broadband", "narrowband",
-        "burst", "echo", "object", "layout", "mask", "composite",
-        "red", "green", "blue", "yellow", "cyan", "magenta",
-        "brown", "black", "white", "gray", "edge",
-        "white noise", "pink noise", "brown noise", "red noise",
-        "blue noise", "violet noise", "grey noise",
-        "gaussian white noise", "uniform white noise",
-    ]
-    return [str(x).strip() for x in class_names if str(x).strip()]
+    """Default semantic class vocabulary.  Source of truth lives in
+    pipeline.vocabulary_defaults.DEFAULT_VOCABULARY."""
+    from pipeline.vocabulary_defaults import DEFAULT_VOCABULARY
+    return [str(x).strip() for x in DEFAULT_VOCABULARY if str(x).strip()]
 
 
 # Backward-compat alias

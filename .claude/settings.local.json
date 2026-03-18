@@ -11,7 +11,10 @@
       "Bash(grep \"\\\\.py$\")",
       "Bash(xargs grep:*)",
       "Bash(grep -n \"save_every_n_rounds\\\\|rebuild_every_n_rounds\" /c/dev/Powershell/meta-nn/pipeline/nodes/*.py)",
-      "Bash(grep -rn \"combine_label_mask_stacks\\\\|_build_pregestation_logic_rows\\\\|provide_pregestation\" c:devPowershellmeta-nn --include=*.py -l)"
+      "Bash(grep -rn \"combine_label_mask_stacks\\\\|_build_pregestation_logic_rows\\\\|provide_pregestation\" c:devPowershellmeta-nn --include=*.py -l)",
+      "Bash(grep -r \"noise_family_terms\\\\|_semantic_noise_family_terms\" c:devPowershellmeta-nn --include=*.py)",
+      "Bash(python -c \"from pipeline.vocabulary_defaults import DEFAULT_VOCABULARY, NOISE_SPECTRUM_BETA; print\\(f''vocab={len\\(DEFAULT_VOCABULARY\\)} terms''\\); print\\(f''beta keys={list\\(NOISE_SPECTRUM_BETA\\)}''\\); assert ''back'' not in DEFAULT_VOCABULARY; assert ''front'' not in DEFAULT_VOCABULARY; print\\(''back/front absent OK''\\)\")",
+      "Bash(grep -n \"provide_formal_logic_image\\\\|_provide_pregestation_images\" c:/dev/Powershell/meta-nn/pipeline/nodes/*.py)"
     ]
   }
 }

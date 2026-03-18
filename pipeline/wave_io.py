@@ -263,14 +263,12 @@ def _latent_pool_stream_kind(path: str) -> str:
 
 
 def _latent_stream_semantic_terms_from_path(path: str) -> List[str]:
-    from pipeline.nodes.vocab_node import (
-        _normalize_vocab_terms,
-        _semantic_noise_profile_terms,
-    )
+    from pipeline.nodes.vocab_node import _normalize_vocab_terms
+    from pipeline.noise_spectrum import noise_profile_key_to_terms
     p = str(path)
     kind = _latent_pool_stream_kind(p)
     profile_key = _latent_noise_profile_key_from_path(p)
-    noise_terms = _semantic_noise_profile_terms(profile_key if profile_key else "gaussian_white_noise")
+    noise_terms = noise_profile_key_to_terms(profile_key if profile_key else "gaussian_white_noise")
     if kind == "noise":
         return _normalize_vocab_terms(list(noise_terms))
     if kind == "mix":

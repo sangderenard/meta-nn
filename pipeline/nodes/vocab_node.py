@@ -53,6 +53,39 @@ from semantic_dataset_loaders import (
 
 
 # ---------------------------------------------------------------------------
+# Subsystem intrinsic vocabulary declarations
+#
+# Each generation subsystem that produces labelled training data declares the
+# vocabulary terms it intrinsically uses here.  Terms not already present in
+# the config's explicit supervised vocabulary become churn burden — the churn
+# system absorbs them automatically.  Subsystems never check whether their
+# terms are in scope; they just emit them.
+#
+# To add a new subsystem: add an entry to SUBSYSTEM_INTRINSIC_VOCABULARY.
+# Key is a stable subsystem identifier string.  Value is a list of terms.
+# ---------------------------------------------------------------------------
+
+SUBSYSTEM_INTRINSIC_VOCABULARY: Dict[str, List[str]] = {
+    # Pregestation image generator — geometric shapes, colours, directions,
+    # structural labels, and observed-colour detector outputs.
+    "pregestation_image_builder": [
+        "red", "green", "blue", "yellow", "cyan", "magenta",
+        "brown", "white", "black", "gray", "orange",
+        "up", "down", "left", "right",
+        "object", "signal", "shape", "edge", "dark",
+        "horizontal center", "vertical center", "center",
+        "front", "behind",
+    ],
+    # Symbol pool builder — origin/provenance tags used as conditioning labels.
+    "symbol_pool_builder": [
+        "official dataset pool", "symbol pool official",
+        "synthetic semantic pool", "symbol pool synthetic",
+        "symbol pool bootstrap", "internal bootstrap material",
+    ],
+}
+
+
+# ---------------------------------------------------------------------------
 # Node config
 # ---------------------------------------------------------------------------
 
@@ -158,6 +191,22 @@ class InitVocabNode(OneTimeNode):
             f"supervised={len(ctx.supervised_class_names)} "
             f"extras={len(ctx.active_extra_terms)}"
         )
+
+        # Collect all subsystem intrinsic vocabulary and register any terms
+        # not already in the current vocabulary as churn burden.
+        all_subsystem_terms: List[str] = []
+        for subsystem, terms in SUBSYSTEM_INTRINSIC_VOCABULARY.items():
+            all_subsystem_terms.extend(terms)
+        if all_subsystem_terms:
+            plan = register_churn_requirement(
+                ctx=ctx,
+                required_terms=_normalize_vocab_terms(all_subsystem_terms),
+                source="subsystem_intrinsic_vocab",
+                stage_label="init",
+            )
+            n_burden = int(plan.get("required_extra_term_count", 0))
+            if n_burden > 0:
+                _log(f"[vocab-init] {n_burden} subsystem terms not in vocab → churn burden")
 
 
 # ---------------------------------------------------------------------------
@@ -348,6 +397,7 @@ class BuildFlashcardRowsNode(PipelineNode):
             class_names=class_names_local,
             condition_num_classes=len(class_names_local),
             supervised_num_classes=len(ctx.supervised_class_names),
+            supervised_class_names=list(ctx.supervised_class_names),
             payload_images_base=ctx.payload_bank if ctx.payload_bank is not None else [],
             payload_conditions_supervised_base=ctx.payload_conditions,
             symbol_pool_by_term=ctx.symbol_pool or {},
@@ -366,6 +416,7 @@ def _build_reference_flashcard_payload_rows(
     class_names: Sequence[str],
     condition_num_classes: int,
     supervised_num_classes: int,
+    supervised_class_names: Sequence[str],
     payload_images_base: Sequence["np.ndarray"],
     payload_conditions_supervised_base: Sequence["np.ndarray"],
     symbol_pool_by_term: Dict[str, List["np.ndarray"]],
@@ -548,7 +599,11 @@ def _build_reference_flashcard_payload_rows(
     cards_cond: List[np.ndarray] = []
     term_counts: Dict[str, int] = {}
 
-    damage_terms = {"blur damage", "noise damage", "dropout damage", "quantization damage", "stride skew damage", "edge highlight", "edge blur"}
+    _sup_names_local: List[str] = [str(n) for n in supervised_class_names]
+
+    def _sup_terms_from_vec(sv: np.ndarray) -> List[str]:
+        arr = np.asarray(sv, dtype=np.float32).reshape(-1)
+        return [_sup_names_local[i] for i in range(min(int(arr.size), len(_sup_names_local))) if float(arr[i]) >= 0.5]
 
     def _emit(term: str, img: np.ndarray, base_supervised: Optional[np.ndarray], extra_terms: Sequence[str]):
         key = re.sub(r"\s+", " ", str(term)).strip().lower()
@@ -569,7 +624,8 @@ def _build_reference_flashcard_payload_rows(
             if re.sub(r"\s+", " ", str(t)).strip()
         }
         requires_berkeley_supervision = bool(
-            ("berkeley sbd dataset" in terms_lc) or ("object" in terms_lc) or (key in damage_terms)
+            ("berkeley sbd dataset" in terms_lc) or ("object" in terms_lc)
+            or key.endswith("damage") or key.startswith("edge ")
         )
         if bool(requires_berkeley_supervision):
             if base_supervised is None:
@@ -639,12 +695,12 @@ def _build_reference_flashcard_payload_rows(
                 continue
             if term_key == "object":
                 obj_img, obj_sup = _pick_object(require_supervised=True)
-                _emit(term_key, obj_img, obj_sup, ["object", "berkeley sbd dataset", "signal"])
+                _emit(term_key, obj_img, obj_sup, ["object", "berkeley sbd dataset", "signal"] + _sup_terms_from_vec(obj_sup))
                 continue
             if term_key in ("mnist dataset", "emnist dataset", "kmnist dataset", "berkeley sbd dataset"):
                 if term_key == "berkeley sbd dataset":
                     obj_img, obj_sup = _pick_object(require_supervised=True)
-                    _emit(term_key, obj_img, obj_sup, [term_key, "object", "signal"])
+                    _emit(term_key, obj_img, obj_sup, [term_key, "object", "signal"] + _sup_terms_from_vec(obj_sup))
                 else:
                     ds_img = _pick_dataset_row(term_key)
                     _emit(term_key, ds_img, None, [term_key, "signal"])
@@ -664,16 +720,16 @@ def _build_reference_flashcard_payload_rows(
                 sig1 = np.roll(sig0, shift=int(rng.integers(2, 9)), axis=1)
                 _emit(term_key, _to_rgb(np.clip((0.55 * sig0) + (0.45 * sig1), 0.0, 1.0)), None, ["regurgitated content", "signal"])
                 continue
-            if term_key in damage_terms:
+            if term_key.endswith("damage") or term_key.startswith("edge "):
                 obj_img, obj_sup = _pick_object(require_supervised=True)
-                dmg_extra_terms = list(_semantic_damage_tags(term_key))
+                dmg_extra_terms = [term_key]
                 if term_key == "noise damage":
                     noise_delta = (rng.standard_normal(obj_img.shape).astype(np.float32) * 0.16).astype(np.float32, copy=False)
                     dmg = np.clip(np.asarray(obj_img, dtype=np.float32) + noise_delta, 0.0, 1.0).astype(np.float32, copy=False)
                     dmg_extra_terms.extend(_semantic_noise_terms_from_spectrum_sample(noise_delta))
                 else:
                     dmg = _apply_damage(obj_img, term_key)
-                _emit(term_key, dmg, obj_sup, list(dmg_extra_terms) + ["object", "berkeley sbd dataset"])
+                _emit(term_key, dmg, obj_sup, list(dmg_extra_terms) + ["object", "berkeley sbd dataset"] + _sup_terms_from_vec(obj_sup))
                 continue
             _emit(term_key, _pick_signal(), None, [term_key, "signal"])
 
@@ -702,19 +758,6 @@ def _build_reference_flashcard_payload_rows(
 # ---------------------------------------------------------------------------
 # Private helpers
 # ---------------------------------------------------------------------------
-
-def _build_full_term_pool(ctx: PipelineContext, cfg: VocabConfig) -> List[str]:
-    """Assemble the full pool of candidate extra terms for churn selection."""
-
-    base = _default_bootstrap_primitive_terms()
-    extra: List[str] = list(cfg.extra_terms_inline)
-    if str(cfg.extra_terms_json).strip():
-        extra = extra + _load_vocab_terms_json(cfg.extra_terms_json)
-
-    removed = set(_removed_semantic_seed_terms() + list(cfg.removed_seed_terms))
-    merged = _merge_vocab_terms(base, extra)
-    return _normalize_vocab_terms([t for t in merged if t.lower() not in removed])
-
 
 def _vocab_term_key(term: str) -> str:
     return re.sub(r"\s+", " ", str(term)).strip().lower()
@@ -1105,18 +1148,6 @@ PREGESTATION_MODE_CONFIGS: Dict[str, Dict[str, Any]] = {
     },
 }
 
-_REMOVED_SEMANTIC_SEED_TERMS = [
-    "none",
-    "noise",
-    "signal",
-    "object",
-    "mixed noise and signal",
-    "mnist dataset",
-    "emnist dataset",
-    "kmnist dataset",
-]
-
-
 def _parse_label_query_texts(raw: str) -> List[str]:
     s = str(raw).strip()
     if not s:
@@ -1206,22 +1237,6 @@ def _normalize_extra_terms(active_terms: Sequence[str], total_slots: int) -> Lis
     return out[:slots]
 
 
-def _removed_semantic_seed_terms() -> List[str]:
-    return [str(x) for x in _REMOVED_SEMANTIC_SEED_TERMS]
-
-
-def _default_bootstrap_primitive_terms() -> List[str]:
-    # Bootstrap/gestation vocabulary is strictly primitive internal semantics only.
-    noise_profile_terms = [
-        "noise", "white noise", "pink noise", "brown noise", "red noise",
-        "blue noise", "violet noise", "grey noise", "gaussian white noise", "uniform white noise",
-    ]
-    color_terms = ["red", "green", "blue", "yellow", "cyan", "magenta", "brown", "gray", "edge"]
-    direction_terms = ["front", "back", "left", "right", "top", "bottom"]
-    structure_terms = ["pattern", "edge", "shape", "texture", "bright", "dark", "smooth", "rough", "object", "signal"]
-    return _normalize_vocab_terms(noise_profile_terms + color_terms + direction_terms + structure_terms)
-
-
 def _semantic_term_index_map(class_names: Sequence[str]) -> Dict[str, int]:
     out: Dict[str, int] = {}
     for i, name in enumerate(class_names):
@@ -1231,74 +1246,14 @@ def _semantic_term_index_map(class_names: Sequence[str]) -> Dict[str, int]:
     return out
 
 
-def _semantic_damage_tags(term: str) -> List[str]:
-    key = re.sub(r"\s+", " ", str(term)).strip().lower()
-    if not key:
-        return []
-    lut: Dict[str, List[str]] = {
-        "noise damage": ["noise damage", "noise", "mixed noise and signal", "signal"],
-        "blur damage": ["blur damage", "signal"],
-        "dropout damage": ["dropout damage", "signal"],
-        "quantization damage": ["quantization damage", "signal"],
-        "stride skew damage": ["stride skew damage", "signal"],
-        "edge highlight": ["edge highlight", "edge", "signal"],
-        "edge blur": ["edge blur", "edge", "blur damage", "signal"],
-    }
-    if key in lut:
-        return _normalize_vocab_terms(lut[key])
-    if key.endswith("damage"):
-        return _normalize_vocab_terms([key, "signal"])
-    return _REMOVED_SEMANTIC_SEED_TERMS
-
-
-def _semantic_noise_family_terms() -> List[str]:
-    return [
-        "noise",
-        "white noise",
-        "pink noise",
-        "brown noise",
-        "red noise",
-        "blue noise",
-        "violet noise",
-        "grey noise",
-        "gaussian white noise",
-        "uniform white noise",
-    ]
-
-
-def _semantic_noise_profile_key_from_term(term: str) -> str:
-    key = re.sub(r"\s+", " ", str(term)).strip().lower()
-    lut = {
-        "noise": "uniform_white_noise",
-        "white noise": "gaussian_white_noise",
-        "uniform white noise": "uniform_white_noise",
-        "gaussian white noise": "gaussian_white_noise",
-        "pink noise": "pink_noise",
-        "brown noise": "brown_noise",
-        "red noise": "red_noise",
-        "blue noise": "blue_noise",
-        "violet noise": "violet_noise",
-        "grey noise": "grey_noise",
-        "gray noise": "grey_noise",
-    }
-    return str(lut.get(key, "")).strip().lower()
+from pipeline.noise_spectrum import (
+    noise_term_to_profile_key as _semantic_noise_profile_key_from_term,
+    noise_profile_key_to_terms as _noise_profile_key_to_terms,
+)
 
 
 def _semantic_noise_profile_terms(profile_key: str) -> List[str]:
-    key = re.sub(r"\s+", "_", str(profile_key)).strip().lower()
-    lut: Dict[str, List[str]] = {
-        "uniform_white_noise": ["noise", "white noise", "uniform white noise"],
-        "gaussian_white_noise": ["noise", "white noise", "gaussian white noise"],
-        "pink_noise": ["noise", "pink noise"],
-        "brown_noise": ["noise", "brown noise"],
-        "red_noise": ["noise", "red noise"],
-        "blue_noise": ["noise", "blue noise"],
-        "violet_noise": ["noise", "violet noise"],
-        "grey_noise": ["noise", "grey noise"],
-    }
-    if key not in lut:
-        return ["noise"]
-    return _normalize_vocab_terms(lut[key])
+    return _normalize_vocab_terms(_noise_profile_key_to_terms(profile_key))
 
 
 def _semantic_expand_inferred_tags(terms: Sequence[str]) -> List[str]:
@@ -1318,117 +1273,14 @@ def _semantic_expand_inferred_tags(terms: Sequence[str]) -> List[str]:
                 out.extend(_semantic_noise_profile_terms(profile_key))
             else:
                 out.extend([key, "noise"])
-        if key.endswith("damage"):
-            out.extend(_semantic_damage_tags(key))
+        if key.endswith("damage") or key.startswith("edge "):
+            out.extend(["signal"])
     return _normalize_vocab_terms(out)
 
 
 def _semantic_noise_terms_from_spectrum_sample(sample: Any) -> List[str]:
-    arr = np.asarray(sample, dtype=np.float32)
-    if int(arr.size) <= 0:
-        return []
-    if int(arr.ndim) == 3:
-        if int(arr.shape[0]) in (1, 3, 4):
-            gray = np.mean(np.asarray(arr[:3, ...], dtype=np.float32), axis=0)
-        elif int(arr.shape[2]) in (1, 3, 4):
-            gray = np.mean(np.asarray(arr[..., :3], dtype=np.float32), axis=2)
-        else:
-            gray = np.asarray(arr, dtype=np.float32).reshape(-1)
-    else:
-        gray = np.asarray(arr, dtype=np.float32)
-    flat0 = np.asarray(gray, dtype=np.float64).reshape(-1)
-    if int(flat0.size) < 32:
-        return []
-    try:
-        dyn = float(np.max(flat0) - np.min(flat0)) if int(flat0.size) > 0 else 0.0
-        centered0 = flat0 - float(np.mean(flat0))
-        var0 = float(np.mean(centered0 * centered0)) if int(flat0.size) > 0 else 0.0
-        diff0 = np.diff(flat0) if int(flat0.size) > 1 else np.zeros((0,), dtype=np.float64)
-        mean_abs_diff0 = float(np.mean(np.abs(diff0))) if int(diff0.size) > 0 else 0.0
-        entropy01 = 0.0
-        if dyn > 1e-12:
-            norm0 = np.clip((flat0 - float(np.min(flat0))) / dyn, 0.0, 1.0)
-            hist0, _ = np.histogram(norm0, bins=64, range=(0.0, 1.0))
-            hist0 = np.asarray(hist0, dtype=np.float64)
-            hist0 = hist0 / max(1.0, float(np.sum(hist0)))
-            hist0 = hist0[hist0 > 0.0]
-            if int(hist0.size) > 0:
-                entropy01 = float(-np.sum(hist0 * np.log2(hist0)) / np.log2(64.0))
-        if dyn < 1e-3 or var0 < 1e-8:
-            return []
-        if entropy01 < 0.08 and mean_abs_diff0 < 2e-3:
-            return []
-    except Exception:
-        pass
-    beta = 0.0
-    excess_kurtosis = 0.0
-    try:
-        flat = np.asarray(gray, dtype=np.float64).reshape(-1)
-        if int(flat.size) >= 32:
-            centered = flat - float(np.mean(flat))
-            var = float(np.mean(centered * centered))
-            if var > 1e-12:
-                m4 = float(np.mean((centered * centered) * (centered * centered)))
-                excess_kurtosis = float((m4 / (var * var)) - 3.0)
-    except Exception:
-        excess_kurtosis = 0.0
-    try:
-        if int(np.asarray(gray).ndim) == 2:
-            g = np.asarray(gray, dtype=np.float64)
-            g = g - float(np.mean(g))
-            h, w = int(g.shape[0]), int(g.shape[1])
-            if h >= 8 and w >= 8:
-                p = np.abs(np.fft.fft2(g)).astype(np.float64) ** 2
-                fy = np.fft.fftfreq(h).astype(np.float64)[:, None]
-                fx = np.fft.fftfreq(w).astype(np.float64)[None, :]
-                r = np.sqrt((fx * fx) + (fy * fy)).reshape(-1)
-                pow_flat = p.reshape(-1)
-                mask = (r > 1e-6) & np.isfinite(pow_flat) & (pow_flat > 1e-20)
-                if int(np.count_nonzero(mask)) >= 32:
-                    x = np.log(r[mask])
-                    y = np.log(pow_flat[mask])
-                    slope = float(np.polyfit(x, y, 1)[0])
-                    beta = -slope
-                else:
-                    v = g.reshape(-1)
-                    v = v - float(np.mean(v))
-                    spec = np.abs(np.fft.rfft(v)).astype(np.float64) ** 2
-                    fr = np.fft.rfftfreq(int(v.size)).astype(np.float64)
-                    mask1 = (fr > 1e-6) & np.isfinite(spec) & (spec > 1e-20)
-                    if int(np.count_nonzero(mask1)) >= 16:
-                        slope = float(np.polyfit(np.log(fr[mask1]), np.log(spec[mask1]), 1)[0])
-                        beta = -slope
-        else:
-            v = np.asarray(gray, dtype=np.float64).reshape(-1)
-            v = v - float(np.mean(v))
-            spec = np.abs(np.fft.rfft(v)).astype(np.float64) ** 2
-            fr = np.fft.rfftfreq(int(v.size)).astype(np.float64)
-            mask = (fr > 1e-6) & np.isfinite(spec) & (spec > 1e-20)
-            if int(np.count_nonzero(mask)) >= 16:
-                slope = float(np.polyfit(np.log(fr[mask]), np.log(spec[mask]), 1)[0])
-                beta = -slope
-    except Exception:
-        beta = 0.0
-    noise_beta_lut = {
-        "violet noise": -2.0,
-        "blue noise": -1.0,
-        "white noise": 0.0,
-        "grey noise": 0.5,
-        "pink noise": 1.0,
-        "red noise": 1.8,
-        "brown noise": 2.0,
-    }
-    best_term = "white noise"
-    best_dist = float("inf")
-    for name, target_beta in noise_beta_lut.items():
-        d = abs(float(beta) - float(target_beta))
-        if d < best_dist:
-            best_dist = d
-            best_term = str(name)
-    if best_term == "white noise":
-        dist_term = "uniform white noise" if float(excess_kurtosis) <= -0.55 else "gaussian white noise"
-        return _normalize_vocab_terms(["noise", "white noise", str(dist_term)])
-    return _normalize_vocab_terms(["noise", str(best_term)])
+    from pipeline.noise_spectrum import classify_noise_spectrum
+    return _normalize_vocab_terms(classify_noise_spectrum(sample))
 
 
 def _semantic_tags_for_symbol_term(term: str) -> List[str]:
@@ -1507,8 +1359,8 @@ def _semantic_tags_for_symbol_term(term: str) -> List[str]:
         out.extend(["regurgitated content", "signal"])
     elif key == "gan image":
         out.extend(["gan image", "signal"])
-    elif key.endswith("damage"):
-        out.extend(_semantic_damage_tags(key))
+    elif key.endswith("damage") or key.startswith("edge "):
+        out.extend(["signal"])
     else:
         out.extend(["signal"])
     out.append(key)
@@ -2326,10 +2178,10 @@ def _build_synthetic_semantic_symbol_pool(
             g = _signal_pattern(phase=phase)
         return _to_rgb(g)
 
-    noise_profile_terms = _normalize_vocab_terms([
-        "noise", "white noise", "pink noise", "brown noise", "red noise",
-        "blue noise", "violet noise", "grey noise", "gaussian white noise", "uniform white noise",
-    ])
+    from pipeline.vocabulary_defaults import DEFAULT_VOCABULARY
+    noise_profile_terms = _normalize_vocab_terms(
+        [t for t in DEFAULT_VOCABULARY if t == "noise" or t.endswith(" noise")]
+    )
     pool: Dict[str, List[np.ndarray]] = {}
     for term in noise_profile_terms:
         key = re.sub(r"\s+", " ", str(term)).strip().lower()
@@ -2742,18 +2594,16 @@ def _build_internal_bootstrap_symbol_pool(
             return np.clip((0.62 * _circle_object()) + (0.38 * _signal_pattern(phase=phase + 0.3)), 0.0, 1.0)
         return _signal_pattern(phase=phase)
 
-    noise_profile_terms = _normalize_vocab_terms([
-        "noise", "white noise", "pink noise", "brown noise", "red noise",
-        "blue noise", "violet noise", "grey noise", "gaussian white noise", "uniform white noise",
-    ])
+    from pipeline.vocabulary_defaults import DEFAULT_VOCABULARY
+    noise_profile_terms = _normalize_vocab_terms(
+        [t for t in DEFAULT_VOCABULARY if t == "noise" or t.endswith(" noise")]
+    )
     try:
-        from pipeline.utils import _default_class_names
-        berkeley_terms = _normalize_vocab_terms(_default_class_names())
+        berkeley_terms = _normalize_vocab_terms(DEFAULT_VOCABULARY)
     except Exception:
         berkeley_terms = []
     berkeley_term_lc = {str(x).strip().lower() for x in berkeley_terms}
-    bootstrap_primitive_terms = _normalize_vocab_terms(_default_bootstrap_primitive_terms())
-    primary_terms = _normalize_vocab_terms(list(bootstrap_primitive_terms))
+    primary_terms = _normalize_vocab_terms(DEFAULT_VOCABULARY)
 
     for term in primary_terms:
         key = re.sub(r"\s+", " ", str(term)).strip().lower()
@@ -2768,7 +2618,6 @@ def _build_internal_bootstrap_symbol_pool(
         "max_samples_per_term": int(cap),
         "primary_terms": list(primary_terms),
         "noise_profile_terms": list(noise_profile_terms),
-        "bootstrap_primitive_terms": list(bootstrap_primitive_terms),
         "berkeley_terms": list(berkeley_terms),
         "origin_label": str(origin_label).strip(),
         "pool_terms": sorted([str(k) for k in pool.keys()]),
@@ -2782,7 +2631,6 @@ def _build_internal_bootstrap_symbol_pool(
     info["available_terms"] = int(len(pool))
     info["samples"] = int(sum(len(v) for v in pool.values()))
     info["primary_terms"] = int(len(primary_terms))
-    info["bootstrap_primitive_terms"] = int(len(bootstrap_primitive_terms))
     return pool, info
 
 

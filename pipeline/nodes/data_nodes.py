@@ -55,11 +55,8 @@ from pipeline.semantic_wheel_cache import (
     ensure_semantic_wheel_cache,
 )
 from pipeline.utils import (
-    _default_class_names,
     _split_payload_cache_indices,
 )
-# Backward-compat alias — internal code now uses _default_class_names
-_default_berkeley_class_names = _default_class_names
 from pipeline.nodes.vocab_node import (
     _normalize_vocab_terms,
     _semantic_term_index_map,
@@ -1211,6 +1208,7 @@ class DataNode(PipelineNode):
                 processing_device=_processing_device,
                 preload_workers=self.bdata_cfg.preload_workers,
                 force_rebuild=_berk_force,
+                class_names=ctx.class_names,
             )
             gate_val_loader, _n_gate_val = _build_berkeley_gate_val_loader(
                 data_root=data_root, image_size=self.bdata_cfg.image_size,
@@ -1227,6 +1225,7 @@ class DataNode(PipelineNode):
                 processing_device=_processing_device,
                 preload_workers=self.bdata_cfg.preload_workers,
                 force_rebuild=_berk_force,
+                class_names=ctx.class_names,
             )
         self.possessions["berkeley"].force_next_rebuild = False
         if loader is None:
@@ -1296,6 +1295,7 @@ class DataNode(PipelineNode):
                 wheel_use_rare_term_deck=self.bdata_cfg.wheel_use_rare_term_deck,
                 processing_device=_processing_device,
                 preload_workers=self.bdata_cfg.preload_workers,
+                class_names=ctx.class_names,
             )
         ctx.payload_bank = out_images
         ctx.payload_masks = out_masks if out_masks else []
@@ -1344,6 +1344,7 @@ class DataNode(PipelineNode):
                 force_rebuild=bool(self.payload_cfg.force_cache_rebuild),
                 processing_device=_processing_device,
                 preload_workers=self.bdata_cfg.preload_workers,
+                class_names=ctx.class_names,
             )
         loader, _n_val = _build_gate_loader_from_dataset(
             dataset=dataset, batch_size=32, num_workers=0,
@@ -1468,6 +1469,7 @@ def _prevectorize_deformations(
     rows: Sequence[Any],
     image_size: int,
     seed: int,
+    class_names: Sequence[str],
     n_variants: int = 2,
     max_total_rows: int = 0,
 ) -> Tuple[Dataset, int]:
@@ -1490,7 +1492,7 @@ def _prevectorize_deformations(
             rows=list(rows), image_size=int(image_size),
             return_masks=True, return_mask_stack=False,
             degrade=False, degrade_seed=int(seed),
-            class_names=_default_class_names(),
+            class_names=list(class_names),
         )
         return ds, n_src
 
@@ -1508,7 +1510,7 @@ def _prevectorize_deformations(
         rows=used_rows, image_size=int(image_size),
         return_masks=True, return_mask_stack=False,
         degrade=False, degrade_seed=int(seed),
-        class_names=_default_class_names(),
+        class_names=list(class_names),
     )
 
     # Variant passes — each with degrade=True at a distinct seed.
@@ -1521,7 +1523,7 @@ def _prevectorize_deformations(
             return_masks=True, return_mask_stack=False,
             degrade=True,
             degrade_seed=int(seed) + (v + 1) * 7919,
-            class_names=_default_class_names(),
+            class_names=list(class_names),
         )
         variant_datasets.append(variant_ds)
 
@@ -1534,7 +1536,10 @@ def _prevectorize_deformations(
 class _LazyDiskSemanticPayloadBank:
     """Lazy payload bank backed by DiskSemanticRowsDataset — loads images on demand."""
 
-    def __init__(self, rows: Sequence[Any], image_size: int, seed: int = 0):
+    def __init__(self, rows: Sequence[Any], image_size: int, seed: int = 0,
+                 class_names: Optional[Sequence[str]] = None):
+        from pipeline.vocabulary_defaults import DEFAULT_VOCABULARY
+        _cn = list(class_names) if class_names is not None else list(DEFAULT_VOCABULARY)
         self._dataset = DiskSemanticRowsDataset(
             rows=list(rows),
             image_size=int(image_size),
@@ -1542,7 +1547,7 @@ class _LazyDiskSemanticPayloadBank:
             return_mask_stack=False,
             degrade=False,
             degrade_seed=int(seed),
-            class_names=_default_class_names(),
+            class_names=_cn,
         )
 
     def __len__(self) -> int:
@@ -2351,6 +2356,7 @@ def _ensure_berkeley_semantic_wheel(
     wheel_expiry_uses: int,
     max_base_rows: int,
     wheel_use_rare_term_deck: bool,
+    class_names: Optional[Sequence[str]] = None,
     force_rebuild: bool = False,
     processing_device: Optional[Any] = None,
     preload_workers: int = 0,
@@ -2377,10 +2383,12 @@ def _ensure_berkeley_semantic_wheel(
         processing_device=processing_device,
         preload_workers=max(0, int(preload_workers)),
     )
+    from pipeline.vocabulary_defaults import DEFAULT_VOCABULARY
+    _cn = list(class_names) if class_names is not None else list(DEFAULT_VOCABULARY)
     wheel_result = ensure_semantic_wheel_cache(
         rows=rows,
         candidate_indices=[int(i) for i in candidate_indices],
-        class_names=_default_class_names(),
+        class_names=_cn,
         config=wheel_cfg,
     )
     wheel_info = dict(wheel_result.get("info") or {})
@@ -2545,11 +2553,14 @@ def _build_berkeley_refresh_loader(
     processing_device: Optional[Any] = None,
     preload_workers: int = 0,
     force_rebuild: bool = False,
+    class_names: Optional[Sequence[str]] = None,
 ):
+    from pipeline.vocabulary_defaults import DEFAULT_VOCABULARY
+    _cn = list(class_names) if class_names is not None else list(DEFAULT_VOCABULARY)
     del auto_install_scipy
     rows, rows_info = collect_semantic_disk_rows(
         data_root=str(data_root),
-        class_names=_default_class_names(),
+        class_names=_cn,
         source_root="",
     )
     n_rows = int(len(rows))
@@ -2582,6 +2593,7 @@ def _build_berkeley_refresh_loader(
         wheel_expiry_uses=int(wheel_expiry_uses),
         max_base_rows=int(max_train),
         wheel_use_rare_term_deck=bool(wheel_use_rare_term_deck),
+        class_names=_cn,
         force_rebuild=bool(force_rebuild),
         processing_device=processing_device,
         preload_workers=int(preload_workers),
@@ -2771,11 +2783,14 @@ def _build_berkeley_gate_val_loader(
     processing_device: Optional[Any] = None,
     preload_workers: int = 0,
     force_rebuild: bool = False,
+    class_names: Optional[Sequence[str]] = None,
 ):
+    from pipeline.vocabulary_defaults import DEFAULT_VOCABULARY
+    _cn = list(class_names) if class_names is not None else list(DEFAULT_VOCABULARY)
     del auto_install_scipy
     rows, rows_info = collect_semantic_disk_rows(
         data_root=str(data_root),
-        class_names=_default_class_names(),
+        class_names=_cn,
         source_root="",
     )
     val_idx = [
@@ -2803,6 +2818,7 @@ def _build_berkeley_gate_val_loader(
         wheel_expiry_uses=int(wheel_expiry_uses),
         max_base_rows=int(max_val),
         wheel_use_rare_term_deck=bool(wheel_use_rare_term_deck),
+        class_names=_cn,
         force_rebuild=bool(force_rebuild),
         processing_device=processing_device,
         preload_workers=int(preload_workers),
@@ -3392,10 +3408,13 @@ def _build_payload_validation_gate_dataset(
     force_rebuild: bool = False,
     processing_device: Optional[Any] = None,
     preload_workers: int = 0,
+    class_names: Optional[Sequence[str]] = None,
 ) -> Tuple[Optional[Dataset], np.ndarray, List[List[str]], Dict[str, Any]]:
+    from pipeline.vocabulary_defaults import DEFAULT_VOCABULARY
+    _cn = list(class_names) if class_names is not None else list(DEFAULT_VOCABULARY)
     rows, rows_info = collect_semantic_disk_rows(
         data_root=str(data_root),
-        class_names=_default_class_names(),
+        class_names=_cn,
         source_root=str(source_root),
     )
     if int(len(rows)) <= 0:
@@ -3426,6 +3445,7 @@ def _build_payload_validation_gate_dataset(
         wheel_expiry_uses=int(wheel_expiry_uses),
         max_base_rows=0,
         wheel_use_rare_term_deck=bool(wheel_use_rare_term_deck),
+        class_names=_cn,
         force_rebuild=bool(force_rebuild),
         processing_device=processing_device,
         preload_workers=int(preload_workers),
@@ -3869,12 +3889,15 @@ def _build_berkeley_payload_bank(
     wheel_use_rare_term_deck: bool = True,
     processing_device: Optional[Any] = None,
     preload_workers: int = 0,
+    class_names: Optional[Sequence[str]] = None,
 ):
+    from pipeline.vocabulary_defaults import DEFAULT_VOCABULARY
+    _cn = list(class_names) if class_names is not None else list(DEFAULT_VOCABULARY)
     _ = bool(auto_install_scipy)
     size = max(8, int(image_size))
     rows, rows_info = collect_semantic_disk_rows(
         data_root=str(data_root),
-        class_names=_default_class_names(),
+        class_names=_cn,
         source_root=str(source_root),
     )
     if int(len(rows)) <= 0:
@@ -3897,6 +3920,7 @@ def _build_berkeley_payload_bank(
         wheel_expiry_uses=int(wheel_expiry_uses),
         max_base_rows=int(max_samples),
         wheel_use_rare_term_deck=bool(wheel_use_rare_term_deck),
+        class_names=_cn,
         force_rebuild=bool(force_cache_rebuild),
         processing_device=processing_device,
         preload_workers=int(preload_workers),
