@@ -390,6 +390,7 @@ class _TransformerStatusOpenGLViewer:
         self._stage_selected: Dict[str, bool] = {}
         self._stage_roster: List[Tuple[str, str]] = []
         self._gate_override = False
+        self._suppress_rebuild = False
         self._paused = True
         self._preview_enabled = True
         self._scrub_editor_enabled = True
@@ -594,6 +595,9 @@ class _TransformerStatusOpenGLViewer:
 
     def gate_override_enabled(self) -> bool:
         return bool(self._gate_override)
+
+    def suppress_rebuild_enabled(self) -> bool:
+        return bool(self._suppress_rebuild)
 
     def set_ipc_server(self, server: "ViewerIPCServer") -> None:
         """Store a back-reference to the IPC server for connection checks."""
@@ -1140,6 +1144,18 @@ class _TransformerStatusOpenGLViewer:
                 text_off=(170, 160, 140),
             )
 
+            _draw_check(
+                max(x + 4, self.window_w - 330),
+                row2_y,
+                "Suppress rebuild",
+                checked=bool(self._suppress_rebuild),
+                kind="suppress_rebuild",
+                fill_on=(60, 100, 120),
+                fill_off=(36, 40, 44),
+                text_on=(170, 210, 230),
+                text_off=(150, 160, 172),
+            )
+
             row3_y = 62
             sx = 8
             for node_id, label in self._stage_roster:
@@ -1582,12 +1598,30 @@ class _TransformerStatusOpenGLViewer:
             draw = ImageDraw.Draw(im, "RGBA")
             font = ImageFont.load_default()
             tab_h = 18
-            draw.rectangle([(0, 0), (int(out.shape[1]) - 1, tab_h + 3)], fill=(12, 16, 22, 208))
-            x = 4
+            panel_w = int(out.shape[1])
+            tab_x_margin = 4
+            tab_y_start = 2
+
+            # Layout pass: compute all tab boxes so we know total header height before drawing.
+            tab_boxes: List[Tuple[str, Tuple[int, int, int, int]]] = []
+            x = tab_x_margin
+            y = tab_y_start
             for model_name in model_names:
                 label = str(model_name)
-                tab_w = max(30, min(int(out.shape[1]) - 8, len(label) * 7 + 12))
-                box = (x, 2, min(int(out.shape[1]) - 4, x + tab_w), 2 + tab_h)
+                tab_w = max(30, len(label) * 7 + 12)
+                if x + tab_w > panel_w - tab_x_margin and x > tab_x_margin:
+                    # Wrap to next row (but don't wrap if this tab is the first on a row).
+                    x = tab_x_margin
+                    y += tab_h + 2
+                clipped_w = min(tab_w, panel_w - tab_x_margin - x)
+                box = (x, y, x + clipped_w, y + tab_h)
+                tab_boxes.append((label, box))
+                x = box[2] + tab_x_margin
+
+            total_tab_h = y + tab_h + 3  # background height covers all rows
+            draw.rectangle([(0, 0), (panel_w - 1, total_tab_h)], fill=(12, 16, 22, 208))
+
+            for label, box in tab_boxes:
                 is_active = str(label) == str(active_model or "")
                 fill = (78, 112, 156, 230) if is_active else (28, 34, 44, 220)
                 outline = (160, 206, 255, 255) if is_active else (76, 86, 98, 255)
@@ -1595,14 +1629,12 @@ class _TransformerStatusOpenGLViewer:
                 draw.rectangle([box[0], box[1], box[2], box[3]], fill=fill, outline=outline)
                 draw.text((box[0] + 5, box[1] + 3), label, fill=fg, font=font)
                 self._weight_tab_hit_boxes.append((label, box))
-                x = int(box[2]) + 4
-                if x >= int(out.shape[1]) - 24:
-                    break
+
             status = "live"
             if isinstance(checkpoint_marker, dict) and int(checkpoint_marker.get("round_id", 0) or 0) > 0:
                 status = f"checkpoint r{int(checkpoint_marker.get('round_id', 0))} c{int(checkpoint_marker.get('cycle', 0))}"
             active_label = str(active_model or "weights")
-            draw.text((6, tab_h + 5), f"{active_label}  {status}", fill=(230, 236, 246, 255), font=font)
+            draw.text((6, total_tab_h + 2), f"{active_label}  {status}", fill=(230, 236, 246, 255), font=font)
             return np.ascontiguousarray(np.asarray(im, dtype=np.uint8))
         except Exception:
             return out
@@ -2672,6 +2704,10 @@ class _TransformerStatusOpenGLViewer:
                         return True
                 elif kind == "override":
                     self._gate_override = not bool(self._gate_override)
+                    self._top_bar_dirty = True
+                    return True
+                elif kind == "suppress_rebuild":
+                    self._suppress_rebuild = not bool(self._suppress_rebuild)
                     self._top_bar_dirty = True
                     return True
                 elif kind == "pause":
@@ -4018,6 +4054,7 @@ class ViewerIPCServer:
             skip_back = bool(self._viewer._skip_back_pending)
             save_now = bool(self._viewer._save_now_pending)
             gate_override = self._viewer.gate_override_enabled()
+            suppress_rebuild = self._viewer.suppress_rebuild_enabled()
             cycle_selected = list(self._viewer._cycle_selected)
             node_selected = dict(self._viewer._stage_selected)
             weight_mode = int(weight_spec.get("mode", 1) or 1)
@@ -4026,7 +4063,7 @@ class ViewerIPCServer:
 
             # Only send if state changed or a one-shot signal is pending.
             snapshot = (
-                is_stopping, is_paused, gate_override, is_preview, is_scrub_editor,
+                is_stopping, is_paused, gate_override, suppress_rebuild, is_preview, is_scrub_editor,
                 tuple(cycle_selected), tuple(sorted(node_selected.items())),
                 weight_mode, weight_cw, weight_ch,
             )
@@ -4047,6 +4084,7 @@ class ViewerIPCServer:
                 "stop_requested": is_stopping,
                 "paused": is_paused,
                 "gate_override": gate_override,
+                "suppress_rebuild": suppress_rebuild,
                 "preview_enabled": is_preview,
                 "scrub_editor_enabled": is_scrub_editor,
                 "cycle_selected": cycle_selected,
@@ -4065,6 +4103,7 @@ class ViewerIPCServer:
                 selected_cycle_ids=self._viewer.selected_cycle_ids(),
                 selected_node_ids=self._viewer.selected_node_ids(),
                 gate_override=bool(status["gate_override"]),
+                suppress_rebuild=bool(status["suppress_rebuild"]),
                 preview_enabled=is_preview,
                 scrub_editor_enabled=is_scrub_editor,
                 metadata={
@@ -4233,6 +4272,7 @@ class ViewerIPCProxy:
         self._stop_flag = False
         self._shutdown_save: Optional[bool] = None
         self._gate_override = False
+        self._suppress_rebuild = False
         self._paused = True
         self._preview_enabled = True
         self._scrub_editor_enabled = True
@@ -4492,6 +4532,7 @@ class ViewerIPCProxy:
                         self._stop_flag = str(payload.command).lower() == "stop"
                         self._paused = str(payload.command).lower() == "pause"
                         self._gate_override = bool(payload.gate_override)
+                        self._suppress_rebuild = bool(getattr(payload, "suppress_rebuild", False))
                         self._preview_enabled = bool(getattr(payload, "preview_enabled", True))
                         self._scrub_editor_enabled = bool(getattr(payload, "scrub_editor_enabled", True))
                         # Extract save preference from metadata
@@ -4513,7 +4554,7 @@ class ViewerIPCProxy:
                                     selected[idx] = True
                             self._cycle_selected = selected
                         sni_raw = getattr(payload, "selected_node_ids", None)
-                        if sni_raw is not None:
+                        if sni_raw:  # empty list = "no explicit preference", same as selected_cycle_ids treatment
                             sni_set = set(sni_raw)
                             all_known = set(self._stage_selected.keys()) | sni_set
                             self._stage_selected = {nid: (nid in sni_set) for nid in all_known}
@@ -4527,6 +4568,7 @@ class ViewerIPCProxy:
                 if t == "status":
                     self._stop_flag = msg.get("stop_requested", False)
                     self._gate_override = msg.get("gate_override", False)
+                    self._suppress_rebuild = msg.get("suppress_rebuild", False)
                     self._paused = msg.get("paused", False)
                     self._preview_enabled = msg.get("preview_enabled", True)
                     self._scrub_editor_enabled = msg.get("scrub_editor_enabled", True)
@@ -4798,6 +4840,9 @@ class ViewerIPCProxy:
 
     def gate_override_enabled(self) -> bool:
         return self._gate_override
+
+    def suppress_rebuild_enabled(self) -> bool:
+        return self._suppress_rebuild
 
     def paused(self) -> bool:
         return self._paused

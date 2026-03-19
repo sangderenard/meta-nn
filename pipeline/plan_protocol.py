@@ -977,6 +977,7 @@ class RunControlPayload:
     selected_cycle_ids: List[int] = field(default_factory=list)
     selected_node_ids: List[str] = field(default_factory=list)
     gate_override: bool = False
+    suppress_rebuild: bool = False
     preview_enabled: bool = True
     scrub_editor_enabled: bool = True
     metadata: Dict[str, Any] = field(default_factory=dict)
@@ -987,6 +988,7 @@ class RunControlPayload:
             "selected_cycle_ids": [int(x) for x in self.selected_cycle_ids],
             "selected_node_ids": [str(x) for x in self.selected_node_ids],
             "gate_override": bool(self.gate_override),
+            "suppress_rebuild": bool(self.suppress_rebuild),
             "preview_enabled": bool(self.preview_enabled),
             "scrub_editor_enabled": bool(self.scrub_editor_enabled),
             "metadata": _jsonable(self.metadata),
@@ -999,6 +1001,7 @@ class RunControlPayload:
             selected_cycle_ids=[int(x) for x in data.get("selected_cycle_ids", [])],
             selected_node_ids=[str(x) for x in data.get("selected_node_ids", [])],
             gate_override=bool(data.get("gate_override", False)),
+            suppress_rebuild=bool(data.get("suppress_rebuild", False)),
             preview_enabled=bool(data.get("preview_enabled", True)),
             scrub_editor_enabled=bool(data.get("scrub_editor_enabled", True)),
             metadata=dict(data.get("metadata", {})),

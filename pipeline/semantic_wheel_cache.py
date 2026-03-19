@@ -7,6 +7,7 @@ import os
 import queue
 import shutil
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
@@ -20,6 +21,7 @@ import torch.nn.functional as F
 from PIL import Image
 from torch.utils.data import Dataset, Sampler
 
+from pipeline.filesystem_emergency import raise_if_filesystem_space_emergency
 from pipeline.progress import interruptible_tqdm
 from semantic_dataset_loaders import (
     SemanticDiskRow,
@@ -90,6 +92,47 @@ def _fit_mask_array(mask: np.ndarray, image_size: int) -> np.ndarray:
             mode='nearest',
         )[0, 0].numpy().astype(np.float32, copy=False)
     return np.clip(arr, 0.0, 1.0).astype(np.float32, copy=False)
+
+
+def _fit_mask_letterbox(mask: np.ndarray, image_size: int) -> np.ndarray:
+    """Resize mask using the same letterbox transform as _fit_pil_to_square.
+
+    Mirrors _fit_pil_to_square(im, image_size, fill=0):
+      - Scales the mask so the larger dimension fits within image_size (never up-scales).
+      - Centers the scaled result in a zero-filled (image_size × image_size) canvas.
+
+    Use this for any mask that will be paired with an image stored via _load_fit_rgb_u8,
+    so that mask and image pixels correspond to the same spatial positions. Unlike
+    _fit_mask_array (which stretches to fill), this preserves the letterbox padding.
+    """
+    size = max(8, int(image_size))
+    arr = np.asarray(mask, dtype=np.float32)
+    if arr.ndim == 3:
+        arr = np.mean(arr, axis=0).astype(np.float32, copy=False)
+    arr = np.clip(arr, 0.0, 1.0).astype(np.float32, copy=False)
+    src_h, src_w = int(arr.shape[0]), int(arr.shape[1])
+    if src_h <= 0 or src_w <= 0:
+        return np.zeros((size, size), dtype=np.float32)
+    # Same scale logic as _fit_pil_to_square: scale down only, never up.
+    scale = 1.0
+    if src_w > size or src_h > size:
+        scale = min(float(size) / float(src_w), float(size) / float(src_h))
+    new_w = max(1, int(round(float(src_w) * float(scale))))
+    new_h = max(1, int(round(float(src_h) * float(scale))))
+    if new_h != src_h or new_w != src_w:
+        scaled = torch.nn.functional.interpolate(
+            torch.from_numpy(arr[None, None, ...]),
+            size=(new_h, new_w),
+            mode='nearest',
+        )[0, 0].numpy().astype(np.float32, copy=False)
+    else:
+        scaled = arr
+    # Center in zero canvas at the same offset as _fit_pil_to_square.
+    out = np.zeros((size, size), dtype=np.float32)
+    left = max(0, int((size - new_w) // 2))
+    top = max(0, int((size - new_h) // 2))
+    out[top:top + new_h, left:left + new_w] = np.clip(scaled, 0.0, 1.0)
+    return out
 
 
 def _positive_label_bits(label_vec: np.ndarray) -> np.ndarray:
@@ -211,10 +254,17 @@ class SemanticWheelCandidate:
 
 
 def _row_creation_mask(row: SemanticDiskRow, image_size: int) -> Optional[np.ndarray]:
-    """Load or derive a float32 [0,1] creation mask for *row*.  No normalization."""
+    """Load or derive a float32 [0,1] creation mask for *row*.
+
+    All mask paths that will be paired with an RGB image loaded via _load_fit_rgb_u8
+    use _fit_mask_letterbox so that the mask's spatial layout matches the image's
+    letterbox padding exactly. _fit_mask_array (stretch-to-fill) is NOT used here
+    because it would bleed mask content into the black padding bands.
+    """
     size = max(8, int(image_size))
     if row.mask_array is not None:
-        return _fit_mask_array(np.asarray(row.mask_array, dtype=np.float32), image_size=size)
+        # mask_array is at the original image resolution — apply same letterbox.
+        return _fit_mask_letterbox(np.asarray(row.mask_array, dtype=np.float32), image_size=size)
     if str(row.mask_path).strip():
         mask_path = Path(str(row.mask_path))
         if mask_path.exists():
@@ -242,7 +292,9 @@ def _row_creation_mask(row: SemanticDiskRow, image_size: int) -> Optional[np.nda
                     seg = None
                 if seg is not None:
                     seg01 = (np.asarray(seg, dtype=np.float32) > 0.0).astype(np.float32, copy=False)
-                    return _fit_mask_array(seg01, image_size=size)
+                    # Apply letterbox — not stretch — so mask aligns with the
+                    # letterboxed RGB image stored alongside it.
+                    return _fit_mask_letterbox(seg01, image_size=size)
             try:
                 with Image.open(str(mask_path)) as im:
                     gray = _fit_pil_to_square(im.convert("L"), image_size=size, fill=0)
@@ -665,9 +717,76 @@ def _load_json(path: Path, default: Dict[str, Any]) -> Dict[str, Any]:
     return dict(default)
 
 
-def _store_json(path: Path, payload: Dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+def _store_json(path: Path, payload: Dict[str, Any], progress_control: Any = None, note: str = "") -> None:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+    except Exception as exc:
+        raise_if_filesystem_space_emergency(
+            progress_control,
+            exc,
+            note=str(note).strip() or "semantic wheel metadata write",
+            write_path=path,
+        )
+        raise
+
+
+def _path_mtime_ns(path: Path) -> int:
+    try:
+        return int(path.stat().st_mtime_ns)
+    except Exception:
+        return 0
+
+
+def _remove_tree_best_effort(path: Path) -> bool:
+    try:
+        shutil.rmtree(str(path), ignore_errors=False)
+        return True
+    except FileNotFoundError:
+        return True
+    except Exception:
+        return False
+
+
+def _prune_semantic_candidate_cache_pool(
+    cache_root: Path,
+    purpose_key: str,
+    *,
+    current_dir: Optional[Path] = None,
+    keep_total: int = 1,
+    tmp_stale_age_s: float = 600.0,
+) -> None:
+    """Prune stale cache variants for one purpose under a shared cache root.
+
+    This keeps the actively selected cache directory and removes older sibling
+    variants for the same logical purpose. It also cleans up stale ``*_tmp``
+    crash leftovers so partial builds do not accumulate indefinitely.
+    """
+    try:
+        entries = list(cache_root.iterdir())
+    except Exception:
+        return
+    prefix = f"{str(purpose_key)}_"
+    now = time.time()
+    current = Path(current_dir) if current_dir is not None else None
+    survivors: List[Path] = []
+    for path in entries:
+        if not path.is_dir():
+            continue
+        if not str(path.name).startswith(prefix):
+            continue
+        if current is not None and path == current:
+            continue
+        if str(path.name).endswith("_tmp"):
+            age_s = max(0.0, now - float(getattr(path.stat(), "st_mtime", now)))
+            if float(age_s) >= float(tmp_stale_age_s):
+                _remove_tree_best_effort(path)
+            continue
+        survivors.append(path)
+    survivors.sort(key=_path_mtime_ns, reverse=True)
+    keep_other = max(0, int(keep_total) - (1 if current is not None else 0))
+    for victim in survivors[int(keep_other):]:
+        _remove_tree_best_effort(victim)
 
 
 def _wheel_signature(config_blob: Dict[str, Any]) -> str:
@@ -762,9 +881,18 @@ def _chunk_payload(entries: Sequence[Dict[str, Any]], label_dim: int, image_size
     return payload, info
 
 
-def _write_chunk(path: Path, payload: Dict[str, np.ndarray]) -> int:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(str(path), **payload)
+def _write_chunk(path: Path, payload: Dict[str, np.ndarray], progress_control: Any = None) -> int:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        np.savez_compressed(str(path), **payload)
+    except Exception as exc:
+        raise_if_filesystem_space_emergency(
+            progress_control,
+            exc,
+            note="semantic wheel chunk write",
+            write_path=path,
+        )
+        raise
     return int(path.stat().st_size) if path.exists() else 0
 
 
@@ -980,7 +1108,16 @@ def ensure_semantic_candidate_cache(
     if len(candidates) <= 0 or len(candidate_indices) <= 0:
         raise RuntimeError(f"{str(config.purpose)} requires non-empty semantic candidates")
     cache_root = Path(str(config.cache_root).strip())
-    cache_root.mkdir(parents=True, exist_ok=True)
+    try:
+        cache_root.mkdir(parents=True, exist_ok=True)
+    except Exception as exc:
+        raise_if_filesystem_space_emergency(
+            config.progress_control,
+            exc,
+            note="semantic wheel cache root write",
+            write_path=cache_root,
+        )
+        raise
     purpose_key = _sanitize_component(config.purpose)
     build_config = {
         "format_version": 2,
@@ -1004,6 +1141,11 @@ def ensure_semantic_candidate_cache(
     deck_state_path = wheel_dir / "deck_state.json"
     candidate_sig = _candidate_signature(candidates=candidates, candidate_indices=candidate_indices)
     manifest = _load_json(manifest_path, default={})
+    cache_use_count = int(manifest.get("cache_use_count", 1 if manifest else 0) or 0)
+    expired_by_use = bool(
+        int(config.expiry_uses) > 0
+        and int(cache_use_count) >= int(config.expiry_uses)
+    )
     manifest_ok = bool(
         not bool(config.force_rebuild)
         and
@@ -1012,11 +1154,26 @@ def ensure_semantic_candidate_cache(
         and str(manifest.get("candidate_signature", "")) == str(candidate_sig)
         and int(manifest.get("label_dim", 0)) == int(label_dim)
         and int(manifest.get("image_size", 0)) == int(config.image_size)
+        and not bool(expired_by_use)
     )
     if bool(manifest_ok):
         manifest["cache_hit"] = True
         manifest["lookahead_batches"] = int(config.lookahead_batches)
-        _store_json(manifest_path, manifest)
+        manifest["cache_use_count"] = int(max(1, int(cache_use_count)) + 1)
+        manifest["last_used_unix_time"] = float(time.time())
+        manifest["expiry_uses"] = int(config.expiry_uses)
+        _store_json(
+            manifest_path,
+            manifest,
+            progress_control=config.progress_control,
+            note="semantic wheel manifest update",
+        )
+        _prune_semantic_candidate_cache_pool(
+            cache_root=cache_root,
+            purpose_key=purpose_key,
+            current_dir=wheel_dir,
+            keep_total=1,
+        )
         return {
             "cache_dir": str(wheel_dir),
             "manifest": str(manifest_path),
@@ -1030,7 +1187,16 @@ def ensure_semantic_candidate_cache(
             "info": dict(manifest),
         }
 
-    wheel_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        wheel_dir.mkdir(parents=True, exist_ok=True)
+    except Exception as exc:
+        raise_if_filesystem_space_emergency(
+            config.progress_control,
+            exc,
+            note="semantic wheel cache directory write",
+            write_path=wheel_dir,
+        )
+        raise
     deck_state = _load_json(deck_state_path, default={})
     state_sig = str(deck_state.get("candidate_signature", ""))
     order = [int(x) for x in list(deck_state.get("order", []))] if state_sig == str(candidate_sig) else []
@@ -1099,7 +1265,16 @@ def ensure_semantic_candidate_cache(
     temp_dir = wheel_dir.with_name(f"{wheel_dir.name}_tmp")
     if temp_dir.exists():
         shutil.rmtree(str(temp_dir), ignore_errors=True)
-    temp_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        temp_dir.mkdir(parents=True, exist_ok=True)
+    except Exception as exc:
+        raise_if_filesystem_space_emergency(
+            config.progress_control,
+            exc,
+            note="semantic wheel temp directory write",
+            write_path=temp_dir,
+        )
+        raise
 
     _SENTINEL = None
     # Queue depth of 2: lets one chunk serialize while the next builds
@@ -1116,6 +1291,16 @@ def ensure_semantic_candidate_cache(
         "total_associations": 0,
         "error": None,
     }
+
+    def _queue_write_item(item: Any) -> None:
+        while True:
+            if writer_state["error"] is not None:
+                raise writer_state["error"]
+            try:
+                write_queue.put(item, timeout=0.1)
+                return
+            except queue.Full:
+                continue
 
     def _writer_loop() -> None:
         try:
@@ -1134,6 +1319,7 @@ def ensure_semantic_candidate_cache(
                 on_disk = _write_chunk(
                     temp_dir / f"chunk_{int(writer_state['chunk_idx']):04d}.npz",
                     payload,
+                    progress_control=config.progress_control,
                 )
                 writer_state["chunk_rows"].append(int(len(entries_to_flush)))
                 writer_state["chunk_bytes"].append(int(on_disk))
@@ -1190,7 +1376,7 @@ def ensure_semantic_candidate_cache(
                     if int(writer_state["total_raw_bytes"]) + int(est_bytes) > int(effective_limit):
                         cap_exceeded = True
                         break
-                write_queue.put((chunk_to_write,))
+                _queue_write_item((chunk_to_write,))
             if not cap_exceeded:
                 selected_base_rows.append(int(base_row_idx))
 
@@ -1201,10 +1387,11 @@ def ensure_semantic_candidate_cache(
             if int(writer_state["total_raw_bytes"]) + int(est_bytes) > int(effective_limit):
                 cap_exceeded = True
         if not cap_exceeded:
-            write_queue.put((list(current_entries),))
+            _queue_write_item((list(current_entries),))
 
     # Signal writer to finish and wait
-    write_queue.put(_SENTINEL)
+    if writer_state["error"] is None:
+        _queue_write_item(_SENTINEL)
     writer_thread.join()
 
     if writer_state["error"] is not None:
@@ -1231,6 +1418,7 @@ def ensure_semantic_candidate_cache(
     chunk_rows = list(writer_state["chunk_rows"])
     chunk_bytes = list(writer_state["chunk_bytes"])
     total_raw_bytes = int(writer_state["total_raw_bytes"])
+    now_ts = float(time.time())
 
     final_manifest = {
         "version": 2,
@@ -1263,11 +1451,29 @@ def ensure_semantic_candidate_cache(
         "deck_epoch_start": int(epoch),
         "deck_cursor_start": int(cursor),
         "deck_use_rare_terms": bool(config.use_rare_term_deck),
+        "expiry_uses": int(config.expiry_uses),
+        "cache_use_count": 1,
+        "created_unix_time": float(now_ts),
+        "last_used_unix_time": float(now_ts),
     }
-    _store_json(temp_dir / "manifest.json", final_manifest)
+    _store_json(
+        temp_dir / "manifest.json",
+        final_manifest,
+        progress_control=config.progress_control,
+        note="semantic wheel manifest write",
+    )
     if wheel_dir.exists():
         shutil.rmtree(str(wheel_dir), ignore_errors=True)
-    temp_dir.replace(wheel_dir)
+    try:
+        temp_dir.replace(wheel_dir)
+    except Exception as exc:
+        raise_if_filesystem_space_emergency(
+            config.progress_control,
+            exc,
+            note="semantic wheel finalize rename",
+            write_path=wheel_dir,
+        )
+        raise
 
     new_cursor = int(cursor + len(selected_base_rows))
     new_epoch = int(epoch)
@@ -1286,7 +1492,18 @@ def ensure_semantic_candidate_cache(
         "cursor": int(new_cursor),
         "order": [int(x) for x in new_order],
     }
-    _store_json(deck_state_path, deck_state_out)
+    _store_json(
+        deck_state_path,
+        deck_state_out,
+        progress_control=config.progress_control,
+        note="semantic wheel deck state write",
+    )
+    _prune_semantic_candidate_cache_pool(
+        cache_root=cache_root,
+        purpose_key=purpose_key,
+        current_dir=wheel_dir,
+        keep_total=1,
+    )
 
     return {
         "cache_dir": str(wheel_dir),

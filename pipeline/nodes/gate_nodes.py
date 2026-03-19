@@ -441,8 +441,9 @@ class GeneratorGateNode(GatedNode):
     required_gates = ["gate_pregestation", "gate_gestation", "gate_berkeley"]
     gpu_models = ["generator", "classifier"]
 
-    def __init__(self, cfg: GeneratorGateConfig) -> None:
+    def __init__(self, cfg: GeneratorGateConfig, generator_cfg: Any = None) -> None:
         self.cfg = cfg
+        self.generator_cfg = generator_cfg
 
     def should_run(self, ctx: PipelineContext) -> bool:
         if not super().should_run(ctx):
@@ -452,16 +453,24 @@ class GeneratorGateNode(GatedNode):
     def execute(self, ctx: PipelineContext) -> None:
         from wav_ml_models import evaluate_conditional_generator
 
+        g_cfg = self.generator_cfg
+        image_size = int(getattr(g_cfg, "image_size", None) or getattr(ctx.args, "image_size", 128))
+        z_dim = int(getattr(g_cfg, "z_dim", None) or getattr(ctx.args, "generator_z_dim", 128))
+
         result = evaluate_conditional_generator(
             generator=ctx.generator,
             classifier=ctx.classifier,
-            class_names=ctx.class_names,
+            payload_conditions=ctx.payload_conditions,
+            payload_masks=ctx.payload_masks if ctx.payload_masks else [],
+            num_classes=len(ctx.class_names) if ctx.class_names else 1,
+            image_hw=(image_size, image_size),
+            z_dim=z_dim,
             device=ctx.device,
-            n_samples=32,
-            args=ctx.args,
+            steps=1,
+            batch_size=32,
         )
 
-        feat_score = float(result.get("feature_score", 0.0))
+        feat_score = float(result.get("feature_score", result.get("target_prob", 0.0)))
 
         ctx.gate_generator.required_consecutive = self.cfg.required_consecutive
         ctx.gate_generator.record(

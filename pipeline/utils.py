@@ -1130,63 +1130,18 @@ def _save_generator_supervision_preview(
 # Cache management
 # ---------------------------------------------------------------------------
 
-def _hard_wipe_pipeline_caches(output_dir: Path, data_root: str, semantic_stage_cache_dir: str = "") -> Dict[str, Any]:
-    out_dir = Path(output_dir)
-    data_root_path = Path(str(data_root).strip() or "data/berkeley_sbd")
-    targets: List[Path] = [
-        out_dir / "accepted_wave_library",
-        out_dir / "latent_wave_pool",
-        out_dir / "training_supervision",
-    ]
-    semantic_stage_root = (
-        Path(str(semantic_stage_cache_dir).strip())
-        if str(semantic_stage_cache_dir).strip()
-        else (out_dir / "semantic_stage_cache")
+def _hard_wipe_pipeline_caches(output_dir: Path, berkeley_data_root: str, semantic_stage_cache_dir: str = "") -> Dict[str, Any]:
+    from pipeline.filesystem_emergency import purge_dataloader_ephemeral_caches
+
+    return purge_dataloader_ephemeral_caches(
+        output_dir=output_dir,
+        berkeley_data_root=str(berkeley_data_root).strip(),
+        semantic_stage_cache_dir=str(semantic_stage_cache_dir).strip(),
     )
-    targets.append(semantic_stage_root)
-    cache_root = data_root_path / "cache"
-    if cache_root.exists():
-        targets.append(cache_root / "semantic_mask_cache")
-        for payload_dir in sorted(cache_root.glob("payload_bank_rgb*")):
-            targets.append(Path(payload_dir))
-
-    def _remove_path_retry(path: Path, retries: int = 6) -> Tuple[bool, str]:
-        last_err = ""
-        for attempt in range(max(1, int(retries))):
-            try:
-                if not path.exists():
-                    return False, ""
-                if path.is_dir():
-                    shutil.rmtree(path)
-                else:
-                    path.unlink()
-                return True, ""
-            except FileNotFoundError:
-                return False, ""
-            except PermissionError as e:
-                last_err = f"{type(e).__name__}: {e}"
-                gc.collect()
-                time.sleep(0.15 * float(attempt + 1))
-            except Exception as e:
-                last_err = f"{type(e).__name__}: {e}"
-                break
-        return False, str(last_err)
-
-    info: Dict[str, Any] = {"requested": [str(p) for p in targets], "removed": [], "missing": [], "errors": []}
-    for p in targets:
-        if not p.exists():
-            info["missing"].append(str(p))
-            continue
-        ok, err = _remove_path_retry(p)
-        if bool(ok):
-            info["removed"].append(str(p))
-        else:
-            info["errors"].append(f"{str(p)} ({str(err)})")
-    return info
 
 
-def _soft_reset_label_caches(output_dir: Path, data_root: str, semantic_stage_cache_dir: str = "") -> Dict[str, Any]:
-    data_root_path = Path(str(data_root).strip() or "data/berkeley_sbd")
+def _soft_reset_label_caches(output_dir: Path, berkeley_data_root: str, semantic_stage_cache_dir: str = "") -> Dict[str, Any]:
+    data_root_path = Path(str(berkeley_data_root).strip() or "data/berkeley_sbd")
     targets: List[Path] = []
     semantic_stage_root = (
         Path(str(semantic_stage_cache_dir).strip())

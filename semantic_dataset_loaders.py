@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import gzip
+import pickle
 import queue
 import json
 import hashlib
@@ -24,6 +26,8 @@ from torch.utils.data._utils.collate import default_collate
 from torchvision.transforms import InterpolationMode
 from torchvision.transforms import functional as TF
 
+from pipeline.filesystem_emergency import raise_if_filesystem_space_emergency
+from pipeline.nodes.interrupts import StageStopRequested
 from pipeline.progress import interruptible_tqdm
 
 
@@ -96,13 +100,28 @@ def _load_cache_control(cache_root: Path) -> Dict[str, Any]:
     return {"loop_cursor": 0}
 
 
-def _store_cache_control(cache_root: Path, payload: Dict[str, Any]) -> None:
+def _store_cache_control(cache_root: Path, payload: Dict[str, Any], progress_control: Any = None) -> None:
     root = Path(cache_root)
-    root.mkdir(parents=True, exist_ok=True)
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+    except Exception as exc:
+        raise_if_filesystem_space_emergency(
+            progress_control,
+            exc,
+            note="semantic stage cache control write",
+            write_path=root,
+        )
+        return
     path = _cache_control_file(root)
     try:
         path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
-    except Exception:
+    except Exception as exc:
+        raise_if_filesystem_space_emergency(
+            progress_control,
+            exc,
+            note="semantic stage cache control write",
+            write_path=path,
+        )
         pass
 
 
@@ -140,7 +159,7 @@ def normalize_vocab_terms(terms: Sequence[str]) -> List[str]:
     return out
 
 
-def convert_sbd_mat_to_npz(root) -> None:
+def convert_sbd_mat_to_npz(root, progress_control: Any = None) -> None:
     """One-time conversion of {root}/cls/*.mat → {root}/cls/*.npz.
 
     After this, scipy.io.loadmat is no longer needed to read Berkeley SBD masks.
@@ -187,7 +206,19 @@ def convert_sbd_mat_to_npz(root) -> None:
                     except Exception:
                         pass
                 if seg is not None:
-                    _np.savez_compressed(str(mat_path.with_suffix(".npz")), segmentation=seg)
+                    npz_path = mat_path.with_suffix(".npz")
+                    try:
+                        _np.savez_compressed(str(npz_path), segmentation=seg)
+                    except Exception as exc:
+                        raise_if_filesystem_space_emergency(
+                            progress_control,
+                            exc,
+                            note="berkeley mat-to-npz conversion",
+                            write_path=npz_path,
+                        )
+                        raise
+            except StageStopRequested:
+                raise
             except Exception:
                 errors += 1
         print(f"[mat2npz] done. errors={errors}", flush=True)
@@ -2672,7 +2703,16 @@ class BootstrapDynamicDataset(Dataset):
             return 0
 
     def _write_persistent_cache(self, cache_dir: Path, desired_rows: int) -> int:
-        _reset_cache_dir(cache_dir)
+        try:
+            _reset_cache_dir(cache_dir)
+        except Exception as exc:
+            raise_if_filesystem_space_emergency(
+                self.progress_control,
+                exc,
+                note=f"{self.dataset_name} persistent cache write",
+                write_path=cache_dir,
+            )
+            raise
         self._cache_images_mm = None
         self._cache_targets_mm = None
         self._cache_masks_mm = None
@@ -2730,30 +2770,39 @@ class BootstrapDynamicDataset(Dataset):
         mask_indices_path = cache_dir / "mask_indices.npy"
         mask_offsets_path = cache_dir / "mask_offsets.npy"
         manifest_path = cache_dir / "manifest.json"
-        np.save(str(images_path), images_np)
-        np.save(str(targets_path), targets_np)
-        if masks_np is not None:
-            np.save(str(masks_path), masks_np)
-        elif masks_path.exists():
-            masks_path.unlink()
-        if mask_stacks_np is not None and mask_indices_np is not None and mask_offsets_np is not None:
-            np.save(str(mask_stacks_path), mask_stacks_np)
-            np.save(str(mask_indices_path), mask_indices_np)
-            np.save(str(mask_offsets_path), mask_offsets_np)
-        else:
-            for orphan_path in (mask_stacks_path, mask_indices_path, mask_offsets_path):
-                if orphan_path.exists():
-                    orphan_path.unlink()
-        manifest = {
-            "version": 3,
-            "dataset_name": str(self.dataset_name),
-            "signature": str(self.persistent_cache_signature),
-            "cached_rows": int(images_np.shape[0]),
-            "target_dim": int(self.target_dim),
-            "return_masks": bool(self.return_masks),
-            "return_mask_stack": bool(self.return_mask_stack),
-        }
-        manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+        try:
+            np.save(str(images_path), images_np)
+            np.save(str(targets_path), targets_np)
+            if masks_np is not None:
+                np.save(str(masks_path), masks_np)
+            elif masks_path.exists():
+                masks_path.unlink()
+            if mask_stacks_np is not None and mask_indices_np is not None and mask_offsets_np is not None:
+                np.save(str(mask_stacks_path), mask_stacks_np)
+                np.save(str(mask_indices_path), mask_indices_np)
+                np.save(str(mask_offsets_path), mask_offsets_np)
+            else:
+                for orphan_path in (mask_stacks_path, mask_indices_path, mask_offsets_path):
+                    if orphan_path.exists():
+                        orphan_path.unlink()
+            manifest = {
+                "version": 3,
+                "dataset_name": str(self.dataset_name),
+                "signature": str(self.persistent_cache_signature),
+                "cached_rows": int(images_np.shape[0]),
+                "target_dim": int(self.target_dim),
+                "return_masks": bool(self.return_masks),
+                "return_mask_stack": bool(self.return_mask_stack),
+            }
+            manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+        except Exception as exc:
+            raise_if_filesystem_space_emergency(
+                self.progress_control,
+                exc,
+                note=f"{self.dataset_name} persistent cache write",
+                write_path=cache_dir,
+            )
+            raise
         self._cache_images_mm = None
         self._cache_targets_mm = None
         self._cache_masks_mm = None
@@ -2783,7 +2832,16 @@ class BootstrapDynamicDataset(Dataset):
 
     def _initialize_loop_persistent_cache(self, cache_root: Path, desired_rows: int) -> bool:
         loop_root = Path(cache_root) / "_loop_pool"
-        loop_root.mkdir(parents=True, exist_ok=True)
+        try:
+            loop_root.mkdir(parents=True, exist_ok=True)
+        except Exception as exc:
+            raise_if_filesystem_space_emergency(
+                self.progress_control,
+                exc,
+                note=f"{self.dataset_name} persistent cache root write",
+                write_path=loop_root,
+            )
+            raise
         estimated_bytes = int(self._estimated_persistent_cache_bytes(int(desired_rows)))
         self.persistent_cache_info["estimated_bytes"] = int(estimated_bytes)
         cap_bytes = max(0, int(self.persistent_cache_max_bytes))
@@ -2809,7 +2867,7 @@ class BootstrapDynamicDataset(Dataset):
                 # Increment the use count for the chosen slot.
                 slot_use_counts[str(slot_idx)] = int(uses) + 1
                 control["slot_use_counts"] = slot_use_counts
-                _store_cache_control(loop_root, control)
+                _store_cache_control(loop_root, control, progress_control=self.progress_control)
                 self.persistent_cache_info["cache_dir"] = str(slot_dir)
                 self.persistent_cache_info["loop_slot"] = int(slot_idx)
                 self.persistent_cache_info["slot_uses"] = int(uses) + 1
@@ -2823,7 +2881,7 @@ class BootstrapDynamicDataset(Dataset):
         # Reset use count for the slot being rebuilt.
         slot_use_counts[str(slot_idx)] = 0
         control["slot_use_counts"] = slot_use_counts
-        _store_cache_control(loop_root, control)
+        _store_cache_control(loop_root, control, progress_control=self.progress_control)
         slot_dir = _loop_slot_dir(loop_root, slot_idx)
         self._write_persistent_cache(cache_dir=slot_dir, desired_rows=int(desired_rows))
         self.persistent_cache_info["cache_dir"] = str(slot_dir)
@@ -2868,7 +2926,16 @@ class BootstrapDynamicDataset(Dataset):
         if int(desired_rows) <= 0:
             return
         cache_root = Path(str(self.persistent_cache_dir)).resolve()
-        cache_root.mkdir(parents=True, exist_ok=True)
+        try:
+            cache_root.mkdir(parents=True, exist_ok=True)
+        except Exception as exc:
+            raise_if_filesystem_space_emergency(
+                self.progress_control,
+                exc,
+                note=f"{self.dataset_name} persistent cache root write",
+                write_path=cache_root,
+            )
+            raise
         if str(self.persistent_cache_overflow_strategy) == "loop":
             self._initialize_loop_persistent_cache(cache_root=cache_root, desired_rows=int(desired_rows))
             return
@@ -3461,8 +3528,18 @@ def _build_and_store_row_mask_cache(
     terms: Sequence[str],
     mask_path: str = "",
     layout: Optional[Dict[str, Any]] = None,
+    progress_control: Any = None,
 ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray], bool]:
-    cache_root.mkdir(parents=True, exist_ok=True)
+    try:
+        cache_root.mkdir(parents=True, exist_ok=True)
+    except Exception as exc:
+        raise_if_filesystem_space_emergency(
+            progress_control,
+            exc,
+            note="semantic mask cache write",
+            write_path=cache_root,
+        )
+        raise
     cache_file = _mask_cache_file_path(
         cache_root=cache_root,
         image_path=image_path,
@@ -3537,7 +3614,13 @@ def _build_and_store_row_mask_cache(
             mask_stack=np.asarray(inferred_stack, dtype=np.float32),
             mask_indices=np.asarray(inferred_idx, dtype=np.int64),
         )
-    except Exception:
+    except Exception as exc:
+        raise_if_filesystem_space_emergency(
+            progress_control,
+            exc,
+            note="semantic mask cache write",
+            write_path=cache_file,
+        )
         pass
     return np.asarray(mixed_mask, dtype=np.float32), np.asarray(inferred_stack, dtype=np.float32), np.asarray(inferred_idx, dtype=np.int64), True
 
@@ -3590,6 +3673,7 @@ def _materialize_semantic_row_mask_cache(
             terms=row.terms,
             mask_path=str(row.mask_path or ""),
             layout=(dict(row.layout) if isinstance(row.layout, dict) else None),
+            progress_control=None,
         )
         return int(row_index), mixed, stack, indices, bool(created)
 
@@ -3614,6 +3698,8 @@ def _materialize_semantic_row_mask_cache(
                     info["mask_cache_writes"] = int(info["mask_cache_writes"]) + 1
                 else:
                     info["mask_cache_hits"] = int(info["mask_cache_hits"]) + 1
+            except StageStopRequested:
+                raise
             except Exception:
                 info["mask_cache_failures"] = int(info["mask_cache_failures"]) + 1
         info["mask_cache_seconds"] = float(max(0.0, time.perf_counter() - t0))
@@ -3651,6 +3737,8 @@ def _materialize_semantic_row_mask_cache(
                     info["mask_cache_writes"] = int(info["mask_cache_writes"]) + 1
                 else:
                     info["mask_cache_hits"] = int(info["mask_cache_hits"]) + 1
+            except StageStopRequested:
+                raise
             except Exception:
                 info["mask_cache_failures"] = int(info["mask_cache_failures"]) + 1
             while submit_cursor < int(len(rows)) and int(len(pending)) < int(max_inflight):
@@ -3697,6 +3785,41 @@ def _folder_source_signature(root: Path) -> Dict[str, Any]:
     return out
 
 
+def _disk_rows_cache_path(data_root: str, cache_key: str) -> Path:
+    """Fixed path for the on-disk row cache, keyed by logical scan parameters."""
+    key_hash = hashlib.sha256(cache_key.encode("utf-8")).hexdigest()[:16]
+    root = Path(str(data_root).strip() or "data/berkeley_sbd")
+    return root / "cache" / f"semantic_disk_rows_{key_hash}.pkl.gz"
+
+
+def _disk_rows_freshness_sig(root: Path, ext_root: Path) -> str:
+    """Cheap string fingerprint of on-disk data; changes when files are added/replaced."""
+    parts: List[str] = []
+    for split_name in ("train", "val"):
+        lp = root / "cache" / f"sbd_{split_name}_multilabel.npz"
+        try:
+            st = lp.stat()
+            parts.append(f"{split_name}:{st.st_mtime:.0f}:{st.st_size}")
+        except Exception:
+            parts.append(f"{split_name}:missing")
+    if ext_root.exists():
+        try:
+            ds_dirs = sorted(
+                [p for p in ext_root.iterdir() if p.is_dir()],
+                key=lambda p: p.name.lower(),
+            )
+            for ds_dir in ds_dirs:
+                files = [
+                    p for p in ds_dir.rglob("*")
+                    if p.is_file() and str(p.suffix).strip().lower() in _IMAGE_SUFFIXES
+                ]
+                latest = max((fp.stat().st_mtime for fp in files), default=0.0)
+                parts.append(f"ext:{ds_dir.name}:{len(files)}:{latest:.0f}")
+        except Exception:
+            parts.append("ext:sig_error")
+    return "|".join(parts)
+
+
 def collect_semantic_disk_rows(
     data_root: str,
     class_names: Sequence[str],
@@ -3718,6 +3841,32 @@ def collect_semantic_disk_rows(
         return _clone_semantic_disk_rows(cached_rows), info_out
 
     t0 = time.perf_counter()
+
+    # --- Disk cache check (survives process restarts) ---
+    _ext_root_pre = Path(str(source_root).strip()) if str(source_root).strip() else (root / "payload_sources")
+    _freshness_sig = _disk_rows_freshness_sig(root, _ext_root_pre)
+    _disk_cache_file = _disk_rows_cache_path(str(root), cache_key)
+    if _disk_cache_file.exists():
+        try:
+            with gzip.open(str(_disk_cache_file), "rb") as _f:
+                _bundle = pickle.load(_f)
+            if _bundle.get("freshness_sig") == _freshness_sig:
+                _rows = _bundle["rows"]
+                _info = dict(_bundle["info"])
+                _info["disk_cache_hit"] = True
+                _info["inprocess_cache_hit"] = False
+                _info["row_build_seconds"] = float(max(0.0, time.perf_counter() - t0))
+                with _SEMANTIC_DISK_ROWS_CACHE_LOCK:
+                    _SEMANTIC_DISK_ROWS_CACHE[cache_key] = (_clone_semantic_disk_rows(_rows), dict(_info))
+                print(
+                    f"[collect-disk-rows] disk cache hit — {len(_rows)} rows"
+                    f" in {_info['row_build_seconds']:.3f}s",
+                    flush=True,
+                )
+                return _clone_semantic_disk_rows(_rows), _info
+        except Exception:
+            pass  # stale / corrupt — fall through to full scan
+
     class_lut = {_norm_txt(name): int(i) for i, name in enumerate(class_names)}
     n_classes = max(1, int(len(class_names)))
     rows: List[SemanticDiskRow] = []
@@ -3788,7 +3937,7 @@ def collect_semantic_disk_rows(
                 out_vec[int(idx)] = 1.0
         return out_vec, normalize_vocab_terms(list(out_terms) + list(color_terms))
 
-    convert_sbd_mat_to_npz(root)
+    convert_sbd_mat_to_npz(root, progress_control=progress_control)
     split_specs = [("train", "berkeley_sbd_train"), ("val", "berkeley_sbd_val")]
     for split_name, source_key in split_specs:
         _split_images, _mask_paths = _read_sbd_split_file(root, split_name)
@@ -3798,7 +3947,9 @@ def collect_semantic_disk_rows(
                 from berkeley_sbd_pretrain import _labels_from_segmentation_masks, _load_sbd_split
                 print(f"[collect-disk-rows] label cache missing — auto-building for split={split_name}...", flush=True)
                 _ds = _load_sbd_split(root, image_set=split_name, download=False)
-                _labels_from_segmentation_masks(_ds, label_path)
+                _labels_from_segmentation_masks(_ds, label_path, progress_control=progress_control)
+            except StageStopRequested:
+                raise
             except Exception as _build_exc:
                 raise RuntimeError(
                     "Berkeley multilabel cache is missing and could not be auto-built: "
@@ -3978,6 +4129,22 @@ def collect_semantic_disk_rows(
         "mask_cache_seconds": 0.0,
         "mask_cache_threads": 0,
     }
+    info["disk_cache_hit"] = False
     with _SEMANTIC_DISK_ROWS_CACHE_LOCK:
         _SEMANTIC_DISK_ROWS_CACHE[cache_key] = (_clone_semantic_disk_rows(rows), dict(info))
+    # --- Write disk cache ---
+    try:
+        _disk_cache_file.parent.mkdir(parents=True, exist_ok=True)
+        _bundle = {"freshness_sig": _freshness_sig, "rows": rows, "info": info}
+        with gzip.open(str(_disk_cache_file), "wb", compresslevel=1) as _f:
+            pickle.dump(_bundle, _f, protocol=pickle.HIGHEST_PROTOCOL)
+        print(f"[collect-disk-rows] disk cache written → {_disk_cache_file}", flush=True)
+    except Exception as _write_exc:
+        raise_if_filesystem_space_emergency(
+            progress_control,
+            _write_exc,
+            note="semantic disk-row cache write",
+            write_path=_disk_cache_file,
+        )
+        print(f"[collect-disk-rows] disk cache write failed: {_write_exc}", flush=True)
     return rows, info

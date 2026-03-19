@@ -1043,6 +1043,8 @@ def parse_args():
     p.add_argument("--generator-base-ch", type=int, default=128)
     p.add_argument("--generator-depth", type=int, default=6)
     p.add_argument("--generator-min-ch", type=int, default=24)
+    p.add_argument("--generator-mask-decoder-channels", type=int, default=64,
+                   help="Channels in the generator mask head (>0 enables it; required for conditional GAN training).")
     p.add_argument("--generator-lr", type=float, default=2e-4)
     p.add_argument("--discriminator-lr", type=float, default=2e-4)
     p.add_argument("--discriminator-base-ch", type=int, default=96)

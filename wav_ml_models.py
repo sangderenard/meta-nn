@@ -1425,62 +1425,58 @@ def _payload_mask_bank(
     payload_masks: Sequence[Any],
     image_hw: Tuple[int, int],
 ) -> torch.Tensor:
-    n = int(len(payload_masks))
     h = max(1, int(image_hw[0]))
     w = max(1, int(image_hw[1]))
-    if n <= 0:
+    if not payload_masks:
         return torch.zeros((0, 1, h, w), dtype=torch.float32)
-    rows = np.zeros((n, 1, h, w), dtype=np.float32)
-    for i in range(n):
-        x = payload_masks[i]
+    items: list = []
+    for i, x in enumerate(payload_masks):
         if isinstance(x, torch.Tensor):
-            arr = x.detach().cpu().numpy().astype(np.float32, copy=False)
+            t = x.detach().float().cpu()
         else:
-            arr = np.asarray(x, dtype=np.float32)
-        if int(arr.ndim) == 3 and int(arr.shape[0]) == 1:
-            arr = arr[0]
-        elif int(arr.ndim) == 3:
-            arr = np.mean(arr, axis=0).astype(np.float32, copy=False)
-        elif int(arr.ndim) != 2:
-            raise RuntimeError(f"Semantic mask row {i} must be [H,W] or [1,H,W], got {tuple(arr.shape)}")
-        arr_t = torch.from_numpy(np.asarray(arr, dtype=np.float32))[None, None, ...]
-        if tuple(arr.shape) != (int(h), int(w)):
-            arr_t = F.interpolate(arr_t, size=(int(h), int(w)), mode="nearest")
-        rows[int(i), 0, :, :] = np.clip(arr_t[0, 0].cpu().numpy().astype(np.float32, copy=False), 0.0, 1.0)
-    return torch.from_numpy(rows)
+            t = torch.from_numpy(np.asarray(x, dtype=np.float32))
+        if t.ndim == 3 and t.shape[0] == 1:
+            t = t[0]
+        elif t.ndim == 3:
+            t = t.mean(0)
+        elif t.ndim != 2:
+            raise RuntimeError(f"Semantic mask row {i} must be [H,W] or [1,H,W], got {tuple(t.shape)}")
+        items.append(t)
+    batch = torch.stack(items).unsqueeze(1)  # [N, 1, H, W]
+    if tuple(batch.shape[-2:]) != (h, w):
+        batch = F.interpolate(batch, size=(h, w), mode="nearest")
+    return batch.clamp(0.0, 1.0).contiguous()
 
 
 def _payload_image_bank(
     payload_images: Sequence[Any],
     image_hw: Tuple[int, int],
 ) -> torch.Tensor:
-    n = int(len(payload_images))
     h = max(1, int(image_hw[0]))
     w = max(1, int(image_hw[1]))
-    if n <= 0:
+    if not payload_images:
         return torch.zeros((0, 3, h, w), dtype=torch.float32)
-    rows = np.zeros((n, 3, h, w), dtype=np.float32)
-    for i in range(n):
-        x = payload_images[i]
+    items: list = []
+    for i, x in enumerate(payload_images):
         if isinstance(x, torch.Tensor):
-            arr = x.detach().cpu().numpy().astype(np.float32, copy=False)
+            t = x.detach().float().cpu()
         else:
-            arr = np.asarray(x, dtype=np.float32)
-        if int(arr.ndim) == 2:
-            arr = np.repeat(arr[None, :, :], 3, axis=0).astype(np.float32, copy=False)
-        elif int(arr.ndim) == 3 and int(arr.shape[0]) == 1:
-            arr = np.repeat(arr, 3, axis=0).astype(np.float32, copy=False)
-        elif int(arr.ndim) == 3 and int(arr.shape[0]) == 3:
+            t = torch.from_numpy(np.asarray(x, dtype=np.float32))
+        if t.ndim == 2:
+            t = t.unsqueeze(0).expand(3, -1, -1).contiguous()
+        elif t.ndim == 3 and t.shape[0] == 1:
+            t = t.expand(3, -1, -1).contiguous()
+        elif t.ndim == 3 and t.shape[0] == 3:
             pass
-        elif int(arr.ndim) == 3 and int(arr.shape[-1]) == 3:
-            arr = np.transpose(arr, (2, 0, 1)).astype(np.float32, copy=False)
+        elif t.ndim == 3 and t.shape[-1] == 3:
+            t = t.permute(2, 0, 1)
         else:
-            raise RuntimeError(f"Semantic payload image row {i} must be [3,H,W] or [H,W,3], got {tuple(arr.shape)}")
-        arr_t = torch.from_numpy(np.asarray(arr, dtype=np.float32))[None, ...]
-        if tuple(arr_t.shape[-2:]) != (int(h), int(w)):
-            arr_t = F.interpolate(arr_t, size=(int(h), int(w)), mode="nearest")
-        rows[int(i), :, :, :] = np.clip(arr_t[0].cpu().numpy().astype(np.float32, copy=False), 0.0, 1.0)
-    return torch.from_numpy(rows)
+            raise RuntimeError(f"Semantic payload image row {i} must be [3,H,W] or [H,W,3], got {tuple(t.shape)}")
+        items.append(t)
+    batch = torch.stack(items)  # [N, 3, H, W]
+    if tuple(batch.shape[-2:]) != (h, w):
+        batch = F.interpolate(batch, size=(h, w), mode="nearest")
+    return batch.clamp(0.0, 1.0).contiguous()
 
 
 def _payload_batch_bank(
@@ -1706,10 +1702,15 @@ def train_conditional_generator_discriminator(
     wave_chunk_samples: int = 32768,
     wave_reference_streams: Optional[Sequence[np.ndarray]] = None,
     log_every_steps: int = 0,
-    step_preview_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+    step_preview_callback: Optional[Callable[[Sequence[Dict[str, Any]]], None]] = None,
+    progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
     stop_requested: Optional[Callable[[], bool]] = None,
+    pause_requested: Optional[Callable[[], bool]] = None,
+    ipc_pump: Optional[Callable[[], None]] = None,
     generator_step_callback: Optional[Callable[[int], None]] = None,
     discriminator_step_callback: Optional[Callable[[int], None]] = None,
+    g_opt: Optional[torch.optim.Optimizer] = None,
+    d_opt: Optional[torch.optim.Optimizer] = None,
     amp: bool = False,
     amp_dtype: str = "float16",
     channels_last: bool = False,
@@ -1718,6 +1719,8 @@ def train_conditional_generator_discriminator(
     seed: int = 0,
     grad_clip_g: float = 1.0,
     grad_clip_d: float = 1.0,
+    prebuilt_image_bank: Optional[torch.Tensor] = None,
+    prebuilt_mask_bank: Optional[torch.Tensor] = None,
 ) -> Tuple[nn.Module, nn.Module, List[Dict[str, float]]]:
     if len(payload_images) <= 0 or len(payload_conditions) <= 0 or len(payload_masks) <= 0:
         raise RuntimeError("Generator/discriminator training requires non-empty payload bank.")
@@ -1786,8 +1789,10 @@ def train_conditional_generator_discriminator(
     for p in classifier.parameters():
         p.requires_grad_(False)
 
-    g_opt = torch.optim.AdamW(generator.parameters(), lr=float(lr_g), betas=(0.5, 0.999), weight_decay=1e-4)
-    d_opt = torch.optim.AdamW(discriminator.parameters(), lr=float(lr_d), betas=(0.5, 0.999), weight_decay=1e-4)
+    if g_opt is None:
+        g_opt = torch.optim.AdamW(generator.parameters(), lr=float(lr_g), betas=(0.5, 0.999), weight_decay=1e-4)
+    if d_opt is None:
+        d_opt = torch.optim.AdamW(discriminator.parameters(), lr=float(lr_d), betas=(0.5, 0.999), weight_decay=1e-4)
     rng = np.random.default_rng(seed)
     disc_steps_per_gen_step = max(1, int(disc_steps_per_gen_step))
     grad_accum_steps = max(1, int(grad_accum_steps))
@@ -1816,6 +1821,15 @@ def train_conditional_generator_discriminator(
     n_payload = min(int(len(payload_images)), int(len(payload_conditions)), int(len(payload_masks)))
     if int(n_payload) <= 0:
         raise RuntimeError("Generator/discriminator training requires non-empty payload bank.")
+
+    # Pre-convert entire payload bank to pinned CPU tensors once — no per-step conversion in the hot loop.
+    # Callers may pass prebuilt image/mask banks (built once outside a slot loop) to avoid per-slot disk reads.
+    _bank_images = (prebuilt_image_bank if prebuilt_image_bank is not None
+                    else _payload_image_bank(payload_images=list(payload_images), image_hw=image_hw).pin_memory())
+    _bank_conds  = _payload_condition_bank(payload_targets=list(payload_conditions), num_classes=int(num_classes)).pin_memory()
+    _bank_masks  = (prebuilt_mask_bank if prebuilt_mask_bank is not None
+                    else _payload_mask_bank(payload_masks=list(payload_masks), image_hw=image_hw).pin_memory())
+
     history: List[Dict[str, float]] = []
 
     stop_now = False
@@ -1847,93 +1861,39 @@ def train_conditional_generator_discriminator(
                         break
                 except Exception:
                     pass
+            if pause_requested is not None:
+                try:
+                    while bool(pause_requested()):
+                        if stop_requested is not None:
+                            try:
+                                if bool(stop_requested()):
+                                    stop_now = True
+                                    break
+                            except Exception:
+                                pass
+                        if stop_now:
+                            break
+                        if ipc_pump is not None:
+                            try:
+                                ipc_pump()
+                            except Exception:
+                                pass
+                        time.sleep(0.05)
+                except Exception:
+                    pass
+                if stop_now:
+                    break
             idx = rng.integers(0, int(n_payload), size=max(1, int(batch_size)))
-            real_cpu, cond_cpu, mask_cpu = _payload_batch_bank(
-                payload_images=payload_images,
-                payload_conditions=payload_conditions,
-                payload_masks=payload_masks,
-                indices=idx.tolist(),
-                num_classes=int(num_classes),
-                image_hw=image_hw,
-            )
-            real = real_cpu.to(device=device, non_blocking=True)
-            cond = cond_cpu.to(device=device, non_blocking=True, dtype=torch.float32)
-            real_mask = mask_cpu.to(device=device, non_blocking=True, dtype=torch.float32)
+            real = _bank_images[idx].to(device=device, non_blocking=True)
+            cond = _bank_conds[idx].to(device=device, non_blocking=True, dtype=torch.float32)
+            real_mask = _bank_masks[idx].to(device=device, non_blocking=True, dtype=torch.float32)
             if channels_last:
                 real = real.contiguous(memory_format=torch.channels_last)
-            d_loss_accum = 0.0
-            for d_sub in range(disc_steps_per_gen_step):
-                if d_sub == 0:
-                    real_d = real
-                    cond_d = cond
-                    real_mask_d = real_mask
-                else:
-                    idx_d = rng.integers(0, int(n_payload), size=max(1, int(batch_size)))
-                    real_d_cpu, cond_d_cpu, mask_d_cpu = _payload_batch_bank(
-                        payload_images=payload_images,
-                        payload_conditions=payload_conditions,
-                        payload_masks=payload_masks,
-                        indices=idx_d.tolist(),
-                        num_classes=int(num_classes),
-                        image_hw=image_hw,
-                    )
-                    real_d = real_d_cpu.to(device=device, non_blocking=True)
-                    cond_d = cond_d_cpu.to(device=device, non_blocking=True, dtype=torch.float32)
-                    real_mask_d = mask_d_cpu.to(device=device, non_blocking=True, dtype=torch.float32)
-                    if channels_last:
-                        real_d = real_d.contiguous(memory_format=torch.channels_last)
-
-                d_opt.zero_grad(set_to_none=True)
-                d_sub_loss = 0.0
-                d_ranges = _chunk_ranges(total=int(real_d.shape[0]), chunks=grad_accum_steps)
-                for st, ed in d_ranges:
-                    real_m = real_d[st:ed]
-                    cond_m = cond_d[st:ed]
-                    real_mask_m = real_mask_d[st:ed]
-                    z = torch.randn((int(real_m.shape[0]), int(z_dim)), device=device)
-                    with _autocast_context(device=device, use_amp=use_amp, amp_dtype_t=amp_dtype_t):
-                        gen_out = generator.forward_with_aux(z, cond_m) if hasattr(generator, "forward_with_aux") else {"image": generator(z, cond_m)}
-                        fake = gen_out["image"]
-                        fake_mask_logits = gen_out.get("mask_logits")
-                        if not isinstance(fake_mask_logits, torch.Tensor):
-                            raise RuntimeError("Conditional generator training requires generator mask logits.")
-                        if tuple(fake_mask_logits.shape[-2:]) != tuple(real_mask_m.shape[-2:]):
-                            fake_mask_logits = F.interpolate(fake_mask_logits, size=tuple(real_mask_m.shape[-2:]), mode="bilinear", align_corners=False)
-                        fake_mask_probs = torch.sigmoid(fake_mask_logits)
-                        if channels_last:
-                            fake = fake.contiguous(memory_format=torch.channels_last)
-                        d_real = discriminator.forward_with_aux(real_m, cond_m, real_mask_m)
-                        d_fake = discriminator.forward_with_aux(fake.detach(), cond_m, fake_mask_probs.detach())
-                        d_loss = 0.5 * (
-                            F.softplus(-d_real["subject_logits"]).mean()
-                            + F.softplus(d_fake["subject_logits"]).mean()
-                            + F.softplus(-d_real["mask_logits"]).mean()
-                            + F.softplus(d_fake["mask_logits"]).mean()
-                        )
-                    d_loss_back = d_loss / float(max(1, len(d_ranges)))
-                    if use_scaler:
-                        scaler_d.scale(d_loss_back).backward()
-                    else:
-                        d_loss_back.backward()
-                    d_sub_loss += float(d_loss.detach().item()) * (float(ed - st) / float(max(1, int(real_d.shape[0]))))
-                if use_scaler:
-                    scaler_d.unscale_(d_opt)
-                nn.utils.clip_grad_norm_(discriminator.parameters(), float(grad_clip_d))
-                if use_scaler:
-                    scaler_d.step(d_opt)
-                    scaler_d.update()
-                else:
-                    d_opt.step()
-                discriminator_step_count += 1
-                if discriminator_step_callback is not None:
-                    try:
-                        discriminator_step_callback(int(discriminator_step_count))
-                    except Exception:
-                        pass
-                d_loss_accum += float(d_sub_loss)
-            d_loss_step = float(d_loss_accum / float(max(1, disc_steps_per_gen_step)))
-
+            # Joint step — single generator forward, full graph retained.
+            # D and G co-learn through one unified backward: no detach, no discarded graphs.
+            d_opt.zero_grad(set_to_none=True)
             g_opt.zero_grad(set_to_none=True)
+            d_loss_step = 0.0
             g_loss_step = 0.0
             adv_loss_step = 0.0
             target_prob_step = 0.0
@@ -1945,36 +1905,47 @@ def train_conditional_generator_discriminator(
             mask_iou_step = 0.0
             mask_dice_step = 0.0
             preview_items = []
-            g_ranges = _chunk_ranges(total=int(real.shape[0]), chunks=grad_accum_steps)
-            for st, ed in g_ranges:
-                cond_g = cond[st:ed]
-                real_g = real[st:ed]
-                real_mask_g = real_mask[st:ed]
-                z2 = torch.randn((int(real_g.shape[0]), int(z_dim)), device=device)
+            joint_ranges = _chunk_ranges(total=int(real.shape[0]), chunks=grad_accum_steps)
+            for st, ed in joint_ranges:
+                real_m = real[st:ed]
+                cond_m = cond[st:ed]
+                real_mask_m = real_mask[st:ed]
+                z = torch.randn((int(real_m.shape[0]), int(z_dim)), device=device)
                 with _autocast_context(device=device, use_amp=use_amp, amp_dtype_t=amp_dtype_t):
-                    gen_out = generator.forward_with_aux(z2, cond_g) if hasattr(generator, "forward_with_aux") else {"image": generator(z2, cond_g)}
-                    fake2 = gen_out["image"]
+                    # One generator forward — graph kept for both D and G objectives.
+                    gen_out = generator.forward_with_aux(z, cond_m) if hasattr(generator, "forward_with_aux") else {"image": generator(z, cond_m)}
+                    fake = gen_out["image"]
                     fake_mask_logits = gen_out.get("mask_logits")
                     if not isinstance(fake_mask_logits, torch.Tensor):
                         raise RuntimeError("Conditional generator training requires generator mask logits.")
-                    if tuple(fake_mask_logits.shape[-2:]) != tuple(real_mask_g.shape[-2:]):
-                        fake_mask_logits = F.interpolate(fake_mask_logits, size=tuple(real_mask_g.shape[-2:]), mode="bilinear", align_corners=False)
-                    fake_mask_probs = torch.sigmoid(fake_mask_logits).to(torch.float32)
+                    if tuple(fake_mask_logits.shape[-2:]) != tuple(real_mask_m.shape[-2:]):
+                        fake_mask_logits = F.interpolate(fake_mask_logits, size=tuple(real_mask_m.shape[-2:]), mode="bilinear", align_corners=False)
+                    fake_mask_probs = torch.sigmoid(fake_mask_logits)
                     if channels_last:
-                        fake2 = fake2.contiguous(memory_format=torch.channels_last)
-                    d_fake2 = discriminator.forward_with_aux(fake2, cond_g, fake_mask_probs)
-                    adv_loss = F.softplus(-d_fake2["subject_logits"]).mean()
-                    disc_mask_loss = F.softplus(-d_fake2["mask_logits"]).mean()
-                    logits = _classifier_forward_chunked(fake2)
+                        fake = fake.contiguous(memory_format=torch.channels_last)
+                    # D sees both real and fake without detach — gradients flow back into G.
+                    d_real = discriminator.forward_with_aux(real_m, cond_m, real_mask_m)
+                    d_fake = discriminator.forward_with_aux(fake, cond_m, fake_mask_probs)
+                    # Discriminator objective: distinguish real from fake.
+                    d_loss = 0.5 * (
+                        F.softplus(-d_real["subject_logits"]).mean()
+                        + F.softplus(d_fake["subject_logits"]).mean()
+                        + F.softplus(-d_real["mask_logits"]).mean()
+                        + F.softplus(d_fake["mask_logits"]).mean()
+                    )
+                    # Generator objective: semantic coherence via D signal + classifier + mask fidelity.
+                    adv_loss = F.softplus(-d_fake["subject_logits"]).mean()
+                    disc_mask_loss = F.softplus(-d_fake["mask_logits"]).mean()
+                    logits = _classifier_forward_chunked(fake)
                     probs = torch.sigmoid(logits).to(torch.float32)
-                    probs_target, cond_target = _align_probs_with_condition(probs=probs, cond=cond_g)
+                    probs_target, cond_target = _align_probs_with_condition(probs=probs, cond=cond_m)
                     target_count = torch.clamp(cond_target.sum(dim=1), min=1.0)
                     target_prob = (probs_target * cond_target).sum(dim=1) / target_count
                     cls_loss = (1.0 - target_prob).mean()
-                    mask_loss = F.binary_cross_entropy_with_logits(fake_mask_logits.to(torch.float32), real_mask_g.to(torch.float32))
-                    outside_weight = torch.clamp(1.0 - real_mask_g.to(torch.float32), 0.0, 1.0)
+                    mask_loss = F.binary_cross_entropy_with_logits(fake_mask_logits.to(torch.float32), real_mask_m.to(torch.float32))
+                    outside_weight = torch.clamp(1.0 - real_mask_m.to(torch.float32), 0.0, 1.0)
                     outside_denom = torch.clamp(outside_weight.sum(), min=1.0)
-                    outside_loss = ((torch.abs(fake2.to(torch.float32) - real_g.to(torch.float32)) * outside_weight).sum() / outside_denom)
+                    outside_loss = ((torch.abs(fake.to(torch.float32) - real_m.to(torch.float32)) * outside_weight).sum() / outside_denom)
                     g_loss = (
                         (float(w_adv) * adv_loss)
                         + (float(w_cls) * cls_loss)
@@ -1986,18 +1957,18 @@ def train_conditional_generator_discriminator(
                     if use_wave_loss and wave_shape_info is not None and wave_index is not None:
                         # Wave-coupled supervision is expensive at high resolutions.
                         # Cap coupling batch size to keep memory bounded on 12GB GPUs.
-                        wave_cap = min(int(fake2.shape[0]), 8)
-                        if wave_cap < int(fake2.shape[0]):
-                            sel = torch.randperm(int(fake2.shape[0]), device=device)[: int(wave_cap)]
-                            fake2_wave = fake2.index_select(0, sel)
-                            cond_wave = cond_g.index_select(0, sel)
+                        wave_cap = min(int(fake.shape[0]), 8)
+                        if wave_cap < int(fake.shape[0]):
+                            sel = torch.randperm(int(fake.shape[0]), device=device)[: int(wave_cap)]
+                            fake_wave = fake.index_select(0, sel)
+                            cond_wave = cond_m.index_select(0, sel)
                             target_count_wave = target_count.index_select(0, sel)
                         else:
-                            fake2_wave = fake2
-                            cond_wave = cond_g
+                            fake_wave = fake
+                            cond_wave = cond_m
                             target_count_wave = target_count
 
-                        fake_canvas = fake2_wave
+                        fake_canvas = fake_wave
                         if int(fake_canvas.shape[2]) != int(wave_canvas_hw[0]) or int(fake_canvas.shape[3]) != int(wave_canvas_hw[1]):
                             fake_canvas = F.interpolate(fake_canvas, size=wave_canvas_hw, mode="nearest")
                         base_seq = _bitwindow_canvas_to_base_sequence_batch(
@@ -2007,7 +1978,7 @@ def train_conditional_generator_discriminator(
                         )
                         n_use = min(int(wave_index.numel()), int(base_seq.shape[1]))
                         if n_use > 0:
-                            bsz = int(fake2_wave.shape[0])
+                            bsz = int(fake_wave.shape[0])
                             idx_use = wave_index[:n_use]
                             idx_valid = (idx_use >= 0) & (idx_use < int(wave_chunk_samples))
                             if bool(torch.any(idx_valid)):
@@ -2018,17 +1989,17 @@ def train_conditional_generator_discriminator(
                             if n_eff <= 0:
                                 idx_use = None
                             if idx_use is not None:
-                                seq01 = torch.clamp(base_seq[:, :n_eff], 0.0, 1.0).to(dtype=fake2.dtype)
-                                payload_wave = torch.zeros((bsz, int(wave_chunk_samples)), device=device, dtype=fake2.dtype)
-                                src = ((seq01 * 2.0) - 1.0).to(dtype=fake2.dtype)
+                                seq01 = torch.clamp(base_seq[:, :n_eff], 0.0, 1.0).to(dtype=fake.dtype)
+                                payload_wave = torch.zeros((bsz, int(wave_chunk_samples)), device=device, dtype=fake.dtype)
+                                src = ((seq01 * 2.0) - 1.0).to(dtype=fake.dtype)
                                 payload_wave.scatter_(1, idx_use.unsqueeze(0).expand(bsz, -1), src)
                             else:
-                                payload_wave = torch.zeros((bsz, int(wave_chunk_samples)), device=device, dtype=fake2.dtype)
+                                payload_wave = torch.zeros((bsz, int(wave_chunk_samples)), device=device, dtype=fake.dtype)
                             if ref_sampler is not None:
                                 carrier_wave, _ = ref_sampler.sample(batch_size=bsz)
                                 if carrier_wave.device != device:
                                     carrier_wave = carrier_wave.to(device, non_blocking=True)
-                                carrier_wave = carrier_wave.to(dtype=fake2.dtype)
+                                carrier_wave = carrier_wave.to(dtype=fake.dtype)
                             elif wave_reference_streams is not None and len(wave_reference_streams) > 0:
                                 carrier_np = _sample_wave_batch_unlabeled(
                                     streams=wave_reference_streams,
@@ -2040,7 +2011,7 @@ def train_conditional_generator_discriminator(
                                     carrier_np,
                                     device=device,
                                     pin_memory=False,
-                                ).to(dtype=fake2.dtype)
+                                ).to(dtype=fake.dtype)
                             else:
                                 carrier_wave = torch.zeros_like(payload_wave)
                             blend = float(max(0.0, min(1.0, float(wave_carrier_blend))))
@@ -2049,7 +2020,7 @@ def train_conditional_generator_discriminator(
                                 -1.0,
                                 1.0,
                             )
-                            s_vec = torch.full((bsz, 1), float(max(0.0, min(1.0, float(wave_strength)))), device=device, dtype=fake2.dtype)
+                            s_vec = torch.full((bsz, 1), float(max(0.0, min(1.0, float(wave_strength)))), device=device, dtype=fake.dtype)
                             dirty_wave = _degrade_wave_batch(
                                 x_clean=clean_wave,
                                 strength=s_vec,
@@ -2098,23 +2069,26 @@ def train_conditional_generator_discriminator(
                             denoise_term = F.l1_loss(wave_out.to(torch.float32), clean_wave.to(torch.float32))
                             wave_loss = score_gap + (float(max(0.0, float(wave_denoise_weight))) * denoise_term)
                             g_loss = g_loss + (float(w_wave) * wave_loss)
-                g_loss_back = g_loss / float(max(1, len(g_ranges)))
+                    # Unified loss — both networks learn from each other's full gradient landscape.
+                    combined_loss = d_loss + g_loss
+                combined_back = combined_loss / float(max(1, len(joint_ranges)))
                 if use_scaler:
-                    scaler_g.scale(g_loss_back).backward()
+                    scaler_g.scale(combined_back).backward()
                 else:
-                    g_loss_back.backward()
+                    combined_back.backward()
 
                 w = float(ed - st) / float(max(1, int(real.shape[0])))
+                d_loss_step += float(d_loss.detach().item()) * w
                 g_loss_step += float(g_loss.detach().item()) * w
                 adv_loss_step += float(adv_loss.detach().item()) * w
                 target_prob_step += float(target_prob.detach().mean().item()) * w
                 mask_loss_step += float(mask_loss.detach().item()) * w
                 outside_loss_step += float(outside_loss.detach().item()) * w
                 wave_loss_step += float(wave_loss.detach().item()) * w
-                disc_fake_pass = float((d_fake2["subject_logits"].detach().to(torch.float32) > 0.0).to(torch.float32).mean().item())
-                disc_mask_fake_pass = float((d_fake2["mask_logits"].detach().to(torch.float32) > 0.0).to(torch.float32).mean().item())
-                fake_mask_probs_f = fake_mask_probs.to(torch.float32)
-                real_mask_f = real_mask_g.to(torch.float32)
+                disc_fake_pass = float((d_fake["subject_logits"].detach().to(torch.float32) > 0.0).to(torch.float32).mean().item())
+                disc_mask_fake_pass = float((d_fake["mask_logits"].detach().to(torch.float32) > 0.0).to(torch.float32).mean().item())
+                fake_mask_probs_f = fake_mask_probs.detach().to(torch.float32)
+                real_mask_f = real_mask_m.to(torch.float32)
                 inter = (fake_mask_probs_f * real_mask_f).sum(dim=(1, 2, 3))
                 union = (fake_mask_probs_f + real_mask_f - fake_mask_probs_f * real_mask_f).sum(dim=(1, 2, 3))
                 pred_mass = fake_mask_probs_f.sum(dim=(1, 2, 3))
@@ -2126,25 +2100,36 @@ def train_conditional_generator_discriminator(
                 mask_iou_step += float(mask_iou.detach().item()) * w
                 mask_dice_step += float(mask_dice.detach().item()) * w
                 if step_preview_callback is not None:
-                    for _i in range(int(real_g.shape[0])):
+                    for _i in range(int(real_m.shape[0])):
                         preview_items.append({
-                            "target_img": real_g[_i].detach().to(torch.float32).cpu(),
-                            "fake_img": fake2[_i].detach().to(torch.float32).cpu(),
-                            "target_mask": real_mask_g[_i].detach().to(torch.float32).cpu(),
+                            "target_img": real_m[_i].detach().to(torch.float32).cpu(),
+                            "fake_img": fake[_i].detach().to(torch.float32).cpu(),
+                            "target_mask": real_mask_m[_i].detach().to(torch.float32).cpu(),
                             "fake_mask": fake_mask_probs[_i].detach().to(torch.float32).cpu(),
                             "probs": probs[_i].detach().to(torch.float32).cpu(),
-                            "target_condition": cond_g[_i].detach().to(torch.float32).cpu(),
+                            "target_condition": cond_m[_i].detach().to(torch.float32).cpu(),
                             "target_prob": float(target_prob[_i].detach().to(torch.float32).item()),
                         })
+            # Unscale and clip both networks, then step both from the same backward pass.
             if use_scaler:
+                scaler_g.unscale_(d_opt)
                 scaler_g.unscale_(g_opt)
+            nn.utils.clip_grad_norm_(discriminator.parameters(), float(grad_clip_d))
             nn.utils.clip_grad_norm_(generator.parameters(), float(grad_clip_g))
             if use_scaler:
+                scaler_g.step(d_opt)
                 scaler_g.step(g_opt)
                 scaler_g.update()
             else:
+                d_opt.step()
                 g_opt.step()
+            discriminator_step_count += 1
             generator_step_count += 1
+            if discriminator_step_callback is not None:
+                try:
+                    discriminator_step_callback(int(discriminator_step_count))
+                except Exception:
+                    pass
             if generator_step_callback is not None:
                 try:
                     generator_step_callback(int(generator_step_count))
@@ -2200,8 +2185,8 @@ def train_conditional_generator_discriminator(
                     )
                 try:
                     step_preview_callback(batch_payloads)
-                except Exception:
-                    pass
+                except Exception as _prev_exc:
+                    print(f"[stage-g] step preview callback failed: {_prev_exc}", flush=True)
             preview_items = []
 
             if int(log_every_steps) > 0 and ((int(step_idx) % int(log_every_steps) == 0) or (int(step_idx) == int(n_steps))):
@@ -2228,6 +2213,22 @@ def train_conditional_generator_discriminator(
                     f"d_steps={int(disc_steps_per_gen_step)}",
                     flush=True,
                 )
+                if progress_callback is not None:
+                    try:
+                        progress_callback({
+                            "global_step": int(step_idx),
+                            "total_steps": int(n_steps),
+                            "loss": _g,
+                        })
+                    except Exception as _prog_exc:
+                        try:
+                            from pipeline.nodes.base import StageSkipBack, StageSkipForward, StageStopRequested
+                        except Exception:
+                            StageSkipBack = ()
+                            StageSkipForward = ()
+                            StageStopRequested = ()
+                        if isinstance(_prog_exc, (StageSkipForward, StageSkipBack, StageStopRequested)):
+                            raise
 
         if int(steps_done) <= 0:
             break
@@ -4326,11 +4327,12 @@ def train_transformer_feature_metric(
                         )
                     except Exception as exc:
                         try:
-                            from pipeline.nodes.base import StageSkipBack, StageSkipForward
+                            from pipeline.nodes.base import StageSkipBack, StageSkipForward, StageStopRequested
                         except Exception:
                             StageSkipBack = ()
                             StageSkipForward = ()
-                        if isinstance(exc, (StageSkipForward, StageSkipBack)):
+                            StageStopRequested = ()
+                        if isinstance(exc, (StageSkipForward, StageSkipBack, StageStopRequested)):
                             raise
 
         if stop_now:

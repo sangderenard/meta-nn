@@ -38,6 +38,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 
 from pipeline.context import PipelineContext
+from pipeline.filesystem_emergency import raise_if_filesystem_space_emergency
 from pipeline.graph import PipelineNode
 from pipeline.nodes.base import GatedNode, OneTimeNode
 from pipeline.progress import interruptible_tqdm
@@ -217,6 +218,7 @@ class WavePoolNode(PipelineNode):
                 structured_ratio=self.cfg.latent_structured_ratio,
                 structured_gain=self.cfg.latent_structured_gain,
                 structured_noise_gain=self.cfg.latent_structured_noise_gain,
+                progress_control=ctx,
             )
             pool_dir = str(pool_info["pool_dir"])
             ctx.latent_wav_pool_dir = Path(pool_dir)
@@ -451,8 +453,8 @@ class DataNode(PipelineNode):
         self._gest_vocab_hash: int = -1
         self._gest_last_build_round: int = -1
         self._bdata_last_build_round: int = -1
-        self._payload_bank_built: bool = False
-        self._payload_validation_built: bool = False
+        self._payload_last_build_round: int = -1
+        self._payload_validation_last_build_round: int = -1
 
         # ---- Possession registry ----
         self.possessions: Dict[str, DataPossession] = {}
@@ -490,14 +492,14 @@ class DataNode(PipelineNode):
                 "payload_bank", "payload_conditions", "payload_masks",
                 "payload_bank_ready",
             ],
-            expiry_fn=lambda ctx: not self._payload_bank_built,
+            expiry_fn=lambda ctx: self._payload_last_build_round < 0,
             size_fn=lambda: self._estimate_possession_bytes("payload"),
         )
         self.possessions["payload_validation"] = DataPossession(
             name="payload_validation",
             tier="ram",
             ctx_attrs=["payload_validation_loader", "payload_validation_dataset"],
-            expiry_fn=lambda ctx: not self._payload_validation_built,
+            expiry_fn=lambda ctx: self._payload_validation_last_build_round < 0,
             size_fn=lambda: self._estimate_possession_bytes("payload_validation"),
         )
 
@@ -612,11 +614,12 @@ class DataNode(PipelineNode):
           3. Age N-pass entries for pregestation/gestation and enforce cap.
         """
         any_expired = False
+        _suppress = getattr(ctx, "suppress_rebuild_enabled", lambda: False)()
         for name, poss in self.possessions.items():
             if not poss.built:
                 continue
-            # Expiry check
-            if poss.expiry_fn is not None and poss.expiry_fn(ctx):
+            # Expiry check — skipped when suppress_rebuild is active
+            if not _suppress and poss.expiry_fn is not None and poss.expiry_fn(ctx):
                 poss.force_next_rebuild = True
                 for attr in poss.ctx_attrs:
                     if hasattr(ctx, attr):
@@ -674,6 +677,11 @@ class DataNode(PipelineNode):
         # Idempotency guard: the edge condition schedules rebuilds; this prevents a
         # double-build when both preg edges fire for the same target on the same round.
         if self._preg_last_build_round == ctx.total_rounds_completed:
+            return
+
+        # Suppress rebuild: keep whatever loaders are already in place
+        if getattr(ctx, "suppress_rebuild_enabled", lambda: False)() and ctx.pregestation_loader is not None:
+            _log("[data-node] provide_pregestation skipped — suppress_rebuild active")
             return
 
         # Release stale loaders before rebuild
@@ -880,7 +888,7 @@ class DataNode(PipelineNode):
                     "all_label_indices": list(all_label_indices),
                     "all_targets": list(all_targets),
                     "all_term_rows": list(all_term_rows),
-                })
+                }, progress_control=ctx)
                 _pbar.update(1)
 
         if not all_images:
@@ -984,6 +992,11 @@ class DataNode(PipelineNode):
         # Idempotency guard: the edge condition schedules rebuilds; this prevents a
         # double-build when both gestation edges fire for the same target on the same round.
         if self._gest_last_build_round == ctx.total_rounds_completed:
+            return
+
+        # Suppress rebuild: keep whatever loaders are already in place
+        if getattr(ctx, "suppress_rebuild_enabled", lambda: False)() and ctx.gestation_loader is not None:
+            _log("[data-node] provide_gestation skipped — suppress_rebuild active")
             return
 
         # Release stale loaders before rebuild
@@ -1137,7 +1150,7 @@ class DataNode(PipelineNode):
                     "mask_stacks": list(mask_stacks),
                     "mask_indices": list(mask_indices),
                     "terms_rows": list(terms_rows),
-                })
+                }, progress_control=ctx)
                 _pbar.update(1)
         _register_churn_terms(
             ctx,
@@ -1232,6 +1245,11 @@ class DataNode(PipelineNode):
         if self._bdata_last_build_round == ctx.total_rounds_completed:
             return
 
+        # Suppress rebuild: keep whatever loaders are already in place
+        if getattr(ctx, "suppress_rebuild_enabled", lambda: False)() and ctx.berkeley_refresh_loader is not None:
+            _log("[data-node] provide_berkeley_data skipped — suppress_rebuild active")
+            return
+
         # Release old loaders/cache before building replacements
         ctx.berkeley_refresh_loader = None
         ctx.berkeley_gate_val_loader = None
@@ -1320,8 +1338,25 @@ class DataNode(PipelineNode):
         _log(f"[data-node] berkeley refresh loader built at round {ctx.total_rounds_completed}")
 
     def provide_payload(self, ctx: PipelineContext) -> None:
-        if self._payload_bank_built:
+        # Idempotency guard: prevents double-build when both payload edges fire on the same round.
+        if self._payload_last_build_round == ctx.total_rounds_completed:
             return
+        _force = bool(self.possessions["payload"].force_next_rebuild)
+        # Suppress rebuild overrides force — keep existing data if already present.
+        if getattr(ctx, "suppress_rebuild_enabled", lambda: False)() and ctx.payload_bank:
+            _log("[data-node] provide_payload skipped — suppress_rebuild active")
+            return
+        # Skip if already built this pipeline run and no forced rebuild requested.
+        if self._payload_last_build_round >= 0 and not _force:
+            return
+
+        # Release old data before rebuild
+        ctx.payload_bank = None
+        ctx.payload_masks = []
+        ctx.payload_conditions = []
+        ctx.payload_terms = []
+        ctx.payload_bank_ready = False
+
         # One-time conversion of .mat masks → .npz so scipy is not needed thereafter
         from semantic_dataset_loaders import convert_sbd_mat_to_npz
         from pathlib import Path as _BPath
@@ -1330,10 +1365,10 @@ class DataNode(PipelineNode):
             or getattr(ctx, "berkeley_data_root", "") or ""
         )
         _broot = _BPath(data_root or "data/berkeley_sbd")
-        convert_sbd_mat_to_npz(_broot)
+        convert_sbd_mat_to_npz(_broot, progress_control=ctx)
 
         with semantic_processing_device(ctx, enabled=bool(self.bdata_cfg.gpu_preprocess)) as _processing_device:
-            out_images, out_targets, _info, _out_terms, out_masks = _build_berkeley_payload_bank(
+            out_images, out_targets, _info, _out_terms, out_masks, out_per_row_terms = _build_berkeley_payload_bank(
                 ctx=ctx,
                 data_root=data_root,
                 image_size=self.payload_cfg.image_size,
@@ -1342,7 +1377,7 @@ class DataNode(PipelineNode):
                 seed=self.payload_cfg.seed,
                 build_batch_size=self.payload_cfg.build_batch_size,
                 source_root=str(self.payload_cfg.payload_bank_dir),
-                force_cache_rebuild=bool(self.payload_cfg.force_cache_rebuild),
+                force_cache_rebuild=_force or bool(self.payload_cfg.force_cache_rebuild),
                 wheel_max_bytes=self.bdata_cfg.wheel_max_bytes,
                 wheel_sanity_cap_bytes=self.bdata_cfg.wheel_sanity_cap_bytes,
                 wheel_allow_large_override=self.bdata_cfg.wheel_allow_large_override,
@@ -1375,16 +1410,31 @@ class DataNode(PipelineNode):
             _log(f"[data-node] payload bank: {len(conditions)} condition rows")
         else:
             ctx.payload_conditions = []
-        self._payload_bank_built = True
+
+        ctx.payload_terms = out_per_row_terms
 
         # Possession tracking
         poss = self.possessions["payload"]
+        poss.force_next_rebuild = False
+        self._payload_last_build_round = ctx.total_rounds_completed
         poss.mark_built()
         _log(f"[data-node] payload bank: {len(out_images)} rows")
 
     def provide_payload_validation(self, ctx: PipelineContext) -> None:
-        if self._payload_validation_built:
+        # Idempotency guard: prevents double-build on the same round.
+        if self._payload_validation_last_build_round == ctx.total_rounds_completed:
             return
+        _force = bool(self.possessions["payload_validation"].force_next_rebuild)
+        # Suppress rebuild: keep existing data if already present.
+        if getattr(ctx, "suppress_rebuild_enabled", lambda: False)() and ctx.payload_validation_loader:
+            _log("[data-node] provide_payload_validation skipped — suppress_rebuild active")
+            return
+        # Skip if already built this pipeline run and not forced.
+        if self._payload_validation_last_build_round >= 0 and not _force:
+            return
+
+        ctx.payload_validation_loader = None
+        ctx.payload_validation_dataset = None
 
         bdata_root = (
             str(self.bdata_cfg.berkeley_data_root).strip()
@@ -1406,7 +1456,7 @@ class DataNode(PipelineNode):
                 wheel_allow_large_override=self.bdata_cfg.wheel_allow_large_override,
                 wheel_lookahead_batches=self.bdata_cfg.wheel_lookahead_batches,
                 wheel_use_rare_term_deck=self.bdata_cfg.wheel_use_rare_term_deck,
-                force_rebuild=bool(self.payload_cfg.force_cache_rebuild),
+                force_rebuild=_force or bool(self.payload_cfg.force_cache_rebuild),
                 processing_device=_processing_device,
                 preload_workers=self.bdata_cfg.preload_workers,
                 class_names=ctx.class_names,
@@ -1417,7 +1467,6 @@ class DataNode(PipelineNode):
         ) if dataset is not None else (None, 0)
         ctx.payload_validation_dataset = dataset
         ctx.payload_validation_loader = loader
-        self._payload_validation_built = True
         _register_churn_terms(
             ctx,
             term_rows=_terms_rows,
@@ -1426,6 +1475,8 @@ class DataNode(PipelineNode):
         )
 
         poss = self.possessions["payload_validation"]
+        poss.force_next_rebuild = False
+        self._payload_validation_last_build_round = ctx.total_rounds_completed
         poss.mark_built()
         _log(f"[data-node] payload validation: {len(dataset) if dataset else 0} rows")
 
@@ -1437,6 +1488,88 @@ class DataNode(PipelineNode):
         it only materializes the validation loader consumed by Gate 2.
         """
         self.provide_payload_validation(ctx)
+
+
+# ---------------------------------------------------------------------------
+# Payload slot filtering — shared by all training nodes that sweep LoRA slots
+# ---------------------------------------------------------------------------
+
+
+class _IndexedPayloadView:
+    """Lazy indexed view over a payload sequence (e.g. SemanticWheelPayloadView).
+    Elements are only read from the underlying source when accessed, so filtering
+    does not trigger disk reads during the selection step.
+    """
+    def __init__(self, source: Any, indices: List[int]) -> None:
+        self._source = source
+        self._indices = indices
+
+    def __len__(self) -> int:
+        return len(self._indices)
+
+    def __getitem__(self, i: int) -> Any:
+        return self._source[self._indices[i]]
+
+
+def filter_payload_for_slot(
+    payload_bank: Any,
+    payload_conditions: List[Any],
+    payload_masks: List[Any],
+    slot_terms: List[str],
+    payload_terms: Optional[List[List[str]]] = None,
+    class_names: Optional[List[str]] = None,
+) -> Tuple[Any, List[Any], Any]:
+    """Return (images_view, conditions, masks_view) for payload rows that contain
+    at least one of *slot_terms*.
+
+    Filtering uses *payload_terms* (per-row string term lists stored at provision
+    time) when available, which is vocabulary-position-agnostic and correct across
+    churn events.  Falls back to positional matching on the condition vector when
+    payload_terms is absent.
+
+    Images and masks are wrapped in _IndexedPayloadView so disk reads are deferred
+    until the training function builds its tensor banks, not during the filter step.
+    """
+    images = payload_bank or []
+    conditions = list(payload_conditions or [])
+    masks = payload_masks or []
+
+    if not images or not conditions or not slot_terms:
+        return images, conditions, masks
+
+    terms_lower = {str(t).strip().lower() for t in slot_terms}
+    n = min(len(images), len(conditions))
+
+    if payload_terms:
+        # String-based matching: correct across vocabulary churn events.
+        coherent = [
+            i for i in range(min(n, len(payload_terms)))
+            if any(str(t).strip().lower() in terms_lower for t in (payload_terms[i] or []))
+        ]
+    elif class_names:
+        # Fallback: positional matching in the condition vector.
+        active_idx = [
+            i for i, name in enumerate(class_names)
+            if str(name).strip().lower() in terms_lower
+        ]
+        if not active_idx:
+            return images, conditions, masks
+        coherent = []
+        for i in range(n):
+            arr = np.asarray(conditions[i], dtype=np.float32).reshape(-1)
+            if any(int(j) < int(arr.size) and float(arr[int(j)]) >= 0.5 for j in active_idx):
+                coherent.append(i)
+    else:
+        return images, conditions, masks
+
+    if not coherent:
+        return [], [], []
+
+    return (
+        _IndexedPayloadView(images, coherent),
+        [conditions[i] for i in coherent],
+        _IndexedPayloadView(masks, coherent) if masks else [],
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1662,6 +1795,7 @@ def _bootstrap_latent_wav_pool(
     structured_ratio: float,
     structured_gain: float,
     structured_noise_gain: float,
+    progress_control: Any = None,
 ) -> Dict[str, Any]:
 
     from wav_ml_core import RenderConfig, read_wav_record
@@ -1725,8 +1859,17 @@ def _bootstrap_latent_wav_pool(
         except (json.JSONDecodeError, OSError):
             pass  # stale/corrupt manifest — regenerate
 
-    noise_dir.mkdir(parents=True, exist_ok=True)
-    mix_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        noise_dir.mkdir(parents=True, exist_ok=True)
+        mix_dir.mkdir(parents=True, exist_ok=True)
+    except Exception as exc:
+        raise_if_filesystem_space_emergency(
+            progress_control,
+            exc,
+            note="latent wav pool directory write",
+            write_path=pool_dir,
+        )
+        raise
 
     if reinject_dir:
         lib_dir = Path(reinject_dir)
@@ -1784,7 +1927,16 @@ def _bootstrap_latent_wav_pool(
         if not prof_slug:
             prof_slug = 'gaussian_white_noise'
         out_path = target_dir / f'latent_{i:05d}_{prof_slug}.wav'
-        _save_mono_wav(out_path, y, framerate=framerate)
+        try:
+            _save_mono_wav(out_path, y, framerate=framerate)
+        except Exception as exc:
+            raise_if_filesystem_space_emergency(
+                progress_control,
+                exc,
+                note="latent wav pool audio write",
+                write_path=out_path,
+            )
+            raise
         rows.append(
             {
                 'file': str(out_path),
@@ -1797,37 +1949,55 @@ def _bootstrap_latent_wav_pool(
         noise_profile_counts[str(prof_slug)] = int(noise_profile_counts.get(str(prof_slug), 0)) + 1
 
     index_path = pool_dir / 'index.jsonl'
-    with index_path.open('w', encoding='utf-8') as f:
-        for row in rows:
-            f.write(json.dumps(row, ensure_ascii=True) + '\n')
+    try:
+        with index_path.open('w', encoding='utf-8') as f:
+            for row in rows:
+                f.write(json.dumps(row, ensure_ascii=True) + '\n')
+    except Exception as exc:
+        raise_if_filesystem_space_emergency(
+            progress_control,
+            exc,
+            note="latent wav pool index write",
+            write_path=index_path,
+        )
+        raise
 
     manifest = pool_dir / 'manifest.json'
-    manifest.write_text(
-        json.dumps(
-            {
-                'seed': int(seed),
-                'count': int(count),
-                'framerate': int(framerate),
-                'seconds': float(seconds),
-                'sample_count': int(sample_count),
-                'noise_std': float(noise_std),
-                'reinject_dir': str(lib_dir),
-                'reinject_ratio': float(reinject_ratio),
-                'reinject_copy_gain': float(reinject_copy_gain),
-                'reinject_noise_gain': float(reinject_noise_gain),
-                'reinject_candidates': len(reinject_paths),
-                'mixed_count': int(mixed_count),
-                'structured_ratio': float(structured_ratio),
-                'structured_gain': float(structured_gain),
-                'structured_noise_gain': float(structured_noise_gain),
-                'structured_count': int(structured_count),
-                'noise_profiles': {str(k): int(v) for k, v in sorted(noise_profile_counts.items(), key=lambda kv: str(kv[0]))},
-                'index': str(index_path),
-            },
-            indent=2,
-        ),
-        encoding='utf-8',
-    )
+    try:
+        manifest.write_text(
+            json.dumps(
+                {
+                    'seed': int(seed),
+                    'count': int(count),
+                    'framerate': int(framerate),
+                    'seconds': float(seconds),
+                    'sample_count': int(sample_count),
+                    'noise_std': float(noise_std),
+                    'reinject_dir': str(lib_dir),
+                    'reinject_ratio': float(reinject_ratio),
+                    'reinject_copy_gain': float(reinject_copy_gain),
+                    'reinject_noise_gain': float(reinject_noise_gain),
+                    'reinject_candidates': len(reinject_paths),
+                    'mixed_count': int(mixed_count),
+                    'structured_ratio': float(structured_ratio),
+                    'structured_gain': float(structured_gain),
+                    'structured_noise_gain': float(structured_noise_gain),
+                    'structured_count': int(structured_count),
+                    'noise_profiles': {str(k): int(v) for k, v in sorted(noise_profile_counts.items(), key=lambda kv: str(kv[0]))},
+                    'index': str(index_path),
+                },
+                indent=2,
+            ),
+            encoding='utf-8',
+        )
+    except Exception as exc:
+        raise_if_filesystem_space_emergency(
+            progress_control,
+            exc,
+            note="latent wav pool manifest write",
+            write_path=manifest,
+        )
+        raise
     return {
         'pool_dir': str(pool_dir),
         'manifest': str(manifest),
@@ -1954,11 +2124,30 @@ def _save_raw_stage_cache(
     key: str,
     data: Dict[str, Any],
     max_entries: int = 30,
+    progress_control: Any = None,
 ) -> None:
-    cache_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+    except Exception as exc:
+        raise_if_filesystem_space_emergency(
+            progress_control,
+            exc,
+            note="raw stage cache directory write",
+            write_path=cache_dir,
+        )
+        raise
     path = cache_dir / f"{key}.pkl.gz"
-    with gzip.open(str(path), "wb", compresslevel=1) as fh:
-        pickle.dump(data, fh)
+    try:
+        with gzip.open(str(path), "wb", compresslevel=1) as fh:
+            pickle.dump(data, fh)
+    except Exception as exc:
+        raise_if_filesystem_space_emergency(
+            progress_control,
+            exc,
+            note="raw stage cache write",
+            write_path=path,
+        )
+        raise
     # Evict oldest entries when over the limit
     entries = sorted(
         [p for p in cache_dir.glob("*.pkl.gz") if p.is_file()],
@@ -4001,7 +4190,7 @@ def _build_berkeley_payload_bank(
         progress_control=ctx,
     )
     if int(len(rows)) <= 0:
-        return [], [], {"available": 0, "used": 0, "available_train": 0, "available_val": 0}, [], []
+        return [], [], {"available": 0, "used": 0, "available_train": 0, "available_val": 0}, [], [], []
     wheel_result, wheel_info = _ensure_berkeley_semantic_wheel(
         rows=rows,
         candidate_indices=list(range(int(len(rows)))),
@@ -4029,6 +4218,7 @@ def _build_berkeley_payload_bank(
     ds = SemanticWheelDataset(cache_dir=str(wheel_result.get("cache_dir", "")), return_mask_stack=False)
     selected_base_rows = [int(x) for x in list(wheel_result.get("base_row_indices") or [])]
     out_targets: List[np.ndarray] = []
+    out_per_row_terms: List[List[str]] = []
     for i in interruptible_tqdm(
         range(int(len(ds))),
         desc="[payload bank] reading targets",
@@ -4039,6 +4229,7 @@ def _build_berkeley_payload_bank(
     ):
         item = ds.read_numpy_entry(int(i))
         out_targets.append(np.asarray(item["label_vec_u8"], dtype=np.float32).reshape(-1))
+        out_per_row_terms.append(list(item.get("terms") or []))
     out_terms = [
         list(_normalize_vocab_terms(getattr(rows[int(idx)], "terms", [])))
         for idx in selected_base_rows
@@ -4077,4 +4268,4 @@ def _build_berkeley_payload_bank(
         "inprocess_cache_hit": bool(rows_info.get("inprocess_cache_hit", False)),
         "total_raw_bytes": int(wheel_info.get("total_raw_bytes", 0)),
     }
-    return out_images, out_targets, info, out_terms, out_masks
+    return out_images, out_targets, info, out_terms, out_masks, out_per_row_terms

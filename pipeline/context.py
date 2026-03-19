@@ -316,6 +316,7 @@ class PipelineContext:
     payload_bank: Optional[Any] = None
     payload_conditions: List[Any] = field(default_factory=list)
     payload_masks: List[Any] = field(default_factory=list)
+    payload_terms: List[List[str]] = field(default_factory=list)
     payload_bank_ready: bool = False
 
     # ---- symbol / flashcard pools ---------------------------------------
@@ -405,6 +406,9 @@ class PipelineContext:
     startup_restore_round: int = 0
     startup_restore_cycle: int = 0
     shutdown_save_pending: bool = False
+    filesystem_space_emergency_pending: bool = False
+    filesystem_space_emergency_reason: str = ""
+    filesystem_space_emergency_cleanup: Dict[str, Any] = field(default_factory=dict)
     run_tag: str = ""
     semantic_cache_nonce: str = ""
     graph_plan: Optional[Any] = None
@@ -510,6 +514,18 @@ class PipelineContext:
         except Exception:
             return False
 
+    def suppress_rebuild_enabled(self) -> bool:
+        proxy = self.viewer_proxy
+        if proxy is None:
+            return False
+        fn = getattr(proxy, "suppress_rebuild_enabled", None)
+        if not callable(fn):
+            return False
+        try:
+            return bool(fn())
+        except Exception:
+            return False
+
     def is_cycle_selected(self, cycle_id: int) -> bool:
         proxy = self.viewer_proxy
         if proxy is None:
@@ -554,6 +570,8 @@ class PipelineContext:
             return []
 
     def stop_requested(self) -> bool:
+        if bool(self.filesystem_space_emergency_pending):
+            return True
         proxy = self.viewer_proxy
         if proxy is None:
             return False
@@ -603,6 +621,8 @@ class PipelineContext:
 
     def shutdown_save(self) -> bool:
         """Return True when the GUI requested stop-with-save (default True)."""
+        if bool(self.filesystem_space_emergency_pending):
+            return True
         proxy = self.viewer_proxy
         if proxy is None:
             return True
@@ -616,6 +636,45 @@ class PipelineContext:
             return bool(val)
         except Exception:
             return True
+
+    def handle_filesystem_space_emergency(
+        self,
+        exc: BaseException,
+        *,
+        note: str = "",
+        write_path: Any = None,
+    ) -> None:
+        from pipeline.filesystem_emergency import purge_dataloader_ephemeral_caches
+        from pipeline.nodes.interrupts import StageStopRequested
+        from pipeline.utils import _log
+
+        path_txt = str(write_path).strip() if write_path is not None else ""
+        prefix = str(note).strip() or "Filesystem space emergency during dataloader cache write"
+        if path_txt:
+            prefix = f"{prefix} [{path_txt}]"
+        message = f"{prefix}: {exc}"
+
+        if bool(self.filesystem_space_emergency_pending):
+            if not str(self.filesystem_space_emergency_reason).strip():
+                self.filesystem_space_emergency_reason = str(message)
+            raise StageStopRequested(str(self.filesystem_space_emergency_reason), save_requested=True)
+
+        self.filesystem_space_emergency_pending = True
+        self.filesystem_space_emergency_reason = str(message)
+        self.shutdown_save_pending = True
+        cleanup = purge_dataloader_ephemeral_caches(
+            output_dir=self.output_dir,
+            berkeley_data_root=str(self.berkeley_data_root or ""),
+            semantic_stage_cache_dir=str(self.semantic_stage_cache_dir or ""),
+        )
+        self.filesystem_space_emergency_cleanup = dict(cleanup)
+        _log(f"[fs-emergency] {message}")
+        _log(
+            "[fs-emergency] cache purge: "
+            f"removed={len(cleanup.get('removed', []))} "
+            f"errors={len(cleanup.get('errors', []))}"
+        )
+        raise StageStopRequested(str(message), save_requested=True)
 
     def publish_loss(self, channel_key: str, loss: float, aux: float = 0.0) -> None:
         ck = str(channel_key)

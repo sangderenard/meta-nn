@@ -371,7 +371,7 @@ def resolve_non_training_device(ctx: "PipelineContext") -> torch.device:
     return primary
 
 
-from pipeline.nodes.interrupts import StageSkipBack, StageSkipForward  # noqa: F401
+from pipeline.nodes.interrupts import StageSkipBack, StageSkipForward, StageStopRequested  # noqa: F401
 
 
 def make_training_progress_callback(
@@ -426,8 +426,19 @@ def make_training_progress_callback(
                 publish_progress(str(node_id), float(loss))
             except Exception:
                 pass
-        # Check GUI skip signals — raised here so they propagate out of the
-        # training loop.  Callers must NOT swallow StageSkipForward/Back.
+        # Check GUI stop/skip signals — raised here so they propagate out of the
+        # training loop.  Callers must NOT swallow these exceptions.
+        stop_fn = getattr(ctx, "stop_requested", None)
+        if callable(stop_fn):
+            try:
+                if stop_fn():
+                    save_fn = getattr(ctx, "shutdown_save", None)
+                    save_now = bool(save_fn()) if callable(save_fn) else True
+                    raise StageStopRequested("GUI stop requested", save_requested=save_now)
+            except StageStopRequested:
+                raise
+            except Exception:
+                pass
         fwd_fn = getattr(ctx, "consume_skip_forward", None)
         if callable(fwd_fn):
             try:

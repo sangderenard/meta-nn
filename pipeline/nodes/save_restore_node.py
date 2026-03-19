@@ -906,6 +906,11 @@ class SaveRestoreNode(PipelineNode):
         if ctx.metrics_history:
             payload["metrics_history"] = list(ctx.metrics_history)
             payload["orchestration_history"] = list(ctx.metrics_history)
+        if bool(getattr(ctx, "filesystem_space_emergency_pending", False)):
+            payload["filesystem_space_emergency"] = {
+                "reason": str(getattr(ctx, "filesystem_space_emergency_reason", "") or ""),
+                "cleanup": dict(getattr(ctx, "filesystem_space_emergency_cleanup", {}) or {}),
+            }
         # LoRA state is saved separately in lora_classifier.pt — not embedded in the
         # main checkpoint so the classifier state_dict is always a clean base model.
 

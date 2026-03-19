@@ -55,6 +55,7 @@ from pipeline.nodes.base import (
     IRTensorPortSpec,
     StageSkipBack,
     StageSkipForward,
+    StageStopRequested,
     autocast_context,
     freeze,
     make_runtime_weight_publish_callback,
@@ -502,6 +503,9 @@ class GestationTrainNode(IRTrainingNode):
             ],
         }
 
+    def should_run(self, ctx: PipelineContext) -> bool:
+        return ctx.gestation_loader is not None and ctx.classifier is not None
+
     def execute(self, ctx: PipelineContext) -> None:
         ensure_vocab_lora_active(ctx, self.cfg)
         from pipeline.nodes.base import make_training_progress_callback
@@ -762,32 +766,9 @@ class LoRARoundNode(IRTrainingNode):
             restore_tiny_classifier_lora_snapshot,
             set_tiny_classifier_lora_state,
         )
-        from pipeline.nodes.vocab_node import activate_vocab_lora_slot
+        from pipeline.nodes.vocab_node import activate_vocab_lora_slot, get_all_planned_lora_slots
 
-        # -- Gather all planned slots for the current requirement set ------
-        plan_signature = str(getattr(ctx, "vocab_lora_latest_plan_signature", "") or "").strip()
-        plan = dict(getattr(ctx, "vocab_lora_plan_cache", {}).get(str(plan_signature), {}) or {}) if plan_signature else {}
-        planned_slots = list(plan.get("slots") or [])
-
-        # Fall back: if no multi-slot plan, synthesize a single-slot entry
-        # from whatever churn currently has active.
-        if not planned_slots:
-            active_signature = str(getattr(ctx, "vocab_lora_active_signature", "") or "").strip()
-            if not active_signature:
-                active_signature = hashlib.sha1(
-                    "|".join([str(x) for x in list(getattr(ctx, "active_extra_terms", []))]).encode("utf-8", errors="ignore")
-                ).hexdigest()[:16]
-            fallback_terms = list(
-                getattr(ctx, "vocab_lora_active_terms", [])
-                or getattr(ctx, "active_extra_terms", [])
-            )
-            planned_slots = [
-                {
-                    "signature": str(active_signature),
-                    "slot_name": f"vocab_{active_signature}",
-                    "terms": list(fallback_terms),
-                }
-            ]
+        planned_slots = get_all_planned_lora_slots(ctx)
 
         # -- Install LoRA adapters once ------------------------------------
         install_tiny_classifier_lora(
@@ -1821,7 +1802,7 @@ def _run_classifier_refresh_epochs(
                                 "loss": float(_cur_loss),
                                 "samples_per_sec": float(ips),
                             })
-                        except (StageSkipForward, StageSkipBack):
+                        except (StageSkipForward, StageSkipBack, StageStopRequested):
                             raise
                         except Exception:
                             pass
@@ -2178,7 +2159,7 @@ def _run_fake_class_refresh_epochs(
                                 "samples_per_sec": float(ips),
                             }
                         )
-                    except (StageSkipForward, StageSkipBack):
+                    except (StageSkipForward, StageSkipBack, StageStopRequested):
                         raise
                     except Exception:
                         pass

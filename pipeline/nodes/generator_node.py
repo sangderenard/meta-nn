@@ -61,6 +61,7 @@ from pipeline.nodes.base import (
 )
 import hashlib
 import json
+import time
 import numpy as np
 
 
@@ -78,6 +79,7 @@ class GeneratorConfig:
     g_base_ch: int = 64
     g_max_ch: int = 512
     image_size: int = 128           # output image side length in pixels
+    g_mask_decoder_channels: int = 64  # >0 enables generator mask head (required for conditional training)
 
     # ---- discriminator architecture -------------------------------------
     d_depth: int = 4
@@ -178,6 +180,7 @@ class BuildGANNode(PipelineNode):
             depth=self.cfg.g_depth,
             base_ch=self.cfg.g_base_ch,
             min_ch=max(8, int(getattr(self.cfg, "g_min_ch", 12) or 12)),
+            mask_decoder_channels=int(self.cfg.g_mask_decoder_channels),
         ).to(ctx.device)
 
         discriminator = ConditionalBitPlaneDiscriminator(
@@ -435,7 +438,15 @@ class GeneratorTrainNode(IRTrainingNode):
         return ctx.generator is not None and ctx.discriminator is not None
 
     def execute(self, ctx: PipelineContext) -> None:
-        from wav_ml_models import train_conditional_generator_discriminator
+        from wav_ml_models import train_conditional_generator_discriminator, _payload_image_bank, _payload_mask_bank
+        from pipeline.preview import make_generator_step_preview_callback
+        from pipeline.nodes.base import make_training_progress_callback
+        from pipeline.nodes.vocab_node import activate_vocab_lora_slot, get_all_planned_lora_slots
+
+        if not ctx.payload_masks:
+            _log("[stageG] WARNING: payload_masks is empty — generator cannot train without spatial masks")
+            return
+
         generator_step_callback = make_runtime_weight_publish_callback(
             ctx,
             model_name="generator",
@@ -448,40 +459,101 @@ class GeneratorTrainNode(IRTrainingNode):
             model=ctx.discriminator,
             node_id=self.node_id,
         )
-
-        # train_conditional_generator_discriminator creates its own optimizers internally
-        # and returns (trained_generator, trained_discriminator, list_of_epoch_metric_dicts).
-        trained_g, trained_d, metrics_list = train_conditional_generator_discriminator(
-            generator=ctx.generator,
-            discriminator=ctx.discriminator,
-            classifier=ctx.classifier,
-            payload_images=ctx.payload_bank,
-            payload_conditions=ctx.payload_conditions,
-            payload_masks=ctx.payload_masks if ctx.payload_masks else [],
-            num_classes=len(ctx.class_names) if ctx.class_names else 1,
-            image_hw=(self.cfg.image_size, self.cfg.image_size),
-            device=ctx.device,
-            steps_per_epoch=self.cfg.steps_per_round,
-            disc_steps_per_gen_step=self.cfg.d_steps_per_g_step,
-            z_dim=self.cfg.z_dim,
-            lr_g=self.cfg.g_lr,
-            lr_d=self.cfg.d_lr,
-            w_adv=self.cfg.adv_weight,
-            w_cls=self.cfg.feature_score_weight,
-            w_wave=self.cfg.wave_recon_weight,
-            amp=ctx.amp_enabled,
-            amp_dtype=str(ctx.amp_dtype or "float16"),
-            channels_last=False,
-            generator_step_callback=generator_step_callback,
-            discriminator_step_callback=discriminator_step_callback,
+        _step_preview_cb = make_generator_step_preview_callback(ctx, self.node_id)
+        _progress_cb = make_training_progress_callback(
+            ctx, self.node_id, "stage_g_generator",
+            publish_loss=(_step_preview_cb is None),
         )
 
-        ctx.generator = trained_g
-        ctx.discriminator = trained_d
-        last_m = (metrics_list or [{}])[-1]
+        planned_slots = get_all_planned_lora_slots(ctx)
+
+        steps_per_slot = max(1, self.cfg.steps_per_round // max(1, len(planned_slots)))
+
+        # Build image and mask banks once — they don't depend on num_classes and are the
+        # same for every slot. The condition bank is cheap and rebuilt per slot (num_classes varies).
+        image_hw = (self.cfg.image_size, self.cfg.image_size)
+        _log(f"[stageG] building image/mask banks from {len(ctx.payload_bank or [])} payload rows …")
+        _prebuilt_image_bank = _payload_image_bank(
+            payload_images=list(ctx.payload_bank or []),
+            image_hw=image_hw,
+        ).pin_memory()
+        _prebuilt_mask_bank = _payload_mask_bank(
+            payload_masks=list(ctx.payload_masks or []),
+            image_hw=image_hw,
+        ).pin_memory()
+        _log(f"[stageG] banks ready: images={tuple(_prebuilt_image_bank.shape)} masks={tuple(_prebuilt_mask_bank.shape)}")
+
+        all_metrics: List[Dict[str, Any]] = []
+        slots_trained = 0
+
+        for slot_def in planned_slots:
+            slot_signature = str(slot_def.get("signature", "")).strip()
+            slot_name = str(slot_def.get("slot_name", f"vocab_{slot_signature}"))
+            slot_terms = list(slot_def.get("terms") or [])
+            if not slot_signature or not slot_terms:
+                continue
+
+            # Activate this slot's vocabulary and install its LoRA on the classifier.
+            activate_vocab_lora_slot(ctx, slot_def)
+
+            # class_names and n_classes are read AFTER activation so they reflect
+            # the slot's vocabulary (slot terms are added to ctx.class_names here).
+            current_class_names = list(ctx.class_names or [])
+            current_n_classes = max(1, len(current_class_names))
+
+            _log(
+                f"[stageG] slot {slot_name} ({len(slot_terms)} terms): "
+                f"{len(ctx.payload_bank or [])} rows, {steps_per_slot} steps"
+            )
+
+            trained_g, trained_d, metrics_list = train_conditional_generator_discriminator(
+                generator=ctx.generator,
+                discriminator=ctx.discriminator,
+                classifier=ctx.classifier,
+                payload_images=ctx.payload_bank,
+                payload_conditions=ctx.payload_conditions,
+                payload_masks=ctx.payload_masks,
+                num_classes=current_n_classes,
+                image_hw=image_hw,
+                prebuilt_image_bank=_prebuilt_image_bank,
+                prebuilt_mask_bank=_prebuilt_mask_bank,
+                device=ctx.device,
+                steps_per_epoch=steps_per_slot,
+                disc_steps_per_gen_step=self.cfg.d_steps_per_g_step,
+                z_dim=self.cfg.z_dim,
+                lr_g=self.cfg.g_lr,
+                lr_d=self.cfg.d_lr,
+                g_opt=ctx.generator_optimizer,
+                d_opt=ctx.discriminator_optimizer,
+                w_adv=self.cfg.adv_weight,
+                w_cls=self.cfg.feature_score_weight,
+                w_wave=self.cfg.wave_recon_weight,
+                amp=ctx.amp_enabled,
+                amp_dtype=str(ctx.amp_dtype or "float16"),
+                channels_last=False,
+                log_every_steps=50,
+                step_preview_callback=_step_preview_cb,
+                progress_callback=_progress_cb,
+                stop_requested=ctx.stop_requested,
+                pause_requested=ctx.paused,
+                ipc_pump=getattr(ctx.viewer_proxy, "pump", None),
+                generator_step_callback=generator_step_callback,
+                discriminator_step_callback=discriminator_step_callback,
+            )
+
+            ctx.generator = trained_g
+            ctx.discriminator = trained_d
+            all_metrics.extend(metrics_list or [])
+            slots_trained += 1
+
+        if slots_trained == 0:
+            _log("[stageG] WARNING: no slots trained — all payload rows skipped")
+            return
+
+        last_m = (all_metrics or [{}])[-1]
         g_loss = float(last_m.get("g_loss", float("inf")))
         d_loss = float(last_m.get("d_loss", float("inf")))
-        feat_score = float(last_m.get("feature_score", 0.0))
+        feat_score = float(last_m.get("feature_score", last_m.get("g_target_prob", 0.0)))
 
         ctx.gate_generator.required_consecutive = self.cfg.gate_required_consecutive
         ctx.gate_generator.record(
@@ -494,12 +566,14 @@ class GeneratorTrainNode(IRTrainingNode):
         ctx.log_metric("stageG", "d_loss", d_loss)
         ctx.log_metric("stageG", "feature_score", feat_score)
 
-        # Update vocab-keyed library snapshot
         if self.cfg.vocab_snapshot_enabled:
             _save_vocab_snapshot(ctx, self.cfg)
 
-        _log(f"[stageG] g_loss={g_loss:.4f} d_loss={d_loss:.4f} "
-             f"feat={feat_score:.4f} gate={'PASS' if ctx.gate_generator.passed else 'hold'}")
+        _log(
+            f"[stageG] {slots_trained} slot(s) — "
+            f"g_loss={g_loss:.4f} d_loss={d_loss:.4f} "
+            f"feat={feat_score:.4f} gate={'PASS' if ctx.gate_generator.passed else 'hold'}"
+        )
 
 
 # ---------------------------------------------------------------------------

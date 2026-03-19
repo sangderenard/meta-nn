@@ -1660,7 +1660,7 @@ def build_pipeline_graph(
     g.add_node(GestationEvalNode(classifier_cfg))
     g.add_node(BerkeleyGateNode(berkeley_gate_cfg))
     g.add_node(TransformerGateNode(transformer_gate_cfg))
-    g.add_node(GeneratorGateNode(generator_gate_cfg))
+    g.add_node(GeneratorGateNode(generator_gate_cfg, generator_cfg=generator_cfg))
     g.add_node(WaveGateNode(wave_gate_cfg))
 
     # Housekeeping
@@ -1708,15 +1708,20 @@ def build_pipeline_graph(
                on_traverse=_data_node.provide_pregestation_eval)
     g.add_edge("data_node", "gate_0_pregestation_eval", label="per_round")
 
-    # Gestation: gate condition is embedded in _gest_rebuild_cond (gate must clear AND rebuild due).
+    # Gestation: conditional edge fires provide_gestation when a rebuild is due;
+    # unconditional per_round edge keeps the path open every round (matches stage_0 pattern).
+    # Without per_round, data.gestation_rebuild_due enters the execution-program guard and
+    # prevents stage_1_gestation from running after the first round.
     g.add_edge("data_node", "stage_1_gestation",
                condition=_gest_rebuild_cond, label="provides:gestation_loader",
                condition_id=_CONDITION_ID_GEST_REBUILD,
                on_traverse=_data_node.provide_gestation)
+    g.add_edge("data_node", "stage_1_gestation", label="per_round")
     g.add_edge("data_node", "gate_1_gestation_eval",
                condition=_gest_rebuild_cond, label="provides:gestation_eval_loader",
                condition_id=_CONDITION_ID_GEST_REBUILD,
                on_traverse=_data_node.provide_gestation_eval)
+    g.add_edge("data_node", "gate_1_gestation_eval", label="per_round")
 
     # Berkeley refresh: predicate graph governs activate vs on_traverse so
     # stage 2 still trains on cached loaders between refresh intervals.
@@ -2559,6 +2564,7 @@ def _build_configs_from_args(args) -> dict:
         joint_mode=bool(_g("joint_enabled", default=False)),
         generator_init_ckpt=str(_g("generator_init", default="") or ""),
         discriminator_init_ckpt=str(_g("discriminator_init", default="") or ""),
+        g_mask_decoder_channels=int(_g("generator_mask_decoder_channels", "g_mask_decoder_ch", default=64)),
     )
 
     wave = WaveClassifierConfig(

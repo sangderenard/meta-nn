@@ -241,6 +241,7 @@ set "TRANS_DROPOUT=0.10"
 set "GEN_BASE_CH=160"
 set "GEN_DEPTH=7"
 set "GEN_MIN_CH=24"
+set "GEN_MASK_DECODER_CH=96"
 set "DISC_BASE_CH=128"
 set "DISC_DEPTH=6"
 set "DISC_MAX_CH=768"
@@ -628,6 +629,7 @@ set "RUN_EXTRA_ARG=%~2"
   --generator-base-ch %GEN_BASE_CH% ^
   --generator-depth %GEN_DEPTH% ^
   --generator-min-ch %GEN_MIN_CH% ^
+  --generator-mask-decoder-channels %GEN_MASK_DECODER_CH% ^
   --generator-lr %GEN_LR% ^
   --generator-log-every %GEN_LOG_EVERY% ^
   --discriminator-lr %DISC_LR% ^

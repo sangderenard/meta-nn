@@ -1033,6 +1033,37 @@ def _source_should_drive_vocab_activation(source: str, stage_label: str) -> bool
     ))
 
 
+def get_all_planned_lora_slots(ctx: PipelineContext) -> List[Dict[str, Any]]:
+    """Return the full ordered list of LoRA slots for the current churn plan.
+
+    Mirrors the logic that StageCLoRANode used inline: reads the latest plan from
+    ctx.vocab_lora_plan_cache and falls back to a single synthesized slot from the
+    currently active churn state when no multi-slot plan exists.  All consumers
+    (Stage C, Stage G, etc.) call this instead of duplicating the lookup.
+    """
+    plan_signature = str(getattr(ctx, "vocab_lora_latest_plan_signature", "") or "").strip()
+    plan = (
+        dict(getattr(ctx, "vocab_lora_plan_cache", {}).get(plan_signature, {}) or {})
+        if plan_signature else {}
+    )
+    slots = list(plan.get("slots") or [])
+    if slots:
+        return slots
+
+    # Fallback: synthesize a single-slot entry from whatever churn has active.
+    active_sig = str(getattr(ctx, "vocab_lora_active_signature", "") or "").strip()
+    if not active_sig:
+        active_sig = hashlib.sha1(
+            "|".join(str(x) for x in list(getattr(ctx, "active_extra_terms", []))
+            ).encode("utf-8", errors="ignore")
+        ).hexdigest()[:16]
+    fallback_terms = list(
+        getattr(ctx, "vocab_lora_active_terms", [])
+        or getattr(ctx, "active_extra_terms", [])
+    )
+    return [{"signature": active_sig, "slot_name": f"vocab_{active_sig}", "terms": fallback_terms}]
+
+
 def select_active_vocab_lora_slot(ctx: PipelineContext) -> Optional[Dict[str, Any]]:
     plan_signature = str(getattr(ctx, "vocab_lora_latest_plan_signature", "") or "").strip()
     if not plan_signature:

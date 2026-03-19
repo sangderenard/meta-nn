@@ -503,3 +503,146 @@ def make_transformer_step_preview_callback(ctx: Any, node_id: str):
                 break
 
     return _callback
+
+
+def _normalize_generator_image_chw(image_like: Any) -> np.ndarray:
+    """Convert a generator output tensor (CHW, possibly in [-1,1]) to a clipped [0,1] CHW array."""
+    arr = _to_np_float(image_like)
+    if arr.ndim == 4:
+        arr = arr[0]
+    if arr.ndim == 3 and int(arr.shape[0]) != 3 and int(arr.shape[-1]) == 3:
+        arr = arr.transpose(2, 0, 1)
+    arr = arr[:3]
+    # Remap [-1,1] → [0,1] if values are negative (tanh-activated output).
+    if float(arr.min()) < -0.05:
+        arr = (arr + 1.0) * 0.5
+    return np.clip(np.asarray(arr, dtype=np.float32), 0.0, 1.0)
+
+
+def build_generator_preview_frames(
+    payload_batch: Sequence[Dict[str, Any]],
+    *,
+    class_names: Sequence[str],
+    cycle_id: int,
+    round_id: int,
+) -> Tuple[Optional[float], List[Dict[str, Any]]]:
+    """Build preview frames for Stage G (conditional GAN) training.
+
+    Three-panel layout:
+      0 – real target image (what the generator is conditioned on)
+      1 – mask comparison: target mask (green) / fake mask (red) over dimmed target
+      2 – generated fake image
+    """
+    if not payload_batch:
+        return None, []
+
+    first = payload_batch[0]
+    step_txt = f"step={int(first.get('step', 0))}/{int(first.get('steps_per_epoch', 0))}"
+
+    g_loss_avg = float(first.get("g_loss_avg", float("nan")))
+    eff_loss: Optional[float] = float(g_loss_avg) if math.isfinite(g_loss_avg) else None
+
+    frames: List[Dict[str, Any]] = []
+    for payload in payload_batch[:1]:  # one frame per callback, first sample only
+        target_raw = payload.get("target_img", None)
+        fake_raw = payload.get("fake_img", None)
+        if target_raw is None or fake_raw is None:
+            continue
+        try:
+            target_chw = _normalize_rgb_chw(target_raw)
+            fake_chw = _normalize_generator_image_chw(fake_raw)
+        except Exception:
+            continue
+
+        h, w = int(target_chw.shape[1]), int(target_chw.shape[2])
+        target_mask = _normalize_mask_hw(payload.get("target_mask", None), height=h, width=w, fill=0.0)
+        fake_mask = _normalize_mask_hw(payload.get("fake_mask", None), height=h, width=w, fill=0.0)
+
+        # Panel 1: dimmed target with target mask (green) and fake mask (red) overlaid.
+        dim = target_chw * 0.45
+        mask_panel = np.clip(
+            dim + np.stack([fake_mask * 0.55, target_mask * 0.55, np.zeros((h, w), dtype=np.float32)], axis=0),
+            0.0, 1.0,
+        )
+
+        # Text rows
+        target_labels = _format_target_lines(payload.get("target_condition", None), class_names=class_names)
+        g_loss = float(payload.get("g_loss", float("nan")))
+        d_loss = float(payload.get("d_loss", float("nan")))
+        adv_loss = float(payload.get("adv_loss", float("nan")))
+        target_prob = float(payload.get("target_prob_avg", float("nan")))
+
+        metric_rows = []
+        for k, v in [("g", g_loss), ("d", d_loss), ("adv", adv_loss), ("prob", target_prob)]:
+            if math.isfinite(v):
+                metric_rows.append(f"{k}={v:.4f}")
+
+        loss_scalars: Dict[str, float] = {}
+        if math.isfinite(g_loss):
+            loss_scalars["loss"] = g_loss
+
+        frames.append({
+            "images": [
+                _chw_to_u8_hwc(target_chw),
+                _chw_to_u8_hwc(mask_panel),
+                _chw_to_u8_hwc(fake_chw),
+            ],
+            "caption": (
+                f"[G] cycle={int(cycle_id)} round={int(round_id)} {step_txt}"
+                + (f" g={g_loss:.4f}" if math.isfinite(g_loss) else "")
+            ),
+            "titles": ["G target", "G masks", "G fake"],
+            "step_txt": step_txt,
+            "rows": [
+                target_labels,
+                metric_rows,
+                [],
+            ],
+            "loss_scalars": loss_scalars,
+        })
+
+    return eff_loss, frames
+
+
+def make_generator_step_preview_callback(ctx: Any, node_id: str, preview_every: int = 10):
+    """Return a step_preview_callback for Stage G GAN training.
+
+    Throttled to one preview per *preview_every* calls so the viewer is not
+    flooded (the GAN's step_preview_callback fires every generator step).
+    """
+    viewer = getattr(ctx, "viewer_proxy", None)
+    enqueue_frame = getattr(viewer, "enqueue_frame", None) if viewer is not None else None
+    publish_progress = getattr(ctx, "publish_node_progress", None)
+    if not callable(enqueue_frame):
+        return None
+
+    _counter = [0]
+    _every = max(1, int(preview_every))
+
+    def _callback(payload_batch: Sequence[Dict[str, Any]]) -> None:
+        _counter[0] += 1
+        if _counter[0] % _every != 0:
+            return
+        preview_check = getattr(ctx, "preview_enabled", None)
+        if callable(preview_check) and not preview_check():
+            return
+        class_names = list(getattr(ctx, "class_names", []) or [])
+        eff_loss, frames = build_generator_preview_frames(
+            payload_batch,
+            class_names=class_names,
+            cycle_id=int(getattr(ctx, "cycle", 0)),
+            round_id=int(getattr(ctx, "round_id", 0)),
+        )
+        for frame in frames:
+            frame_loss = frame.get("loss_scalars", {}).get("loss", eff_loss)
+            if callable(publish_progress) and frame_loss is not None and math.isfinite(float(frame_loss)):
+                try:
+                    publish_progress(str(node_id), float(frame_loss))
+                except Exception:
+                    pass
+            try:
+                enqueue_frame(frame)
+            except Exception:
+                break
+
+    return _callback

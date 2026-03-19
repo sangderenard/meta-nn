@@ -535,6 +535,8 @@ typedef struct LayerLayout {
     int group_id;   /* branch/group identifier for tinting */
     int x0;        /* raw grid column start */
     int x1;        /* raw grid column end */
+    int y_top_raw;  /* topmost raw row used by this layer's pixels */
+    int y_bot_raw;  /* bottommost raw row used by this layer's pixels */
     float max_abs_mean;
     float max_energy;
     float max_diff;
@@ -741,6 +743,9 @@ static int render_architectural(
             row_capacity = maxi(1, (int)ceilf((float)maxi(1, n) / (float)maxi(1, ll[li].image_display_cols)));
             row_capacity = mini(raw_h, row_capacity);
         }
+        /* Box interior is row_capacity; border is drawn 1px outside by draw_rect_border. */
+        ll[li].y_top_raw = (raw_h - row_capacity) / 2;
+        ll[li].y_bot_raw = ll[li].y_top_raw + row_capacity - 1;
         for (int idx = 0; idx < n; idx++) {
             int col = idx / row_capacity;
             int pos_in_col = idx % row_capacity;
@@ -875,8 +880,13 @@ static int render_architectural(
                     int li1 = group_end[gi];
                     int gx0 = x0 + ll[li0].x0 * scale;
                     int gx1 = x0 + ll[li1].x1 * scale;
-                    int y_start = grid_y0;
-                    int y_end = grid_y1;
+                    int y_start = eff_h, y_end = -1;
+                    for (int k = li0; k <= li1; k++) {
+                        int ly_top = y0 + ll[k].y_top_raw * scale;
+                        int ly_bot = y0 + (ll[k].y_bot_raw + 1) * scale - 1;
+                        if (ly_top < y_start) y_start = ly_top;
+                        if (ly_bot > y_end)   y_end   = ly_bot;
+                    }
                     uint8_t gr, gg, gb;
                     if (gx1 <= gx0) gx1 = gx0 + 1;
                     gx0 = maxi(0, gx0);
@@ -892,12 +902,12 @@ static int render_architectural(
                 }
             }
 
-            /* Pass 2: mega tint + red border ring using inter-layer boundary bands. */
+            /* Pass 2: mega tint + dark-grey border ring using inter-layer boundary bands. */
             for (int li = 0; li < num_layers; li++) {
                 int lx0 = x0 + ll[li].x0 * scale;
                 int lx1 = x0 + ll[li].x1 * scale;
-                int y_start = grid_y0;
-                int y_end = grid_y1;
+                int y_start = y0 + ll[li].y_top_raw * scale;
+                int y_end   = y0 + (ll[li].y_bot_raw + 1) * scale - 1;
                 int left_seam = seam_cols ? seam_cols[li] : 0;
                 int right_seam = seam_cols ? seam_cols[li + 1] : 0;
                 if (!ll[li].is_mega) continue;
@@ -908,7 +918,7 @@ static int render_architectural(
 
                 for (int y = y_start; y <= y_end; y++) {
                     for (int x = lx0; x < lx1; x++) {
-                        blend_pixel(out_rgb, eff_w, eff_h, x, y, 255, 56, 56, 0.16f);
+                        blend_pixel(out_rgb, eff_w, eff_h, x, y, 64, 64, 68, 0.16f);
                     }
                 }
 
@@ -919,7 +929,7 @@ static int render_architectural(
                     int y_bottom = mini(data_h - 1, y_end + 1);
                     /* Avoid rendering 1px seam-lines as fake borders for tiny boxes. */
                     if ((x_right - x_left) >= 2 && (y_bottom - y_top) >= 2) {
-                        draw_rect_border(out_rgb, eff_w, eff_h, x_left, y_top, x_right, y_bottom, 255, 92, 92);
+                        draw_rect_border(out_rgb, eff_w, eff_h, x_left, y_top, x_right, y_bottom, 72, 72, 76);
                     }
                 }
             }
@@ -931,8 +941,13 @@ static int render_architectural(
                     int li1 = group_end[gi];
                     int gx0 = x0 + ll[li0].x0 * scale;
                     int gx1 = x0 + ll[li1].x1 * scale;
-                    int y_start = grid_y0;
-                    int y_end = grid_y1;
+                    int y_start = eff_h, y_end = -1;
+                    for (int k = li0; k <= li1; k++) {
+                        int ly_top = y0 + ll[k].y_top_raw * scale;
+                        int ly_bot = y0 + (ll[k].y_bot_raw + 1) * scale - 1;
+                        if (ly_top < y_start) y_start = ly_top;
+                        if (ly_bot > y_end)   y_end   = ly_bot;
+                    }
                     int left_seam = seam_cols ? seam_cols[li0] : 0;
                     int right_seam = seam_cols ? seam_cols[li1 + 1] : 0;
                     uint8_t gr, gg, gb;

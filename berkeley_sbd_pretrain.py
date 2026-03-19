@@ -18,6 +18,8 @@ from torchvision.datasets import SBDataset
 from torchvision.transforms import functional as TF
 from torchvision.transforms import InterpolationMode
 
+from pipeline.filesystem_emergency import raise_if_filesystem_space_emergency
+from pipeline.nodes.interrupts import StageStopRequested
 from wav_ml_models import (
         SinusoidalLRController,
         SinusoidalLROptions,
@@ -270,7 +272,7 @@ class SBDMultiLabelMaskDataset(Dataset):
         return x, y, mask_t
 
 
-def _labels_from_segmentation_masks(ds: SBDataset, cache_path: Path):
+def _labels_from_segmentation_masks(ds: SBDataset, cache_path: Path, progress_control=None):
     target_dim = max(1, int(len(VOC20_CLASSES)))
 
     def _adapt_shape(arr: np.ndarray) -> np.ndarray:
@@ -290,7 +292,15 @@ def _labels_from_segmentation_masks(ds: SBDataset, cache_path: Path):
         labels = _adapt_shape(blob["labels"])
         try:
             np.savez_compressed(cache_path, labels=labels.astype(np.float32, copy=False))
-        except Exception:
+        except StageStopRequested:
+            raise
+        except Exception as exc:
+            raise_if_filesystem_space_emergency(
+                progress_control,
+                exc,
+                note="berkeley multilabel cache refresh",
+                write_path=cache_path,
+            )
             pass
         return labels
 
@@ -306,8 +316,17 @@ def _labels_from_segmentation_masks(ds: SBDataset, cache_path: Path):
         if (i + 1) % 500 == 0 or (i + 1) == n:
             _log(f"  parsed {i + 1}/{n} masks")
 
-    cache_path.parent.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(cache_path, labels=labels)
+    try:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        np.savez_compressed(cache_path, labels=labels)
+    except Exception as exc:
+        raise_if_filesystem_space_emergency(
+            progress_control,
+            exc,
+            note="berkeley multilabel cache write",
+            write_path=cache_path,
+        )
+        raise
     return labels
 
 
@@ -335,7 +354,16 @@ def prepare_sbd_multilabel(
 ):
     ensure_scipy(auto_install=auto_install_scipy)
     root = Path(data_root)
-    root.mkdir(parents=True, exist_ok=True)
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+    except Exception as exc:
+        raise_if_filesystem_space_emergency(
+            None,
+            exc,
+            note="berkeley data root write",
+            write_path=root,
+        )
+        raise
 
     # Download/extract at most once; subsequent split loads must be local-only.
     should_download = not _sbd_looks_ready(root)
