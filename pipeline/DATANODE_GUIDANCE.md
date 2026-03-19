@@ -21,9 +21,9 @@ and which DataNode method provisions it.
 data_node → stage_0_pregestation   on_traverse=provide_pregestation   (unconditional)
 data_node → stage_1_gestation      on_traverse=provide_gestation       (after gate_pregestation)
 data_node → stage_2_berkeley       on_traverse=provide_berkeley_data   (after early_gates)
-data_node → gate_berkeley          on_traverse=provide_gate_data       (after early_gates)
+data_node → gate_berkeley          on_traverse=provide_gate_data       (after early_gates; gate-local validation only)
+data_node → build_flashcard_rows   on_traverse=provide_payload         (after gate_transformer / immediately before generator path)
 data_node → stage_g_generator      on_traverse=provide_payload         (after all_gates)
-data_node → build_flashcard_rows   on_traverse=provide_payload         (unconditional)
 ```
 
 ### DataNode.execute() — Active Housekeeping

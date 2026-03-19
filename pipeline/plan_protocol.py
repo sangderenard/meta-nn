@@ -33,6 +33,7 @@ MESSAGE_TYPE_RUN_CONTROL = "run_control"
 MESSAGE_TYPE_RUNTIME_SNAPSHOT = "runtime_snapshot"
 MESSAGE_TYPE_EXECUTION_EVENT = "execution_event"
 MESSAGE_TYPE_GUI_SELECTION = "gui_selection"
+MESSAGE_TYPE_SCHEDULE_APPLY = "schedule_apply"
 
 
 def _clean_dict(data: Dict[str, Any]) -> Dict[str, Any]:
@@ -1141,6 +1142,132 @@ class GuiSelectionPayload:
         )
 
 
+@dataclass
+class ScheduleRow:
+    """One block in a user-authored training schedule.
+
+    The orchestrator executes rows sequentially.  Each row runs for
+    ``cycles`` cycles with ``rounds_per_cycle`` rounds each.  An empty
+    ``active_stages`` list means all stages run (no filter); a non-empty
+    list restricts execution to only those node_ids.  ``config_overrides``
+    maps node_id → {field: value} patches applied before the row starts.
+    """
+
+    label: str = ""
+    cycles: int = 1
+    rounds_per_cycle: int = 1
+    active_stages: List[str] = field(default_factory=list)   # [] = all stages
+    gate_override: bool = False
+    config_overrides: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    row_id: str = ""
+
+    def __post_init__(self) -> None:
+        if not self.row_id:
+            self.row_id = _stable_digest({
+                "label": self.label,
+                "cycles": self.cycles,
+                "rounds_per_cycle": self.rounds_per_cycle,
+                "active_stages": sorted(self.active_stages),
+                "gate_override": self.gate_override,
+                "config_overrides": _jsonable(self.config_overrides),
+            })
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "row_id": str(self.row_id),
+            "label": str(self.label),
+            "cycles": int(self.cycles),
+            "rounds_per_cycle": int(self.rounds_per_cycle),
+            "active_stages": [str(s) for s in self.active_stages],
+            "gate_override": bool(self.gate_override),
+            "config_overrides": {
+                str(k): dict(v) for k, v in self.config_overrides.items()
+            },
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "ScheduleRow":
+        return cls(
+            row_id=str(data.get("row_id", "")),
+            label=str(data.get("label", "")),
+            cycles=max(1, int(data.get("cycles", 1))),
+            rounds_per_cycle=max(1, int(data.get("rounds_per_cycle", 1))),
+            active_stages=[str(s) for s in data.get("active_stages", [])],
+            gate_override=bool(data.get("gate_override", False)),
+            config_overrides={
+                str(k): dict(v)
+                for k, v in dict(data.get("config_overrides", {})).items()
+            },
+        )
+
+
+@dataclass
+class TrainingSchedule:
+    """An ordered list of ScheduleRows that the orchestrator walks sequentially."""
+
+    rows: List[ScheduleRow] = field(default_factory=list)
+    schedule_id: str = ""
+
+    def __post_init__(self) -> None:
+        if not self.schedule_id:
+            self.schedule_id = _stable_digest([r.to_dict() for r in self.rows])
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "schedule_id": str(self.schedule_id),
+            "rows": [r.to_dict() for r in self.rows],
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "TrainingSchedule":
+        return cls(
+            schedule_id=str(data.get("schedule_id", "")),
+            rows=[ScheduleRow.from_dict(dict(r)) for r in data.get("rows", [])],
+        )
+
+    @classmethod
+    def default_from_plan(cls, plan: Any) -> "TrainingSchedule":
+        """Build a one-row default schedule from the plan's cycle edge."""
+        cycles = 1
+        rounds_per_cycle = 1
+        for edge in list(getattr(plan, "edges", []) or []):
+            if str(getattr(edge, "layer", "") or "") != "cycle":
+                continue
+            cc = dict(getattr(edge, "cycle_control", {}) or {})
+            if int(cc.get("max_iterations", 0) or 0) <= 0:
+                continue
+            cycles = int(cc.get("cycles", 1) or 1)
+            rounds_per_cycle = int(cc.get("rounds_per_cycle", 1) or 1)
+            break
+        row = ScheduleRow(label="default", cycles=max(1, cycles),
+                          rounds_per_cycle=max(1, rounds_per_cycle))
+        return cls(rows=[row])
+
+
+@dataclass
+class ScheduleApplyPayload:
+    """GUI → backend: replace the active training schedule."""
+
+    schedule: TrainingSchedule
+    replace_current: bool = True
+    reason: str = ""
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "schedule": self.schedule.to_dict(),
+            "replace_current": bool(self.replace_current),
+            "reason": str(self.reason),
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "ScheduleApplyPayload":
+        return cls(
+            schedule=TrainingSchedule.from_dict(dict(data["schedule"])),
+            replace_current=bool(data.get("replace_current", True)),
+            reason=str(data.get("reason", "")),
+        )
+
+
 _PAYLOAD_TYPES = {
     MESSAGE_TYPE_WORKER_HELLO: WorkerHelloPayload,
     MESSAGE_TYPE_PLAN_SNAPSHOT: PlanSnapshotPayload,
@@ -1150,6 +1277,7 @@ _PAYLOAD_TYPES = {
     MESSAGE_TYPE_RUNTIME_SNAPSHOT: RuntimeSnapshotPayload,
     MESSAGE_TYPE_EXECUTION_EVENT: ExecutionEventPayload,
     MESSAGE_TYPE_GUI_SELECTION: GuiSelectionPayload,
+    MESSAGE_TYPE_SCHEDULE_APPLY: ScheduleApplyPayload,
 }
 
 

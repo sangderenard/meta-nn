@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -m unittest pipeline.test_progress -v)",
+      "Bash(python -c \":*)",
+      "Bash(python -c \"import pipeline.orchestrator; print\\(''OK''\\)\")"
+    ]
+  }
+}

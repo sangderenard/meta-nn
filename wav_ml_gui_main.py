@@ -267,6 +267,9 @@ def main():
         while True:
             viewer.pump()
             server.poll()
+            backend_quit = getattr(viewer, "backend_quit_requested", lambda: False)
+            if backend_quit():
+                viewer._backend_quit_requested = False
             if viewer.stop_requested():
                 break
             time.sleep(0.002)  # ~500 Hz poll; pump() self-throttles via slew

@@ -574,7 +574,7 @@ def parse_args():
     p.add_argument(
         "--semantic-stage-cache-sanity-cap-mb",
         type=int,
-        default=30720,
+        default=8192,
         help="Hard sanity guard for projected semantic stage cache size in MB when no explicit override is enabled.",
     )
     p.add_argument(
@@ -728,7 +728,7 @@ def parse_args():
     p.add_argument(
         "--berkeley-wheel-sanity-cap-mb",
         type=int,
-        default=30720,
+        default=8192,
         help="Hard sanity guard for projected Berkeley wheel size in MB when no explicit override is enabled.",
     )
     p.add_argument(

@@ -20,6 +20,7 @@ import torch.nn.functional as F
 from PIL import Image
 from torch.utils.data import Dataset, Sampler
 
+from pipeline.progress import interruptible_tqdm
 from semantic_dataset_loaders import (
     SemanticDiskRow,
     _apply_degrade as _canonical_apply_degrade,
@@ -399,6 +400,7 @@ def _build_clean_entries_batch(
     idx_to_term: Dict[int, str],
     processing_device: Optional[Any] = None,
     preload_workers: int = 0,
+    progress_control: Any = None,
 ) -> List[Dict[str, Any]]:
     if len(rows) <= 0:
         return []
@@ -456,7 +458,15 @@ def _build_clean_entries_batch(
     )
 
     out: List[Dict[str, Any]] = []
-    for row_idx, row in tqdm(enumerate(rows), total=len(rows), desc="[wheel cache] building entries", unit="row", leave=False, dynamic_ncols=True):
+    for row_idx, row in interruptible_tqdm(
+        enumerate(rows),
+        total=len(rows),
+        desc="[wheel cache] building entries",
+        unit="row",
+        leave=False,
+        dynamic_ncols=True,
+        control=progress_control,
+    ):
         label_vec = np.asarray(label_batch[int(row_idx)], dtype=np.float32)
         creation_mask_u8 = creation_masks_u8[int(row_idx)]
         creation_mask = np.asarray(creation_mask_u8, dtype=np.float32) if creation_mask_u8 is not None else None
@@ -778,6 +788,7 @@ class SemanticWheelConfig:
     force_rebuild: bool = False
     processing_device: Optional[Any] = None
     preload_workers: int = 0
+    progress_control: Optional[Any] = None
 
 
 class SemanticWheelDataset(Dataset):
@@ -1153,7 +1164,15 @@ def ensure_semantic_candidate_cache(
         ))
 
     _build_desc = f"[{config.purpose}] building & writing"
-    for spec_batch in tqdm(spec_batches, total=len(spec_batches), desc=_build_desc, unit="batch", leave=False, dynamic_ncols=True):
+    for spec_batch in interruptible_tqdm(
+        spec_batches,
+        total=len(spec_batches),
+        desc=_build_desc,
+        unit="batch",
+        leave=False,
+        dynamic_ncols=True,
+        control=config.progress_control,
+    ):
         if cap_exceeded:
             break
         if writer_state["error"] is not None:
@@ -1291,7 +1310,15 @@ def ensure_semantic_wheel_cache(
     term_to_idx = {_norm_txt(str(name)): int(i) for i, name in enumerate(class_names) if str(name).strip()}
     idx_to_term = {int(i): str(name) for i, name in enumerate(class_names) if str(name).strip()}
     candidates: List[SemanticWheelCandidate] = []
-    for row in tqdm(rows, total=len(rows), desc=f"[{config.purpose}] hashing rows", unit="row", leave=False, dynamic_ncols=True):
+    for row in interruptible_tqdm(
+        rows,
+        total=len(rows),
+        desc=f"[{config.purpose}] hashing rows",
+        unit="row",
+        leave=False,
+        dynamic_ncols=True,
+        control=config.progress_control,
+    ):
         payload = {
             "image_path": str(row.image_path),
             "mask_path": str(row.mask_path or ""),
@@ -1340,6 +1367,7 @@ def ensure_semantic_wheel_cache(
             idx_to_term=idx_to_term,
             processing_device=config.processing_device,
             preload_workers=int(config.preload_workers),
+            progress_control=config.progress_control,
         )
         out_groups: List[List[Dict[str, Any]]] = []
         for clean, (base_row_idx, base_row_pos) in zip(clean_entries, spec_batch):

@@ -14,6 +14,8 @@ from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Set
 
+from pipeline.nodes.interrupts import StageSkipBack, StageSkipForward, StageStopRequested
+
 
 def _sanitize_edge_token(raw: str) -> str:
     text = str(raw or "").replace(" ", "_").replace(":", "_").replace(".", "_")
@@ -816,7 +818,12 @@ class PipelineGraph:
         edge_overrides = raw_edge_overrides if isinstance(raw_edge_overrides, dict) else {}
         step_specs = dict(program_steps or {})
 
-        for step_index, node_id in enumerate(sequence, start=1):
+        _seq = list(sequence)
+        _seq_i = 0
+        while _seq_i < len(_seq):
+            node_id = _seq[_seq_i]
+            step_index = _seq_i + 1
+            _seq_i += 1  # advance early so all continue statements are correct
             _wait_while_paused(ctx)
             node = self._nodes.get(node_id)
             step_spec = dict(step_specs.get(node_id, {}) or {})
@@ -944,6 +951,28 @@ class PipelineGraph:
                     _log(f"[graph] SKIP {step_index:02d} {node_id!r} (all incoming edges inactive)")
                 continue
 
+            if not getattr(ctx, "is_node_selected", lambda _nid: True)(node_id):
+                statuses[node_id] = "skipped:gui_deselected"
+                trace.append(
+                    {
+                        "step": int(step_index),
+                        "node_id": str(node_id),
+                        "status": "skipped:gui_deselected",
+                        "incoming_edge_ids": incoming_edge_ids,
+                        "active_edge_ids": active_edge_ids,
+                        "guard_condition_ids": guard_condition_ids,
+                        "guard_results": dict(guard_results),
+                        "frame_keys": list(program_frame_keys),
+                        "call_ref": call_ref,
+                        "program_step_id": program_step_id,
+                        "execution_mode": execution_mode,
+                        "gates": _gate_status_snapshot(ctx),
+                    }
+                )
+                if verbose:
+                    _log(f"[graph] SKIP {step_index:02d} {node_id!r} (GUI deselected)")
+                continue
+
             active_edge_configs: Dict[str, Dict[str, Any]] = {}
             for edge in active_incoming:
                 incoming_cfg = edge_overrides.get(edge.edge_id)
@@ -1009,6 +1038,80 @@ class PipelineGraph:
                         "gates": _gate_status_snapshot(ctx),
                     }
                 )
+            except StageStopRequested as exc:
+                status = "interrupted:stop_save" if bool(getattr(exc, "save_requested", False)) else "interrupted:stop"
+                statuses[node_id] = status
+                trace.append(
+                    {
+                        "step": int(step_index),
+                        "node_id": str(node_id),
+                        "status": status,
+                        "incoming_edge_ids": incoming_edge_ids,
+                        "active_edge_ids": active_edge_ids,
+                        "guard_condition_ids": guard_condition_ids,
+                        "guard_results": dict(guard_results),
+                        "frame_keys": list(frame_keys),
+                        "reaction_names": [str(e.reaction.reaction_name or '') for e in active_incoming],
+                        "call_ref": call_ref,
+                        "program_step_id": program_step_id,
+                        "execution_mode": execution_mode,
+                        "gates": _gate_status_snapshot(ctx),
+                    }
+                )
+                setattr(ctx, "last_execution_trace", trace)
+                setattr(ctx, "last_node_statuses", dict(statuses))
+                _log(f"[graph] STOP {step_index:02d} {node_id!r} ({'save' if 'stop_save' in status else 'stop'})")
+                raise
+            except StageSkipForward:
+                statuses[node_id] = "interrupted:fwd"
+                trace.append(
+                    {
+                        "step": int(step_index),
+                        "node_id": str(node_id),
+                        "status": "interrupted:fwd",
+                        "incoming_edge_ids": incoming_edge_ids,
+                        "active_edge_ids": active_edge_ids,
+                        "guard_condition_ids": guard_condition_ids,
+                        "guard_results": dict(guard_results),
+                        "frame_keys": list(frame_keys),
+                        "reaction_names": [str(e.reaction.reaction_name or '') for e in active_incoming],
+                        "call_ref": call_ref,
+                        "program_step_id": program_step_id,
+                        "execution_mode": execution_mode,
+                        "gates": _gate_status_snapshot(ctx),
+                    }
+                )
+                _log(f"[graph] FWD  {step_index:02d} {node_id!r} (GUI skip forward)")
+            except StageSkipBack:
+                statuses[node_id] = "interrupted:back"
+                trace.append(
+                    {
+                        "step": int(step_index),
+                        "node_id": str(node_id),
+                        "status": "interrupted:back",
+                        "incoming_edge_ids": incoming_edge_ids,
+                        "active_edge_ids": active_edge_ids,
+                        "guard_condition_ids": guard_condition_ids,
+                        "guard_results": dict(guard_results),
+                        "frame_keys": list(frame_keys),
+                        "reaction_names": [str(e.reaction.reaction_name or '') for e in active_incoming],
+                        "call_ref": call_ref,
+                        "program_step_id": program_step_id,
+                        "execution_mode": execution_mode,
+                        "gates": _gate_status_snapshot(ctx),
+                    }
+                )
+                # Seek backward to the nearest preceding stage node
+                _prev_stage_i = None
+                for _back_i in range(_seq_i - 2, -1, -1):
+                    if str(_seq[_back_i]).startswith("stage_"):
+                        _prev_stage_i = _back_i
+                        break
+                if _prev_stage_i is not None:
+                    _log(f"[graph] BACK {step_index:02d} {node_id!r} → {_seq[_prev_stage_i]!r} (GUI skip back)")
+                    _seq_i = _prev_stage_i
+                else:
+                    _log(f"[graph] BACK {step_index:02d} {node_id!r} (no prior stage; staying forward)")
             except Exception as exc:
                 statuses[node_id] = f"failed:{exc}"
                 trace.append(

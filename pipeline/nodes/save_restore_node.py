@@ -830,6 +830,10 @@ class SaveRestoreNode(PipelineNode):
         if not ctx.scrub_editor_enabled():
             return
 
+        # QUIT (no-save stop) → skip checkpoint so the process exits promptly
+        if ctx.stop_requested() and not ctx.shutdown_save():
+            return
+
         # Normal save path
         self._execute_save(ctx)
 
@@ -1071,6 +1075,13 @@ class SaveRestoreNode(PipelineNode):
         if bool(getattr(ctx, "shutdown_save_pending", False)):
             self.prepare_shutdown_save(ctx)
             return
+        save_now_fn = getattr(ctx, "save_now_requested", None)
+        if callable(save_now_fn):
+            try:
+                if save_now_fn():
+                    self._force_save_pending = True
+            except Exception:
+                pass
         if bool(getattr(ctx, "startup_restore_pending", False)):
             self.prepare_startup_restore(ctx)
 

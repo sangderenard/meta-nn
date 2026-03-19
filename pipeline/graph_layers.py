@@ -1689,7 +1689,6 @@ def _condition_display_label(
 ) -> str:
     if not condition_ids:
         return f"Run {target_label}?" if target_label else "Guard satisfied?"
-    primary = str(condition_ids[0] or "").strip()
     known = {
         "orchestration.mode_has_generator": "GAN mode?",
         "gates.pregestation_passed": "Gate 0 passed?",
@@ -1697,6 +1696,11 @@ def _condition_display_label(
         "gates.all_base_passed": "Gate 2 passed?",
         "gates.wave_stage_ready": "Wave stage ready?",
     }
+    for condition_id in condition_ids:
+        resolved = str(condition_id or "").strip()
+        if resolved in known:
+            return known[resolved]
+    primary = str(condition_ids[0] or "").strip()
     if primary in known:
         return known[primary]
     blob = dict((condition_blobs or {}).get(primary, {}) or {})

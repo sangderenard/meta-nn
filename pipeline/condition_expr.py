@@ -377,6 +377,7 @@ _CALLABLE_WHITELIST = frozenset({
     "early_gates_passed",
     "all_base_gates_passed",
     "wave_stage_ready",
+    "stage_2_berkeley_selected",
 })
 
 

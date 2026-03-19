@@ -53,6 +53,8 @@ from pipeline.nodes.base import (
     IRStateSpec,
     IRTrainingNode,
     IRTensorPortSpec,
+    StageSkipBack,
+    StageSkipForward,
     autocast_context,
     freeze,
     make_runtime_weight_publish_callback,
@@ -414,6 +416,8 @@ class PregestationTrainNode(IRTrainingNode):
                 publish_loss=(preview_callback is None),
             ),
             stop_requested=ctx.stop_requested,
+            pause_requested=ctx.paused,
+            ipc_pump=getattr(ctx.viewer_proxy, "pump", None),
             weight_update_callback=weight_update_callback,
             args=ctx.args,
         )
@@ -531,6 +535,8 @@ class GestationTrainNode(IRTrainingNode):
                 publish_loss=(preview_callback is None),
             ),
             stop_requested=ctx.stop_requested,
+            pause_requested=ctx.paused,
+            ipc_pump=getattr(ctx.viewer_proxy, "pump", None),
             weight_update_callback=weight_update_callback,
             args=ctx.args,
         )
@@ -647,6 +653,8 @@ class BerkeleyRefreshTrainNode(IRTrainingNode):
                 publish_loss=(preview_callback is None),
             ),
             stop_requested=ctx.stop_requested,
+            pause_requested=ctx.paused,
+            ipc_pump=getattr(ctx.viewer_proxy, "pump", None),
             weight_update_callback=weight_update_callback,
             args=ctx.args,
             remap_targets_from_terms=True,
@@ -840,6 +848,9 @@ class LoRARoundNode(IRTrainingNode):
                 remap_targets_from_terms=True,
                 active_class_names=list(ctx.class_names),
                 source_class_names=list(ctx.supervised_class_names),
+                stop_requested=ctx.stop_requested,
+                pause_requested=ctx.paused,
+                ipc_pump=getattr(ctx.viewer_proxy, "pump", None),
             )
 
             # Snapshot trained slot
@@ -1433,6 +1444,8 @@ def _run_classifier_refresh_epochs(
     remap_targets_from_terms: bool = False,
     active_class_names: Optional[Sequence[str]] = None,
     source_class_names: Optional[Sequence[str]] = None,
+    pause_requested: Optional[Callable[[], bool]] = None,
+    ipc_pump: Optional[Callable[[], None]] = None,
 ):
     if epochs <= 0:
         return {"ran": False, "loss": 0.0}
@@ -1522,6 +1535,30 @@ def _run_classifier_refresh_epochs(
                             break
                     except Exception:
                         pass
+                # Batch-level pause: spin here so the GUI can pause/resume
+                # between any two batches (and during dataloader pre-fetch waits).
+                if pause_requested is not None:
+                    try:
+                        while bool(pause_requested()):
+                            if stop_requested is not None:
+                                try:
+                                    if bool(stop_requested()):
+                                        stop_now = True
+                                        break
+                                except Exception:
+                                    pass
+                            if stop_now:
+                                break
+                            if ipc_pump is not None:
+                                try:
+                                    ipc_pump()
+                                except Exception:
+                                    pass
+                            time.sleep(0.05)
+                    except Exception:
+                        pass
+                    if stop_now:
+                        break
                 if use_cache:
                     idx_parts: List[torch.Tensor] = []
                     need = int(cache_batch_size)
@@ -1741,6 +1778,8 @@ def _run_classifier_refresh_epochs(
                                 "loss": float(_cur_loss),
                                 "samples_per_sec": float(ips),
                             })
+                        except (StageSkipForward, StageSkipBack):
+                            raise
                         except Exception:
                             pass
                 if step_preview_callback is not None and len(preview_items) > 0:

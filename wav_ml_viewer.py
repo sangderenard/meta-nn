@@ -26,11 +26,14 @@ from pipeline.plan_protocol import (
     MESSAGE_TYPE_PLAN_SNAPSHOT,
     MESSAGE_TYPE_RUN_CONTROL,
     MESSAGE_TYPE_RUNTIME_SNAPSHOT,
+    MESSAGE_TYPE_SCHEDULE_APPLY,
     MESSAGE_TYPE_WORKER_HELLO,
     ExecutionEventPayload,
     PlanApplyPayload,
     RunControlPayload,
     RuntimeSnapshotPayload,
+    ScheduleApplyPayload,
+    TrainingSchedule,
     WorkerHelloPayload,
     is_protocol_envelope_message,
     make_envelope,
@@ -321,7 +324,7 @@ class _TransformerStatusOpenGLViewer:
         self.panel_w = max(8, min(256, int(self.image_w)))
         self.panel_h = max(8, min(256, int(self.image_h)))
         self.num_panels = 3
-        self.top_bar_h = 84
+        self.top_bar_h = 104
         self.graph_h = max(0, int(graph_h))
         self.graph_toolbar_h = 22 if self.graph_h > 0 else 0
         self.graph_total_h = int(self.graph_h + self.graph_toolbar_h)
@@ -339,6 +342,7 @@ class _TransformerStatusOpenGLViewer:
         self._gl = None
         self._textures = None
         self._stop_requested = False
+        self._backend_quit_requested = False  # QUIT button: stop backend only, keep GUI open
         self._shutdown_save: Optional[bool] = None  # None=no shutdown, True=save, False=nosave
         self._launch_script: Optional[str] = None   # .bat to re-launch training
         self._output_dir: Optional[str] = None
@@ -383,11 +387,16 @@ class _TransformerStatusOpenGLViewer:
         self._top_bar_rgb = np.full((self.top_bar_h, self.window_w, 3), 18, dtype=np.uint8)
 
         self._cycle_selected: List[bool] = []
+        self._stage_selected: Dict[str, bool] = {}
+        self._stage_roster: List[Tuple[str, str]] = []
         self._gate_override = False
-        self._paused = False
+        self._paused = True
         self._preview_enabled = True
         self._scrub_editor_enabled = True
-        self._control_boxes: List[Tuple[str, int, Tuple[int, int, int, int]]] = []
+        self._skip_forward_pending: bool = False
+        self._skip_back_pending: bool = False
+        self._save_now_pending: bool = False
+        self._control_boxes: List[Tuple[str, Any, Tuple[int, int, int, int]]] = []
         self._graph_control_boxes: List[Tuple[str, str, Tuple[int, int, int, int]]] = []
         self._graph_worker_hello: Dict[str, Any] = {}
         self._graph_plan_snapshot: Optional[Dict[str, Any]] = None
@@ -396,6 +405,15 @@ class _TransformerStatusOpenGLViewer:
         self._graph_x_axis_mode: str = "t"
         self._graph_history_mode: str = "recent"
         self.set_cycle_roster(total_cycles=int(cycle_slots))
+        self.set_stage_roster([
+            ("stage_0_pregestation", "Pregest"),
+            ("stage_1_gestation", "Gestation"),
+            ("stage_2_berkeley", "Berkeley"),
+            ("stage_r_transformer", "Transf"),
+            ("stage_g_generator", "Generat"),
+            ("stage_c_lora", "LoRA"),
+            ("stage_w_wave_classifier", "WaveCls"),
+        ])
 
         # The native C loss store is the single source of truth.
         # The viewer reads it directly -- no local deque copies.
@@ -533,6 +551,46 @@ class _TransformerStatusOpenGLViewer:
         if idx < 0 or idx >= len(self._cycle_selected):
             return True
         return bool(self._cycle_selected[idx])
+
+    def set_stage_roster(self, roster) -> None:
+        self._stage_roster = list(roster)
+        for node_id, _label in roster:
+            if node_id not in self._stage_selected:
+                self._stage_selected[node_id] = True
+        self._top_bar_dirty = True
+
+    _GATE_PARENT_STAGE: Dict[str, str] = {
+        "gate_0_pregestation_eval": "stage_0_pregestation",
+        "gate_1_gestation_eval":    "stage_1_gestation",
+        "gate_berkeley":            "stage_2_berkeley",
+        "gate_transformer":         "stage_r_transformer",
+        "gate_generator":           "stage_g_generator",
+        "gate_wave":                "stage_w_wave_classifier",
+    }
+
+    _STAGE_SUPPORT_NODES: Dict[str, str] = {
+        "build_flashcard_rows": "stage_g_generator",
+        "stage_fake_feedback":  "stage_g_generator",
+    }
+
+    def is_node_selected(self, node_id: str) -> bool:
+        nid = str(node_id)
+        if not bool(self._stage_selected.get(nid, True)):
+            return False
+        parent = self._GATE_PARENT_STAGE.get(nid)
+        if parent is not None:
+            if not bool(self._stage_selected.get(parent, True)):
+                return False
+            if self._gate_override:
+                return False
+        support_parent = self._STAGE_SUPPORT_NODES.get(nid)
+        if support_parent is not None:
+            if not bool(self._stage_selected.get(support_parent, True)):
+                return False
+        return True
+
+    def selected_node_ids(self) -> List[str]:
+        return [nid for nid, v in self._stage_selected.items() if bool(v)]
 
     def gate_override_enabled(self) -> bool:
         return bool(self._gate_override)
@@ -940,7 +998,7 @@ class _TransformerStatusOpenGLViewer:
                 *,
                 checked: bool,
                 kind: str,
-                idx: int = -1,
+                idx=-1,
                 fill_on: Tuple[int, int, int] = (52, 120, 66),
                 fill_off: Tuple[int, int, int] = (36, 40, 44),
                 text_on: Tuple[int, int, int] = (224, 230, 236),
@@ -956,12 +1014,14 @@ class _TransformerStatusOpenGLViewer:
                     draw.line([(box[0] + 2, box[1] + 6), (box[0] + 5, box[1] + 9)], fill=(236, 244, 248), width=1)
                     draw.line([(box[0] + 5, box[1] + 9), (box[0] + 9, box[1] + 2)], fill=(236, 244, 248), width=1)
                 draw.text((x + 15, y - 1), label, fill=(text_on if checked and enabled else text_off), font=font)
-                self._control_boxes.append((kind, int(idx), box))
+                self._control_boxes.append((kind, idx, box))
                 return int(x + 15 + (len(label) * 7) + 10)
 
             draw.rectangle([(0, 0), (self.window_w - 1, self.top_bar_h - 1)], fill=(18, 22, 28))
             draw.line([(0, 17), (self.window_w - 1, 17)], fill=(42, 48, 58), width=1)
             draw.line([(0, 37), (self.window_w - 1, 37)], fill=(34, 40, 48), width=1)
+            draw.line([(0, 57), (self.window_w - 1, 57)], fill=(34, 40, 48), width=1)
+            draw.line([(0, 77), (self.window_w - 1, 77)], fill=(28, 34, 42), width=1)
             draw.line(
                 [(0, self.top_bar_h - 1), (self.window_w - 1, self.top_bar_h - 1)],
                 fill=(70, 76, 88),
@@ -978,75 +1038,8 @@ class _TransformerStatusOpenGLViewer:
             btn_right_margin = 6
             bx = self.window_w - btn_right_margin
 
-            if connected and stopping:
-                label_pending = "STOPPING..."
-                lw_p = len(label_pending) * 7 + 10
-                p_box = (bx - lw_p, btn_y, bx, btn_y + btn_h)
-                draw.rectangle(
-                    [p_box[0], p_box[1], p_box[2], p_box[3]],
-                    outline=(120, 120, 60), fill=(80, 80, 30),
-                )
-                draw.text((p_box[0] + 5, btn_y + 1), label_pending, fill=(220, 220, 160), font=font)
-            elif connected:
-                label_stop = "STOP"
-                lw_stop = len(label_stop) * 7 + 10
-                stop_box = (bx - lw_stop, btn_y, bx, btn_y + btn_h)
-                draw.rectangle(
-                    [stop_box[0], stop_box[1], stop_box[2], stop_box[3]],
-                    outline=(180, 60, 60), fill=(120, 36, 36),
-                )
-                draw.text((stop_box[0] + 5, btn_y + 1), label_stop, fill=(240, 200, 200), font=font)
-                self._control_boxes.append(("stop_nosave", -1, stop_box))
-                bx = stop_box[0] - 6
-
-                label_save = "STOP+SAVE"
-                lw_save = len(label_save) * 7 + 10
-                save_box = (bx - lw_save, btn_y, bx, btn_y + btn_h)
-                draw.rectangle(
-                    [save_box[0], save_box[1], save_box[2], save_box[3]],
-                    outline=(60, 160, 80), fill=(36, 100, 50),
-                )
-                draw.text((save_box[0] + 5, btn_y + 1), label_save, fill=(200, 240, 210), font=font)
-                self._control_boxes.append(("stop_save", -1, save_box))
-            elif self._launch_script:
-                cooldown_remaining = self._start_cooldown_remaining()
-                launch_pending = self._has_launch_pending()
-                proc_alive = self._is_training_proc_alive()
-                can_start = (cooldown_remaining <= 0.0) and (not launch_pending) and (not proc_alive)
-                if launch_pending:
-                    label_start = "STARTING..."
-                elif proc_alive:
-                    label_start = "RUNNING..."
-                elif cooldown_remaining > 0.0:
-                    label_start = f"START {int(math.ceil(cooldown_remaining))}s"
-                else:
-                    label_start = "START"
-                lw_start = len(label_start) * 7 + 10
-                start_box = (bx - lw_start, btn_y, bx, btn_y + btn_h)
-                start_outline = (60, 100, 180) if can_start else (86, 92, 104)
-                start_fill = (36, 64, 130) if can_start else (48, 54, 64)
-                start_text = (200, 220, 250) if can_start else (170, 178, 188)
-                draw.rectangle(
-                    [start_box[0], start_box[1], start_box[2], start_box[3]],
-                    outline=start_outline, fill=start_fill,
-                )
-                draw.text((start_box[0] + 5, btn_y + 1), label_start, fill=start_text, font=font)
-                if can_start:
-                    self._control_boxes.append(("start", -1, start_box))
-
-            tx = 8
             row1_y = 22
-            tx = _draw_check(
-                tx,
-                row1_y,
-                "PAUSED" if self._paused else "PLAY",
-                checked=bool(self._paused),
-                kind="pause",
-                fill_on=(180, 140, 40),
-                fill_off=(36, 40, 44),
-                text_on=(230, 220, 140),
-                text_off=(140, 200, 140),
-            )
+            tx = 8
             tx = _draw_check(
                 tx,
                 row1_y,
@@ -1070,6 +1063,51 @@ class _TransformerStatusOpenGLViewer:
                 text_off=(200, 120, 120),
                 enabled=bool(self._preview_enabled),
             )
+
+            # -- Right-side action buttons (right to left: STOP, STOP+SAVE, SAVE, >|, PLAY/PAUSE, |<) --
+            def _draw_btn(bx, label, kind, fill, outline, text_fill):
+                lw = len(label) * 7 + 10
+                box = (bx - lw, btn_y, bx, btn_y + btn_h)
+                draw.rectangle([box[0], box[1], box[2], box[3]], outline=outline, fill=fill)
+                draw.text((box[0] + 5, btn_y + 1), label, fill=text_fill, font=font)
+                self._control_boxes.append((kind, -1, box))
+                return box[0] - 6  # next bx
+
+            if connected and stopping:
+                label_pending = "STOPPING..."
+                lw_p = len(label_pending) * 7 + 10
+                p_box = (bx - lw_p, btn_y, bx, btn_y + btn_h)
+                draw.rectangle([p_box[0], p_box[1], p_box[2], p_box[3]], outline=(120, 120, 60), fill=(80, 80, 30))
+                draw.text((p_box[0] + 5, btn_y + 1), label_pending, fill=(220, 220, 160), font=font)
+            elif connected:
+                bx = _draw_btn(bx, "QUIT",      "quit",        (80, 20, 20),   (140, 40, 40),  (255, 180, 180))
+                bx -= 4  # gap before stop buttons
+                bx = _draw_btn(bx, "STOP",      "stop_nosave", (120, 36, 36),  (180, 60, 60),  (240, 200, 200))
+                bx = _draw_btn(bx, "STOP+SAVE", "stop_save",   (36, 100, 50),  (60, 160, 80),  (200, 240, 210))
+                bx = _draw_btn(bx, "SAVE",      "save_now",    (30, 60, 140),  (60, 100, 200), (190, 210, 255))
+                bx -= 4  # small gap before transport controls
+                bx = _draw_btn(bx, ">|",        "skip_fwd",    (52, 52, 60),   (100, 104, 116),(200, 210, 224))
+                bx = _draw_btn(bx, "PAUSE" if not self._paused else "PLAY",
+                               "pause",          (60, 60, 70),   (100, 104, 116),(220, 224, 232))
+                bx = _draw_btn(bx, "|<",        "skip_back",   (52, 52, 60),   (100, 104, 116),(200, 210, 224))
+            elif not connected and self._launch_script:
+                cooldown_remaining = self._start_cooldown_remaining()
+                launch_pending = self._has_launch_pending()
+                proc_alive = self._is_training_proc_alive()
+                can_start = (cooldown_remaining <= 0.0) and (not launch_pending) and (not proc_alive)
+                if launch_pending:
+                    label_start = "STARTING..."
+                elif proc_alive:
+                    label_start = "RUNNING..."
+                elif cooldown_remaining > 0.0:
+                    label_start = f"START {int(math.ceil(cooldown_remaining))}s"
+                else:
+                    label_start = "START"
+                start_outline = (60, 100, 180) if can_start else (86, 92, 104)
+                start_fill = (36, 64, 130) if can_start else (48, 54, 64)
+                start_text_fill = (200, 220, 250) if can_start else (170, 178, 188)
+                _draw_btn(bx, label_start, "start" if can_start else "_start_disabled",
+                          start_fill, start_outline, start_text_fill)
 
             row2_y = 42
             x = 8
@@ -1102,13 +1140,30 @@ class _TransformerStatusOpenGLViewer:
                 text_off=(170, 160, 140),
             )
 
+            row3_y = 62
+            sx = 8
+            for node_id, label in self._stage_roster:
+                is_on = bool(self._stage_selected.get(node_id, True))
+                sx = _draw_check(
+                    sx,
+                    row3_y,
+                    label,
+                    checked=is_on,
+                    kind="stage",
+                    idx=node_id,
+                    fill_on=(44, 80, 130),
+                    fill_off=(60, 36, 36),
+                    text_on=(190, 210, 240),
+                    text_off=(180, 140, 140),
+                )
+
             active = self.selected_cycle_ids()
             active_txt = ",".join(str(i) for i in active) if len(active) > 0 else "none"
+            desel_stages = [label for nid, label in self._stage_roster if not self._stage_selected.get(nid, True)]
+            desel_txt = (",".join(desel_stages) if desel_stages else "none off")
             draw.text(
                 (6, self.top_bar_h - 14),
-                f"cycles={active_txt} gate_override={1 if self._gate_override else 0}"
-                f" preview={'on' if self._preview_enabled else 'off'}"
-                f" scrub={'on' if self._scrub_editor_enabled else 'off'}"
+                f"cycles={active_txt} skip={desel_txt} override={1 if self._gate_override else 0}"
                 f"{' PAUSED' if self._paused else ''}",
                 fill=(180, 188, 198),
                 font=font,
@@ -2609,6 +2664,12 @@ class _TransformerStatusOpenGLViewer:
                         self._cycle_selected[int(idx)] = not bool(self._cycle_selected[int(idx)])
                         self._top_bar_dirty = True
                         return True
+                elif kind == "stage":
+                    node_id = str(idx)
+                    if node_id in self._stage_selected:
+                        self._stage_selected[node_id] = not bool(self._stage_selected[node_id])
+                        self._top_bar_dirty = True
+                        return True
                 elif kind == "override":
                     self._gate_override = not bool(self._gate_override)
                     self._top_bar_dirty = True
@@ -2641,6 +2702,34 @@ class _TransformerStatusOpenGLViewer:
                     self._shutdown_save = False
                     self._top_bar_dirty = True
                     print("[viewer] STOP (no save) requested", flush=True)
+                    return True
+                elif kind == "quit":
+                    self._shutdown_save = False
+                    self._backend_quit_requested = True
+                    self._top_bar_dirty = True
+                    print("[viewer] QUIT requested — stopping backend", flush=True)
+                    proc = getattr(self, "_training_proc", None)
+                    if proc is not None:
+                        try:
+                            proc.terminate()
+                            print(f"[viewer] terminated training process (pid={proc.pid})", flush=True)
+                        except Exception as e:
+                            print(f"[viewer] terminate failed: {e}", flush=True)
+                    return True
+                elif kind == "save_now":
+                    self._save_now_pending = True
+                    self._top_bar_dirty = True
+                    print("[viewer] SAVE requested", flush=True)
+                    return True
+                elif kind == "skip_fwd":
+                    self._skip_forward_pending = True
+                    self._top_bar_dirty = True
+                    print("[viewer] skip forward requested", flush=True)
+                    return True
+                elif kind == "skip_back":
+                    self._skip_back_pending = True
+                    self._top_bar_dirty = True
+                    print("[viewer] skip back requested", flush=True)
                     return True
                 elif kind == "start":
                     self._start_training()
@@ -2983,6 +3072,9 @@ class _TransformerStatusOpenGLViewer:
 
     def stop_requested(self) -> bool:
         return bool(self._stop_requested)
+
+    def backend_quit_requested(self) -> bool:
+        return bool(self._backend_quit_requested)
 
     def update_loss(self, channel_key: str, loss: float, aux: float = 0.0, ts: float = 0.0):
         """Record a per-step loss value into the native C store.
@@ -3838,7 +3930,7 @@ class ViewerIPCServer:
         self._accept_thread: Optional[threading.Thread] = None
         self._lock = threading.Lock()
         self._stopped = False
-        self._last_status_t: float = 0.0
+        self._last_sent_snapshot: Optional[tuple] = None
 
     @property
     def port(self) -> int:
@@ -3871,7 +3963,7 @@ class ViewerIPCServer:
                 print("[viewer-ipc] training process connected", flush=True)
                 # Reset shutdown state for the new connection
                 self._viewer._shutdown_save = None
-                self._viewer._top_bar_dirty = True
+                self._last_sent_snapshot = None  # force first status send
             except OSError:
                 break
             except Exception as e:
@@ -3906,14 +3998,10 @@ class ViewerIPCServer:
             print(f"[viewer-ipc] recv error: {e}", flush=True)
             return
 
-        # Send status back at most every 100 ms to avoid flooding
-        now = time.time()
-        if now - self._last_status_t < 0.1:
-            return
-        self._last_status_t = now
         try:
             is_stopping = (
                 self._viewer.stop_requested()
+                or bool(getattr(self._viewer, "_backend_quit_requested", False))
                 or self._viewer.shutdown_save() is not None
             )
             is_paused = bool(self._viewer._paused)
@@ -3926,23 +4014,56 @@ class ViewerIPCServer:
                     weight_spec = dict(get_weight_spec() or {})
                 except Exception:
                     weight_spec = {}
+            skip_fwd = bool(self._viewer._skip_forward_pending)
+            skip_back = bool(self._viewer._skip_back_pending)
+            save_now = bool(self._viewer._save_now_pending)
+            gate_override = self._viewer.gate_override_enabled()
+            cycle_selected = list(self._viewer._cycle_selected)
+            node_selected = dict(self._viewer._stage_selected)
+            weight_mode = int(weight_spec.get("mode", 1) or 1)
+            weight_cw = int(weight_spec.get("panel_crop_w", 0) or 0)
+            weight_ch = int(weight_spec.get("panel_crop_h", 0) or 0)
+
+            # Only send if state changed or a one-shot signal is pending.
+            snapshot = (
+                is_stopping, is_paused, gate_override, is_preview, is_scrub_editor,
+                tuple(cycle_selected), tuple(sorted(node_selected.items())),
+                weight_mode, weight_cw, weight_ch,
+            )
+            if snapshot == self._last_sent_snapshot and not skip_fwd and not skip_back and not save_now:
+                return
+            self._last_sent_snapshot = snapshot
+
+            # Consume one-shot signals only after we've decided to send.
+            if skip_fwd:
+                self._viewer._skip_forward_pending = False
+            if skip_back:
+                self._viewer._skip_back_pending = False
+            if save_now:
+                self._viewer._save_now_pending = False
+
             status = {
                 "type": "status",
                 "stop_requested": is_stopping,
                 "paused": is_paused,
-                "gate_override": self._viewer.gate_override_enabled(),
+                "gate_override": gate_override,
                 "preview_enabled": is_preview,
                 "scrub_editor_enabled": is_scrub_editor,
-                "cycle_selected": list(self._viewer._cycle_selected),
-                "weight_image_mode": int(weight_spec.get("mode", 1) or 1),
-                "weight_panel_crop_w": int(weight_spec.get("panel_crop_w", 0) or 0),
-                "weight_panel_crop_h": int(weight_spec.get("panel_crop_h", 0) or 0),
+                "cycle_selected": cycle_selected,
+                "node_selected": node_selected,
+                "skip_forward": skip_fwd,
+                "skip_back": skip_back,
+                "save_now": save_now,
+                "weight_image_mode": weight_mode,
+                "weight_panel_crop_w": weight_cw,
+                "weight_panel_crop_h": weight_ch,
             }
             conn.send(status)
             cmd = "stop" if bool(status["stop_requested"]) else ("pause" if is_paused else "resume")
             run_control = RunControlPayload(
                 command=cmd,
                 selected_cycle_ids=self._viewer.selected_cycle_ids(),
+                selected_node_ids=self._viewer.selected_node_ids(),
                 gate_override=bool(status["gate_override"]),
                 preview_enabled=is_preview,
                 scrub_editor_enabled=is_scrub_editor,
@@ -3972,6 +4093,7 @@ class ViewerIPCServer:
                 # Clear stale stop state from any previous run so the new
                 # training process is not immediately told to stop.
                 self._viewer._stop_requested = False
+                self._viewer._backend_quit_requested = False
                 self._viewer._shutdown_save = None
                 self._viewer._top_bar_dirty = True
                 # Loss data is owned by the SaveRestoreNode.  Clear the
@@ -4111,19 +4233,25 @@ class ViewerIPCProxy:
         self._stop_flag = False
         self._shutdown_save: Optional[bool] = None
         self._gate_override = False
-        self._paused = False
+        self._paused = True
         self._preview_enabled = True
         self._scrub_editor_enabled = True
         self._cycle_selected: List[bool] = [True] * max(0, cycle_slots)
+        self._stage_selected: Dict[str, bool] = {}
+        self._skip_forward_pending: bool = False
+        self._skip_back_pending: bool = False
+        self._save_now_pending: bool = False
         self._last_run_control = RunControlPayload(
-            command="resume",
+            command="pause",
             selected_cycle_ids=[int(i + 1) for i in range(max(0, cycle_slots))],
             gate_override=False,
         )
         self._pending_plan_apply: Optional[PlanApplyPayload] = None
+        self._pending_schedule: Optional[Any] = None  # ScheduleApplyPayload
         self._conn: Optional[Any] = None
         self._connect_lock = threading.Lock()
         self._send_lock = threading.Lock()  # protects concurrent writes
+        self._recv_lock = threading.Lock()  # protects concurrent reads (bg pump vs stop_requested)
         self._connected_once = False
         self._connection_lost = False
         self._port_file = str(port_file) if port_file else ""
@@ -4232,7 +4360,6 @@ class ViewerIPCProxy:
             self._connection_lost = False
             self._stop_flag = False
             self._shutdown_save = None
-            self._paused = False
             self._preview_enabled = True
             self._scrub_editor_enabled = True
             self._last_applied_weight_image_spec = None
@@ -4255,9 +4382,12 @@ class ViewerIPCProxy:
         if self._connection_lost:
             return
         self._connection_lost = True
-        self._stop_flag = False
+        # Do NOT set _stop_flag here.  A transient socket blip races with the
+        # reconnect thread: the training loop would see stop_requested()=True and
+        # raise StageStopRequested before _connect() has a chance to clear it.
+        # Do NOT touch _paused — preserve pause state so the backend does not
+        # spontaneously resume on a momentary disconnect.
         self._shutdown_save = None
-        self._paused = False
         self._preview_enabled = False
         self._scrub_editor_enabled = False
         conn = self._conn
@@ -4349,6 +4479,9 @@ class ViewerIPCProxy:
                 return
         if self._conn is None:
             return
+        if not self._recv_lock.acquire(timeout=0.02):
+            # Another drainer active; skip — cached state is fresh enough.
+            return
         try:
             while self._conn.poll(0):
                 msg = self._conn.recv()
@@ -4379,8 +4512,15 @@ class ViewerIPCProxy:
                                 if 0 <= idx < len(selected):
                                     selected[idx] = True
                             self._cycle_selected = selected
+                        sni_raw = getattr(payload, "selected_node_ids", None)
+                        if sni_raw is not None:
+                            sni_set = set(sni_raw)
+                            all_known = set(self._stage_selected.keys()) | sni_set
+                            self._stage_selected = {nid: (nid in sni_set) for nid in all_known}
                     elif envelope.message_type == MESSAGE_TYPE_PLAN_APPLY:
                         self._pending_plan_apply = payload
+                    elif envelope.message_type == MESSAGE_TYPE_SCHEDULE_APPLY:
+                        self._pending_schedule = payload
                     continue
 
                 t = msg.get("type")
@@ -4393,6 +4533,15 @@ class ViewerIPCProxy:
                     cs = msg.get("cycle_selected")
                     if cs is not None:
                         self._cycle_selected = list(cs)
+                    ns = msg.get("node_selected")
+                    if isinstance(ns, dict):
+                        self._stage_selected = {str(k): bool(v) for k, v in ns.items()}
+                    if msg.get("skip_forward"):
+                        self._skip_forward_pending = True
+                    if msg.get("skip_back"):
+                        self._skip_back_pending = True
+                    if msg.get("save_now"):
+                        self._save_now_pending = True
                     self._update_weight_image_spec(
                         mode=msg.get("weight_image_mode"),
                         panel_crop_w=msg.get("weight_panel_crop_w"),
@@ -4435,6 +4584,8 @@ class ViewerIPCProxy:
             self._mark_connection_lost("status read failed")
         except Exception:
             pass
+        finally:
+            self._recv_lock.release()
 
     # -- public API (mirrors _TransformerStatusOpenGLViewer) ---------------
 
@@ -4466,7 +4617,7 @@ class ViewerIPCProxy:
         self._drain_status()
 
     def stop_requested(self) -> bool:
-        self._drain_status()
+        self._drain_status()  # keep receive buffer drained to prevent IPC deadlock
         return self._stop_flag
 
     def shutdown_save(self) -> Optional[bool]:
@@ -4586,27 +4737,81 @@ class ViewerIPCProxy:
             return True
         return bool(self._cycle_selected[idx])
 
+    _GATE_PARENT_STAGE: Dict[str, str] = {
+        "gate_0_pregestation_eval": "stage_0_pregestation",
+        "gate_1_gestation_eval":    "stage_1_gestation",
+        "gate_berkeley":            "stage_2_berkeley",
+        "gate_transformer":         "stage_r_transformer",
+        "gate_generator":           "stage_g_generator",
+        "gate_wave":                "stage_w_wave_classifier",
+    }
+
+    # Non-roster nodes that load data/run work on behalf of a parent training stage.
+    # If the parent stage is deselected these nodes must also be skipped, regardless
+    # of gate_override (unlike gate eval nodes they are NOT suppressed by gate_override
+    # alone — only by the parent being off).
+    _STAGE_SUPPORT_NODES: Dict[str, str] = {
+        "build_flashcard_rows": "stage_g_generator",
+        "stage_fake_feedback":  "stage_g_generator",
+    }
+
+    def is_node_selected(self, node_id: str) -> bool:
+        self._drain_status()
+        nid = str(node_id)
+        if not bool(self._stage_selected.get(nid, True)):
+            return False
+        parent = self._GATE_PARENT_STAGE.get(nid)
+        if parent is not None:
+            if not bool(self._stage_selected.get(parent, True)):
+                return False
+            if self._gate_override:
+                return False
+        support_parent = self._STAGE_SUPPORT_NODES.get(nid)
+        if support_parent is not None:
+            if not bool(self._stage_selected.get(support_parent, True)):
+                return False
+        return True
+
+    def selected_node_ids(self) -> List[str]:
+        return [nid for nid, v in self._stage_selected.items() if bool(v)]
+
+    def consume_skip_forward(self) -> bool:
+        self._drain_status()
+        if self._skip_forward_pending:
+            self._skip_forward_pending = False
+            return True
+        return False
+
+    def consume_skip_back(self) -> bool:
+        self._drain_status()
+        if self._skip_back_pending:
+            self._skip_back_pending = False
+            return True
+        return False
+
+    def consume_save_now(self) -> bool:
+        self._drain_status()
+        if self._save_now_pending:
+            self._save_now_pending = False
+            return True
+        return False
+
     def gate_override_enabled(self) -> bool:
         return self._gate_override
 
     def paused(self) -> bool:
-        self._drain_status()
         return self._paused
 
     def preview_enabled(self) -> bool:
-        self._drain_status()
         return self._preview_enabled
 
     def scrub_editor_enabled(self) -> bool:
-        self._drain_status()
         return self._scrub_editor_enabled
 
     def gui_connected(self) -> bool:
-        self._drain_status()
         return bool(self.enabled and self._conn is not None)
 
     def weight_image_spec(self) -> Dict[str, int]:
-        self._drain_status()
         return {
             "mode": int(self._weight_image_mode),
             "panel_crop_w": int(self._weight_panel_crop_w),
@@ -4617,7 +4822,6 @@ class ViewerIPCProxy:
         return [int(i + 1) for i, v in enumerate(self._cycle_selected) if bool(v)]
 
     def current_run_control(self) -> RunControlPayload:
-        self._drain_status()
         return self._last_run_control
 
     def consume_pending_plan_apply(self) -> Optional[PlanApplyPayload]:
@@ -4626,6 +4830,30 @@ class ViewerIPCProxy:
         payload = self._pending_plan_apply
         self._pending_plan_apply = None
         return payload
+
+    def consume_pending_schedule(self) -> Optional[ScheduleApplyPayload]:
+        """Return and clear any schedule_apply payload queued from the GUI, or None."""
+        self._drain_status()
+        payload = self._pending_schedule
+        self._pending_schedule = None
+        return payload
+
+    def send_schedule_apply(
+        self,
+        schedule: "TrainingSchedule",
+        *,
+        replace_current: bool = True,
+        reason: str = "",
+        session_id: str = "",
+    ) -> None:
+        """Send a ScheduleApplyPayload to the connected worker backend."""
+        payload = ScheduleApplyPayload(
+            schedule=schedule,
+            replace_current=replace_current,
+            reason=reason,
+        )
+        envelope = make_envelope(MESSAGE_TYPE_SCHEDULE_APPLY, payload, session_id=session_id)
+        self._send(envelope.to_dict())
 
     def send_worker_hello(
         self,

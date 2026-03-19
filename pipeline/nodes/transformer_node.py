@@ -50,6 +50,8 @@ from pipeline.nodes.base import (
     IRStateSpec,
     IRTrainingNode,
     IRTensorPortSpec,
+    StageSkipBack,
+    StageSkipForward,
     autocast_context,
     make_runtime_weight_publish_callback,
     make_grad_scaler,
@@ -489,6 +491,37 @@ class TransformerTrainNode(IRTrainingNode):
             enabled=self.cfg.degrade_curriculum_enabled,
         )
 
+        # Build a stop_requested wrapper that also detects GUI skip signals.
+        # The training loop polls this every step; we capture the skip direction
+        # in a mutable cell so we can raise the right exception after the loop.
+        _skip_dir: list = [0]  # 0=none, 1=forward, -1=back
+
+        def _stop_or_skip() -> bool:
+            stop_fn = getattr(ctx, "stop_requested", None)
+            if callable(stop_fn):
+                try:
+                    if stop_fn():
+                        return True
+                except Exception:
+                    pass
+            fwd_fn = getattr(ctx, "consume_skip_forward", None)
+            if callable(fwd_fn):
+                try:
+                    if fwd_fn():
+                        _skip_dir[0] = 1
+                        return True
+                except Exception:
+                    pass
+            back_fn = getattr(ctx, "consume_skip_back", None)
+            if callable(back_fn):
+                try:
+                    if back_fn():
+                        _skip_dir[0] = -1
+                        return True
+                except Exception:
+                    pass
+            return False
+
         # train_transformer_feature_metric creates its own optimizer internally and
         # returns (trained_module, list_of_epoch_metric_dicts).  ctx.transformer_optimizer
         # is not consumed here — the function manages its own LR schedule per-call.
@@ -525,7 +558,13 @@ class TransformerTrainNode(IRTrainingNode):
             low_bit_penalty_weight=self.cfg.low_bit_weight,
             wave_l1_weight=self.cfg.wave_l1_weight,
             weight_update_callback=weight_update_callback,
+            stop_requested=_stop_or_skip,
         )
+
+        if _skip_dir[0] == 1:
+            raise StageSkipForward("GUI skip forward")
+        if _skip_dir[0] == -1:
+            raise StageSkipBack("GUI skip back")
 
         ctx.transformer = trained_transformer
         last_m = (metrics_list or [{}])[-1]

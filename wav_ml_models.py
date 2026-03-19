@@ -2,6 +2,7 @@ import copy
 import math
 import random
 import time
+from collections import deque
 from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path

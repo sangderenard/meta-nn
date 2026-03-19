@@ -68,6 +68,7 @@ import numpy as np
 import torch
 
 from pipeline.context import PipelineContext
+from pipeline.nodes.interrupts import StageStopRequested
 from pipeline.graph import EdgeReactionSpec, PipelineGraph
 from pipeline.graph_layers import (
     build_execution_program as _materialize_execution_program,
@@ -576,10 +577,18 @@ def _build_plan_predicate_graphs() -> list[PredicateGraph]:
     # Controls the data_node → gate_berkeley edge.  Distinguishes three
     # scenarios: gates not yet passed ("hold"), gates passed but data
     # still fresh ("pass_cached"), gates passed and data stale ("rebuild").
+    # Entry node first checks that stage_2_berkeley is selected; if not,
+    # short-circuits to "hold" so provide_berkeley_data is never invoked.
     gate_berkeley_data_flow = PredicateGraph(
         graph_id="pg:gate_berkeley_data_flow",
-        entry_node_id="check_gates",
+        entry_node_id="check_selected",
         nodes=[
+            PredicateNode(
+                node_id="check_selected",
+                kind="condition",
+                condition_expr="stage_2_berkeley_selected",
+                branches={"true": "check_gates", "false": "hold"},
+            ),
             PredicateNode(
                 node_id="check_gates",
                 kind="condition",
@@ -603,10 +612,18 @@ def _build_plan_predicate_graphs() -> list[PredicateGraph]:
     # --- pg:berkeley_refresh_flow ---
     # Controls the data_node → stage_2_berkeley edge.  Same three-way
     # split so stage 2 still trains on cached loaders between refreshes.
+    # Entry node first checks that stage_2_berkeley is selected; if not,
+    # short-circuits to "hold" so provide_berkeley_data is never invoked.
     berkeley_refresh_flow = PredicateGraph(
         graph_id="pg:berkeley_refresh_flow",
-        entry_node_id="check_gates",
+        entry_node_id="check_selected",
         nodes=[
+            PredicateNode(
+                node_id="check_selected",
+                kind="condition",
+                condition_expr="stage_2_berkeley_selected",
+                branches={"true": "check_gates", "false": "hold"},
+            ),
             PredicateNode(
                 node_id="check_gates",
                 kind="condition",
@@ -701,12 +718,10 @@ def _edge_provided_resources(method_name: str, label: str) -> list[str]:
         "provide_gestation_eval": ["gestation_eval_loader", "gestation_eval_dataset"],
         "provide_berkeley_data": ["berkeley_refresh_loader", "berkeley_gate_val_loader", "berkeley_cache"],
         "provide_payload": ["payload_bank", "payload_conditions", "payload_masks", "payload_bank_ready"],
+        "provide_payload_validation": ["payload_validation_loader", "payload_validation_dataset"],
         "provide_gate_data": [
-            "berkeley_refresh_loader",
-            "berkeley_gate_val_loader",
             "payload_validation_loader",
             "payload_validation_dataset",
-            "payload_bank",
         ],
     }
     resources = list(mapping.get(str(method_name or ""), []))
@@ -1048,7 +1063,14 @@ def _condition_for_plan_edge(condition_id: str, *, condition_blobs: dict | None 
     resolved_id = str(condition_id or "").strip()
     resolved_expr = str(condition_expr or "").strip()
 
-    # Prefer condition_expr when available — it's the portable, IR-first path.
+    # Registry functions take precedence for known condition IDs — they implement
+    # the full runtime logic including stage-deselection auto-bypass which the
+    # condition_expr grammar cannot express.  condition_expr is only used for
+    # conditions that have no registered Python implementation.
+    if resolved_id in registry:
+        return registry[resolved_id]
+
+    # Portable, IR-first path for conditions not in the registry.
     if resolved_expr:
         from pipeline.condition_expr import evaluate_condition_expr
         def _expr_condition(ctx, _e=resolved_expr):
@@ -1057,8 +1079,6 @@ def _condition_for_plan_edge(condition_id: str, *, condition_blobs: dict | None 
 
     if not resolved_id:
         return None
-    if resolved_id in registry:
-        return registry[resolved_id]
     blob = dict((condition_blobs or {}).get(resolved_id, {}) or {})
 
     # Check if the blob carries a condition_expr.
@@ -1303,6 +1323,9 @@ def _build_runtime_snapshot(
             "gates": _gate_status_blob(ctx),
             "class_count": int(len(ctx.class_names)),
             "metrics_history_size": int(len(ctx.metrics_history)),
+            "schedule_index": int(getattr(ctx, "schedule_index", -1)),
+            "schedule_row_label": str(getattr(ctx, "schedule_row_label", "")),
+            "schedule_total_rows": int(len(getattr(getattr(ctx, "schedule", None), "rows", []) or [])),
         },
     )
 
@@ -1417,6 +1440,74 @@ def _emit_execution_event(
 
 
 # ---------------------------------------------------------------------------
+# Schedule helpers
+# ---------------------------------------------------------------------------
+
+
+def _apply_pending_schedule(ctx: PipelineContext) -> bool:
+    """Consume any queued schedule_apply from the GUI and store it on ctx.
+
+    Returns True if a new schedule was applied.
+    """
+    proxy = ctx.viewer_proxy
+    if proxy is None:
+        return False
+    consume_fn = getattr(proxy, "consume_pending_schedule", None)
+    if not callable(consume_fn):
+        return False
+    try:
+        payload = consume_fn()
+    except Exception:
+        return False
+    if payload is None:
+        return False
+    from pipeline.plan_protocol import ScheduleApplyPayload
+    if not isinstance(payload, ScheduleApplyPayload):
+        return False
+    new_schedule = payload.schedule
+    if not new_schedule or not new_schedule.rows:
+        return False
+    ctx.schedule = new_schedule
+    _log(
+        f"[orchestrator] schedule_apply: {len(new_schedule.rows)} row(s) "
+        f"id={new_schedule.schedule_id!r} reason={payload.reason!r}"
+    )
+    return True
+
+
+def _apply_row_config(ctx: PipelineContext, row: Any, row_idx: int) -> None:
+    """Activate a schedule row: update stage filter, config overrides, and
+    gate_override on the viewer proxy.
+    """
+    from pipeline.plan_protocol import ScheduleRow
+    ctx.schedule_index = int(row_idx)
+    ctx.schedule_row_label = str(getattr(row, "label", "") or f"row_{row_idx}")
+
+    # Stage filter — frozenset or None (None = all)
+    stages = list(getattr(row, "active_stages", []) or [])
+    ctx.schedule_active_stages = frozenset(str(s) for s in stages) if stages else None
+
+    # Config overrides — replace entirely from this row
+    overrides = dict(getattr(row, "config_overrides", {}) or {})
+    ctx.node_config_overrides = {str(k): dict(v) for k, v in overrides.items()}
+
+    # Push gate_override into proxy if available
+    gate_override = bool(getattr(row, "gate_override", False))
+    proxy = ctx.viewer_proxy
+    if proxy is not None:
+        try:
+            proxy._gate_override = gate_override
+        except Exception:
+            pass
+
+    _log(
+        f"[orchestrator] schedule row {row_idx}: label={ctx.schedule_row_label!r} "
+        f"cycles={getattr(row, 'cycles', 1)} rounds={getattr(row, 'rounds_per_cycle', 1)} "
+        f"stages={stages or 'all'} overrides={list(overrides.keys())}"
+    )
+
+
+# ---------------------------------------------------------------------------
 # Edge condition lambdas
 # ---------------------------------------------------------------------------
 
@@ -1424,18 +1515,27 @@ def _emit_execution_event(
 def _gate_override_enabled(ctx: PipelineContext) -> bool:
     return ctx.gate_override_enabled()
 
+
+def _stage_deselected(ctx: PipelineContext, node_id: str) -> bool:
+    """True when the GUI or schedule has explicitly deselected *node_id*."""
+    try:
+        return not bool(ctx.is_node_selected(node_id))
+    except Exception:
+        return False
+
+
 def _gate_pregestation_passed(ctx: PipelineContext) -> bool:
-    return _gate_override_enabled(ctx) or ctx.gate_pregestation.passed
+    return ctx.gate_effectively_passed("gate_pregestation")
+
 
 def _early_gates_passed(ctx: PipelineContext) -> bool:
-    return _gate_override_enabled(ctx) or ctx.early_gates_passed()
+    return ctx.early_gates_passed()
+
 
 def _all_gates_passed(ctx: PipelineContext) -> bool:
-    return _gate_override_enabled(ctx) or ctx.all_base_gates_passed()
+    return ctx.all_base_gates_passed()
 
 def _wave_stage_ready(ctx: PipelineContext) -> bool:
-    if _gate_override_enabled(ctx):
-        return ctx.transformer is not None
     return ctx.wave_stage_ready()
 
 def _generator_exists(ctx: PipelineContext) -> bool:
@@ -1643,7 +1743,9 @@ def build_pipeline_graph(
                condition_id=_CONDITION_ID_ALL_GATES,
                on_traverse=_data_node.provide_payload)
 
-    # Flashcard: data_node provides ctx.payload_bank (after all gates pass)
+    # Flashcard prep sits immediately before the generator path so payload work
+    # does not begin near the top of the round merely because later stages are enabled.
+    # The data edge still provisions payload JIT, but only when this support node is next.
     g.add_edge("data_node", "build_flashcard_rows",
                condition=_all_gates_passed,
                condition_id=_CONDITION_ID_ALL_GATES,
@@ -1674,6 +1776,10 @@ def build_pipeline_graph(
 
     # == Stage G — Generator =======================================
 
+    g.add_edge("gate_transformer", "build_flashcard_rows",
+               condition=_all_gates_passed, label="before_generator", condition_id=_CONDITION_ID_ALL_GATES)
+    g.add_edge("build_flashcard_rows", "stage_g_generator",
+               condition=_all_gates_passed, label="flashcards_ready", condition_id=_CONDITION_ID_ALL_GATES)
     g.add_edge("gate_transformer", "stage_g_generator",
                condition=_all_gates_passed, label="after_all_gates", condition_id=_CONDITION_ID_ALL_GATES)
     g.add_edge("stage_g_generator", "gate_generator",
@@ -1777,6 +1883,88 @@ def _execute_runtime_pass(graph: PipelineGraph, ctx: PipelineContext, *, sequenc
             condition_resolver=resolver,
         )
     return graph.execute_sequence(ctx, sequence=sequence)
+
+
+def _cleanup_context_resources(ctx: PipelineContext) -> None:
+    """Release DataLoader workers and free GPU/CPU memory after a stop (no save)."""
+    import gc
+    loader_attrs = [
+        "pregestation_loader", "pregestation_dataset",
+        "pregestation_eval_loader", "pregestation_eval_dataset",
+        "pregestation_logic_rows",
+        "gestation_loader", "gestation_dataset",
+        "gestation_eval_loader", "gestation_eval_dataset",
+        "berkeley_refresh_loader", "berkeley_gate_val_loader", "berkeley_cache",
+    ]
+    for attr in loader_attrs:
+        try:
+            setattr(ctx, attr, None)
+        except Exception:
+            pass
+    gc.collect()
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
+    _log("[orchestrator] context resources released after stop")
+
+
+def _run_shutdown_save_pass(graph: PipelineGraph, ctx: PipelineContext, *, sequence: Optional[list[str]] = None) -> Optional[dict[str, str]]:
+    try:
+        ctx.shutdown_save_pending = True
+        statuses = _execute_runtime_pass(graph, ctx, sequence=sequence)
+        ctx.last_node_statuses = dict(statuses)
+        _log_statuses("shutdown-save", statuses)
+        return statuses
+    except StageStopRequested as exc:
+        _log(f"[orchestrator] shutdown-save interrupted before checkpoint completed: {exc}")
+    except Exception as exc:
+        _log(f"[orchestrator] WARNING: stop-save checkpoint failed: {exc}")
+    finally:
+        ctx.shutdown_save_pending = False
+    return None
+
+
+def _execute_runtime_pass_handling_stop(
+    graph: PipelineGraph,
+    ctx: PipelineContext,
+    *,
+    sequence: Optional[list[str]] = None,
+    stop_context: str,
+) -> tuple[Optional[dict[str, str]], bool]:
+    try:
+        statuses = _execute_runtime_pass(graph, ctx, sequence=sequence)
+        ctx.last_node_statuses = dict(statuses)
+        # Training may have set stop_now and returned normally (no exception).
+        # Check the flag so we don't start another round.
+        if ctx.stop_requested():
+            save_on_stop = False
+            try:
+                save_on_stop = bool(ctx.shutdown_save())
+            except Exception:
+                save_on_stop = False
+            _log(f"[orchestrator] stop detected after {stop_context} (save={save_on_stop})")
+            if save_on_stop:
+                _run_shutdown_save_pass(graph, ctx, sequence=sequence)
+            else:
+                _cleanup_context_resources(ctx)
+            return None, True
+        return statuses, False
+    except StageStopRequested as exc:
+        save_on_stop = bool(getattr(exc, "save_requested", False))
+        if not save_on_stop:
+            try:
+                save_on_stop = bool(ctx.shutdown_save())
+            except Exception:
+                save_on_stop = False
+        _log(f"[orchestrator] GUI requested stop during {stop_context} (save={save_on_stop})")
+        if save_on_stop:
+            _run_shutdown_save_pass(graph, ctx, sequence=sequence)
+        else:
+            _cleanup_context_resources(ctx)
+        return None, True
 
 
 # ---------------------------------------------------------------------------
@@ -1977,11 +2165,24 @@ def run(args, output_dir: Path, initial_plan=None) -> None:
     # Build a fixed runtime sequence once from the persisted execution program.
     sequence = _runtime_node_sequence(graph, ctx.graph_plan)
 
+    # -- Startup pause: hold here until the GUI releases play -------------
+    # The proxy (and GUI) default to paused=True so stage/eval options can
+    # be configured before any work begins.  Without a viewer proxy this
+    # exits immediately and the run proceeds as normal.
+    from pipeline.graph import _wait_while_paused
+    _wait_while_paused(ctx)
+
     # -- One-time initialisation pass (no loop) ---------------------------
     # The first pass runs init_vocab, build_classifier, wave_pool, etc.
     # Subsequent passes will hit the `_done` guards on one-shot nodes.
-    statuses = _execute_runtime_pass(graph, ctx, sequence=sequence)
-    ctx.last_node_statuses = dict(statuses)
+    statuses, interrupted = _execute_runtime_pass_handling_stop(
+        graph,
+        ctx,
+        sequence=sequence,
+        stop_context="initialization",
+    )
+    if interrupted or statuses is None:
+        return
     _log_statuses("init", statuses)
     _save_runtime_snapshot(
         ctx,
@@ -2000,121 +2201,189 @@ def run(args, output_dir: Path, initial_plan=None) -> None:
         },
     )
 
-    # -- Outer orchestration loop — driven by CycleGate objects -----------
-    # The IR cycle edges caused CycleGate objects to be instantiated above.
-    # Those objects own the iteration decision.  The orchestrator consults
-    # them rather than counting with hardcoded for-ranges.
+    # -- Apply any schedule sent during startup pause, or build default ----
+    _apply_pending_schedule(ctx)
+    if ctx.schedule is None:
+        from pipeline.plan_protocol import TrainingSchedule
+        ctx.schedule = TrainingSchedule.default_from_plan(ctx.graph_plan)
+        _log(f"[orchestrator] no schedule provided — using default "
+             f"({len(ctx.schedule.rows)} row, "
+             f"{ctx.schedule.rows[0].cycles}c × {ctx.schedule.rows[0].rounds_per_cycle}r)")
+
+    # -- Outer orchestration loop — schedule-driven -----------------------
+    # Walk the TrainingSchedule row by row.  Each row instantiates a fresh
+    # CycleGate from its own cycles/rounds spec.  The original plan-derived
+    # CycleGates (_cycle_gates) are kept as a fallback for plan_apply mid-run.
     stop_requested = False
     _primary_gate = _cycle_gates[0] if _cycle_gates else None
 
-    while True:
-        if ctx.stop_requested():
-            save_on_stop = ctx.shutdown_save()
-            _log(f"[orchestrator] GUI requested stop before next iteration (save={save_on_stop}); stopping run")
-            stop_requested = True
-            if save_on_stop:
-                try:
-                    ctx.shutdown_save_pending = True
-                    statuses = _execute_runtime_pass(graph, ctx, sequence=sequence)
-                    ctx.last_node_statuses = dict(statuses)
-                    _log_statuses("shutdown-save", statuses)
-                except Exception as _ckpt_exc:
-                    _log(f"[orchestrator] WARNING: stop-save checkpoint failed: {_ckpt_exc}")
-                finally:
-                    ctx.shutdown_save_pending = False
-            break
+    schedule_rows = list(ctx.schedule.rows)
+    row_idx = 0
 
-        # Ask the CycleGate whether to continue.  When no gate exists
-        # (legacy plan without cycle edges), we do zero iterations here
-        # because the init pass above already executed the graph once.
-        if _primary_gate is None:
-            break
-        branch = _primary_gate.evaluate(ctx)
-        if branch == "exhaust":
-            break
-        cycle_idx = ctx.cycle
-        round_idx = ctx.round_id
-
-        # Honour GUI pause toggle — spin-wait until un-paused.
-        from pipeline.graph import _wait_while_paused
-        _wait_while_paused(ctx)
-
-        # READ POINT A — apply a new plan received from the GUI between cycles
-        if ctx.viewer_proxy is not None:
-            apply_payload = ctx.viewer_proxy.consume_pending_plan_apply()
-            if apply_payload is not None:
-                _log(
-                    f"[orchestrator] plan_apply received before cycle {cycle_idx}: "
-                    f"reason={apply_payload.reason!r} replace_current={apply_payload.replace_current}"
-                )
-                try:
-                    new_graph = build_training_graph_from_plan(apply_payload.plan)
-                    graph = new_graph
-                    sequence = _runtime_node_sequence(new_graph, apply_payload.plan)
-                    ctx.graph_plan = apply_payload.plan
-                    ctx.plan_id = str(apply_payload.plan.plan_id)
-                    ctx.graph_layers = dict(getattr(apply_payload.plan, "graph_layers", {}) or {})
-                    # Re-instantiate CycleGate from the new plan's IR.
-                    _cycle_gates = CycleGate.from_plan(apply_payload.plan)
-                    ctx.cycle_gates = _cycle_gates
-                    _primary_gate = _cycle_gates[0] if _cycle_gates else None
-                    if ctx.graph_plan_path is not None:
-                        try:
-                            apply_payload.plan.save_json(ctx.graph_plan_path)
-                        except Exception as _save_exc:
-                            _log(f"[orchestrator] WARNING: could not persist applied plan: {_save_exc}")
-                    _log(f"[orchestrator] plan_apply complete: {len(sequence)} nodes in new sequence")
-                    _send_viewer_bootstrap(ctx)
-                except Exception as apply_exc:
-                    _log(f"[orchestrator] ERROR: plan_apply failed — keeping existing graph: {apply_exc}")
-
-        if not ctx.is_cycle_selected(cycle_idx):
-            deselected = {node_id: "skipped:cycle_deselected" for node_id in sequence}
-            ctx.last_node_statuses = dict(deselected)
-            _log(f"[orchestrator] cycle={cycle_idx}/{cycles} skipped by GUI selection")
-            _save_runtime_snapshot(
-                ctx,
-                _build_runtime_snapshot(ctx, deselected, "idle", default_cycle_ids=default_cycle_ids),
-            )
-            _emit_execution_event(
-                ctx,
-                event_id=f"{ctx.session_id}:cycle:{cycle_idx}:skipped",
-                phase="cycle",
-                status="skipped",
-                message=f"Cycle {cycle_idx} skipped by GUI selection.",
-                metrics={"cycle": int(cycle_idx)},
-            )
-            continue
-
-        _log(f"\n{'=' * 60}")
-        _log(f"[orchestrator] cycle={cycle_idx}/{cycles}  round={round_idx}/{rounds_per_cycle}"
-             f"  total={ctx.total_rounds_completed}")
-        _log(f"{'=' * 60}")
-
-        statuses = _execute_runtime_pass(graph, ctx, sequence=sequence)
-        ctx.last_node_statuses = dict(statuses)
-        _log_statuses(f"c{cycle_idx}r{round_idx}", statuses)
-        _save_runtime_snapshot(
-            ctx,
-            _build_runtime_snapshot(ctx, statuses, "running", default_cycle_ids=default_cycle_ids),
-        )
+    while row_idx < len(schedule_rows):
+        row = schedule_rows[row_idx]
+        _apply_row_config(ctx, row, row_idx)
         _emit_execution_event(
             ctx,
-            event_id=f"{ctx.session_id}:cycle:{cycle_idx}:round:{round_idx}",
-            phase="round",
-            status="ok",
-            message=f"Executed cycle {cycle_idx} round {round_idx}.",
-            metrics={
-                "cycle": int(cycle_idx),
-                "round": int(round_idx),
-                "ran": sum(1 for s in statuses.values() if s == "ran"),
-                "skipped": sum(1 for s in statuses.values() if str(s).startswith("skipped")),
-                "failed": sum(1 for s in statuses.values() if str(s).startswith("failed")),
+            event_id=f"{ctx.session_id}:schedule:row:{row_idx}:start",
+            phase="schedule_row",
+            status="start",
+            message=f"Schedule row {row_idx}: {ctx.schedule_row_label!r}",
+            metrics={"row_index": row_idx, "cycles": row.cycles,
+                     "rounds_per_cycle": row.rounds_per_cycle},
+        )
+
+        # Build a CycleGate for this row
+        from pipeline.graph import CycleGate
+        row_max_iters = max(1, int(row.cycles) * max(1, int(row.rounds_per_cycle)))
+        _row_gate = CycleGate(
+            edge_id=f"schedule_row_{row_idx}",
+            source_node_id="schedule",
+            target_node_id="schedule",
+            cycle_control={
+                "max_iterations": row_max_iters,
+                "cycles": row.cycles,
+                "rounds_per_cycle": row.rounds_per_cycle,
             },
         )
 
-        if ctx.vocab_rotation_cycle == 0:
-            ctx.vocab_rotation_cycle = 1
+        while True:
+            if ctx.stop_requested():
+                save_on_stop = ctx.shutdown_save()
+                _log(f"[orchestrator] GUI requested stop (row={row_idx}, save={save_on_stop})")
+                stop_requested = True
+                if save_on_stop:
+                    _run_shutdown_save_pass(graph, ctx, sequence=sequence)
+                else:
+                    _cleanup_context_resources(ctx)
+                break
+
+            # Row gate advance — exhaust when row's cycles×rounds are done
+            branch = _row_gate.evaluate(ctx)
+            if branch == "exhaust":
+                break
+            cycle_idx = ctx.cycle
+            round_idx = ctx.round_id
+
+            # Mid-process pause: between any two cycles
+            from pipeline.graph import _wait_while_paused
+            _wait_while_paused(ctx)
+            if ctx.stop_requested():
+                continue  # will be caught at top of inner while
+
+            # READ POINT A — apply a new plan or schedule received from GUI
+            if ctx.viewer_proxy is not None:
+                apply_payload = ctx.viewer_proxy.consume_pending_plan_apply()
+                if apply_payload is not None:
+                    _log(
+                        f"[orchestrator] plan_apply received before cycle {cycle_idx}: "
+                        f"reason={apply_payload.reason!r}"
+                    )
+                    try:
+                        new_graph = build_training_graph_from_plan(apply_payload.plan)
+                        graph = new_graph
+                        sequence = _runtime_node_sequence(new_graph, apply_payload.plan)
+                        ctx.graph_plan = apply_payload.plan
+                        ctx.plan_id = str(apply_payload.plan.plan_id)
+                        ctx.graph_layers = dict(getattr(apply_payload.plan, "graph_layers", {}) or {})
+                        _cycle_gates = CycleGate.from_plan(apply_payload.plan)
+                        ctx.cycle_gates = _cycle_gates
+                        _primary_gate = _cycle_gates[0] if _cycle_gates else None
+                        if ctx.graph_plan_path is not None:
+                            try:
+                                apply_payload.plan.save_json(ctx.graph_plan_path)
+                            except Exception as _save_exc:
+                                _log(f"[orchestrator] WARNING: could not persist applied plan: {_save_exc}")
+                        _log(f"[orchestrator] plan_apply complete: {len(sequence)} nodes in new sequence")
+                        _send_viewer_bootstrap(ctx)
+                    except Exception as apply_exc:
+                        _log(f"[orchestrator] ERROR: plan_apply failed — keeping existing graph: {apply_exc}")
+
+                # READ POINT B — schedule_apply replaces the schedule list;
+                # complete the current row first, then reload from new schedule.
+                if _apply_pending_schedule(ctx):
+                    schedule_rows = list(ctx.schedule.rows)
+                    _log(f"[orchestrator] schedule replaced mid-run: "
+                         f"{len(schedule_rows)} row(s); completing current row then restarting")
+
+            if not ctx.is_cycle_selected(cycle_idx):
+                deselected = {node_id: "skipped:cycle_deselected" for node_id in sequence}
+                ctx.last_node_statuses = dict(deselected)
+                _log(f"[orchestrator] cycle={cycle_idx} skipped by GUI selection")
+                _save_runtime_snapshot(
+                    ctx,
+                    _build_runtime_snapshot(ctx, deselected, "idle", default_cycle_ids=default_cycle_ids),
+                )
+                _emit_execution_event(
+                    ctx,
+                    event_id=f"{ctx.session_id}:cycle:{cycle_idx}:skipped",
+                    phase="cycle",
+                    status="skipped",
+                    message=f"Cycle {cycle_idx} skipped by GUI selection.",
+                    metrics={"cycle": int(cycle_idx), "row_index": row_idx},
+                )
+                continue
+
+            _log(f"\n{'=' * 60}")
+            _log(f"[orchestrator] row={row_idx}/{len(schedule_rows)-1}  "
+                 f"cycle={cycle_idx}/{row.cycles}  round={round_idx}/{row.rounds_per_cycle}"
+                 f"  total={ctx.total_rounds_completed}")
+            _log(f"{'=' * 60}")
+
+            statuses, interrupted = _execute_runtime_pass_handling_stop(
+                graph,
+                ctx,
+                sequence=sequence,
+                stop_context=f"row={row_idx} cycle={cycle_idx} round={round_idx}",
+            )
+            if interrupted or statuses is None:
+                stop_requested = True
+                break
+            _log_statuses(f"r{row_idx}c{cycle_idx}r{round_idx}", statuses)
+            _save_runtime_snapshot(
+                ctx,
+                _build_runtime_snapshot(ctx, statuses, "running", default_cycle_ids=default_cycle_ids),
+            )
+            _emit_execution_event(
+                ctx,
+                event_id=f"{ctx.session_id}:row:{row_idx}:cycle:{cycle_idx}:round:{round_idx}",
+                phase="round",
+                status="ok",
+                message=f"Row {row_idx} cycle {cycle_idx} round {round_idx}.",
+                metrics={
+                    "row_index": row_idx,
+                    "cycle": int(cycle_idx),
+                    "round": int(round_idx),
+                    "ran": sum(1 for s in statuses.values() if s == "ran"),
+                    "skipped": sum(1 for s in statuses.values() if str(s).startswith("skipped")),
+                    "failed": sum(1 for s in statuses.values() if str(s).startswith("failed")),
+                },
+            )
+
+            if ctx.vocab_rotation_cycle == 0:
+                ctx.vocab_rotation_cycle = 1
+
+        # Inner loop ended — either exhausted, stopped, or stop was set
+        if stop_requested:
+            break
+
+        # Row complete
+        _emit_execution_event(
+            ctx,
+            event_id=f"{ctx.session_id}:schedule:row:{row_idx}:complete",
+            phase="schedule_row",
+            status="complete",
+            message=f"Schedule row {row_idx} complete: {ctx.schedule_row_label!r}",
+            metrics={"row_index": row_idx},
+        )
+
+        # Pause between rows — user can adjust options before next row begins
+        _wait_while_paused(ctx)
+        if ctx.stop_requested():
+            stop_requested = True
+            break
+
+        row_idx += 1
 
     # -- Final summary ----------------------------------------------------
     summary_path = output_dir / "pipeline_run_summary.json"
@@ -2404,7 +2673,7 @@ def _build_configs_from_args(args) -> dict:
         cache_device=str(_g("berkeley_refresh_cache_device", default="auto") or "auto"),
         seed=int(_g("seed", default=42)),
         wheel_max_bytes=int(max(0, int(_g("berkeley_wheel_max_mb", default=0)))) * 1024 * 1024,
-        wheel_sanity_cap_bytes=int(max(1, int(_g("berkeley_wheel_sanity_cap_mb", default=30720)))) * 1024 * 1024,
+        wheel_sanity_cap_bytes=int(max(1, int(_g("berkeley_wheel_sanity_cap_mb", default=8192)))) * 1024 * 1024,
         wheel_allow_large_override=bool(_g("berkeley_wheel_allow_large_override", default=False)),
         wheel_lookahead_batches=int(_g("berkeley_wheel_lookahead_batches", default=0)),
         wheel_use_rare_term_deck=bool(_g("berkeley_wheel_use_rare_term_deck", default=True)),

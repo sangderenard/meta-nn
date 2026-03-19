@@ -322,6 +322,13 @@ class TransformerGateConfig:
 
     required_consecutive: int = 3
 
+    # Evaluation parameters
+    image_size: int = 128
+    patch_size: int = 16
+    chunk_samples: int = 0        # 0 = auto-derive
+    eval_max_batches: int = 10
+    channels_last: bool = False
+
 
 class TransformerGateNode(GatedNode):
     """Gate R: Evaluate transformer output quality via classifier feature score.
@@ -346,18 +353,38 @@ class TransformerGateNode(GatedNode):
         return ctx.transformer is not None and ctx.classifier is not None
 
     def execute(self, ctx: PipelineContext) -> None:
+        from wav_ml_models import evaluate_feature_score_before_after
+        from pipeline.utils import _resolve_synced_chunk_samples
 
-        result = _wave_feedback_snapshot(
+        image_size = int(self.cfg.image_size)
+        requested_chunks = int(self.cfg.chunk_samples or getattr(ctx.args, "chunk_samples", 0) or 1)
+        if ctx.render_config is not None:
+            chunk_samples, _ = _resolve_synced_chunk_samples(
+                requested_chunk_samples=requested_chunks,
+                patch_size=int(self.cfg.patch_size),
+                cfg=ctx.render_config,
+                image_hw=(image_size, image_size),
+            )
+        else:
+            chunk_samples = max(1, requested_chunks)
+
+        result = evaluate_feature_score_before_after(
+            transformer=ctx.transformer,
             classifier=ctx.classifier,
-            wave_classifier=ctx.wave_classifier,
             streams=ctx.float_streams,
-            render_cfg=ctx.render_config,
+            cfg=ctx.render_config,
+            sample_bits=int(getattr(ctx.args, "sample_bits", 16) or 16),
+            image_hw=(image_size, image_size),
+            chunk_samples=int(chunk_samples),
             device=ctx.device,
-            args=ctx.args,
+            max_batches=int(self.cfg.eval_max_batches),
+            amp=bool(ctx.amp_enabled),
+            amp_dtype=str(ctx.amp_dtype or "float16"),
+            channels_last=bool(self.cfg.channels_last),
         )
 
-        feature_score = float(result.get("feature_score", 0.0))
-        entropy = float(result.get("entropy", 0.0))
+        feature_score = float(result.get("score_after", 0.0))
+        entropy = float(result.get("hard_coverage_after", 0.0))
         combined = (feature_score + entropy) / 2.0
 
         passes = (
@@ -465,6 +492,13 @@ class WaveGateConfig:
     feature_score_min: float = 0.55
     required_consecutive: int = 3
 
+    # Evaluation parameters
+    image_size: int = 128
+    patch_size: int = 16
+    chunk_samples: int = 0        # 0 = auto-derive
+    eval_max_batches: int = 10
+    channels_last: bool = False
+
 
 class WaveGateNode(GatedNode):
     """Gate W: Combined wave entropy + classifier feature score gate.
@@ -490,18 +524,38 @@ class WaveGateNode(GatedNode):
         return "w" in mode and ctx.classifier is not None
 
     def execute(self, ctx: PipelineContext) -> None:
+        from wav_ml_models import evaluate_feature_score_before_after
+        from pipeline.utils import _resolve_synced_chunk_samples
 
-        result = _wave_feedback_snapshot(
+        image_size = int(self.cfg.image_size)
+        requested_chunks = int(self.cfg.chunk_samples or getattr(ctx.args, "chunk_samples", 0) or 1)
+        if ctx.render_config is not None:
+            chunk_samples, _ = _resolve_synced_chunk_samples(
+                requested_chunk_samples=requested_chunks,
+                patch_size=int(self.cfg.patch_size),
+                cfg=ctx.render_config,
+                image_hw=(image_size, image_size),
+            )
+        else:
+            chunk_samples = max(1, requested_chunks)
+
+        result = evaluate_feature_score_before_after(
+            transformer=ctx.transformer,
             classifier=ctx.classifier,
-            wave_classifier=ctx.wave_classifier,
             streams=ctx.float_streams,
-            render_cfg=ctx.render_config,
+            cfg=ctx.render_config,
+            sample_bits=int(getattr(ctx.args, "sample_bits", 16) or 16),
+            image_hw=(image_size, image_size),
+            chunk_samples=int(chunk_samples),
             device=ctx.device,
-            args=ctx.args,
+            max_batches=int(self.cfg.eval_max_batches),
+            amp=bool(ctx.amp_enabled),
+            amp_dtype=str(ctx.amp_dtype or "float16"),
+            channels_last=bool(self.cfg.channels_last),
         )
 
-        feature_score = float(result.get("feature_score", 0.0))
-        entropy = float(result.get("entropy", 0.0))
+        feature_score = float(result.get("score_after", 0.0))
+        entropy = float(result.get("hard_coverage_after", 0.0))
         combined = (feature_score + entropy) / 2.0
         target = (self.cfg.feature_score_min + self.cfg.entropy_min) / 2.0
 

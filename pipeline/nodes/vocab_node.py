@@ -37,7 +37,6 @@ import hashlib
 import json
 import math
 import numpy as np
-from tqdm import tqdm
 import re
 import torch
 import torch.nn.functional as F
@@ -45,6 +44,7 @@ import torch.nn.functional as F
 from pipeline.context import PipelineContext
 from pipeline.graph import PipelineNode
 from pipeline.nodes.base import OneTimeNode
+from pipeline.progress import interruptible_tqdm
 from semantic_dataset_loaders import (
     _composite_mask_stack,
     _semantic_color_score_maps,
@@ -405,6 +405,7 @@ class BuildFlashcardRowsNode(PipelineNode):
             per_term=self.cfg.flashcard_rows_per_term,
             seed=self.cfg.seed,
             condition_vector_builder=_condition_builder,
+            progress_control=ctx,
         )
 
         ctx.flashcard_rows = list(zip(flashcard_images, flashcard_conditions))
@@ -425,6 +426,7 @@ def _build_reference_flashcard_payload_rows(
     seed: int,
     condition_vector_builder: Callable[[Sequence[str], Optional["np.ndarray"]], "np.ndarray"],
     gan_image_provider: Optional[Callable[[int], List["np.ndarray"]]] = None,
+    progress_control: Any = None,
 ) -> Tuple[List["np.ndarray"], List["np.ndarray"], Dict[str, Any]]:
     import math
     import re
@@ -556,7 +558,14 @@ def _build_reference_flashcard_payload_rows(
 
     object_seed_rows: List[Tuple[np.ndarray, np.ndarray]] = []
     n_obj = min(len(payload_images_base), len(payload_conditions_supervised_base))
-    for i in tqdm(range(int(n_obj)), desc="[flashcard] loading payload images", unit="img", leave=False, dynamic_ncols=True):
+    for i in interruptible_tqdm(
+        range(int(n_obj)),
+        desc="[flashcard] loading payload images",
+        unit="img",
+        leave=False,
+        dynamic_ncols=True,
+        control=progress_control,
+    ):
         object_seed_rows.append((
             _image_any_to_rgb_chw01(payload_images_base[int(i)], image_size=int(size)),
             np.asarray(payload_conditions_supervised_base[int(i)], dtype=np.float32).reshape(-1),
@@ -647,7 +656,14 @@ def _build_reference_flashcard_payload_rows(
         cards_cond.append(np.asarray(vec, dtype=np.float32).reshape(-1))
         term_counts[key] = int(term_counts.get(key, 0)) + 1
 
-    for term in tqdm(target_terms, desc="[flashcard] building term rows", unit="term", leave=False, dynamic_ncols=True):
+    for term in interruptible_tqdm(
+        target_terms,
+        desc="[flashcard] building term rows",
+        unit="term",
+        leave=False,
+        dynamic_ncols=True,
+        control=progress_control,
+    ):
         term_key = re.sub(r"\s+", " ", str(term)).strip().lower()
         for _ in range(int(per)):
             if term_key == "none":

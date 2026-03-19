@@ -25,8 +25,10 @@ Checks:
  18. execution_policy fields survive plan export and JSON round-trip
  19. execution_policy badges appear in dense Mermaid rendering
  20. condition expression DSL parses and evaluates correctly
- 21. condition_expr and run_condition_expr survive plan JSON round-trip
- 22. condition_expr appears in Mermaid and roundtrips through editable edit
+21. condition_expr and run_condition_expr survive plan JSON round-trip
+22. condition_expr appears in Mermaid and roundtrips through editable edit
+ 23. flashcard payload prep stays immediately upstream of the generator path
+ 24. Berkeley gate provisioning does not eagerly build generator payload assets
 """
 from __future__ import annotations
 
@@ -62,6 +64,7 @@ from pipeline.nodes.wave_classifier_node import WaveClassifierConfig
 from pipeline.nodes.vocab_node import VocabConfig
 from pipeline.nodes.label_embedding_node import LabelEmbeddingConfig
 from pipeline.nodes.data_nodes import (
+    DataNode,
     WavePoolConfig,
     PregestationDataConfig,
     GestationDataConfig,
@@ -129,6 +132,38 @@ def test_build_pipeline_graph():
     sequence = graph.build_sequence()
     _assert(len(sequence) == node_count, f"sequence length matches node count ({node_count})")
     return graph, node_count, edge_count
+
+
+def test_flashcard_payload_prep_is_generator_local(graph):
+    print("\n--- test_flashcard_payload_prep_is_generator_local ---")
+    sequence = graph.build_sequence()
+    gate_transformer_idx = sequence.index("gate_transformer")
+    flashcard_idx = sequence.index("build_flashcard_rows")
+    generator_idx = sequence.index("stage_g_generator")
+    _assert(gate_transformer_idx < flashcard_idx, "flashcard prep now waits until after gate_transformer")
+    _assert(flashcard_idx < generator_idx, "flashcard prep stays immediately upstream of stage_g_generator")
+
+
+def test_gate_data_provision_is_gate_local():
+    print("\n--- test_gate_data_provision_is_gate_local ---")
+    node = DataNode(
+        PregestationDataConfig(),
+        GestationDataConfig(),
+        BerkeleyPayloadConfig(),
+        BerkeleyDataConfig(),
+    )
+    calls = []
+
+    def _record_validation(_ctx):
+        calls.append("payload_validation")
+
+    def _record_payload(_ctx):
+        calls.append("payload_bank")
+
+    node.provide_payload_validation = _record_validation  # type: ignore[assignment]
+    node.provide_payload = _record_payload  # type: ignore[assignment]
+    node.provide_gate_data(PipelineContext())
+    _assert(calls == ["payload_validation"], "gate_berkeley provisioning stays local to gate validation data")
 
 
 # ── test: plan export ─────────────────────────────────────────────────────────
@@ -340,6 +375,11 @@ old
 def test_plan_topology_is_authoritative(plan: TrainingGraphPlan, edge_count: int):
     print("\n--- test_plan_topology_is_authoritative ---")
     edited = TrainingGraphPlan.from_dict(plan.to_dict())
+    exec_edge_count = sum(
+        1 for edge in (edited.edges or [])
+        if bool(getattr(edge, "enabled", True))
+        and str(getattr(edge, "layer", "execution") or "execution") == "execution"
+    )
     removed_edge = next(
         (edge for edge in edited.edges if edge.source_node_id == "sync_gate_replica" and edge.target_node_id == "checkpoint_save"),
         None,
@@ -349,7 +389,7 @@ def test_plan_topology_is_authoritative(plan: TrainingGraphPlan, edge_count: int
 
     rebuilt = build_training_graph_from_plan(edited)
     rebuilt_edge_ids = {edge.edge_id for edge in rebuilt.edges}
-    _assert(len(rebuilt.edges) == edge_count - 1, "rebuilt graph reflects removed plan edge")
+    _assert(len(rebuilt.edges) == exec_edge_count - 1, "rebuilt graph reflects removed plan edge")
     _assert(removed_edge.edge_id not in rebuilt_edge_ids, "removed plan edge is absent from rebuilt graph")
 
 
@@ -1367,6 +1407,8 @@ def test_data_node_mask_subnodes_exported(plan):
 def main():
     print("=== Smoke test: plan round-trip ===")
     graph, node_count, edge_count = test_build_pipeline_graph()
+    test_flashcard_payload_prep_is_generator_local(graph)
+    test_gate_data_provision_is_gate_local()
     plan = test_plan_export(graph, node_count)
     reloaded_plan = test_json_roundtrip(plan, node_count, edge_count)
     test_rebuild_from_plan(reloaded_plan, node_count, edge_count)

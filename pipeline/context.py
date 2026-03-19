@@ -9,7 +9,7 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, ClassVar, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -342,6 +342,20 @@ class PipelineContext:
     round_rows: List[Dict[str, Any]] = field(default_factory=list)
     config_search_history: List[Dict[str, Any]] = field(default_factory=list)
 
+    # ---- training schedule (GUI plan builder) ----------------------------
+    #  When a TrainingSchedule is active, the orchestrator walks its rows
+    #  sequentially.  Each row specifies cycles, rounds, active stages, and
+    #  per-node config overrides.  schedule_index = -1 means pre-start.
+    schedule: Optional[Any] = None              # TrainingSchedule | None
+    schedule_index: int = -1                    # -1 = pre-start, 0+ = active row
+    schedule_row_label: str = ""
+    schedule_active_stages: Optional[Any] = None  # frozenset[str] | None (None = all)
+
+    # ---- per-node config overrides (set from schedule row) ---------------
+    #  Maps node_id → {field_name: value}.  Applied by each node's execute()
+    #  before running.  Cleared and replaced at the start of each schedule row.
+    node_config_overrides: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+
     # ---- orchestration loop state ---------------------------------------
     cycle: int = 0
     round_id: int = 0
@@ -407,16 +421,66 @@ class PipelineContext:
     # ------------------------------------------------------------------
 
     def all_base_gates_passed(self) -> bool:
-        """True once Stage 0, 1, and 2 have all cleared."""
+        """True once Stage 0, 1, and 2 have all effectively cleared."""
         return (
-            self.gate_pregestation.passed
-            and self.gate_gestation.passed
-            and self.gate_berkeley.passed
+            self.gate_effectively_passed("gate_pregestation")
+            and self.gate_effectively_passed("gate_gestation")
+            and self.gate_effectively_passed("gate_berkeley")
         )
 
     def early_gates_passed(self) -> bool:
-        """True once Stage 0 and Stage 1 have cleared (Stage 2 not required yet)."""
-        return self.gate_pregestation.passed and self.gate_gestation.passed
+        """True when Stage 0 and Stage 1 gates are both effectively passed."""
+        return (
+            self.gate_effectively_passed("gate_pregestation")
+            and self.gate_effectively_passed("gate_gestation")
+        )
+
+    def stage_2_berkeley_selected(self) -> bool:
+        """True when stage_2_berkeley is selected in the GUI (or no GUI is attached)."""
+        return self.is_node_selected("stage_2_berkeley")
+
+    # Mapping from gate context-attribute name → the training stage node_id whose
+    # execution produces that gate's value.  Used by is_gate_bypassed() and
+    # gate_effectively_passed().
+    _GATE_PREREQUISITE_STAGE: ClassVar[Dict[str, str]] = {
+        "gate_pregestation": "stage_0_pregestation",
+        "gate_gestation":    "stage_1_gestation",
+        "gate_berkeley":     "stage_2_berkeley",
+        "gate_transformer":  "stage_r_transformer",
+        "gate_generator":    "stage_g_generator",
+        "gate_wave":         "stage_w_wave_classifier",
+    }
+
+    def is_gate_bypassed(self, gate_attr: str) -> bool:
+        """True when this gate's result should be treated as satisfied without
+        the gate having actually passed:
+
+        - gate_override is active (explicit GUI override), OR
+        - the training stage that produces this gate is deselected (user skipped
+          the prerequisite — implicitly accepting the gate as met).
+        """
+        if self.gate_override_enabled():
+            return True
+        stage_id = self._GATE_PREREQUISITE_STAGE.get(str(gate_attr))
+        if stage_id is not None:
+            try:
+                return not bool(self.is_node_selected(stage_id))
+            except Exception:
+                pass
+        return False
+
+    def gate_effectively_passed(self, gate_attr: str) -> bool:
+        """Canonical single-gate satisfaction check.
+
+        A gate is effectively passed when it has actually passed OR is bypassed
+        (gate_override active, or the prerequisite training stage is deselected).
+        This is the single source of truth — all composite gate predicates should
+        compose from this method.
+        """
+        gate = getattr(self, gate_attr, None)
+        if gate is not None and getattr(gate, "passed", False):
+            return True
+        return self.is_gate_bypassed(gate_attr)
 
     def generator_and_classifier_ready(self) -> bool:
         return (
@@ -428,7 +492,7 @@ class PipelineContext:
     def wave_stage_ready(self) -> bool:
         return (
             self.all_base_gates_passed()
-            and self.gate_transformer.passed
+            and self.gate_effectively_passed("gate_transformer")
             and self.transformer is not None
         )
 
@@ -456,6 +520,25 @@ class PipelineContext:
         except Exception:
             return True
 
+    def is_node_selected(self, node_id: str) -> bool:
+        # Schedule-row active_stages is a hard gate: if set and non-empty,
+        # only listed nodes may run.  The GUI's per-node toggle can still
+        # deselect within those; it cannot add back what the row excluded.
+        sas = self.schedule_active_stages
+        if sas is not None and len(sas) > 0:
+            if str(node_id) not in sas:
+                return False
+        proxy = self.viewer_proxy
+        if proxy is None:
+            return True
+        fn = getattr(proxy, "is_node_selected", None)
+        if not callable(fn):
+            return True
+        try:
+            return bool(fn(str(node_id)))
+        except Exception:
+            return True
+
     def selected_cycle_ids(self) -> List[int]:
         proxy = self.viewer_proxy
         if proxy is None:
@@ -473,6 +556,42 @@ class PipelineContext:
         if proxy is None:
             return False
         fn = getattr(proxy, "stop_requested", None)
+        if not callable(fn):
+            return False
+        try:
+            return bool(fn())
+        except Exception:
+            return False
+
+    def consume_skip_forward(self) -> bool:
+        proxy = self.viewer_proxy
+        if proxy is None:
+            return False
+        fn = getattr(proxy, "consume_skip_forward", None)
+        if not callable(fn):
+            return False
+        try:
+            return bool(fn())
+        except Exception:
+            return False
+
+    def consume_skip_back(self) -> bool:
+        proxy = self.viewer_proxy
+        if proxy is None:
+            return False
+        fn = getattr(proxy, "consume_skip_back", None)
+        if not callable(fn):
+            return False
+        try:
+            return bool(fn())
+        except Exception:
+            return False
+
+    def save_now_requested(self) -> bool:
+        proxy = self.viewer_proxy
+        if proxy is None:
+            return False
+        fn = getattr(proxy, "consume_save_now", None)
         if not callable(fn):
             return False
         try:

@@ -124,6 +124,13 @@ class WaveClassifierConfig:
     feedback_min_weight: float = 0.3
     feedback_max_weight: float = 1.0
 
+    # ---- feature-score evaluation (evaluate_feature_score_before_after) ----
+    eval_image_size: int = 128
+    eval_patch_size: int = 16
+    eval_chunk_samples: int = 0       # 0 = auto-derive
+    eval_max_batches: int = 10
+    eval_channels_last: bool = False
+
 
 # ---------------------------------------------------------------------------
 # Build node
@@ -362,15 +369,10 @@ class WaveClassifierTrainNode(IRTrainingNode):
         return ctx.transformer is not None and ctx.classifier is not None
 
     def execute(self, ctx: PipelineContext) -> None:
-        from pipeline.nodes.gate_nodes import (
-            _wave_feedback_gate_pass,
-            _wave_feedback_snapshot,
-        )
-        from wav_ml_models import (
-            train_classifier,
-            evaluate_classifier,
-            evaluate_feature_score_before_after,
-        )
+        from pipeline.nodes.classifier_node import _run_classifier_refresh_epochs
+        from pipeline.nodes.gate_nodes import _evaluate_berkeley_classifier_gate
+        from pipeline.utils import _resolve_synced_chunk_samples
+        from wav_ml_models import evaluate_feature_score_before_after
 
         # -- Build dataset ------------------------------------------------
         dataset_result = _build_wave_classifier_dataset_from_transformer(
@@ -407,28 +409,31 @@ class WaveClassifierTrainNode(IRTrainingNode):
             model=ctx.wave_classifier,
             node_id=self.node_id,
         )
-        train_classifier(
+        _run_classifier_refresh_epochs(
             classifier=ctx.wave_classifier,
-            optimizer=ctx.wave_classifier_optimizer,
             loader=train_loader,
             device=ctx.device,
             epochs=self.cfg.epochs_per_round,
-            amp_enabled=ctx.amp_enabled,
-            amp_dtype=ctx.amp_dtype,
-            grad_clip=self.cfg.grad_clip,
+            optimizer=ctx.wave_classifier_optimizer,
             grad_scaler=ctx.wave_classifier_grad_scaler,
-            weight_update_callback=weight_update_callback,
+            stage_label="stageW",
             args=ctx.args,
+            amp_enabled=bool(ctx.amp_enabled),
+            amp_dtype=str(ctx.amp_dtype or "float16"),
+            grad_clip=float(self.cfg.grad_clip),
+            weight_update_callback=weight_update_callback,
         )
 
         # -- Evaluate -----------------------------------------------------
         eval_result: Dict[str, float] = {}
         if val_loader is not None:
-            eval_result = evaluate_classifier(
+            eval_result = _evaluate_berkeley_classifier_gate(
                 classifier=ctx.wave_classifier,
                 loader=val_loader,
                 device=ctx.device,
-                args=ctx.args,
+                max_steps=0,
+                amp_enabled=bool(ctx.amp_enabled),
+                amp_dtype=str(ctx.amp_dtype or "float16"),
             )
 
         accuracy = float(eval_result.get("accuracy", 0.0))
@@ -439,17 +444,35 @@ class WaveClassifierTrainNode(IRTrainingNode):
         if self.cfg.zero_shot_enabled and ctx.label_embedding_bank is not None:
             zs_top1 = _run_zero_shot_eval(ctx, self.cfg, val_loader)
 
-        # -- Wave feedback gate -------------------------------------------
-        feedback = _wave_feedback_snapshot(
+        # -- Feature-score feedback (transformer → classifier) ------------
+        image_size = int(self.cfg.eval_image_size)
+        requested_chunks = int(self.cfg.eval_chunk_samples or getattr(ctx.args, "chunk_samples", 0) or 1)
+        if ctx.render_config is not None:
+            chunk_samples, _ = _resolve_synced_chunk_samples(
+                requested_chunk_samples=requested_chunks,
+                patch_size=int(self.cfg.eval_patch_size),
+                cfg=ctx.render_config,
+                image_hw=(image_size, image_size),
+            )
+        else:
+            chunk_samples = max(1, requested_chunks)
+
+        fs_result = evaluate_feature_score_before_after(
+            transformer=ctx.transformer,
             classifier=ctx.classifier,
-            wave_classifier=ctx.wave_classifier,
             streams=ctx.float_streams,
-            render_cfg=ctx.render_config,
+            cfg=ctx.render_config,
+            sample_bits=int(getattr(ctx.args, "sample_bits", 16) or 16),
+            image_hw=(image_size, image_size),
+            chunk_samples=int(chunk_samples),
             device=ctx.device,
-            args=ctx.args,
+            max_batches=int(self.cfg.eval_max_batches),
+            amp=bool(ctx.amp_enabled),
+            amp_dtype=str(ctx.amp_dtype or "float16"),
+            channels_last=bool(self.cfg.eval_channels_last),
         )
-        feature_score = float(feedback.get("feature_score", 0.0))
-        entropy = float(feedback.get("entropy", 0.0))
+        feature_score = float(fs_result.get("score_after", 0.0))
+        entropy = float(fs_result.get("hard_coverage_after", 0.0))
         combined = (feature_score + entropy) / 2.0
 
         ctx.gate_wave.required_consecutive = self.cfg.gate_required_consecutive

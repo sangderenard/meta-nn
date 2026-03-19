@@ -33,7 +33,6 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
-from tqdm import tqdm
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
@@ -41,6 +40,7 @@ from torch.utils.data import DataLoader, Dataset
 from pipeline.context import PipelineContext
 from pipeline.graph import PipelineNode
 from pipeline.nodes.base import GatedNode, OneTimeNode
+from pipeline.progress import interruptible_tqdm
 from pipeline.semantic_gpu import semantic_processing_device
 from pipeline.semantic_wheel_cache import (
     SemanticWheelCandidate,
@@ -451,14 +451,15 @@ class DataNode(PipelineNode):
         self._gest_vocab_hash: int = -1
         self._gest_last_build_round: int = -1
         self._bdata_last_build_round: int = -1
-        self._payload_built: bool = False
+        self._payload_bank_built: bool = False
+        self._payload_validation_built: bool = False
 
         # ---- Possession registry ----
         self.possessions: Dict[str, DataPossession] = {}
         self._register_possessions()
 
     def _register_possessions(self) -> None:
-        """Populate the possession registry with the four canonical entries."""
+        """Populate the possession registry with the canonical data entries."""
         self.possessions["pregestation"] = DataPossession(
             name="pregestation",
             tier="ram",
@@ -487,11 +488,17 @@ class DataNode(PipelineNode):
             tier="ram",
             ctx_attrs=[
                 "payload_bank", "payload_conditions", "payload_masks",
-                "payload_bank_ready", "payload_validation_loader",
-                "payload_validation_dataset",
+                "payload_bank_ready",
             ],
-            expiry_fn=lambda ctx: not self._payload_built,
+            expiry_fn=lambda ctx: not self._payload_bank_built,
             size_fn=lambda: self._estimate_possession_bytes("payload"),
+        )
+        self.possessions["payload_validation"] = DataPossession(
+            name="payload_validation",
+            tier="ram",
+            ctx_attrs=["payload_validation_loader", "payload_validation_dataset"],
+            expiry_fn=lambda ctx: not self._payload_validation_built,
+            size_fn=lambda: self._estimate_possession_bytes("payload_validation"),
         )
 
     def _check_item_exhaustion(self, possession_name: str, loader: Any) -> bool:
@@ -720,7 +727,14 @@ class DataNode(PipelineNode):
             all_targets: list = []
             all_term_rows: list = []
             all_tonal_masks: list = []  # List[Dict[str, np.ndarray]] — tonal masks per row
-            for mode in tqdm(_mode_seq, desc="[pregestation] generating modes", unit="mode", leave=False, dynamic_ncols=True):
+            for mode in interruptible_tqdm(
+                _mode_seq,
+                desc="[pregestation] generating modes",
+                unit="mode",
+                leave=False,
+                dynamic_ncols=True,
+                control=ctx,
+            ):
                 imgs, masks, mask_stacks, elem_term_lists, term_rows, _info = _build_pregestation_logic_rows(
                     image_size=self.preg_cfg.image_size,
                     seed=self.preg_cfg.seed,
@@ -768,7 +782,14 @@ class DataNode(PipelineNode):
             idx_to_term = {int(i): str(name) for i, name in enumerate(ctx.class_names)}
             all_label_stacks: list = []
             all_label_indices: list = []
-            for i in tqdm(range(len(all_images)), desc="[pregestation] building mask stacks", unit="img", leave=False, dynamic_ncols=True):
+            for i in interruptible_tqdm(
+                range(len(all_images)),
+                desc="[pregestation] building mask stacks",
+                unit="img",
+                leave=False,
+                dynamic_ncols=True,
+                control=ctx,
+            ):
                 img_np = np.asarray(all_images[i], dtype=np.float32)
                 if i < len(all_masks):
                     base_mask_np = np.asarray(all_masks[i], dtype=np.float32)
@@ -844,7 +865,14 @@ class DataNode(PipelineNode):
 
             # ---- Persist to disk cache ----
             _log(f"[data-node] pregestation saving raw cache ({_raw_cache_key[:8]}…)")
-            with tqdm(total=1, desc="[pregestation] writing cache", unit="file", leave=False, dynamic_ncols=True) as _pbar:
+            with interruptible_tqdm(
+                total=1,
+                desc="[pregestation] writing cache",
+                unit="file",
+                leave=False,
+                dynamic_ncols=True,
+                control=ctx,
+            ) as _pbar:
                 _save_raw_stage_cache(_raw_cache_dir, _raw_cache_key, {
                     "all_images": [np.asarray(im, dtype=np.float32) for im in all_images],
                     "all_masks": [np.asarray(m, dtype=np.float32) for m in all_masks],
@@ -1018,7 +1046,14 @@ class DataNode(PipelineNode):
                     image=images[i],
                     image_size=_gest_image_size,
                 ))
-                for i in tqdm(range(_n_gest), desc="[gestation] building terms", unit="img", leave=False, dynamic_ncols=True)
+                for i in interruptible_tqdm(
+                    range(_n_gest),
+                    desc="[gestation] building terms",
+                    unit="img",
+                    leave=False,
+                    dynamic_ncols=True,
+                    control=ctx,
+                )
             ]
 
             # --- Step 2: infer support masks — one vectorised call for ALL images ---
@@ -1043,7 +1078,14 @@ class DataNode(PipelineNode):
                 masks: List[np.ndarray] = []
                 mask_stacks: List[np.ndarray] = []
                 mask_indices: List[np.ndarray] = []
-                for i in tqdm(range(_n_gest), desc="[gestation] combining mask stacks", unit="img", leave=False, dynamic_ncols=True):
+                for i in interruptible_tqdm(
+                    range(_n_gest),
+                    desc="[gestation] combining mask stacks",
+                    unit="img",
+                    leave=False,
+                    dynamic_ncols=True,
+                    control=ctx,
+                ):
                     y = np.asarray(targets[int(i)], dtype=np.float32).reshape(-1)
                     base_mask = np.asarray(_base_masks[i], dtype=np.float32)
                     special_stack, special_idx = build_label_mask_stack(
@@ -1082,7 +1124,14 @@ class DataNode(PipelineNode):
 
             # ---- Persist to disk cache ----
             _log(f"[data-node] gestation saving raw cache ({_raw_cache_key[:8]}…)")
-            with tqdm(total=1, desc="[gestation] writing cache", unit="file", leave=False, dynamic_ncols=True) as _pbar:
+            with interruptible_tqdm(
+                total=1,
+                desc="[gestation] writing cache",
+                unit="file",
+                leave=False,
+                dynamic_ncols=True,
+                control=ctx,
+            ) as _pbar:
                 _save_raw_stage_cache(_raw_cache_dir, _raw_cache_key, {
                     "masks": list(masks),
                     "mask_stacks": list(mask_stacks),
@@ -1175,6 +1224,9 @@ class DataNode(PipelineNode):
         self.provide_gestation(ctx)
 
     def provide_berkeley_data(self, ctx: PipelineContext) -> None:
+        # Skip rebuild if stage_2_berkeley is deselected in the GUI.
+        if not getattr(ctx, "is_node_selected", lambda _: True)("stage_2_berkeley"):
+            return
         # Idempotency guard: the edge condition (_berk_refresh_cond) gates when this
         # callback fires; guard only against an unexpected double-call on the same round.
         if self._bdata_last_build_round == ctx.total_rounds_completed:
@@ -1192,6 +1244,7 @@ class DataNode(PipelineNode):
         _berk_force = bool(self.possessions["berkeley"].force_next_rebuild)
         with semantic_processing_device(ctx, enabled=bool(self.bdata_cfg.gpu_preprocess)) as _processing_device:
             loader, _n_refresh = _build_berkeley_refresh_loader(
+                ctx=ctx,
                 data_root=data_root, image_size=self.bdata_cfg.image_size,
                 auto_install_scipy=False, batch_size=self.bdata_cfg.batch_size,
                 num_workers=self.bdata_cfg.num_workers, max_train=self.bdata_cfg.max_train,
@@ -1211,6 +1264,7 @@ class DataNode(PipelineNode):
                 class_names=ctx.class_names,
             )
             gate_val_loader, _n_gate_val = _build_berkeley_gate_val_loader(
+                ctx=ctx,
                 data_root=data_root, image_size=self.bdata_cfg.image_size,
                 auto_install_scipy=False, batch_size=self.bdata_cfg.gate_val_batch_size,
                 num_workers=self.bdata_cfg.gate_val_num_workers,
@@ -1247,13 +1301,13 @@ class DataNode(PipelineNode):
         self._bdata_last_build_round = ctx.total_rounds_completed
         _register_churn_terms(
             ctx,
-            term_rows=_dataset_terms_rows(getattr(loader, "dataset", None)),
+            term_rows=_dataset_terms_rows(getattr(loader, "dataset", None), progress_control=ctx),
             source="berkeley_refresh",
             stage_label="stage2_berkeley",
         )
         _register_churn_terms(
             ctx,
-            term_rows=_dataset_terms_rows(getattr(gate_val_loader, "dataset", None)),
+            term_rows=_dataset_terms_rows(getattr(gate_val_loader, "dataset", None), progress_control=ctx),
             source="berkeley_gate_val",
             stage_label="gate_berkeley",
         )
@@ -1266,7 +1320,7 @@ class DataNode(PipelineNode):
         _log(f"[data-node] berkeley refresh loader built at round {ctx.total_rounds_completed}")
 
     def provide_payload(self, ctx: PipelineContext) -> None:
-        if self._payload_built:
+        if self._payload_bank_built:
             return
         # One-time conversion of .mat masks → .npz so scipy is not needed thereafter
         from semantic_dataset_loaders import convert_sbd_mat_to_npz
@@ -1280,6 +1334,7 @@ class DataNode(PipelineNode):
 
         with semantic_processing_device(ctx, enabled=bool(self.bdata_cfg.gpu_preprocess)) as _processing_device:
             out_images, out_targets, _info, _out_terms, out_masks = _build_berkeley_payload_bank(
+                ctx=ctx,
                 data_root=data_root,
                 image_size=self.payload_cfg.image_size,
                 auto_install_scipy=self.payload_cfg.auto_install_scipy,
@@ -1320,8 +1375,17 @@ class DataNode(PipelineNode):
             _log(f"[data-node] payload bank: {len(conditions)} condition rows")
         else:
             ctx.payload_conditions = []
+        self._payload_bank_built = True
 
-        # Build payload validation loader (used by BerkeleyGateNode)
+        # Possession tracking
+        poss = self.possessions["payload"]
+        poss.mark_built()
+        _log(f"[data-node] payload bank: {len(out_images)} rows")
+
+    def provide_payload_validation(self, ctx: PipelineContext) -> None:
+        if self._payload_validation_built:
+            return
+
         bdata_root = (
             str(self.bdata_cfg.berkeley_data_root).strip()
             or getattr(ctx, "berkeley_data_root", "") or ""
@@ -1330,6 +1394,7 @@ class DataNode(PipelineNode):
         seed = self.payload_cfg.seed
         with semantic_processing_device(ctx, enabled=bool(self.bdata_cfg.gpu_preprocess)) as _processing_device:
             dataset, _labels_np, _terms_rows, _info2 = _build_payload_validation_gate_dataset(
+                ctx=ctx,
                 data_root=bdata_root,
                 image_size=image_size,
                 seed=seed,
@@ -1352,7 +1417,7 @@ class DataNode(PipelineNode):
         ) if dataset is not None else (None, 0)
         ctx.payload_validation_dataset = dataset
         ctx.payload_validation_loader = loader
-        self._payload_built = True
+        self._payload_validation_built = True
         _register_churn_terms(
             ctx,
             term_rows=_terms_rows,
@@ -1360,21 +1425,18 @@ class DataNode(PipelineNode):
             stage_label="payload_validation",
         )
 
-        # Possession tracking
-        poss = self.possessions["payload"]
+        poss = self.possessions["payload_validation"]
         poss.mark_built()
         _log(f"[data-node] payload validation: {len(dataset) if dataset else 0} rows")
 
     def provide_gate_data(self, ctx: PipelineContext) -> None:
-        """Provide both the berkeley refresh/gate-val loaders AND the payload bank.
+        """Provide only the gate-local validation inputs for Berkeley gate eval.
 
         Assigned as on_traverse on the data_node → gate_berkeley edge.
-        Gate evaluation needs all three: the refresh loader (for stage-2 training
-        that feeds into gate eval), the gate-val loader, and the payload
-        validation loader.  Both providers are idempotent.
+        This callback must not eagerly provision generator payload assets;
+        it only materializes the validation loader consumed by Gate 2.
         """
-        self.provide_berkeley_data(ctx)
-        self.provide_payload(ctx)
+        self.provide_payload_validation(ctx)
 
 
 # ---------------------------------------------------------------------------
@@ -1918,7 +1980,7 @@ def _semantic_stage_cache_args(ctx: PipelineContext, stage_cache_mb: int) -> Dic
         "rebuild": bool(getattr(args, "semantic_stage_cache_rebuild", False)),
         "slot_lifespan": int(getattr(args, "semantic_stage_cache_slot_lifespan", 0) or 0),
         "lookahead_batches": max(0, int(getattr(args, "semantic_stage_cache_lookahead_batches", 0) or 0)),
-        "sanity_cap_bytes": max(1, int(getattr(args, "semantic_stage_cache_sanity_cap_mb", 30720) or 30720)) * 1024 * 1024,
+        "sanity_cap_bytes": max(1, int(getattr(args, "semantic_stage_cache_sanity_cap_mb", 8192) or 8192)) * 1024 * 1024,
         "allow_large_override": bool(getattr(args, "semantic_stage_cache_allow_large_override", False)),
         "use_rare_term_deck": bool(getattr(args, "semantic_stage_cache_use_rare_term_deck", True)),
         "explicit_max_bytes": max(0, int(stage_cache_mb)) * 1024 * 1024,
@@ -1962,6 +2024,7 @@ def _build_inmemory_semantic_stage_dataset(
     target_dim: int,
     semantic_term_to_idx: Dict[str, int],
     dataset_name: str,
+    progress_control: Any = None,
 ) -> Dataset:
     dataset = BootstrapDynamicDataset(
         images=images,
@@ -1976,6 +2039,7 @@ def _build_inmemory_semantic_stage_dataset(
         return_mask_stack=True,
         dataset_name=str(dataset_name),
         base_masks=(list(masks) if int(len(masks)) == int(len(images)) else None),
+        progress_control=progress_control,
     )
     for i in range(int(len(images))):
         if int(i) < int(len(mask_stacks)) and mask_stacks[int(i)] is not None:
@@ -2125,11 +2189,19 @@ def _build_semantic_stage_cache_dataset(
             target_dim=int(target_dim),
             semantic_term_to_idx=semantic_term_to_idx,
             dataset_name=str(stage_name),
+            progress_control=ctx,
         )
         return ds, list(range(int(total_rows))), {"cache_enabled": False, "total_rows": int(total_rows)}
 
     candidates: List[SemanticWheelCandidate] = []
-    for i in tqdm(range(int(total_rows)), desc=f"[{stage_name}] hashing candidates", unit="row", leave=False, dynamic_ncols=True):
+    for i in interruptible_tqdm(
+        range(int(total_rows)),
+        desc=f"[{stage_name}] hashing candidates",
+        unit="row",
+        leave=False,
+        dynamic_ncols=True,
+        control=ctx,
+    ):
         term_row = list(_normalize_vocab_terms(terms_rows[int(i)]))
         candidates.append(
             SemanticWheelCandidate(
@@ -2201,6 +2273,7 @@ def _build_semantic_stage_cache_dataset(
             use_rare_term_deck=bool(cache_args.get("use_rare_term_deck", True)),
             force_rebuild=bool(force_rebuild) or bool(cache_args.get("rebuild", False)),
             processing_device=processing_device,
+            progress_control=ctx,
         ),
     )
     wheel_info = dict(wheel_result.get("info") or {})
@@ -2236,14 +2309,21 @@ def _selected_source_counts(rows: Sequence[Any], indices: Sequence[int]) -> Dict
     return counts
 
 
-def _dataset_terms_rows(dataset: Optional[Dataset], max_rows: int = 0) -> List[List[str]]:
+def _dataset_terms_rows(dataset: Optional[Dataset], max_rows: int = 0, progress_control: Any = None) -> List[List[str]]:
     if dataset is None:
         return []
     limit = int(max_rows) if int(max_rows) > 0 else int(len(dataset))
     out: List[List[str]] = []
     reader = getattr(dataset, "read_numpy_entry", None)
     if callable(reader):
-        for idx in tqdm(range(int(limit)), desc="[data-node] reading dataset terms", unit="row", leave=False, dynamic_ncols=True):
+        for idx in interruptible_tqdm(
+            range(int(limit)),
+            desc="[data-node] reading dataset terms",
+            unit="row",
+            leave=False,
+            dynamic_ncols=True,
+            control=progress_control,
+        ):
             try:
                 item = reader(int(idx))
             except Exception:
@@ -2360,6 +2440,7 @@ def _ensure_berkeley_semantic_wheel(
     force_rebuild: bool = False,
     processing_device: Optional[Any] = None,
     preload_workers: int = 0,
+    progress_control: Any = None,
 ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     wheel_cfg = SemanticWheelConfig(
         purpose=str(purpose),
@@ -2382,6 +2463,7 @@ def _ensure_berkeley_semantic_wheel(
         force_rebuild=bool(force_rebuild),
         processing_device=processing_device,
         preload_workers=max(0, int(preload_workers)),
+        progress_control=progress_control,
     )
     from pipeline.vocabulary_defaults import DEFAULT_VOCABULARY
     _cn = list(class_names) if class_names is not None else list(DEFAULT_VOCABULARY)
@@ -2529,6 +2611,7 @@ def _evaluate_berkeley_confidence_loss_gate(
 
 
 def _build_berkeley_refresh_loader(
+    ctx: PipelineContext,
     data_root: str,
     image_size: int,
     auto_install_scipy: bool,
@@ -2562,6 +2645,7 @@ def _build_berkeley_refresh_loader(
         data_root=str(data_root),
         class_names=_cn,
         source_root="",
+        progress_control=ctx,
     )
     n_rows = int(len(rows))
     if n_rows <= 0:
@@ -2597,6 +2681,7 @@ def _build_berkeley_refresh_loader(
         force_rebuild=bool(force_rebuild),
         processing_device=processing_device,
         preload_workers=int(preload_workers),
+        progress_control=ctx,
     )
     ds = SemanticWheelDataset(
         cache_dir=str(wheel_result.get("cache_dir", "")),
@@ -2763,6 +2848,7 @@ def _auto_berkeley_refresh_batch_size(
 
 
 def _build_berkeley_gate_val_loader(
+    ctx: PipelineContext,
     data_root: str,
     image_size: int,
     auto_install_scipy: bool,
@@ -2792,6 +2878,7 @@ def _build_berkeley_gate_val_loader(
         data_root=str(data_root),
         class_names=_cn,
         source_root="",
+        progress_control=ctx,
     )
     val_idx = [
         int(i)
@@ -2822,6 +2909,7 @@ def _build_berkeley_gate_val_loader(
         force_rebuild=bool(force_rebuild),
         processing_device=processing_device,
         preload_workers=int(preload_workers),
+        progress_control=ctx,
     )
     ds = SemanticWheelDataset(
         cache_dir=str(wheel_result.get("cache_dir", "")),
@@ -3392,6 +3480,7 @@ def _build_payload_validation_gate_rows(
 
 
 def _build_payload_validation_gate_dataset(
+    ctx: PipelineContext,
     data_root: str,
     image_size: int,
     seed: int,
@@ -3416,6 +3505,7 @@ def _build_payload_validation_gate_dataset(
         data_root=str(data_root),
         class_names=_cn,
         source_root=str(source_root),
+        progress_control=ctx,
     )
     if int(len(rows)) <= 0:
         info = dict(rows_info)
@@ -3449,6 +3539,7 @@ def _build_payload_validation_gate_dataset(
         force_rebuild=bool(force_rebuild),
         processing_device=processing_device,
         preload_workers=int(preload_workers),
+        progress_control=ctx,
     )
     ds = SemanticWheelDataset(
         cache_dir=str(wheel_result.get("cache_dir", "")),
@@ -3461,7 +3552,14 @@ def _build_payload_validation_gate_dataset(
         if 0 <= int(idx) < int(len(rows))
     ]
     label_rows = []
-    for i in tqdm(range(int(len(ds))), desc="[payload val] reading labels", unit="row", leave=False, dynamic_ncols=True):
+    for i in interruptible_tqdm(
+        range(int(len(ds))),
+        desc="[payload val] reading labels",
+        unit="row",
+        leave=False,
+        dynamic_ncols=True,
+        control=ctx,
+    ):
         item = ds.read_numpy_entry(int(i))
         label_rows.append(np.asarray(item["label_vec_u8"], dtype=np.float32).reshape(-1))
     label_dim = int(label_rows[0].size) if int(len(label_rows)) > 0 else 0
@@ -3873,6 +3971,7 @@ def _payload_condition_bank_tensor(
 
 
 def _build_berkeley_payload_bank(
+    ctx: PipelineContext,
     data_root: str,
     image_size: int,
     auto_install_scipy: bool,
@@ -3899,6 +3998,7 @@ def _build_berkeley_payload_bank(
         data_root=str(data_root),
         class_names=_cn,
         source_root=str(source_root),
+        progress_control=ctx,
     )
     if int(len(rows)) <= 0:
         return [], [], {"available": 0, "used": 0, "available_train": 0, "available_val": 0}, [], []
@@ -3924,11 +4024,19 @@ def _build_berkeley_payload_bank(
         force_rebuild=bool(force_cache_rebuild),
         processing_device=processing_device,
         preload_workers=int(preload_workers),
+        progress_control=ctx,
     )
     ds = SemanticWheelDataset(cache_dir=str(wheel_result.get("cache_dir", "")), return_mask_stack=False)
     selected_base_rows = [int(x) for x in list(wheel_result.get("base_row_indices") or [])]
     out_targets: List[np.ndarray] = []
-    for i in tqdm(range(int(len(ds))), desc="[payload bank] reading targets", unit="row", leave=False, dynamic_ncols=True):
+    for i in interruptible_tqdm(
+        range(int(len(ds))),
+        desc="[payload bank] reading targets",
+        unit="row",
+        leave=False,
+        dynamic_ncols=True,
+        control=ctx,
+    ):
         item = ds.read_numpy_entry(int(i))
         out_targets.append(np.asarray(item["label_vec_u8"], dtype=np.float32).reshape(-1))
     out_terms = [

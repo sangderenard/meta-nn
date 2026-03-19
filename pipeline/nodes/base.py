@@ -6,6 +6,7 @@ Provides:
   - OneShotNode — run exactly once, skip on subsequent rounds
   - GPUResidenceManager — VRAM budget enforcer that parks idle models to CPU
   - _resolve_amp / _make_scaler — AMP helpers used by every training node
+  - StageSkipForward / StageSkipBack — raised by training loops on GUI skip
 """
 from __future__ import annotations
 
@@ -370,6 +371,9 @@ def resolve_non_training_device(ctx: "PipelineContext") -> torch.device:
     return primary
 
 
+from pipeline.nodes.interrupts import StageSkipBack, StageSkipForward  # noqa: F401
+
+
 def make_training_progress_callback(
     ctx: "PipelineContext",
     node_id: str,
@@ -420,6 +424,26 @@ def make_training_progress_callback(
         if bool(publish_loss) and callable(publish_progress):
             try:
                 publish_progress(str(node_id), float(loss))
+            except Exception:
+                pass
+        # Check GUI skip signals — raised here so they propagate out of the
+        # training loop.  Callers must NOT swallow StageSkipForward/Back.
+        fwd_fn = getattr(ctx, "consume_skip_forward", None)
+        if callable(fwd_fn):
+            try:
+                if fwd_fn():
+                    raise StageSkipForward("GUI skip forward")
+            except StageSkipForward:
+                raise
+            except Exception:
+                pass
+        back_fn = getattr(ctx, "consume_skip_back", None)
+        if callable(back_fn):
+            try:
+                if back_fn():
+                    raise StageSkipBack("GUI skip back")
+            except StageSkipBack:
+                raise
             except Exception:
                 pass
 
@@ -559,9 +583,9 @@ class GatedNode(PipelineNode):
         return ("gated", {"gate_ids": list(self.required_gates)})
 
     def should_run(self, ctx: PipelineContext) -> bool:
-        if ctx.gate_override_enabled():
-            return True
         for gate_attr in self.required_gates:
+            if ctx.is_gate_bypassed(gate_attr):
+                continue
             gate: GateState = getattr(ctx, gate_attr, None)
             if gate is None or not gate.passed:
                 return False

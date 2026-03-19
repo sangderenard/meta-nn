@@ -15,8 +15,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from tqdm import tqdm
-
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -25,6 +23,8 @@ from torch.utils.data import DataLoader, Dataset, Sampler
 from torch.utils.data._utils.collate import default_collate
 from torchvision.transforms import InterpolationMode
 from torchvision.transforms import functional as TF
+
+from pipeline.progress import interruptible_tqdm
 
 
 _IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".bmp", ".webp", ".tif", ".tiff"}
@@ -320,6 +320,7 @@ def _ordered_thread_map(
     worker_fn: Any,
     max_workers: int,
     desc: str = "processing",
+    progress_control: Any = None,
 ) -> List[Any]:
     count = int(len(items))
     if count <= 0:
@@ -328,16 +329,38 @@ def _ordered_thread_map(
     if workers <= 1:
         return [
             worker_fn(item)
-            for item in tqdm(items, desc=desc, unit="row", leave=False, dynamic_ncols=True)
+            for item in interruptible_tqdm(
+                items,
+                desc=desc,
+                unit="row",
+                leave=False,
+                dynamic_ncols=True,
+                control=progress_control,
+            )
         ]
     results: List[Any] = [None] * count
-    with ThreadPoolExecutor(max_workers=int(workers), thread_name_prefix="semantic-row-build") as pool:
+    pool = ThreadPoolExecutor(max_workers=int(workers), thread_name_prefix="semantic-row-build")
+    try:
         future_to_index = {pool.submit(worker_fn, item): int(i) for i, item in enumerate(items)}
-        with tqdm(total=count, desc=desc, unit="row", leave=False, dynamic_ncols=True) as pbar:
+        with interruptible_tqdm(
+            total=count,
+            desc=desc,
+            unit="row",
+            leave=False,
+            dynamic_ncols=True,
+            control=progress_control,
+        ) as pbar:
             for future in as_completed(future_to_index):
                 idx = int(future_to_index[future])
                 results[idx] = future.result()
                 pbar.update(1)
+    except BaseException:
+        # Cancel pending futures immediately so shutdown doesn't block on thousands
+        # of queued items (e.g. when StageStopRequested is raised mid-collection).
+        pool.shutdown(wait=False, cancel_futures=True)
+        raise
+    else:
+        pool.shutdown(wait=True)
     return results
 
 
@@ -2386,6 +2409,7 @@ class BootstrapDynamicDataset(Dataset):
         persistent_cache_overflow_strategy: str = "loop",
         persistent_cache_slot_lifespan: int = 0,
         base_masks: Optional[Sequence[np.ndarray]] = None,
+        progress_control: Any = None,
     ):
         n = min(int(len(images)), int(len(targets)))
         if n <= 0:
@@ -2426,6 +2450,7 @@ class BootstrapDynamicDataset(Dataset):
         self.base_mask_stacks: List[Optional[np.ndarray]] = [None] * int(self.base_rows)
         self.base_mask_stack_indices: List[Optional[np.ndarray]] = [None] * int(self.base_rows)
         self.dataset_name = str(dataset_name)
+        self.progress_control = progress_control
         self.persistent_cache_dir = str(persistent_cache_dir).strip()
         self.persistent_cache_max_rows = int(persistent_cache_max_rows)
         self.persistent_cache_rebuild = bool(persistent_cache_rebuild)
@@ -2482,12 +2507,13 @@ class BootstrapDynamicDataset(Dataset):
         # For non-augmented datasets with no disk cache: pre-materialise every row
         # once now so each subsequent __getitem__ is a zero-cost list lookup.
         if not bool(self.augment) and int(self.cached_rows) < int(self.total_rows):
-            for _ei in tqdm(
+            for _ei in interruptible_tqdm(
                 range(int(self.total_rows)),
                 desc=f"[{self.dataset_name}] materializing",
                 unit="row",
                 leave=False,
                 dynamic_ncols=True,
+                control=self.progress_control,
             ):
                 self._eager_row_cache[_ei] = self._materialize_numpy_row(_ei)
             self._eager_row_cache_ready = True
@@ -2659,12 +2685,13 @@ class BootstrapDynamicDataset(Dataset):
         mask_stack_rows: List[np.ndarray] = []
         mask_index_rows: List[np.ndarray] = []
         mask_offsets: List[int] = [0]
-        for idx in tqdm(
+        for idx in interruptible_tqdm(
             range(int(desired_rows)),
             desc=f"[{self.dataset_name}] building cache",
             unit="row",
             leave=False,
             dynamic_ncols=True,
+            control=self.progress_control,
         ):
             img_np, tgt_np, mask_np, mask_stack_np, mask_idx_np = self._materialize_numpy_row(int(idx))
             images_rows.append(_cache_encode_image_u8(img_np))
@@ -3674,6 +3701,7 @@ def collect_semantic_disk_rows(
     data_root: str,
     class_names: Sequence[str],
     source_root: str = "",
+    progress_control: Any = None,
 ) -> Tuple[List[SemanticDiskRow], Dict[str, Any]]:
     root = Path(str(data_root).strip() or "data/berkeley_sbd")
     cache_key = _semantic_disk_rows_cache_key(
@@ -3842,7 +3870,13 @@ def collect_semantic_disk_rows(
                 mask_path=str(mask_path_local),
             )
 
-        for row in _ordered_thread_map(split_specs_rows, _build_berkeley_row, max_workers=int(split_workers), desc=f"[berkeley/{split_name}] loading rows"):
+        for row in _ordered_thread_map(
+            split_specs_rows,
+            _build_berkeley_row,
+            max_workers=int(split_workers),
+            desc=f"[berkeley/{split_name}] loading rows",
+            progress_control=progress_control,
+        ):
             rows.append(row)
             source_counts[str(source_key)] = int(source_counts.get(str(source_key), 0)) + 1
             loaded_split_counts[str(split_name)] = int(loaded_split_counts.get(str(split_name), 0)) + 1
@@ -3911,7 +3945,13 @@ def collect_semantic_disk_rows(
                 layout=_sidecar_layout(fp),
             ), 0
 
-        for row, unmapped_skip in _ordered_thread_map(external_specs, _build_external_row, max_workers=int(external_workers), desc="[external] loading rows"):
+        for row, unmapped_skip in _ordered_thread_map(
+            external_specs,
+            _build_external_row,
+            max_workers=int(external_workers),
+            desc="[external] loading rows",
+            progress_control=progress_control,
+        ):
             external_unmapped_skipped += int(unmapped_skip)
             if row is None:
                 continue
