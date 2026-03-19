@@ -263,6 +263,162 @@ def build_classifier_preview_frames(
     return eff_loss, frames
 
 
+def _wave_batch_cpu(value: Any) -> torch.Tensor:
+    if isinstance(value, torch.Tensor):
+        arr = value.detach().to(device="cpu", dtype=torch.float32)
+    else:
+        arr = torch.as_tensor(value, dtype=torch.float32)
+    if arr.ndim == 1:
+        arr = arr.unsqueeze(0)
+    elif arr.ndim > 2:
+        arr = arr.reshape(int(arr.shape[0]), -1)
+    if arr.ndim != 2:
+        raise ValueError(f"preview wave must resolve to [B, T], got {tuple(arr.shape)}")
+    return arr
+
+
+def build_transformer_preview_frames(
+    payload_batch: Sequence[Dict[str, Any]],
+    *,
+    render_config: Any,
+    image_hw: Tuple[int, int],
+    sample_bits: int,
+    class_names: Sequence[str],
+    cycle_id: int,
+    round_id: int,
+) -> Tuple[Optional[float], List[Dict[str, Any]]]:
+    if not payload_batch or render_config is None:
+        return None, []
+
+    from wav_ml_core import render_mono_wave_to_tensor
+
+    eff_loss = _effective_batch_loss(payload_batch)
+    first = payload_batch[0]
+    step_txt = (
+        f"step={int(first.get('step', 0))}/{int(first.get('steps_per_epoch', 0))}"
+        if ("step" in first or "steps_per_epoch" in first)
+        else "step=0/0"
+    )
+
+    valid_payloads: List[Dict[str, Any]] = []
+    clean_rows: List[torch.Tensor] = []
+    input_rows: List[torch.Tensor] = []
+    output_rows: List[torch.Tensor] = []
+    for payload in payload_batch:
+        if any(payload.get(key, None) is None for key in ("x_clean", "x_in", "x_out")):
+            continue
+        try:
+            clean_rows.append(_wave_batch_cpu(payload.get("x_clean")))
+            input_rows.append(_wave_batch_cpu(payload.get("x_in")))
+            output_rows.append(_wave_batch_cpu(payload.get("x_out")))
+            valid_payloads.append(payload)
+        except Exception:
+            continue
+
+    if not valid_payloads:
+        return eff_loss, []
+
+    with torch.no_grad():
+        clean_images = render_mono_wave_to_tensor(
+            torch.cat(clean_rows, dim=0),
+            cfg=render_config,
+            image_hw=image_hw,
+            sample_bits=int(sample_bits),
+        )
+        input_images = render_mono_wave_to_tensor(
+            torch.cat(input_rows, dim=0),
+            cfg=render_config,
+            image_hw=image_hw,
+            sample_bits=int(sample_bits),
+        )
+        output_images = render_mono_wave_to_tensor(
+            torch.cat(output_rows, dim=0),
+            cfg=render_config,
+            image_hw=image_hw,
+            sample_bits=int(sample_bits),
+        )
+
+    frames: List[Dict[str, Any]] = []
+    batch_size = len(valid_payloads)
+    for sample_idx, payload in enumerate(valid_payloads):
+        try:
+            clean_chw = _normalize_rgb_chw(clean_images[sample_idx])
+            input_chw = _normalize_rgb_chw(input_images[sample_idx])
+            output_chw = _normalize_rgb_chw(output_images[sample_idx])
+        except Exception:
+            continue
+
+        target_line = _format_target_line(payload.get("target_condition", None), class_names=class_names)
+        metric_rows = [
+            f"loss={float(payload.get('loss', float('nan'))):.4f}",
+            f"score_target={float(payload.get('score_target', float('nan'))):.4f}",
+            f"after={float(payload.get('score_after', float('nan'))):.4f}",
+            f"gap={float(payload.get('score_gap', float('nan'))):.4f}",
+        ]
+        input_rows_txt = [
+            f"degrade={float(payload.get('degrade_strength', 0.0)):.3f}",
+            f"denoise={float(payload.get('denoise_l1', float('nan'))):.4f}",
+            f"entropy={float(payload.get('entropy_excess', float('nan'))):.4f}",
+            f"hi={float(payload.get('high_bits_l1', float('nan'))):.4f}",
+            f"lo={float(payload.get('low_bits_l1', float('nan'))):.4f}",
+        ]
+
+        deskew_rows: List[str] = []
+        deskew_preview = payload.get("deskew_preview", None)
+        if isinstance(deskew_preview, dict):
+            try:
+                deskew_rows.append(
+                    "deskew "
+                    f"tgt={float(deskew_preview.get('target_skew', 0.0)):+.4f} "
+                    f"pred={float(deskew_preview.get('pred_skew', 0.0)):+.4f} "
+                    f"app={float(deskew_preview.get('applied_skew', 0.0)):+.4f} "
+                    f"conf={float(deskew_preview.get('confidence', 0.0)):.3f}"
+                )
+                deskew_rows.append(
+                    "deskew "
+                    f"rem={float(deskew_preview.get('remaining_skew', 0.0)):+.4f} "
+                    f"post={float(deskew_preview.get('post_residual_skew', 0.0)):+.4f}"
+                )
+            except Exception:
+                deskew_rows = []
+        if not deskew_rows:
+            deskew_rows.append(
+                "deskew "
+                f"|pred|={float(payload.get('deskew_pred_abs', 0.0)):.4f} "
+                f"|app|={float(payload.get('deskew_applied_abs', 0.0)):.4f} "
+                f"conf={float(payload.get('deskew_confidence_mean', 0.0)):.3f}"
+            )
+
+        frame_loss = float(payload.get("loss", eff_loss if eff_loss is not None else float("nan")))
+        loss_scalars: Dict[str, float] = {}
+        if math.isfinite(frame_loss):
+            loss_scalars["loss"] = frame_loss
+
+        frames.append(
+            {
+                "images": [
+                    _chw_to_u8_hwc(clean_chw),
+                    _chw_to_u8_hwc(input_chw),
+                    _chw_to_u8_hwc(output_chw),
+                ],
+                "caption": (
+                    f"[R] cycle={int(cycle_id)} round={int(round_id)} {step_txt} "
+                    f"[{sample_idx+1}/{batch_size}] loss={frame_loss:.4f}"
+                ),
+                "titles": ["R clean", "R input", "R output"],
+                "step_txt": f"{step_txt} [{sample_idx+1}/{batch_size}]",
+                "rows": [
+                    [target_line, step_txt] + metric_rows[:2],
+                    input_rows_txt,
+                    metric_rows[2:] + deskew_rows,
+                ],
+                "loss_scalars": loss_scalars,
+            }
+        )
+
+    return eff_loss, frames
+
+
 def make_classifier_step_preview_callback(ctx: Any, node_id: str):
     viewer = getattr(ctx, "viewer_proxy", None)
     enqueue_frame = getattr(viewer, "enqueue_frame", None) if viewer is not None else None
@@ -292,6 +448,48 @@ def make_classifier_step_preview_callback(ctx: Any, node_id: str):
             # Publish one loss entry per item so the graph ticks at the same
             # granularity as the scrub ring (one frame = one graph point).
             frame_loss = frame.get("loss_scalars", {}).get("batch_loss", None)
+            if frame_loss is None:
+                frame_loss = eff_loss
+            if callable(publish_progress) and frame_loss is not None and math.isfinite(float(frame_loss)):
+                try:
+                    publish_progress(str(node_id), float(frame_loss))
+                except Exception:
+                    pass
+            try:
+                enqueue_frame(frame)
+            except Exception:
+                break
+
+    return _callback
+
+
+def make_transformer_step_preview_callback(ctx: Any, node_id: str):
+    viewer = getattr(ctx, "viewer_proxy", None)
+    enqueue_frame = getattr(viewer, "enqueue_frame", None) if viewer is not None else None
+    publish_progress = getattr(ctx, "publish_node_progress", None)
+    if not callable(enqueue_frame):
+        return None
+
+    def _callback(payload_batch: Sequence[Dict[str, Any]]) -> None:
+        preview_check = getattr(ctx, "preview_enabled", None)
+        if callable(preview_check) and not preview_check():
+            return
+        render_config = getattr(ctx, "render_config", None)
+        args = getattr(ctx, "args", None)
+        image_size = int(getattr(args, "image_size", 128) or 128)
+        sample_bits = int(getattr(args, "sample_bits", 16) or 16)
+        class_names = list(getattr(ctx, "class_names", []) or [])
+        eff_loss, frames = build_transformer_preview_frames(
+            payload_batch,
+            render_config=render_config,
+            image_hw=(image_size, image_size),
+            sample_bits=sample_bits,
+            class_names=class_names,
+            cycle_id=int(getattr(ctx, "cycle", 0)),
+            round_id=int(getattr(ctx, "round_id", 0)),
+        )
+        for frame in frames:
+            frame_loss = frame.get("loss_scalars", {}).get("loss", None)
             if frame_loss is None:
                 frame_loss = eff_loss
             if callable(publish_progress) and frame_loss is not None and math.isfinite(float(frame_loss)):

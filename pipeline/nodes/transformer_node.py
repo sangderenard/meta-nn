@@ -115,6 +115,7 @@ class TransformerConfig:
 
     # ---- Stage R training schedule --------------------------------------
     steps_per_round: int = 64
+    log_every: int = 0
     degrade_curriculum_enabled: bool = True
     degrade_start_prob: float = 0.0
     degrade_end_prob: float = 0.5
@@ -474,7 +475,10 @@ class TransformerTrainNode(IRTrainingNode):
         return ctx.transformer is not None and ctx.classifier is not None
 
     def execute(self, ctx: PipelineContext) -> None:
+        from pipeline.nodes.base import make_training_progress_callback
+        from pipeline.preview import make_transformer_step_preview_callback
         from wav_ml_models import train_transformer_feature_metric
+        preview_callback = make_transformer_step_preview_callback(ctx, self.node_id)
         weight_update_callback = make_runtime_weight_publish_callback(
             ctx,
             model_name="transformer",
@@ -546,6 +550,7 @@ class TransformerTrainNode(IRTrainingNode):
             amp_dtype=str(ctx.amp_dtype or "float16"),
             channels_last=self.cfg.channels_last,
             grad_accum_steps=self.cfg.grad_accum_steps,
+            log_every_steps=max(0, int(self.cfg.log_every)),
             grad_clip=self.cfg.grad_clip,
             degrade_inputs=self.cfg.degrade_curriculum_enabled and degrade_prob > 0,
             degrade_min_strength=degrade_prob,
@@ -557,6 +562,13 @@ class TransformerTrainNode(IRTrainingNode):
             high_bit_penalty_weight=self.cfg.high_bit_weight,
             low_bit_penalty_weight=self.cfg.low_bit_weight,
             wave_l1_weight=self.cfg.wave_l1_weight,
+            step_preview_callback=preview_callback,
+            progress_callback=make_training_progress_callback(
+                ctx,
+                self.node_id,
+                "stageR_transformer",
+                publish_loss=(preview_callback is None),
+            ),
             weight_update_callback=weight_update_callback,
             stop_requested=_stop_or_skip,
         )

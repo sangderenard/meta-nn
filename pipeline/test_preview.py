@@ -4,13 +4,18 @@ from tempfile import TemporaryDirectory
 import numpy as np
 import torch
 
-from pipeline.preview import build_classifier_preview_frames
+from pipeline.preview import (
+    build_classifier_preview_frames,
+    build_transformer_preview_frames,
+    make_transformer_step_preview_callback,
+)
 from pipeline.weight_image_cache import (
     checkpoint_thumbnail_path,
     checkpoint_thumbnail_root,
     crop_weight_image_rgb,
     save_checkpoint_thumbnail,
 )
+from wav_ml_core import RenderConfig
 from wav_ml_viewer import _TransformerStatusOpenGLViewer
 
 
@@ -53,6 +58,96 @@ def test_build_classifier_preview_frames_formats_masks_and_scores():
     assert frame["images"][0].shape == (2, 2, 4)
     assert frame["images"][1].shape == (2, 2, 3)
     assert frame["images"][2].shape == (2, 2, 4)
+
+
+def test_build_transformer_preview_frames_renders_wave_triplet():
+    cfg = RenderConfig(width=32, downsample=1, max_points=32)
+    payload_batch = [
+        {
+            "step": 2,
+            "steps_per_epoch": 8,
+            "x_clean": torch.linspace(-1.0, 1.0, steps=32, dtype=torch.float32).unsqueeze(0),
+            "x_in": torch.zeros((1, 32), dtype=torch.float32),
+            "x_out": torch.linspace(1.0, -1.0, steps=32, dtype=torch.float32).unsqueeze(0),
+            "loss": 0.4,
+            "score_target": 0.25,
+            "score_after": 0.6,
+            "score_gap": 0.1,
+            "denoise_l1": 0.2,
+            "high_bits_l1": 0.05,
+            "low_bits_l1": 0.03,
+            "entropy_excess": 0.02,
+            "degrade_strength": 0.3,
+        }
+    ]
+
+    eff_loss, frames = build_transformer_preview_frames(
+        payload_batch,
+        render_config=cfg,
+        image_hw=(16, 16),
+        sample_bits=16,
+        class_names=["zero", "one"],
+        cycle_id=1,
+        round_id=2,
+    )
+
+    assert eff_loss == 0.4
+    assert len(frames) == 1
+    frame = frames[0]
+    assert frame["caption"].startswith("[R] cycle=1 round=2 step=2/8")
+    assert frame["titles"] == ["R clean", "R input", "R output"]
+    assert frame["rows"][0][0] == "target:none"
+    assert "degrade=0.300" in frame["rows"][1]
+    assert "after=0.6000" in frame["rows"][2]
+    assert frame["images"][0].shape == (16, 16, 3)
+    assert frame["images"][1].shape == (16, 16, 3)
+    assert frame["images"][2].shape == (16, 16, 3)
+
+
+def test_transformer_preview_callback_enqueues_frames_and_publishes_loss():
+    class _FakeViewer:
+        def __init__(self):
+            self.frames = []
+
+        def enqueue_frame(self, frame):
+            self.frames.append(frame)
+
+    published = []
+    ctx = SimpleNamespace(
+        viewer_proxy=_FakeViewer(),
+        render_config=RenderConfig(width=32, downsample=1, max_points=32),
+        class_names=["zero", "one"],
+        cycle=4,
+        round_id=5,
+        args=SimpleNamespace(image_size=16, sample_bits=16),
+        preview_enabled=lambda: True,
+        publish_node_progress=lambda node_id, loss: published.append((node_id, loss)),
+    )
+    callback = make_transformer_step_preview_callback(ctx, "stage_r_transformer")
+
+    callback(
+        [
+            {
+                "step": 1,
+                "steps_per_epoch": 4,
+                "x_clean": torch.linspace(-1.0, 1.0, steps=32, dtype=torch.float32).unsqueeze(0),
+                "x_in": torch.zeros((1, 32), dtype=torch.float32),
+                "x_out": torch.linspace(1.0, -1.0, steps=32, dtype=torch.float32).unsqueeze(0),
+                "loss": 0.25,
+                "score_target": 0.2,
+                "score_after": 0.5,
+                "score_gap": 0.1,
+                "denoise_l1": 0.15,
+                "high_bits_l1": 0.04,
+                "low_bits_l1": 0.02,
+                "entropy_excess": 0.01,
+                "degrade_strength": 0.4,
+            }
+        ]
+    )
+
+    assert len(ctx.viewer_proxy.frames) == 1
+    assert published == [("stage_r_transformer", 0.25)]
 
 
 class _FakeCompositeCache:

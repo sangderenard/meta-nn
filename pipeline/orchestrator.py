@@ -2515,6 +2515,7 @@ def _build_configs_from_args(args) -> dict:
         low_bit_weight=float(_g("transformer_loss_low_bit_weight", default=0.10)),
         wave_l1_weight=float(_g("transformer_loss_wave_l1_weight", default=0.05)),
         steps_per_round=int(_g("transformer_steps_per_round", "transformer_steps", default=64)),
+        log_every=int(_g("transformer_log_every", default=0)),
         degrade_curriculum_enabled=bool(_g("transformer_degrade_inputs", default=True)),
         config_search_trials=int(_g("config_trials", "config_search_trials", default=32)),
         config_search_epochs_per_trial=int(_g("config_epochs", default=1)),

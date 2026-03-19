@@ -976,29 +976,72 @@ class FakeClassFeedbackNode(IRTrainingNode):
 
     def execute(self, ctx: PipelineContext) -> None:
         ensure_vocab_lora_active(ctx, self.cfg)
+        from pipeline.nodes.base import make_training_progress_callback
+        preview_callback = make_classifier_step_preview_callback(ctx, self.node_id)
         weight_update_callback = make_runtime_weight_publish_callback(
             ctx,
             model_name="classifier",
             model=ctx.classifier,
             node_id=self.node_id,
         )
-
-        _run_fake_class_refresh_epochs(
+        fake_label_vector = _resolve_fake_feedback_label_vector(ctx)
+        if fake_label_vector is None:
+            _log("[fake-class] skipped: fake-sentinel label vector unavailable")
+            return
+        result = _run_fake_class_refresh_epochs(
             classifier=ctx.classifier,
-            optimizer=ctx.classifier_optimizer,
             generator=ctx.generator,
             discriminator=ctx.discriminator,
+            payload_conditions=list(getattr(ctx, "payload_conditions", []) or []),
+            condition_num_classes=_infer_condition_vector_width(
+                payload_conditions=list(getattr(ctx, "payload_conditions", []) or []),
+                class_names=list(getattr(ctx, "class_names", []) or []),
+            ),
+            fake_label_vector=fake_label_vector,
+            z_dim=max(8, int(getattr(ctx.generator, "z_dim", getattr(ctx.args, "generator_z_dim", 128)) or 128)),
             device=ctx.device,
-            steps=self.cfg.fake_class_steps,
-            batch_size=self.cfg.fake_class_batch_size,
-            disc_weight=self.cfg.fake_class_disc_weight,
+            epochs=max(1, int(getattr(ctx.args, "generator_fake_feedback_epochs", 1) or 1)),
+            steps_per_epoch=max(1, int(self.cfg.fake_class_steps)),
+            batch_size=max(1, int(self.cfg.fake_class_batch_size)),
+            lr=float(getattr(ctx.args, "generator_fake_feedback_lr", 6e-4) or 6e-4),
+            weight_decay=float(getattr(ctx.args, "generator_fake_feedback_weight_decay", 1e-4) or 1e-4),
+            lr_sine_cycles=float(getattr(ctx.args, "lr_sine_cycles", 1.0) or 1.0),
+            lr_sine_frequency=float(getattr(ctx.args, "lr_sine_frequency", 0.0) or 0.0),
+            lr_sine_tail_fraction=float(getattr(ctx.args, "lr_sine_tail_fraction", 0.15) or 0.15),
+            lr_sine_min_scale=float(getattr(ctx.args, "lr_sine_min_scale", 0.0) or 0.0),
             amp_enabled=ctx.amp_enabled,
             amp_dtype=ctx.amp_dtype,
-            grad_scaler=ctx.classifier_grad_scaler,
-            class_names=ctx.class_names,
+            channels_last=self.cfg.channels_last,
+            grad_accum_steps=max(1, int(self.cfg.grad_accum_steps)),
+            log_every=max(0, int(getattr(ctx.args, "generator_fake_feedback_log_every", 0) or 0)),
+            include_condition_targets=bool(getattr(ctx.args, "generator_fake_feedback_include_condition_targets", True)),
+            fake_vector_weight=float(getattr(ctx.args, "generator_fake_feedback_vector_weight", 1.0) or 1.0),
+            condition_target_weight=float(
+                getattr(
+                    ctx.args,
+                    "generator_fake_feedback_condition_weight",
+                    self.cfg.fake_class_disc_weight,
+                )
+                or self.cfg.fake_class_disc_weight
+            ),
+            disc_conf_temperature=float(getattr(ctx.args, "generator_fake_feedback_disc_conf_temperature", 1.0) or 1.0),
+            disc_conf_floor=float(getattr(ctx.args, "generator_fake_feedback_disc_conf_floor", 0.25) or 0.25),
+            balance_disc_groups=bool(getattr(ctx.args, "generator_fake_feedback_disc_balance_groups", True)),
+            step_preview_callback=preview_callback,
+            progress_callback=make_training_progress_callback(
+                ctx,
+                self.node_id,
+                "stage_fake_feedback",
+                publish_loss=(preview_callback is None),
+            ),
+            stop_requested=ctx.stop_requested,
             weight_update_callback=weight_update_callback,
-            args=ctx.args,
+            seed=int(getattr(ctx.args, "seed", 0) or 0) + 19000 + (int(getattr(ctx, "round_id", 0)) * 17),
+            grad_clip=float(self.cfg.grad_clip),
         )
+
+        loss = float(result.get("loss", 0.0))
+        ctx.log_metric("stagefake", "loss", loss)
         _log("[fake-class] feedback epoch complete")
 
 
@@ -1875,6 +1918,7 @@ def _run_fake_class_refresh_epochs(
     disc_conf_floor: float = 0.25,
     balance_disc_groups: bool = True,
     step_preview_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+    progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
     stop_requested: Optional[Callable[[], bool]] = None,
     weight_update_callback: Optional[Callable[[int], None]] = None,
     seed: int = 0,
@@ -2124,6 +2168,20 @@ def _run_fake_class_refresh_epochs(
                     f"samp_per_sec={ips:.1f}",
                     flush=True,
                 )
+                if progress_callback is not None:
+                    try:
+                        progress_callback(
+                            {
+                                "global_step": int(global_step),
+                                "total_steps": int(total_target_steps),
+                                "loss": float(total_loss / max(1, n)),
+                                "samples_per_sec": float(ips),
+                            }
+                        )
+                    except (StageSkipForward, StageSkipBack):
+                        raise
+                    except Exception:
+                        pass
             if step_preview_callback is not None and int(xb.shape[0]) > 0:
                 _avg_loss = float(total_loss / max(1, n))
                 _batch_loss = float(loss.detach().to(torch.float32).item())
@@ -2204,3 +2262,53 @@ def _run_fake_class_refresh_epochs(
         "disc_logit_pass": float(disc_logit_pass),
         "disc_logit_fail": float(disc_logit_fail),
     }
+
+
+def _infer_condition_vector_width(payload_conditions: Sequence[Any], class_names: Sequence[str]) -> int:
+    for row in payload_conditions:
+        try:
+            arr = np.asarray(row, dtype=np.float32).reshape(-1)
+        except Exception:
+            continue
+        if int(arr.size) > 0:
+            return int(arr.size)
+    return max(1, int(len(class_names)))
+
+
+def _resolve_fake_feedback_label_vector(ctx: PipelineContext) -> Optional[torch.Tensor]:
+    cached_text = str(getattr(ctx, "fake_feedback_label_text", "") or "")
+    cached_vec = getattr(ctx, "fake_feedback_label_vector", None)
+    sentinel_text = str(getattr(ctx.args, "fake_image_sentinel_label", "GAN image") or "GAN image").strip() or "GAN image"
+    if isinstance(cached_vec, torch.Tensor) and cached_text == sentinel_text and int(cached_vec.numel()) > 0:
+        return cached_vec.detach().to(dtype=torch.float32, device="cpu")
+
+    backend = str(getattr(ctx.args, "label_embedding_backend", "") or "").strip().lower()
+    if backend != "sentence_transformers":
+        _log(f"[fake-class] unsupported label embedding backend for fake sentinel: {backend!r}")
+        return None
+
+    model_name = str(getattr(ctx.args, "label_embedding_model", "") or "").strip()
+    if not model_name:
+        _log("[fake-class] missing label embedding model for fake sentinel encoding")
+        return None
+
+    try:
+        from pipeline.nodes.label_embedding_node import _encode_texts_sentence_transformers
+
+        vec_np = _encode_texts_sentence_transformers(
+            [sentinel_text],
+            model_name=model_name,
+            device=ctx.device,
+        )
+    except Exception as exc:
+        _log(f"[fake-class] could not encode fake sentinel label {sentinel_text!r}: {exc}")
+        return None
+
+    if not isinstance(vec_np, np.ndarray) or int(vec_np.ndim) != 2 or int(vec_np.shape[0]) <= 0 or int(vec_np.shape[1]) <= 0:
+        _log(f"[fake-class] invalid fake sentinel embedding shape: {getattr(vec_np, 'shape', None)}")
+        return None
+
+    vec_t = torch.from_numpy(np.asarray(vec_np[0], dtype=np.float32)).detach().to(device="cpu")
+    setattr(ctx, "fake_feedback_label_text", sentinel_text)
+    setattr(ctx, "fake_feedback_label_vector", vec_t)
+    return vec_t

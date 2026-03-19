@@ -3543,6 +3543,7 @@ def train_transformer_feature_metric(
     seed: int = 0,
     log_every_steps: int = 0,
     step_preview_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+    progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
     stop_requested: Optional[Callable[[], bool]] = None,
     weight_update_callback: Optional[Callable[[int], None]] = None,
     aux_filter_input_builder: Optional[Callable[[Dict[str, Any]], Dict[str, Dict[str, Any]]]] = None,
@@ -4313,6 +4314,24 @@ def train_transformer_feature_metric(
                     f"backward_ms={(1000.0 * t_backward) / steps_done:.2f}",
                     flush=True,
                 )
+                if progress_callback is not None:
+                    try:
+                        progress_callback(
+                            {
+                                "global_step": int(epoch_step_offset + steps_done),
+                                "total_steps": int(total_train_steps),
+                                "loss": float(avg_loss),
+                                "samples_per_sec": float((steps_done * int(batch_size)) / elapsed),
+                            }
+                        )
+                    except Exception as exc:
+                        try:
+                            from pipeline.nodes.base import StageSkipBack, StageSkipForward
+                        except Exception:
+                            StageSkipBack = ()
+                            StageSkipForward = ()
+                        if isinstance(exc, (StageSkipForward, StageSkipBack)):
+                            raise
 
         if stop_now:
             break
