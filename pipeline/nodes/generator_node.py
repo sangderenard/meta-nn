@@ -164,14 +164,14 @@ class GeneratorConfig:
     adv_weight: float = 1.0         # adversarial (non-saturating)
     feature_score_weight: float = 0.5  # classifier feature score guidance
     wave_recon_weight: float = 0.1  # bit-plane reconstruction fidelity
-    mask_weight: float = 0.0        # mask BCE supervision
-    outside_mask_weight: float = 0.0  # L1 reconstruction outside mask
+    mask_weight: float = 1.0        # mask BCE supervision
+    outside_mask_weight: float = 0.5  # L1 reconstruction outside mask
     disc_mask_weight: float = 0.0   # discriminator mask head adversarial
 
     # Anti-collapse losses
     # diversity_weight > 0 adds a penalty when batch-level per-pixel std
     # falls below diversity_target_std — directly fights mode collapse.
-    diversity_weight: float = 0.0
+    diversity_weight: float = 1.0
     diversity_target_std: float = 0.15
 
     # R1 gradient penalty weight on discriminator (0 = disabled)
@@ -179,7 +179,7 @@ class GeneratorConfig:
 
     # Discriminator instance noise: add Gaussian noise (std) to D inputs
     # so D cannot dominate G early; set to e.g. 0.05–0.10 to help escape.
-    d_instance_noise_std: float = 0.0
+    d_instance_noise_std: float = 0.1
 
     # ---- vocab-snapshot library -----------------------------------------
     vocab_snapshot_enabled: bool = True
@@ -565,8 +565,8 @@ class GeneratorTrainNode(IRTrainingNode):
             )
 
             if _payload_bank_obj is not None:
-                from torch.utils.data import ConcatDataset, DataLoader, RandomSampler, Subset
-                from pipeline.nodes.data_nodes import rebuild_conditions_from_terms
+                from torch.utils.data import ConcatDataset, RandomSampler, Subset
+                from pipeline.nodes.data_nodes import rebuild_conditions_from_terms, build_stage_loaders
                 _slot_conditions = rebuild_conditions_from_terms(
                     payload_terms=ctx.payload_terms or [],
                     class_names=current_class_names,
@@ -627,14 +627,17 @@ class GeneratorTrainNode(IRTrainingNode):
                             f"[stageG] merged {len(_fc_ds)} flashcard rows into slot "
                             f"{slot_name} dataset (total {len(_ds)} rows)"
                         )
-                _slot_loader = DataLoader(
-                    _ds,
+                _slot_loader, _ = build_stage_loaders(
+                    dataset=_ds,
+                    name=f"generator_slot_{slot_name}",
                     batch_size=self.cfg.batch_size,
-                    sampler=RandomSampler(_ds, replacement=True),
                     num_workers=1,
+                    device_type=str(ctx.device.type),
                     pin_memory=True,
                     prefetch_factor=2,
                     persistent_workers=True,
+                    shuffle_train=True,
+                    train_sampler=RandomSampler(_ds, replacement=True),
                 )
             else:
                 _slot_loader = None
@@ -667,6 +670,7 @@ class GeneratorTrainNode(IRTrainingNode):
                 w_diversity=self.cfg.diversity_weight,
                 diversity_target_std=self.cfg.diversity_target_std,
                 d_instance_noise_std=self.cfg.d_instance_noise_std,
+                r1_weight=self.cfg.r1_weight,
                 amp=ctx.amp_enabled,
                 amp_dtype=str(ctx.amp_dtype or "float16"),
                 channels_last=False,

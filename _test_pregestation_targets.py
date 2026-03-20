@@ -5,7 +5,7 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset, TensorDataset
 
-from pipeline.nodes.data_nodes import _build_stage_loader_pair
+from pipeline.nodes.data_nodes import build_stage_loaders
 from pipeline.semantic_wheel_cache import StatefulSequentialDeckSampler
 from pipeline.nodes.vocab_node import (
     _build_pregestation_logic_rows,
@@ -223,7 +223,7 @@ def test_chunked_stage_loader_uses_sequential_subset_access() -> None:
             return torch.tensor(int(self.values[int(index)]), dtype=torch.int64)
 
     ds = _ChunkedIndexDataset(range(8))
-    loader, eval_loader = _build_stage_loader_pair(
+    loader, eval_loader = build_stage_loaders(
         dataset=ds,
         name="chunked_smoke",
         batch_size=4,

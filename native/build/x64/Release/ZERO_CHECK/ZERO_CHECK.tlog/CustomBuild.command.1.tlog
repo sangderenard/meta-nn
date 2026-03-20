@@ -1,6 +1,6 @@
 ^C:\DEV\POWERSHELL\META-NN\NATIVE\BUILD\CMAKEFILES\C7DCBA3E3004FE59C58928472C6E338A\GENERATE.STAMP.RULE
 setlocal
-"C:\Program Files\CMake\bin\cmake.exe" -SC:/dev/Powershell/meta-nn/native -BC:/dev/Powershell/meta-nn/native/build --check-stamp-list CMakeFiles/generate.stamp.list --vs-solution-file C:/dev/Powershell/meta-nn/native/build/nodus_loss_store.sln
+"C:\Program Files\CMake\bin\cmake.exe" -SC:/dev/Powershell/meta-nn/native -BC:/dev/Powershell/meta-nn/native/build --check-stamp-list CMakeFiles/generate.stamp.list --vs-solution-file C:/dev/Powershell/meta-nn/native/build/nodus_native.sln
 if %errorlevel% neq 0 goto :cmEnd
 :cmEnd
 endlocal & call :cmErrorLevel %errorlevel% & goto :cmDone

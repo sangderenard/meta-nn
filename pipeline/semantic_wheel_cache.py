@@ -574,7 +574,7 @@ def _build_clean_entries_batch(
             {
                 "image_u8": np.asarray(image_u8_batch[int(row_idx)], dtype=np.uint8),
                 "label_vec_u8": _positive_label_bits(label_vec),
-                "mixed_mask": np.clip(np.asarray(mixed_mask, dtype=np.float32), 0.0, 1.0),
+                "mixed_mask": np.asarray(mixed_mask, dtype=np.float32),
                 "mask_stack": np.asarray(mask_stack, dtype=np.float32),
                 "mask_indices": np.asarray(mask_indices, dtype=np.int32).reshape(-1),
                 "terms": list(normalize_vocab_terms(enriched_terms_per_row[int(row_idx)])),

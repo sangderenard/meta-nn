@@ -527,77 +527,13 @@ def _normalize_mask_array(mask: Any, height: int, width: int) -> np.ndarray:
     return np.clip(arr, 0.0, 1.0).astype(np.float32, copy=False)
 
 
-def _normalize_attention_map(mask: Any, gamma: float = 1.0, blur_kernel: int = 0, apply_vmean_compression: bool = False, apply_binarize: bool = False) -> np.ndarray:
-    arr = np.asarray(mask, dtype=np.float32)
-    if int(arr.ndim) != 2 or int(arr.size) <= 0:
-        return np.zeros_like(np.asarray(arr, dtype=np.float32), dtype=np.float32)
-    arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32, copy=False)
-    arr = np.maximum(arr, 0.0).astype(np.float32, copy=False)
-    vmax = float(np.max(arr)) if int(arr.size) > 0 else 0.0
-    if vmax > 1e-8:
-        arr = (arr / float(vmax)).astype(np.float32, copy=False)
-    else:
-        return np.zeros_like(arr, dtype=np.float32)
-    if bool(apply_vmean_compression):
-        vmean = float(np.mean(arr)) if int(arr.size) > 0 else 0.0
-        if vmean > 1e-8:
-            arr = np.clip(arr / float(max(vmean * 2.0, 1.0)), 0.0, 1.0).astype(np.float32, copy=False)
-    if bool(apply_binarize):
-        return (arr > 0.5).astype(np.float32, copy=False)
-    gm = max(0.35, float(gamma))
-    if abs(gm - 1.0) > 1e-6:
-        arr = np.power(np.clip(arr, 0.0, 1.0), gm).astype(np.float32, copy=False)
-    kk = int(blur_kernel)
-    if kk >= 3:
-        kk = int(kk) | 1
-        arr = np.asarray(
-            F.avg_pool2d(torch.from_numpy(arr[None, None, ...]), kernel_size=int(kk), stride=1, padding=int(kk // 2))[0, 0].cpu().numpy(),
-            dtype=np.float32,
-        )
-        vmax = float(np.max(arr)) if int(arr.size) > 0 else 0.0
-        if vmax > 1e-8:
-            arr = (arr / float(vmax)).astype(np.float32, copy=False)
-    return np.clip(arr, 0.0, 1.0).astype(np.float32, copy=False)
-
-
-def _blend_attention_maps(maps: Sequence[Any], weights: Optional[Sequence[float]] = None, gamma: float = 1.0, apply_vmean_compression: bool = False, apply_binarize: bool = False) -> np.ndarray:
-    valid: List[np.ndarray] = []
-    valid_weights: List[float] = []
-    for i, m in enumerate(maps):
-        arr = np.asarray(m, dtype=np.float32)
-        if int(arr.ndim) != 2 or int(arr.size) <= 0:
-            continue
-        w = 1.0 if weights is None or i >= int(len(weights)) else float(weights[i])
-        if w <= 0.0:
-            continue
-        norm = _normalize_attention_map(arr, gamma=1.0, blur_kernel=0, apply_vmean_compression=bool(apply_vmean_compression))
-        if float(np.max(norm)) <= 1e-8:
-            continue
-        valid.append(norm)
-        valid_weights.append(float(w))
-    if len(valid) <= 0:
-        if len(maps) > 0:
-            ref = np.asarray(maps[0], dtype=np.float32)
-            return np.zeros_like(ref, dtype=np.float32)
-        return np.zeros((0, 0), dtype=np.float32)
-    acc = np.zeros_like(valid[0], dtype=np.float32)
-    wsum = 0.0
-    for arr, w in zip(valid, valid_weights):
-        acc += float(w) * arr
-        wsum += float(w)
-    if wsum > 1e-8:
-        acc = acc / float(wsum)
-    return _normalize_attention_map(acc, gamma=float(gamma), blur_kernel=5, apply_vmean_compression=bool(apply_vmean_compression), apply_binarize=bool(apply_binarize))
-
 
 def _composite_mask_stack(stack: Any, processing_device: Optional[Any] = None) -> np.ndarray:
-    """Additive-sum all per-label masks, then normalize to [0, 1] by vmax only.
+    """Label-density composite: sum of per-label masks, normalized by vmax.
 
-    Individual masks must already be in [0, 1] (via _normalize_stack_row /
-    _normalize_stack_row_batch).  The sum is divided by its maximum so that
-    pixels covered by the most labels reach 1.0; no vmean/gamma distortion is
-    applied here.  Attention-style normalization belongs on the final
-    mixed_mask stored in the cache entry, not on the raw stack composite.
+    This is the ONE canonical mask compositing method.  Individual masks are
+    assumed to be in [0, 1].  The sum is divided by its maximum so that the
+    densest pixel reaches 1.0.  No clipping, no gating, no gamma.
     """
     arr = np.asarray(stack, dtype=np.float32)
     if int(arr.ndim) != 3 or int(arr.shape[0]) <= 0:
@@ -605,7 +541,7 @@ def _composite_mask_stack(stack: Any, processing_device: Optional[Any] = None) -
     composite = np.sum(arr, axis=0).astype(np.float32, copy=False)
     vmax = float(np.max(composite))
     if vmax > 1e-8:
-        composite = np.clip(composite / vmax, 0.0, 1.0).astype(np.float32, copy=False)
+        composite = (composite / vmax).astype(np.float32, copy=False)
     else:
         composite = np.zeros_like(composite, dtype=np.float32)
     return composite
@@ -621,23 +557,8 @@ def _normalize_stack_row(
     height: int,
     width: int,
     processing_device: Optional[Any] = None,
-    apply_attention_normalization: bool = False,
 ) -> np.ndarray:
-    clamped = _normalize_mask_array(mask, height=int(height), width=int(width))
-    if not bool(apply_attention_normalization):
-        return clamped
-    resolved = _resolve_processing_device(processing_device)
-    if resolved is None:
-        return _normalize_attention_map(
-            clamped,
-            gamma=1.0,
-            blur_kernel=0,
-            apply_vmean_compression=True,
-        )
-    return np.asarray(
-        _normalize_attention_map_batch_torch(clamped, gamma=1.0, blur_kernel=0, device=resolved, apply_vmean_compression=True).detach().cpu().numpy(),
-        dtype=np.float32,
-    )
+    return _normalize_mask_array(mask, height=int(height), width=int(width))
 
 
 def _normalize_mask_array_batch(stack: np.ndarray, height: int, width: int) -> np.ndarray:
@@ -684,13 +605,7 @@ def _normalize_stack_row_batch(
     clamped = _normalize_mask_array_batch(stack, height=int(height), width=int(width))
     if not bool(apply_attention_normalization):
         return clamped
-    resolved = _resolve_processing_device(processing_device)
-    if resolved is None:
-        return _normalize_attention_map_batch(clamped, gamma=1.0, blur_kernel=0, apply_vmean_compression=True)
-    return np.asarray(
-        _normalize_attention_map_batch_torch(clamped, gamma=1.0, blur_kernel=0, device=resolved, apply_vmean_compression=True).detach().cpu().numpy(),
-        dtype=np.float32,
-    )
+    return clamped
 
 
 def build_creation_label_mask_stack(
@@ -853,51 +768,6 @@ def combine_label_mask_stacks(
     return np.stack(rows, axis=0).astype(np.float32, copy=False), np.asarray(indices, dtype=np.int64)
 
 
-def flatten_density_to_transmissivity(stack: Any) -> np.ndarray:
-    """Max-projection of a label stack: each pixel shows peak single-label coverage.
-
-    Represents transmissivity — which pixels are blocked/covered by any label at
-    all, ignoring how many labels overlap (density is lost).  Suitable for
-    visualization, attention gating, or future training modes where occlusion
-    without density is the semantic.  Do NOT use for density-based training.
-    """
-    arr = np.asarray(stack, dtype=np.float32)
-    if int(arr.ndim) != 3 or int(arr.shape[0]) <= 0:
-        return np.zeros((0, 0) if int(arr.ndim) < 2 else (int(arr.shape[-2]), int(arr.shape[-1])), dtype=np.float32)
-    flat = np.max(arr, axis=0).astype(np.float32, copy=False)
-    return _normalize_attention_map(flat, gamma=1.0, blur_kernel=0)
-
-
-def depth_map_from_mask_stack(stack: Any, label_indices: Optional[Sequence[int]] = None) -> np.ndarray:
-    """Depth-weighted composite of a label stack.
-
-    Labels at a lower stack position (earlier in the label list = higher semantic
-    priority / foreground) contribute more strongly than later labels.  Weight
-    for position i in a stack of N is (N - i) / N, so position 0 → weight 1.0
-    and the last position → weight 1/N.  Optionally pass ``label_indices`` (a
-    sequence of raw label indices) to remap the depth ordering to the original
-    label-list position rather than the stack-row position.
-
-    Suitable for layered spatial attention or future training modes where label
-    hierarchy encodes scene depth.  Do NOT use for density-based training.
-    """
-    arr = np.asarray(stack, dtype=np.float32)
-    if int(arr.ndim) != 3 or int(arr.shape[0]) <= 0:
-        return np.zeros((0, 0) if int(arr.ndim) < 2 else (int(arr.shape[-2]), int(arr.shape[-1])), dtype=np.float32)
-    n = int(arr.shape[0])
-    if label_indices is not None and int(len(label_indices)) == n:
-        order = [int(x) for x in label_indices]
-        rank = {idx: pos for pos, idx in enumerate(sorted(set(order)))}
-        max_rank = max(rank.values()) if rank else 0
-        weights = np.array(
-            [float(max_rank - rank.get(order[i], max_rank)) / float(max(1, max_rank)) for i in range(n)],
-            dtype=np.float32,
-        )
-    else:
-        weights = np.linspace(1.0, 1.0 / float(max(1, n)), n, dtype=np.float32)
-    weighted = np.sum(arr * weights[:, None, None], axis=0).astype(np.float32, copy=False)
-    return _normalize_attention_map(weighted, gamma=1.0, blur_kernel=0)
-
 
 def elem_stacks_to_label_stacks(
     elem_stack: np.ndarray,
@@ -956,13 +826,7 @@ def _resolve_creation_mask(
 ) -> np.ndarray:
     mixed_arr = np.asarray(mixed_mask, dtype=np.float32)
     if int(mixed_arr.ndim) >= 2 and float(np.max(mixed_arr)) > 1e-8:
-        return _normalize_stack_row(
-            mixed_arr,
-            height=int(height),
-            width=int(width),
-            processing_device=processing_device,
-            apply_attention_normalization=True,
-        )
+        return _normalize_mask_array(mixed_arr, height=int(height), width=int(width))
     if mask_stack_array is None:
         return np.zeros((int(max(0, height)), int(max(0, width))), dtype=np.float32)
     stack_arr = np.asarray(mask_stack_array, dtype=np.float32)
@@ -973,12 +837,10 @@ def _resolve_creation_mask(
     if int(height) <= 0 or int(width) <= 0:
         height = int(stack_arr.shape[-2])
         width = int(stack_arr.shape[-1])
-    return _normalize_stack_row(
+    return _normalize_mask_array(
         _composite_mask_stack(stack_arr, processing_device=processing_device),
         height=int(height),
         width=int(width),
-        processing_device=processing_device,
-        apply_attention_normalization=True,
     )
 
 
@@ -1017,44 +879,6 @@ def _build_special_label_mask_stack(
         return np.zeros((0, int(height), int(width)), dtype=np.float32), np.zeros((0,), dtype=np.int64)
     return np.stack(rows, axis=0).astype(np.float32, copy=False), np.asarray(indices, dtype=np.int64)
 
-
-def _composite_non_dataset_label_stack(
-    mask_stack: Any,
-    mask_indices: Any,
-    *,
-    idx_to_term: Optional[Dict[int, str]] = None,
-    height: int = 0,
-    width: int = 0,
-    fallback_mask: Optional[Any] = None,
-    processing_device: Optional[Any] = None,
-) -> np.ndarray:
-    stack_arr = np.asarray(mask_stack, dtype=np.float32)
-    idx_arr = np.asarray(mask_indices, dtype=np.int64).reshape(-1)
-    if int(stack_arr.ndim) == 2:
-        stack_arr = stack_arr[None, ...]
-    if int(stack_arr.ndim) == 3 and int(stack_arr.shape[0]) > 0:
-        if int(height) <= 0 or int(width) <= 0:
-            height = int(stack_arr.shape[-2])
-            width = int(stack_arr.shape[-1])
-        pair_count = min(int(stack_arr.shape[0]), int(idx_arr.size))
-        keep: List[int] = []
-        for si in range(int(pair_count)):
-            term_name = str(idx_to_term.get(int(idx_arr[int(si)]), "")) if isinstance(idx_to_term, dict) else ""
-            if not _is_dataset_label_term(term_name):
-                keep.append(int(si))
-        if keep:
-            return np.asarray(
-                _composite_mask_stack(stack_arr[np.asarray(keep, dtype=np.int64)], processing_device=processing_device),
-                dtype=np.float32,
-            )
-    if fallback_mask is not None and int(height) > 0 and int(width) > 0:
-        return _normalize_stack_row(
-            fallback_mask,
-            height=int(height),
-            width=int(width),
-            processing_device=processing_device,
-        )
-    return np.zeros((int(max(0, height)), int(max(0, width))), dtype=np.float32)
 
 
 def build_label_mask_stack(
@@ -1231,18 +1055,13 @@ def assemble_semantic_mask_layers(
         np.zeros((0, int(h), int(w)), dtype=np.float32),
         np.zeros((0,), dtype=np.int64),
     )
-    detect_mask = _composite_non_dataset_label_stack(
-        pre_detect_stack,
-        pre_detect_idx,
-        idx_to_term=idx_to_term,
-        height=int(h),
-        width=int(w),
-        fallback_mask=original_mixed_mask,
-    ) if int(pre_detect_stack.shape[0]) > 0 else (
-        _normalize_stack_row(original_mixed_mask, height=int(h), width=int(w))
-        if original_mixed_mask is not None
-        else None
-    )
+    if int(pre_detect_stack.shape[0]) > 0:
+        _nds_keep = [i for i in range(min(int(pre_detect_stack.shape[0]), int(pre_detect_idx.size))) if not _is_dataset_label_term(str((idx_to_term or {}).get(int(pre_detect_idx[i]), "")))]
+        detect_mask = _composite_mask_stack(pre_detect_stack[np.asarray(_nds_keep, dtype=np.int64)]) if _nds_keep else (
+            _normalize_stack_row(original_mixed_mask, height=int(h), width=int(w)) if original_mixed_mask is not None else None
+        )
+    else:
+        detect_mask = _normalize_stack_row(original_mixed_mask, height=int(h), width=int(w)) if original_mixed_mask is not None else None
     y = augment_label_vec_with_detected_color_terms(
         image=chw,
         label_vec=y,
@@ -1270,18 +1089,13 @@ def assemble_semantic_mask_layers(
         np.zeros((0, int(h), int(w)), dtype=np.float32),
         np.zeros((0,), dtype=np.int64),
     )
-    mixed_mask = _composite_non_dataset_label_stack(
-        final_stack,
-        final_idx,
-        idx_to_term=idx_to_term,
-        height=int(h),
-        width=int(w),
-        fallback_mask=original_mixed_mask,
-    ) if int(final_stack.shape[0]) > 0 else (
-        _normalize_stack_row(original_mixed_mask, height=int(h), width=int(w))
-        if original_mixed_mask is not None
-        else np.zeros((int(h), int(w)), dtype=np.float32)
-    )
+    if int(final_stack.shape[0]) > 0:
+        _nds_keep = [i for i in range(min(int(final_stack.shape[0]), int(final_idx.size))) if not _is_dataset_label_term(str((idx_to_term or {}).get(int(final_idx[i]), "")))]
+        mixed_mask = _composite_mask_stack(final_stack[np.asarray(_nds_keep, dtype=np.int64)]) if _nds_keep else (
+            _normalize_stack_row(original_mixed_mask, height=int(h), width=int(w)) if original_mixed_mask is not None else np.zeros((int(h), int(w)), dtype=np.float32)
+        )
+    else:
+        mixed_mask = _normalize_stack_row(original_mixed_mask, height=int(h), width=int(w)) if original_mixed_mask is not None else np.zeros((int(h), int(w)), dtype=np.float32)
     return y, np.asarray(mixed_mask, dtype=np.float32), np.asarray(final_stack, dtype=np.float32), np.asarray(final_idx, dtype=np.int64)
 
 
@@ -1397,94 +1211,6 @@ def _resolve_processing_device(processing_device: Optional[Any]) -> Optional[tor
         return None
 
 
-def _normalize_attention_map_batch_torch(
-    mask: Any,
-    *,
-    gamma: float = 1.0,
-    blur_kernel: int = 0,
-    device: Optional[Any] = None,
-    apply_vmean_compression: bool = False,
-    apply_binarize: bool = False,
-) -> torch.Tensor:
-    resolved = _resolve_processing_device(device) or torch.device("cpu")
-    arr = mask if torch.is_tensor(mask) else torch.as_tensor(mask, dtype=torch.float32, device=resolved)
-    if torch.is_tensor(arr):
-        arr = arr.to(device=resolved, dtype=torch.float32)
-    squeeze = False
-    if int(arr.ndim) == 2:
-        arr = arr.unsqueeze(0)
-        squeeze = True
-    if int(arr.ndim) != 3 or int(arr.numel()) <= 0:
-        out = torch.zeros_like(arr, dtype=torch.float32)
-        return out[0] if bool(squeeze) and int(out.ndim) == 3 and int(out.shape[0]) > 0 else out
-    arr = torch.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
-    arr = torch.clamp(arr, min=0.0)
-    vmax = torch.amax(arr, dim=(1, 2), keepdim=True)
-    valid = vmax > 1e-8
-    arr = torch.where(valid, arr / torch.where(valid, vmax, torch.ones_like(vmax)), torch.zeros_like(arr))
-    if bool(apply_vmean_compression):
-        vmean = torch.mean(arr, dim=(1, 2), keepdim=True)
-        denom = torch.clamp(vmean * 2.0, min=1.0)
-        arr = torch.where(vmean > 1e-8, torch.clamp(arr / denom, 0.0, 1.0), arr)
-    if bool(apply_binarize):
-        arr = (arr > 0.5).to(dtype=torch.float32)
-        return arr[0] if bool(squeeze) else arr
-    gm = max(0.35, float(gamma))
-    if abs(gm - 1.0) > 1e-6:
-        arr = torch.pow(torch.clamp(arr, 0.0, 1.0), gm)
-    kk = int(blur_kernel)
-    if kk >= 3:
-        kk = int(kk) | 1
-        arr = F.avg_pool2d(arr[:, None, :, :], kernel_size=int(kk), stride=1, padding=int(kk // 2))[:, 0]
-        vmax = torch.amax(arr, dim=(1, 2), keepdim=True)
-        valid = vmax > 1e-8
-        arr = torch.where(valid, arr / torch.where(valid, vmax, torch.ones_like(vmax)), torch.zeros_like(arr))
-    arr = torch.clamp(arr, 0.0, 1.0).to(dtype=torch.float32)
-    return arr[0] if bool(squeeze) else arr
-
-
-def _blend_attention_maps_batch_torch(
-    maps: Sequence[Any],
-    *,
-    weights: Optional[Sequence[float]] = None,
-    gamma: float = 1.0,
-    device: Optional[Any] = None,
-    apply_vmean_compression: bool = False,
-    apply_binarize: bool = False,
-) -> torch.Tensor:
-    resolved = _resolve_processing_device(device) or torch.device("cpu")
-    valid: List[torch.Tensor] = []
-    valid_weights: List[float] = []
-    ref_shape: Optional[Tuple[int, int, int]] = None
-    for i, m in enumerate(maps):
-        arr = m if torch.is_tensor(m) else torch.as_tensor(m, dtype=torch.float32, device=resolved)
-        arr = arr.to(device=resolved, dtype=torch.float32)
-        if int(arr.ndim) == 2:
-            arr = arr.unsqueeze(0)
-        if int(arr.ndim) != 3 or int(arr.numel()) <= 0:
-            continue
-        if ref_shape is None:
-            ref_shape = (int(arr.shape[0]), int(arr.shape[1]), int(arr.shape[2]))
-        w = 1.0 if weights is None or i >= int(len(weights)) else float(weights[i])
-        if w <= 0.0:
-            continue
-        norm = _normalize_attention_map_batch_torch(arr, gamma=1.0, blur_kernel=0, device=resolved, apply_vmean_compression=bool(apply_vmean_compression))
-        if float(torch.amax(norm).detach().cpu().item()) <= 1e-8:
-            continue
-        valid.append(norm)
-        valid_weights.append(float(w))
-    if len(valid) <= 0:
-        if ref_shape is None:
-            return torch.zeros((0, 0, 0), dtype=torch.float32, device=resolved)
-        return torch.zeros(ref_shape, dtype=torch.float32, device=resolved)
-    weights_t = torch.as_tensor(valid_weights, dtype=torch.float32, device=resolved).view(-1, 1, 1, 1)
-    stack = torch.stack(valid, dim=0).to(dtype=torch.float32)
-    acc = torch.sum(weights_t * stack, dim=0)
-    wsum = float(torch.sum(torch.as_tensor(valid_weights, dtype=torch.float32)).item())
-    if wsum > 1e-8:
-        acc = acc / float(wsum)
-    return _normalize_attention_map_batch_torch(acc, gamma=float(gamma), blur_kernel=5, device=resolved, apply_vmean_compression=bool(apply_vmean_compression), apply_binarize=bool(apply_binarize))
-
 
 def _semantic_color_score_maps_batch_torch(
     chw_batch: Any,
@@ -1573,88 +1299,10 @@ def _semantic_color_mask_from_score_batch_torch(
         thr = torch.as_tensor(np.percentile(flat.detach().cpu().numpy(), 82, axis=1), dtype=torch.float32, device=resolved)
     thr = torch.clamp(thr * 0.75, min=0.20)
     exact = (arr >= thr[:, None, None]).to(dtype=torch.float32) * arr
-    out = _normalize_attention_map_batch_torch(exact, gamma=0.78, blur_kernel=1, device=resolved)
+    vmax = torch.amax(exact.view(int(n), -1), dim=1, keepdim=True).unsqueeze(-1)
+    out = torch.where(vmax > 1e-8, exact / torch.where(vmax > 1e-8, vmax, torch.ones_like(vmax)), torch.zeros_like(exact))
     return out[0] if bool(squeeze) else out
 
-
-def _avg_pool2d_batch(batch_hw: np.ndarray, kernel_size: int) -> np.ndarray:
-    kk = max(1, int(kernel_size))
-    if kk <= 1:
-        return np.asarray(batch_hw, dtype=np.float32)
-    pooled = F.avg_pool2d(
-        torch.from_numpy(np.asarray(batch_hw, dtype=np.float32)[:, None, :, :]),
-        kernel_size=int(kk),
-        stride=1,
-        padding=int(kk // 2),
-    )
-    return np.asarray(pooled[:, 0].cpu().numpy(), dtype=np.float32)
-
-
-def _normalize_attention_map_batch(mask: Any, gamma: float = 1.0, blur_kernel: int = 0, apply_vmean_compression: bool = False, apply_binarize: bool = False) -> np.ndarray:
-    arr = np.asarray(mask, dtype=np.float32)
-    squeeze = False
-    if int(arr.ndim) == 2:
-        arr = arr[None, ...]
-        squeeze = True
-    if int(arr.ndim) != 3 or int(arr.size) <= 0:
-        out = np.zeros_like(np.asarray(arr, dtype=np.float32), dtype=np.float32)
-        return out[0] if bool(squeeze) and int(out.ndim) == 3 and int(out.shape[0]) > 0 else out
-    arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32, copy=False)
-    arr = np.maximum(arr, 0.0).astype(np.float32, copy=False)
-    vmax = np.max(arr, axis=(1, 2), keepdims=True) if int(arr.size) > 0 else np.zeros((int(arr.shape[0]), 1, 1), dtype=np.float32)
-    valid = vmax > 1e-8
-    arr = np.where(valid, arr / np.where(valid, vmax, 1.0), 0.0).astype(np.float32, copy=False)
-    if bool(apply_vmean_compression):
-        vmean = np.mean(arr, axis=(1, 2), keepdims=True) if int(arr.size) > 0 else np.zeros((int(arr.shape[0]), 1, 1), dtype=np.float32)
-        arr = np.where(vmean > 1e-8, np.clip(arr / np.maximum(vmean * 2.0, 1.0), 0.0, 1.0), arr).astype(np.float32, copy=False)
-    if bool(apply_binarize):
-        arr = (arr > 0.5).astype(np.float32, copy=False)
-        return np.asarray(arr[0], dtype=np.float32) if bool(squeeze) else arr
-    gm = max(0.35, float(gamma))
-    if abs(gm - 1.0) > 1e-6:
-        arr = np.power(np.clip(arr, 0.0, 1.0), gm).astype(np.float32, copy=False)
-    kk = int(blur_kernel)
-    if kk >= 3:
-        kk = int(kk) | 1
-        arr = _avg_pool2d_batch(arr, kernel_size=int(kk))
-        vmax = np.max(arr, axis=(1, 2), keepdims=True) if int(arr.size) > 0 else np.zeros((int(arr.shape[0]), 1, 1), dtype=np.float32)
-        valid = vmax > 1e-8
-        arr = np.where(valid, arr / np.where(valid, vmax, 1.0), 0.0).astype(np.float32, copy=False)
-    arr = np.clip(arr, 0.0, 1.0).astype(np.float32, copy=False)
-    return np.asarray(arr[0], dtype=np.float32) if bool(squeeze) else arr
-
-
-def _blend_attention_maps_batch(maps: Sequence[Any], weights: Optional[Sequence[float]] = None, gamma: float = 1.0, apply_vmean_compression: bool = False, apply_binarize: bool = False) -> np.ndarray:
-    valid: List[np.ndarray] = []
-    valid_weights: List[float] = []
-    ref_shape: Optional[Tuple[int, int, int]] = None
-    for i, m in enumerate(maps):
-        arr = np.asarray(m, dtype=np.float32)
-        if int(arr.ndim) == 2:
-            arr = arr[None, ...]
-        if int(arr.ndim) != 3 or int(arr.size) <= 0:
-            continue
-        if ref_shape is None:
-            ref_shape = (int(arr.shape[0]), int(arr.shape[1]), int(arr.shape[2]))
-        w = 1.0 if weights is None or i >= int(len(weights)) else float(weights[i])
-        if w <= 0.0:
-            continue
-        norm = _normalize_attention_map_batch(arr, gamma=1.0, blur_kernel=0, apply_vmean_compression=bool(apply_vmean_compression))
-        if float(np.max(norm)) <= 1e-8:
-            continue
-        valid.append(np.asarray(norm, dtype=np.float32))
-        valid_weights.append(float(w))
-    if len(valid) <= 0:
-        if ref_shape is None:
-            return np.zeros((0, 0, 0), dtype=np.float32)
-        return np.zeros(ref_shape, dtype=np.float32)
-    weights_np = np.asarray(valid_weights, dtype=np.float32).reshape(-1, 1, 1, 1)
-    stack = np.stack(valid, axis=0).astype(np.float32, copy=False)
-    acc = np.sum(weights_np * stack, axis=0).astype(np.float32, copy=False)
-    wsum = float(np.sum(np.asarray(valid_weights, dtype=np.float32)))
-    if wsum > 1e-8:
-        acc = acc / float(wsum)
-    return _normalize_attention_map_batch(acc, gamma=float(gamma), blur_kernel=5, apply_vmean_compression=bool(apply_vmean_compression), apply_binarize=bool(apply_binarize))
 
 
 def _semantic_color_score_maps(chw: np.ndarray) -> Dict[str, np.ndarray]:
@@ -1785,7 +1433,8 @@ def _semantic_color_mask_from_score(color_score: Any) -> np.ndarray:
         return np.zeros((0, 0), dtype=np.float32)
     thr = max(0.20, float(np.percentile(score.reshape(-1), 82)) * 0.75)
     exact = (score >= float(thr)).astype(np.float32, copy=False) * score
-    return _normalize_attention_map(exact, gamma=0.78, blur_kernel=1)
+    vmax = float(np.max(exact))
+    return (exact / vmax).astype(np.float32) if vmax > 1e-8 else np.zeros_like(exact, dtype=np.float32)
 
 
 def _semantic_color_mask_from_score_batch(scores: Any) -> np.ndarray:
@@ -1809,7 +1458,8 @@ def _semantic_color_mask_from_score_batch(scores: Any) -> np.ndarray:
     thr = np.maximum(0.20, thr)  # [N]
     # broadcast threshold over [N, H, W]
     exact = (arr >= thr[:, None, None]) * arr  # [N, H, W]
-    out = _normalize_attention_map_batch(exact, gamma=0.78, blur_kernel=1)
+    vmax = np.max(exact.reshape(n, -1), axis=1, keepdims=True).reshape(n, 1, 1)
+    out = np.where(vmax > 1e-8, exact / np.where(vmax > 1e-8, vmax, 1.0), 0.0).astype(np.float32)
     return np.asarray(out[0], dtype=np.float32) if squeeze else out
 
 
@@ -1965,7 +1615,9 @@ def build_term_mask_stacks_from_images(
                 # skip if already contributed by color_map path above
                 if any(int(ei) == int(cls_idx) for ei in idx_per_image[int(row_idx)]):
                     continue
-                mask = _normalize_attention_map(override_lut[term_key], gamma=0.85, blur_kernel=1)
+                mask_arr = np.maximum(np.asarray(override_lut[term_key], dtype=np.float32), 0.0)
+                _vm = float(np.max(mask_arr))
+                mask = (mask_arr / _vm).astype(np.float32) if _vm > 1e-8 else np.zeros_like(mask_arr, dtype=np.float32)
                 if float(np.max(mask)) <= 1e-8:
                     continue
                 masks_per_image[int(row_idx)].append(np.asarray(mask, dtype=np.float32))
@@ -2114,7 +1766,7 @@ def _apply_degrade(
       - term_masks: Dict[str, ndarray] of per-term raw accumulated pixel-delta masks.
 
     Masks in term_masks are RAW accumulated deltas — NO internal normalization.
-    Callers normalize via _normalize_attention_map / _normalize_attention_map_batch.
+    Callers normalize via vmax division before compositing.
 
     Term labeling is honest to what each operation does — "signal" is never added by degrade:
       Spatial transforms label only their own name (shift / horizontal flip / vertical flip).
@@ -2973,34 +2625,15 @@ class BootstrapDynamicDataset(Dataset):
                 return_touch_mask=True,
                 return_term_masks=True,
             )
+            mask = _composite_mask_stack(np.stack([
+                np.asarray(mask, dtype=np.float32),
+                np.asarray(touched, dtype=np.float32),
+            ])).astype(np.float32, copy=False)
             aug_term_set = {
                 re.sub(r"\s+", " ", str(term)).strip().lower()
                 for term in (aug_terms if isinstance(aug_terms, list) else [])
                 if str(term).strip()
             }
-            global_aug = bool(
-                aug_term_set.intersection(
-                    {
-                        "signal",
-                        "noise",
-                        "mixed noise and signal",
-                        "blur damage",
-                        "noise damage",
-                        "dropout damage",
-                        "quantization damage",
-                        "stride skew damage",
-                        "edge highlight",
-                        "edge blur",
-                        "texture",
-                        "pattern",
-                    }
-                )
-            )
-            mask = _blend_attention_maps(
-                [np.asarray(mask, dtype=np.float32), np.asarray(touched, dtype=np.float32)],
-                weights=([0.35, 1.25] if bool(global_aug) else [0.70, 0.95]),
-                gamma=(1.08 if bool(global_aug) else 0.95),
-            ).astype(np.float32, copy=False)
             if bool(self.augment_apply_terms) and int(len(self.semantic_term_to_idx)) > 0 and isinstance(aug_terms, list):
                 for term in aug_terms:
                     tk = re.sub(r"\s+", " ", str(term)).strip().lower()
@@ -3062,14 +2695,8 @@ class BootstrapDynamicDataset(Dataset):
                         treat_mixed_mask_as_creation=bool(float(np.max(np.asarray(mask, dtype=np.float32))) > 1e-8),
                     )
             if float(np.max(np.asarray(mask, dtype=np.float32))) <= 1e-8 and int(mask_stack_np.shape[0]) > 0 and int(mask_idx_np.size) > 0:
-                mask = _composite_non_dataset_label_stack(
-                    mask_stack_np,
-                    mask_idx_np,
-                    idx_to_term=self.idx_to_term,
-                    height=int(img.shape[1]),
-                    width=int(img.shape[2]),
-                    fallback_mask=mask,
-                )
+                _nds_keep = [i for i in range(min(int(mask_stack_np.shape[0]), int(mask_idx_np.size))) if not _is_dataset_label_term(str((self.idx_to_term or {}).get(int(mask_idx_np[i]), "")))]
+                mask = _composite_mask_stack(mask_stack_np[np.asarray(_nds_keep, dtype=np.int64)]) if _nds_keep else _normalize_mask_array(mask, height=int(img.shape[1]), width=int(img.shape[2]))
         else:
             mask_stack_np = np.zeros((0, int(mask.shape[0]), int(mask.shape[1])), dtype=np.float32)
             mask_idx_np = np.zeros((0,), dtype=np.int64)
@@ -3117,14 +2744,8 @@ class BootstrapDynamicDataset(Dataset):
             stack_np = np.asarray(self.base_mask_stacks[int(idx)], dtype=np.float32)
             stack_idx_np = np.asarray(self.base_mask_stack_indices[int(idx)], dtype=np.int64)
             if float(np.max(mask_np)) <= 1e-8 and int(stack_np.shape[0]) > 0 and int(stack_idx_np.size) > 0:
-                mask_np = _composite_non_dataset_label_stack(
-                    stack_np,
-                    stack_idx_np,
-                    idx_to_term=self.idx_to_term,
-                    height=int(mask_np.shape[0]),
-                    width=int(mask_np.shape[1]),
-                    fallback_mask=mask_np,
-                )
+                _nds_keep = [i for i in range(min(int(stack_np.shape[0]), int(stack_idx_np.size))) if not _is_dataset_label_term(str((self.idx_to_term or {}).get(int(stack_idx_np[i]), "")))]
+                mask_np = _composite_mask_stack(stack_np[np.asarray(_nds_keep, dtype=np.int64)]) if _nds_keep else _normalize_mask_array(mask_np, height=int(mask_np.shape[0]), width=int(mask_np.shape[1]))
                 self.base_masks[int(idx)] = np.asarray(mask_np, dtype=np.float32)
         else:
             stack_np = np.zeros((0, int(mask_np.shape[0]), int(mask_np.shape[1])), dtype=np.float32)
@@ -3588,9 +3209,13 @@ def _build_and_store_row_mask_cache(
                 with Image.open(str(mp)) as mm:
                     explicit_mask = np.asarray(mm.convert("L"), dtype=np.float32)
             if explicit_mask is not None:
-                explicit_mask = _normalize_attention_map(_normalize_mask_array(explicit_mask, height=int(h), width=int(w)), gamma=0.95, blur_kernel=3)
+                explicit_mask = _normalize_mask_array(explicit_mask, height=int(h), width=int(w))
+                _vm = float(np.max(explicit_mask))
+                explicit_mask = (explicit_mask / _vm).astype(np.float32) if _vm > 1e-8 else np.zeros_like(explicit_mask, dtype=np.float32)
     if explicit_mask is None and isinstance(layout, dict):
-        explicit_mask = _normalize_attention_map(build_layout_mask(layout, height=int(h), width=int(w)), gamma=0.95, blur_kernel=3)
+        explicit_mask = np.maximum(np.asarray(build_layout_mask(layout, height=int(h), width=int(w)), dtype=np.float32), 0.0)
+        _vm = float(np.max(explicit_mask))
+        explicit_mask = (explicit_mask / _vm).astype(np.float32) if _vm > 1e-8 else np.zeros_like(explicit_mask, dtype=np.float32)
 
     term_to_idx = {
         _norm_txt(str(term)): int(idx)
@@ -3606,7 +3231,9 @@ def _build_and_store_row_mask_cache(
         original_parts=None,
         deformation_term_masks=None,
     )
-    mixed_mask = _normalize_attention_map(np.asarray(mixed_mask, dtype=np.float32), gamma=0.92, blur_kernel=5)
+    _mm_arr = np.maximum(np.asarray(mixed_mask, dtype=np.float32), 0.0)
+    _mm_vm = float(np.max(_mm_arr))
+    mixed_mask = (_mm_arr / _mm_vm).astype(np.float32) if _mm_vm > 1e-8 else np.zeros_like(_mm_arr, dtype=np.float32)
     try:
         np.savez_compressed(
             str(cache_file),

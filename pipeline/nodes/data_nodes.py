@@ -69,8 +69,8 @@ from semantic_dataset_loaders import (
     BootstrapDynamicDataset,
     DiskSemanticRowsDataset,
     _build_special_label_mask_stack,
-    _composite_non_dataset_label_stack,
     _composite_mask_stack,
+    _is_dataset_label_term,
     build_label_mask_stack,
     build_loader_from_manifest,
     build_term_mask_stack_from_image,
@@ -867,18 +867,11 @@ class DataNode(PipelineNode):
                     idx_to_term=idx_to_term,
                 )
                 if i < len(all_masks):
-                    all_masks[i] = (
-                        _composite_non_dataset_label_stack(
-                            merged_stack,
-                            merged_idx,
-                            idx_to_term=idx_to_term,
-                            height=int(base_mask_np.shape[0]),
-                            width=int(base_mask_np.shape[1]),
-                            fallback_mask=base_mask_np,
-                        )
-                        if int(np.asarray(merged_stack).size) > 0
-                        else np.asarray(base_mask_np, dtype=np.float32)
-                    )
+                    if int(np.asarray(merged_stack).size) > 0:
+                        _nds_keep = [si for si in range(min(int(merged_stack.shape[0]), int(merged_idx.size))) if not _is_dataset_label_term(str((idx_to_term or {}).get(int(merged_idx[si]), "")))]
+                        all_masks[i] = _composite_mask_stack(merged_stack[np.asarray(_nds_keep, dtype=np.int64)]) if _nds_keep else np.asarray(base_mask_np, dtype=np.float32)
+                    else:
+                        all_masks[i] = np.asarray(base_mask_np, dtype=np.float32)
                 all_label_stacks.append(np.asarray(merged_stack, dtype=np.float32))
                 all_label_indices.append(np.asarray(merged_idx, dtype=np.int64))
 
@@ -968,7 +961,7 @@ class DataNode(PipelineNode):
                 for pos in val_idx
                 for j in range(entries_per_clean)
             ]
-        loader, eval_loader = _build_stage_loader_pair(
+        loader, eval_loader = build_stage_loaders(
             dataset=dataset,
             name="pregestation",
             batch_size=max(1, int(self.preg_cfg.batch_size)),
@@ -1128,19 +1121,11 @@ class DataNode(PipelineNode):
                         strict=True,
                         idx_to_term=idx_to_term,
                     )
-                    mixed_mask = (
-                        _composite_non_dataset_label_stack(
-                            merged_stack,
-                            merged_idx,
-                            idx_to_term=idx_to_term,
-                            height=int(base_mask.shape[0]),
-                            width=int(base_mask.shape[1]),
-                            fallback_mask=base_mask,
-                            processing_device=_processing_device,
-                        )
-                        if int(np.asarray(merged_stack).size) > 0
-                        else np.asarray(base_mask, dtype=np.float32)
-                    )
+                    if int(np.asarray(merged_stack).size) > 0:
+                        _nds_keep = [si for si in range(min(int(merged_stack.shape[0]), int(merged_idx.size))) if not _is_dataset_label_term(str((idx_to_term or {}).get(int(merged_idx[si]), "")))]
+                        mixed_mask = _composite_mask_stack(merged_stack[np.asarray(_nds_keep, dtype=np.int64)]) if _nds_keep else np.asarray(base_mask, dtype=np.float32)
+                    else:
+                        mixed_mask = np.asarray(base_mask, dtype=np.float32)
                     terms_rows.append(_all_terms[i])
                     masks.append(np.asarray(mixed_mask, dtype=np.float32))
                     mask_stacks.append(np.asarray(merged_stack, dtype=np.float32))
@@ -1210,7 +1195,7 @@ class DataNode(PipelineNode):
                 for pos in val_idx
                 for j in range(_gest_entries_per_clean)
             ]
-        loader, eval_loader = _build_stage_loader_pair(
+        loader, eval_loader = build_stage_loaders(
             dataset=dataset,
             name="gestation",
             batch_size=max(1, int(self.gest_cfg.batch_size)),
@@ -1272,12 +1257,15 @@ class DataNode(PipelineNode):
         )
         _berk_force = bool(self.possessions["berkeley"].force_next_rebuild)
         with semantic_processing_device(ctx, enabled=bool(self.bdata_cfg.gpu_preprocess)) as _processing_device:
-            loader, _n_refresh = _build_berkeley_refresh_loader(
+            loader, _n_refresh = _build_berkeley_wheel_loader(
                 ctx=ctx,
                 data_root=data_root, image_size=self.bdata_cfg.image_size,
-                auto_install_scipy=False, batch_size=self.bdata_cfg.batch_size,
-                num_workers=self.bdata_cfg.num_workers, max_train=self.bdata_cfg.max_train,
+                batch_size=self.bdata_cfg.batch_size,
+                num_workers=self.bdata_cfg.num_workers,
                 seed=self.bdata_cfg.seed, device=ctx.device,
+                purpose="berkeley_refresh_train",
+                split="train",
+                max_rows=self.bdata_cfg.max_train,
                 external_val_fraction=self.bdata_cfg.external_val_fraction,
                 prefetch_factor=self.bdata_cfg.prefetch_factor,
                 wheel_max_bytes=self.bdata_cfg.wheel_max_bytes,
@@ -1292,13 +1280,18 @@ class DataNode(PipelineNode):
                 force_rebuild=_berk_force,
                 class_names=ctx.class_names,
             )
-            gate_val_loader, _n_gate_val = _build_berkeley_gate_val_loader(
+            gate_val_loader, _n_gate_val = _build_berkeley_wheel_loader(
                 ctx=ctx,
                 data_root=data_root, image_size=self.bdata_cfg.image_size,
-                auto_install_scipy=False, batch_size=self.bdata_cfg.gate_val_batch_size,
+                batch_size=self.bdata_cfg.gate_val_batch_size,
                 num_workers=self.bdata_cfg.gate_val_num_workers,
-                max_val=self.bdata_cfg.gate_val_max_val,
                 seed=self.bdata_cfg.seed, device=ctx.device,
+                purpose="berkeley_gate_val",
+                split="val",
+                max_rows=self.bdata_cfg.gate_val_max_val,
+                return_mask_stack=False,
+                deformations_per_clean=0,
+                include_clean=True,
                 prefetch_factor=self.bdata_cfg.prefetch_factor,
                 wheel_max_bytes=self.bdata_cfg.wheel_max_bytes,
                 wheel_sanity_cap_bytes=self.bdata_cfg.wheel_sanity_cap_bytes,
@@ -1472,10 +1465,12 @@ class DataNode(PipelineNode):
                 preload_workers=self.bdata_cfg.preload_workers,
                 class_names=ctx.class_names,
             )
-        loader, _n_val = _build_gate_loader_from_dataset(
-            dataset=dataset, batch_size=32, num_workers=0,
-            device=ctx.device, seed=seed,
-        ) if dataset is not None else (None, 0)
+        loader, _ = build_stage_loaders(
+            dataset=dataset, name="payload_validation",
+            batch_size=32, num_workers=0,
+            device_type=str(ctx.device.type), seed=seed,
+            pin_memory=(ctx.device.type == "cuda"),
+        ) if dataset is not None else (None, None)
         ctx.payload_validation_dataset = dataset
         ctx.payload_validation_loader = loader
         _register_churn_terms(
@@ -2249,99 +2244,149 @@ def _build_inmemory_semantic_stage_dataset(
     return dataset
 
 
-def _build_stage_loader_pair(
+def build_stage_loaders(
     *,
     dataset: Dataset,
     name: str,
     batch_size: int,
-    num_workers: int,
-    seed: int,
-    device_type: str,
-    train_indices: Sequence[int],
-    eval_indices: Sequence[int],
+    num_workers: int = 0,
+    seed: int = 0,
+    device_type: str = "cpu",
+    train_indices: Optional[Sequence[int]] = None,
+    eval_indices: Optional[Sequence[int]] = None,
     prefetch_factor: int = 2,
     shuffle_train: bool = True,
     train_sampler: Optional[Any] = None,
+    pin_memory: Optional[bool] = None,
+    persistent_workers: bool = False,
+    max_samples: int = 0,
 ) -> Tuple[Optional[DataLoader], Optional[DataLoader]]:
-    # Semantic-wheel datasets are chunked on disk. Random sample-level access
+    """Universal data-loader factory — THE single method for building loaders.
+
+    Returns ``(train_loader, eval_loader)``.  Either may be ``None`` when the
+    corresponding index set is empty or omitted.  When *neither*
+    ``train_indices`` nor ``eval_indices`` is given the full dataset is wrapped
+    into a single loader returned as ``(loader, None)``.
+    """
+    _pin = bool(pin_memory) if pin_memory is not None else (str(device_type).strip().lower() == "cuda")
+
+    # Semantic-wheel datasets are chunked on disk.  Random sample-level access
     # defeats their chunk cache and turns each batch into repeated .npz loads,
     # so consume any train/eval subset sequentially over the subset view.
-    prefers_sequential_subset = bool(
+    prefers_sequential = bool(
         hasattr(dataset, "read_numpy_entry")
         and hasattr(dataset, "chunk_rows")
         and hasattr(dataset, "lookahead_batches")
     )
-    if bool(prefers_sequential_subset):
-        train_picks = [int(i) for i in train_indices if 0 <= int(i) < int(len(dataset))]
-        eval_picks = [int(i) for i in eval_indices if 0 <= int(i) < int(len(dataset))]
-        train_dataset: Dataset = dataset if int(len(train_picks)) == int(len(dataset)) else torch.utils.data.Subset(dataset, train_picks)
-        eval_dataset: Dataset = dataset if int(len(eval_picks)) == int(len(dataset)) else torch.utils.data.Subset(dataset, eval_picks)
-        local_train_sampler = train_sampler
-        if local_train_sampler is None or (
-            isinstance(local_train_sampler, StatefulSequentialDeckSampler)
-            and int(getattr(local_train_sampler, "length", -1)) != int(len(train_dataset))
-        ):
-            local_train_sampler = StatefulSequentialDeckSampler(len(train_dataset))
-        _log(
-            f"[data-node] {str(name)} loader: sequential subset access for chunked wheel "
-            f"(train_rows={int(len(train_dataset))} eval_rows={int(len(eval_dataset))})"
-        )
-        train_manifest = StageDatasetManifest(
-            name=str(name),
-            dataset=train_dataset,
-            batch_size=max(1, int(batch_size)),
-            seed=int(seed),
-            num_workers=max(0, int(num_workers)),
-            device_type=str(device_type),
-            ordered_indices=list(range(int(len(train_dataset)))),
-            prefetch_factor=int(prefetch_factor),
-            pin_memory=(str(device_type).strip().lower() == "cuda"),
-            shuffle=False,
-            sampler=local_train_sampler,
-        )
-        loader, _ = build_loader_from_manifest(manifest=train_manifest)
-        eval_manifest = StageDatasetManifest(
-            name=f"{str(name)}_eval",
-            dataset=eval_dataset,
-            batch_size=max(1, int(batch_size)),
-            seed=int(seed),
-            num_workers=max(0, int(num_workers)),
-            device_type=str(device_type),
-            ordered_indices=list(range(int(len(eval_dataset)))),
-            prefetch_factor=int(prefetch_factor),
-            pin_memory=(str(device_type).strip().lower() == "cuda"),
-            shuffle=False,
-        )
-        eval_loader, _ = build_loader_from_manifest(manifest=eval_manifest)
-        return loader, eval_loader
 
-    train_manifest = StageDatasetManifest(
-        name=str(name),
-        dataset=dataset,
-        batch_size=max(1, int(batch_size)),
-        seed=int(seed),
-        num_workers=max(0, int(num_workers)),
-        device_type=str(device_type),
-        ordered_indices=list(train_indices),
-        prefetch_factor=int(prefetch_factor),
-        pin_memory=(str(device_type).strip().lower() == "cuda"),
-        shuffle=bool(shuffle_train),
-        sampler=train_sampler,
-    )
-    loader, _ = build_loader_from_manifest(manifest=train_manifest)
-    eval_manifest = StageDatasetManifest(
-        name=f"{str(name)}_eval",
-        dataset=dataset,
-        batch_size=max(1, int(batch_size)),
-        seed=int(seed),
-        num_workers=max(0, int(num_workers)),
-        device_type=str(device_type),
-        ordered_indices=list(eval_indices),
-        prefetch_factor=int(prefetch_factor),
-        pin_memory=(str(device_type).strip().lower() == "cuda"),
-        shuffle=False,
-    )
-    eval_loader, _ = build_loader_from_manifest(manifest=eval_manifest)
+    has_train = train_indices is not None and len(train_indices) > 0
+    has_eval = eval_indices is not None and len(eval_indices) > 0
+    full_dataset_mode = (not has_train and not has_eval)
+
+    # ---------- build train loader ----------
+    loader: Optional[DataLoader] = None
+    if has_train or full_dataset_mode:
+        if prefers_sequential and has_train:
+            picks = [int(i) for i in train_indices if 0 <= int(i) < int(len(dataset))]
+            train_ds: Dataset = dataset if int(len(picks)) == int(len(dataset)) else torch.utils.data.Subset(dataset, picks)
+            local_sampler = train_sampler
+            if local_sampler is None or (
+                isinstance(local_sampler, StatefulSequentialDeckSampler)
+                and int(getattr(local_sampler, "length", -1)) != int(len(train_ds))
+            ):
+                local_sampler = StatefulSequentialDeckSampler(len(train_ds))
+            _log(
+                f"[data-node] {str(name)} loader: sequential subset for chunked wheel "
+                f"(train_rows={int(len(train_ds))})"
+            )
+            manifest = StageDatasetManifest(
+                name=str(name),
+                dataset=train_ds,
+                batch_size=max(1, int(batch_size)),
+                seed=int(seed),
+                num_workers=max(0, int(num_workers)),
+                device_type=str(device_type),
+                ordered_indices=list(range(int(len(train_ds)))),
+                prefetch_factor=int(prefetch_factor),
+                pin_memory=_pin,
+                persistent_workers=bool(persistent_workers),
+                shuffle=False,
+                sampler=local_sampler,
+            )
+        elif prefers_sequential and full_dataset_mode:
+            local_sampler = train_sampler
+            if local_sampler is None:
+                local_sampler = StatefulSequentialDeckSampler(len(dataset))
+            manifest = StageDatasetManifest(
+                name=str(name),
+                dataset=dataset,
+                batch_size=max(1, int(batch_size)),
+                seed=int(seed),
+                num_workers=max(0, int(num_workers)),
+                device_type=str(device_type),
+                ordered_indices=list(range(int(len(dataset)))),
+                prefetch_factor=int(prefetch_factor),
+                pin_memory=_pin,
+                persistent_workers=bool(persistent_workers),
+                shuffle=False,
+                sampler=local_sampler,
+            )
+        else:
+            manifest = StageDatasetManifest(
+                name=str(name),
+                dataset=dataset,
+                batch_size=max(1, int(batch_size)),
+                seed=int(seed),
+                num_workers=max(0, int(num_workers)),
+                device_type=str(device_type),
+                ordered_indices=list(train_indices) if has_train else None,
+                max_samples=max(0, int(max_samples)),
+                prefetch_factor=int(prefetch_factor),
+                pin_memory=_pin,
+                persistent_workers=bool(persistent_workers),
+                shuffle=bool(shuffle_train),
+                sampler=train_sampler,
+            )
+        loader, _ = build_loader_from_manifest(manifest=manifest)
+
+    # ---------- build eval loader ----------
+    eval_loader: Optional[DataLoader] = None
+    if has_eval:
+        if prefers_sequential:
+            picks = [int(i) for i in eval_indices if 0 <= int(i) < int(len(dataset))]
+            eval_ds: Dataset = dataset if int(len(picks)) == int(len(dataset)) else torch.utils.data.Subset(dataset, picks)
+            if has_train:
+                _log(f"[data-node] {str(name)} eval: sequential subset (eval_rows={int(len(eval_ds))})")
+            eval_manifest = StageDatasetManifest(
+                name=f"{str(name)}_eval",
+                dataset=eval_ds,
+                batch_size=max(1, int(batch_size)),
+                seed=int(seed),
+                num_workers=max(0, int(num_workers)),
+                device_type=str(device_type),
+                ordered_indices=list(range(int(len(eval_ds)))),
+                prefetch_factor=int(prefetch_factor),
+                pin_memory=_pin,
+                persistent_workers=bool(persistent_workers),
+                shuffle=False,
+            )
+        else:
+            eval_manifest = StageDatasetManifest(
+                name=f"{str(name)}_eval",
+                dataset=dataset,
+                batch_size=max(1, int(batch_size)),
+                seed=int(seed),
+                num_workers=max(0, int(num_workers)),
+                device_type=str(device_type),
+                ordered_indices=list(eval_indices),
+                max_samples=max(0, int(max_samples)),
+                prefetch_factor=int(prefetch_factor),
+                pin_memory=_pin,
+                persistent_workers=bool(persistent_workers),
+                shuffle=False,
+            )
+        eval_loader, _ = build_loader_from_manifest(manifest=eval_manifest)
+
     return loader, eval_loader
 
 
@@ -2810,16 +2855,18 @@ def _evaluate_berkeley_confidence_loss_gate(
     }
 
 
-def _build_berkeley_refresh_loader(
+def _build_berkeley_wheel_loader(
     ctx: PipelineContext,
     data_root: str,
     image_size: int,
-    auto_install_scipy: bool,
     batch_size: int,
     num_workers: int,
-    max_train: int,
     seed: int,
     device: torch.device,
+    *,
+    purpose: str = "berkeley_refresh_train",
+    split: str = "train",
+    max_rows: int = 0,
     external_val_fraction: float = 0.20,
     validation_split_seed: int = 0,
     persistent_workers: bool = False,
@@ -2833,37 +2880,47 @@ def _build_berkeley_refresh_loader(
     wheel_use_rare_term_deck: bool = True,
     deformations_per_clean: int = 2,
     include_clean: bool = True,
+    shuffle_train: bool = False,
     processing_device: Optional[Any] = None,
     preload_workers: int = 0,
     force_rebuild: bool = False,
     class_names: Optional[Sequence[str]] = None,
 ):
+    """Unified Berkeley wheel-backed loader for both refresh (train) and gate (val) splits."""
     from pipeline.vocabulary_defaults import DEFAULT_VOCABULARY
     _cn = list(class_names) if class_names is not None else list(DEFAULT_VOCABULARY)
-    del auto_install_scipy
     rows, rows_info = collect_semantic_disk_rows(
         data_root=str(data_root),
         class_names=_cn,
         source_root="",
         progress_control=ctx,
     )
-    n_rows = int(len(rows))
-    if n_rows <= 0:
-        raise RuntimeError("Berkeley disk row collection is empty for refresh loader.")
-    source_rows = [str(r.source) for r in rows]
-    split_seed = int(validation_split_seed) if int(validation_split_seed) != 0 else int(seed)
-    train_idx, _, source_stats = _split_payload_cache_indices(
-        source_rows=source_rows,
-        seed=int(split_seed),
-        external_val_fraction=float(external_val_fraction),
-    )
-    if int(len(train_idx)) <= 0:
-        raise RuntimeError("Refresh loader has no non-validation rows after split.")
+    if int(len(rows)) <= 0:
+        raise RuntimeError(f"Berkeley disk row collection is empty for {purpose}.")
+    if str(split) == "val":
+        candidate_idx = [
+            int(i)
+            for i, row in enumerate(rows)
+            if str(getattr(row, "source", "")).strip().lower() == "berkeley_sbd_val"
+        ]
+        source_stats: Optional[Dict[str, Any]] = None
+        if int(len(candidate_idx)) <= 0:
+            raise RuntimeError("Berkeley gate validation selection is empty.")
+    else:
+        source_rows = [str(r.source) for r in rows]
+        split_seed = int(validation_split_seed) if int(validation_split_seed) != 0 else int(seed)
+        candidate_idx, _, source_stats = _split_payload_cache_indices(
+            source_rows=source_rows,
+            seed=int(split_seed),
+            external_val_fraction=float(external_val_fraction),
+        )
+        if int(len(candidate_idx)) <= 0:
+            raise RuntimeError("Refresh loader has no non-validation rows after split.")
     wheel_result, wheel_info = _ensure_berkeley_semantic_wheel(
         rows=rows,
-        candidate_indices=train_idx,
+        candidate_indices=candidate_idx,
         data_root=str(data_root),
-        purpose="berkeley_refresh_train",
+        purpose=str(purpose),
         image_size=int(image_size),
         batch_size=int(batch_size),
         prefetch_factor=int(prefetch_factor),
@@ -2875,7 +2932,7 @@ def _build_berkeley_refresh_loader(
         wheel_sanity_cap_bytes=int(wheel_sanity_cap_bytes),
         wheel_allow_large_override=bool(wheel_allow_large_override),
         wheel_expiry_uses=int(wheel_expiry_uses),
-        max_base_rows=int(max_train),
+        max_base_rows=int(max_rows),
         wheel_use_rare_term_deck=bool(wheel_use_rare_term_deck),
         class_names=_cn,
         force_rebuild=bool(force_rebuild),
@@ -2887,25 +2944,23 @@ def _build_berkeley_refresh_loader(
         cache_dir=str(wheel_result.get("cache_dir", "")),
         return_mask_stack=bool(return_mask_stack),
     )
-    loader, _ = build_loader_from_manifest(
-        manifest=StageDatasetManifest(
-            name="berkeley_refresh_train",
-            dataset=ds,
-            batch_size=max(1, int(batch_size)),
-            seed=int(seed),
-            num_workers=max(0, int(num_workers)),
-            device_type=str(device.type),
-            ordered_indices=list(range(int(len(ds)))),
-            persistent_workers=bool(persistent_workers),
-            prefetch_factor=int(prefetch_factor),
-            pin_memory=(device.type == "cuda"),
-            shuffle=False,
-            sampler=StatefulSequentialDeckSampler(len(ds)),
-        )
+    loader, _ = build_stage_loaders(
+        dataset=ds,
+        name=str(purpose),
+        batch_size=max(1, int(batch_size)),
+        num_workers=max(0, int(num_workers)),
+        seed=int(seed),
+        device_type=str(device.type),
+        prefetch_factor=int(prefetch_factor),
+        persistent_workers=bool(persistent_workers),
+        shuffle_train=bool(shuffle_train),
+        pin_memory=(device.type == "cuda"),
     )
-    setattr(loader, "_refresh_source_stats", source_stats)
-    setattr(loader, "_refresh_rows_info", rows_info)
-    setattr(loader, "_semantic_wheel_info", wheel_info)
+    if loader is not None:
+        if source_stats is not None:
+            setattr(loader, "_refresh_source_stats", source_stats)
+        setattr(loader, "_refresh_rows_info", rows_info)
+        setattr(loader, "_semantic_wheel_info", wheel_info)
     return loader, int(len(ds))
 
 
@@ -3045,91 +3100,6 @@ def _auto_berkeley_refresh_batch_size(
         return max(1, min(64, hard_cap))
     est = int(target // int(sample_bytes * mult))
     return max(1, min(est, hard_cap))
-
-
-def _build_berkeley_gate_val_loader(
-    ctx: PipelineContext,
-    data_root: str,
-    image_size: int,
-    auto_install_scipy: bool,
-    batch_size: int,
-    num_workers: int,
-    max_val: int,
-    seed: int,
-    device: torch.device,
-    persistent_workers: bool = False,
-    prefetch_factor: int = 2,
-    return_mask_stack: bool = False,
-    wheel_max_bytes: int = 0,
-    wheel_sanity_cap_bytes: int = 8 * 1024 * 1024 * 1024,
-    wheel_allow_large_override: bool = False,
-    wheel_expiry_uses: int = 0,
-    wheel_lookahead_batches: int = 0,
-    wheel_use_rare_term_deck: bool = True,
-    processing_device: Optional[Any] = None,
-    preload_workers: int = 0,
-    force_rebuild: bool = False,
-    class_names: Optional[Sequence[str]] = None,
-):
-    from pipeline.vocabulary_defaults import DEFAULT_VOCABULARY
-    _cn = list(class_names) if class_names is not None else list(DEFAULT_VOCABULARY)
-    del auto_install_scipy
-    rows, rows_info = collect_semantic_disk_rows(
-        data_root=str(data_root),
-        class_names=_cn,
-        source_root="",
-        progress_control=ctx,
-    )
-    val_idx = [
-        int(i)
-        for i, row in enumerate(rows)
-        if str(getattr(row, "source", "")).strip().lower() == "berkeley_sbd_val"
-    ]
-    if int(len(val_idx)) <= 0:
-        raise RuntimeError("Berkeley gate validation selection is empty.")
-    wheel_result, wheel_info = _ensure_berkeley_semantic_wheel(
-        rows=rows,
-        candidate_indices=val_idx,
-        data_root=str(data_root),
-        purpose="berkeley_gate_val",
-        image_size=int(image_size),
-        batch_size=int(batch_size),
-        prefetch_factor=int(prefetch_factor),
-        lookahead_batches=int(wheel_lookahead_batches),
-        seed=int(seed),
-        deformations_per_clean=0,
-        include_clean=True,
-        wheel_max_bytes=int(wheel_max_bytes),
-        wheel_sanity_cap_bytes=int(wheel_sanity_cap_bytes),
-        wheel_allow_large_override=bool(wheel_allow_large_override),
-        wheel_expiry_uses=int(wheel_expiry_uses),
-        max_base_rows=int(max_val),
-        wheel_use_rare_term_deck=bool(wheel_use_rare_term_deck),
-        class_names=_cn,
-        force_rebuild=bool(force_rebuild),
-        processing_device=processing_device,
-        preload_workers=int(preload_workers),
-        progress_control=ctx,
-    )
-    ds = SemanticWheelDataset(
-        cache_dir=str(wheel_result.get("cache_dir", "")),
-        return_mask_stack=bool(return_mask_stack),
-    )
-    loader, sample_count = _build_gate_loader_from_dataset(
-        dataset=ds,
-        batch_size=max(1, int(batch_size)),
-        num_workers=int(num_workers),
-        device=device,
-        seed=int(seed),
-        max_samples=0,
-        ordered_indices=None,
-        persistent_workers=bool(persistent_workers),
-        prefetch_factor=int(prefetch_factor),
-    )
-    if loader is not None:
-        setattr(loader, "_gate_val_rows_info", rows_info)
-        setattr(loader, "_semantic_wheel_info", wheel_info)
-    return loader, int(sample_count)
 
 
 def _schedule_payload_gate_rows_by_active_terms(
@@ -3799,105 +3769,6 @@ def _build_payload_validation_gate_dataset(
         "total_raw_bytes": int(wheel_info.get("total_raw_bytes", 0)),
     }
     return ds, labels_np, terms_rows, info
-
-
-def _build_gate_loader_from_arrays(
-    images: Sequence[np.ndarray],
-    targets: Sequence[np.ndarray],
-    batch_size: int,
-    num_workers: int,
-    device: torch.device,
-    seed: int,
-    max_samples: int = 0,
-    expected_target_dim: int = 0,
-    ordered_indices: Optional[Sequence[int]] = None,
-    persistent_workers: bool = False,
-    prefetch_factor: int = 2,
-) -> Tuple[Optional[DataLoader], int]:
-    n = min(int(len(images)), int(len(targets)))
-    if n <= 0:
-        return None, 0
-    x_rows: List[np.ndarray] = []
-    for i in range(int(n)):
-        arr = np.asarray(images[i], dtype=np.float32)
-        if int(arr.ndim) == 3 and int(arr.shape[0]) == 3:
-            row = arr
-        elif int(arr.ndim) == 3 and int(arr.shape[2]) == 3:
-            row = np.transpose(arr, (2, 0, 1)).astype(np.float32, copy=False)
-        elif int(arr.ndim) == 2:
-            row = np.repeat(arr[None, :, :], 3, axis=0).astype(np.float32, copy=False)
-        else:
-            raise RuntimeError(f"Unsupported gate image row shape: {tuple(arr.shape)}")
-        x_rows.append(np.clip(row, 0.0, 1.0).astype(np.float32, copy=False))
-    x_np = np.stack(x_rows, axis=0).astype(np.float32, copy=False)
-    y_rows = [np.asarray(targets[i], dtype=np.float32).reshape(-1) for i in range(int(n))]
-    y_sizes = [int(r.size) for r in y_rows]
-    bad_dims = sorted({int(sz) for sz in y_sizes if int(sz) != int(y_sizes[0])}) if len(y_sizes) > 0 else []
-    if len(bad_dims) > 0:
-        dims = sorted({int(x) for x in y_sizes})
-        raise RuntimeError(
-            "Gate loader received mixed label widths; all rows must already match sentence-transformer semantic width. "
-            f"got_dims={dims}"
-        )
-    y_dim = int(y_sizes[0]) if len(y_sizes) > 0 else 0
-    if int(y_dim) <= 0:
-        raise RuntimeError("Gate loader received empty label vectors.")
-    if int(expected_target_dim) > 0 and int(y_dim) != int(expected_target_dim):
-        raise RuntimeError(
-            "Gate loader label width mismatch: "
-            f"got={int(y_dim)} expected={int(expected_target_dim)}"
-        )
-    y_np = np.stack(y_rows, axis=0).astype(np.float32, copy=False)
-    y_np = np.clip(y_np[:, : int(y_dim)], 0.0, 1.0).astype(np.float32, copy=False)
-    ds = torch.utils.data.TensorDataset(
-        torch.from_numpy(x_np),
-        torch.from_numpy(y_np),
-    )
-    return build_loader_from_manifest(
-        manifest=StageDatasetManifest(
-            name="gate_array_loader",
-            dataset=ds,
-            batch_size=max(1, int(batch_size)),
-            seed=int(seed),
-            num_workers=max(0, int(num_workers)),
-            device_type=str(device.type),
-            max_samples=max(0, int(max_samples)),
-            ordered_indices=ordered_indices,
-            persistent_workers=bool(persistent_workers),
-            prefetch_factor=int(prefetch_factor),
-            pin_memory=(device.type == "cuda"),
-            shuffle=False,
-        )
-    )
-
-
-def _build_gate_loader_from_dataset(
-    dataset: Dataset,
-    batch_size: int,
-    num_workers: int,
-    device: torch.device,
-    seed: int,
-    max_samples: int = 0,
-    ordered_indices: Optional[Sequence[int]] = None,
-    persistent_workers: bool = False,
-    prefetch_factor: int = 2,
-) -> Tuple[Optional[DataLoader], int]:
-    return build_loader_from_manifest(
-        manifest=StageDatasetManifest(
-            name="gate_dataset_loader",
-            dataset=dataset,
-            batch_size=max(1, int(batch_size)),
-            seed=int(seed),
-            num_workers=max(0, int(num_workers)),
-            device_type=str(device.type),
-            max_samples=max(0, int(max_samples)),
-            ordered_indices=ordered_indices,
-            persistent_workers=bool(persistent_workers),
-            prefetch_factor=int(prefetch_factor),
-            pin_memory=(device.type == "cuda"),
-            shuffle=False,
-        )
-    )
 
 
 def _unpack_masked_semantic_batch(batch: Any, context: str) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, Any]]:

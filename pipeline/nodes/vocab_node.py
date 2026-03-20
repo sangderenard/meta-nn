@@ -53,39 +53,6 @@ from semantic_dataset_loaders import (
 
 
 # ---------------------------------------------------------------------------
-# Subsystem intrinsic vocabulary declarations
-#
-# Each generation subsystem that produces labelled training data declares the
-# vocabulary terms it intrinsically uses here.  Terms not already present in
-# the config's explicit supervised vocabulary become churn burden — the churn
-# system absorbs them automatically.  Subsystems never check whether their
-# terms are in scope; they just emit them.
-#
-# To add a new subsystem: add an entry to SUBSYSTEM_INTRINSIC_VOCABULARY.
-# Key is a stable subsystem identifier string.  Value is a list of terms.
-# ---------------------------------------------------------------------------
-
-SUBSYSTEM_INTRINSIC_VOCABULARY: Dict[str, List[str]] = {
-    # Pregestation image generator — geometric shapes, colours, directions,
-    # structural labels, and observed-colour detector outputs.
-    "pregestation_image_builder": [
-        "red", "green", "blue", "yellow", "cyan", "magenta",
-        "brown", "white", "black", "gray", "orange",
-        "up", "down", "left", "right",
-        "object", "signal", "shape", "edge", "dark",
-        "horizontal center", "vertical center", "center",
-        "front", "behind",
-    ],
-    # Symbol pool builder — origin/provenance tags used as conditioning labels.
-    "symbol_pool_builder": [
-        "official dataset pool", "symbol pool official",
-        "synthetic semantic pool", "symbol pool synthetic",
-        "symbol pool bootstrap", "internal bootstrap material",
-    ],
-}
-
-
-# ---------------------------------------------------------------------------
 # Node config
 # ---------------------------------------------------------------------------
 
@@ -191,22 +158,6 @@ class InitVocabNode(OneTimeNode):
             f"supervised={len(ctx.supervised_class_names)} "
             f"extras={len(ctx.active_extra_terms)}"
         )
-
-        # Collect all subsystem intrinsic vocabulary and register any terms
-        # not already in the current vocabulary as churn burden.
-        all_subsystem_terms: List[str] = []
-        for subsystem, terms in SUBSYSTEM_INTRINSIC_VOCABULARY.items():
-            all_subsystem_terms.extend(terms)
-        if all_subsystem_terms:
-            plan = register_churn_requirement(
-                ctx=ctx,
-                required_terms=_normalize_vocab_terms(all_subsystem_terms),
-                source="subsystem_intrinsic_vocab",
-                stage_label="init",
-            )
-            n_burden = int(plan.get("required_extra_term_count", 0))
-            if n_burden > 0:
-                _log(f"[vocab-init] {n_burden} subsystem terms not in vocab → churn burden")
 
 
 # ---------------------------------------------------------------------------
@@ -1358,88 +1309,7 @@ def _semantic_noise_terms_from_spectrum_sample(sample: Any) -> List[str]:
     return _normalize_vocab_terms(classify_noise_spectrum(sample))
 
 
-def _semantic_tags_for_symbol_term(term: str) -> List[str]:
-    key = re.sub(r"\s+", " ", str(term)).strip().lower()
-    if not key:
-        return []
-    berkeley_lut = getattr(_semantic_tags_for_symbol_term, "_berkeley_lut", None)
-    if berkeley_lut is None:
-        try:
-            from pipeline.utils import _default_class_names
-            berkeley_lut = {
-                str(x).strip().lower()
-                for x in _default_class_names()
-                if str(x).strip()
-            }
-            # Keep only object-like Berkeley labels here; dataset tags and symbol namespaces
-            # have dedicated handlers below.
-            berkeley_lut = {
-                str(x)
-                for x in berkeley_lut
-                if str(x)
-                not in {
-                    "berkeley sbd dataset",
-                    "mnist dataset",
-                    "emnist dataset",
-                    "kmnist dataset",
-                    "object",
-                    "signal",
-                }
-                and (not bool(re.fullmatch(r"digit \d+", str(x))))
-                and (not bool(re.fullmatch(r"letter [a-z]", str(x))))
-                and (not bool(re.fullmatch(r"pictogram \d+", str(x))))
-            }
-        except Exception:
-            berkeley_lut = set()
-        setattr(_semantic_tags_for_symbol_term, "_berkeley_lut", berkeley_lut)
-    out: List[str] = []
-    if key.startswith("digit "):
-        out.extend(["mnist dataset", "signal"])
-    elif key.startswith("letter "):
-        out.extend(["emnist dataset", "signal"])
-    elif key.startswith("pictogram "):
-        out.extend(["kmnist dataset", "signal"])
-    elif key in ("red", "green", "blue", "yellow", "cyan", "magenta", "brown", "gray", "edge"):
-        out.extend([key, "signal"])
-    elif key in ("front", "back", "left", "right", "top", "bottom"):
-        out.extend([key, "object", "signal"])
-    elif key in ("none",):
-        out.extend(["none"])
-    elif key in ("noise",):
-        out.extend(_semantic_noise_profile_terms("uniform_white_noise"))
-    elif key.endswith("noise"):
-        profile_key = _semantic_noise_profile_key_from_term(key)
-        if profile_key:
-            out.extend(_semantic_noise_profile_terms(profile_key))
-        else:
-            out.extend([key, "noise"])
-    elif key in ("mixed noise and signal", "mix"):
-        out.extend(["mixed noise and signal", "signal"])
-        out.extend(_semantic_noise_profile_terms("uniform_white_noise"))
-    elif key in ("white", "black", "signal"):
-        out.extend(["signal"])
-    elif key == "spectrographic output":
-        out.extend([key])
-    elif key == "inverse spectrographic composition":
-        out.extend([key])
-    elif key == "pure tone construction":
-        out.extend([key])
-    elif key == "berkeley sbd dataset":
-        out.extend(["berkeley sbd dataset", "object", "signal"])
-    elif key in berkeley_lut:
-        out.extend(["object", "berkeley sbd dataset", "signal"])
-    elif key in ("mnist dataset", "emnist dataset", "kmnist dataset"):
-        out.extend([key, "signal"])
-    elif key == "regurgitated content":
-        out.extend(["regurgitated content", "signal"])
-    elif key == "gan image":
-        out.extend(["gan image", "signal"])
-    elif key.endswith("damage") or key.startswith("edge "):
-        out.extend(["signal"])
-    else:
-        out.extend(["signal"])
-    out.append(key)
-    return _semantic_expand_inferred_tags(out)
+
 
 
 def _merge_symbol_term_pools(
@@ -1463,65 +1333,7 @@ def _merge_symbol_term_pools(
     return out
 
 
-def _build_symbol_term_origin_terms_map(
-    official_pool: Dict[str, List[np.ndarray]],
-    synthetic_pool: Dict[str, List[np.ndarray]],
-    bootstrap_pool: Dict[str, List[np.ndarray]],
-    bootstrap_origin_label: str,
-) -> Dict[str, List[str]]:
-    out: Dict[str, List[str]] = {}
-    origin_txt = re.sub(r"\s+", " ", str(bootstrap_origin_label)).strip() or "internal bootstrap root vocab"
 
-    def _append(term: str, tags: Sequence[str]):
-        key = re.sub(r"\s+", " ", str(term)).strip().lower()
-        if not key:
-            return
-        row = out.setdefault(key, [])
-        seen = {str(x).strip().lower() for x in row}
-        for t in _normalize_vocab_terms(tags):
-            tl = str(t).strip().lower()
-            if not tl or tl in seen:
-                continue
-            seen.add(tl)
-            row.append(str(t))
-
-    for term in official_pool.keys():
-        key = re.sub(r"\s+", " ", str(term)).strip().lower()
-        if not key:
-            continue
-        _append(
-            key,
-            _normalize_vocab_terms(
-                ["official dataset pool", "symbol pool official"] + _semantic_tags_for_symbol_term(key)
-            ),
-        )
-    for term in synthetic_pool.keys():
-        key = re.sub(r"\s+", " ", str(term)).strip().lower()
-        if not key:
-            continue
-        _append(
-            key,
-            _normalize_vocab_terms(
-                ["synthetic semantic pool", "symbol pool synthetic"] + _semantic_tags_for_symbol_term(key)
-            ),
-        )
-    for term in bootstrap_pool.keys():
-        key = re.sub(r"\s+", " ", str(term)).strip().lower()
-        if not key:
-            continue
-        _append(
-            key,
-            _normalize_vocab_terms(
-                [
-                    "symbol pool bootstrap",
-                    "internal bootstrap material",
-                    origin_txt,
-                    f"{origin_txt}::{key}",
-                ]
-                + _semantic_tags_for_symbol_term(key)
-            ),
-        )
-    return out
 
 
 def _image_any_to_rgb_chw01(img: Any, image_size: int) -> np.ndarray:

@@ -87,7 +87,8 @@ from pipeline.utils import (
     _unwrap_module_for_replica,
 )
 from semantic_dataset_loaders import (
-    _composite_non_dataset_label_stack,
+    _composite_mask_stack,
+    _is_dataset_label_term,
     build_creation_label_mask_stack,
     build_label_mask_stack,
     combine_label_mask_stacks,
@@ -1404,14 +1405,8 @@ def _remap_semantic_batch_to_active_vocab(
             strict=True,
             idx_to_term=active_idx_to_term,
         )
-        mixed_mask_np = _composite_non_dataset_label_stack(
-            remapped_stack,
-            remapped_idx,
-            idx_to_term=active_idx_to_term,
-            height=int(height),
-            width=int(width),
-            fallback_mask=base_mask_np,
-        )
+        _nds_keep = [i for i in range(min(int(remapped_stack.shape[0]), int(remapped_idx.size))) if not _is_dataset_label_term(str((active_idx_to_term or {}).get(int(remapped_idx[i]), "")))]
+        mixed_mask_np = _composite_mask_stack(remapped_stack[np.asarray(_nds_keep, dtype=np.int64)]) if _nds_keep else np.asarray(base_mask_np, dtype=np.float32)
         out_y_rows.append(torch.from_numpy(np.asarray(y_active_np, dtype=np.float32)))
         out_m_rows.append(torch.from_numpy(np.asarray(mixed_mask_np, dtype=np.float32)).unsqueeze(0))
         out_stack_rows.append(torch.from_numpy(np.asarray(remapped_stack, dtype=np.float32)))

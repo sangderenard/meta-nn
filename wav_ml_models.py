@@ -1758,6 +1758,7 @@ def train_conditional_generator_discriminator(
     w_diversity: float = 0.0,
     diversity_target_std: float = 0.15,
     d_instance_noise_std: float = 0.0,
+    r1_weight: float = 0.0,
 ) -> Tuple[nn.Module, nn.Module, List[Dict[str, float]]]:
     if len(payload_images) <= 0 or len(payload_conditions) <= 0 or len(payload_masks) <= 0:
         raise RuntimeError("Generator/discriminator training requires non-empty payload bank.")
@@ -1991,6 +1992,8 @@ def train_conditional_generator_discriminator(
                         else:
                             _real_d_in = _real_d
                             _fake_d_in = _fake_d
+                        if float(r1_weight) > 0.0:
+                            _real_d_in = _real_d_in.detach().requires_grad_(True)
                         _dr = discriminator.forward_with_aux(_real_d_in, _cond_d, _rmask_d)
                         _df = discriminator.forward_with_aux(_fake_d_in, _cond_d, _fmp_d)
                         _d_loss = 0.5 * (
@@ -1999,6 +2002,15 @@ def train_conditional_generator_discriminator(
                             + F.softplus(-_dr["mask_logits"]).mean()
                             + F.softplus(_df["mask_logits"]).mean()
                         )
+                    # R1 gradient penalty on real images (fp32 for stability)
+                    if float(r1_weight) > 0.0:
+                        _r1_grads = torch.autograd.grad(
+                            outputs=_dr["subject_logits"].sum() + _dr["mask_logits"].sum(),
+                            inputs=_real_d_in,
+                            create_graph=True,
+                        )[0]
+                        _r1_penalty = _r1_grads.to(torch.float32).pow(2).reshape(int(_r1_grads.shape[0]), -1).sum(dim=1).mean()
+                        _d_loss = _d_loss + (float(r1_weight) / 2.0) * _r1_penalty
                     _d_back = _d_loss / float(max(1, len(_d_ranges)))
                     if use_scaler:
                         scaler_d.scale(_d_back).backward()

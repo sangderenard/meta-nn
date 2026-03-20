@@ -116,7 +116,7 @@ function applies a stochastic combination of: blur (avg_pool2d), stride-skew (od
 pixel dropout, quantization, and Gaussian noise to the image. Critically, degrade also
 **produces its own mask**: each degradation operation accumulates a "touch" map recording
 where and how strongly the image was modified. This touch map is then blended with the
-original mask via `_blend_attention_maps()` to produce a new composite mask for the
+original mask via `_composite_mask_stack()` to produce a new composite mask for the
 deformed variant. The mask is not merely transformed geometrically — **each deformation
 supplies its own mask contribution**.
 
@@ -217,8 +217,8 @@ Add an edge from `data_node` to the new node with `on_traverse=_data_node.provid
 **Adding a new deformation type:**
 It must go through `DiskSemanticRowsDataset._apply_degrade()` in `semantic_dataset_loaders.py`
 or follow the same protocol: apply the deformation to the image, accumulate a touch map
-recording where and how strongly the image was modified, blend the touch map into the mask
-via `_blend_attention_maps()`, then recompute the per-label mask stack and call
+recording where and how strongly the image was modified, stack the touch map with the mask
+and call `_composite_mask_stack()`, then recompute the per-label mask stack and call
 `_composite_mask_stack()` to regenerate the gestalt composite. Every deformation supplies
 its own mask. Do not reuse the original undeformed composite.
 

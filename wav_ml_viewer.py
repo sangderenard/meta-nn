@@ -910,6 +910,10 @@ class _TransformerStatusOpenGLViewer:
     def _clear_frame_text_cache(self) -> None:
         self._composite_ring_cursors.clear()
 
+    def _prune_pending_frame_text(self, *, min_cursor: int) -> None:
+        while self._composite_ring_cursors and self._composite_ring_cursors[0] < min_cursor:
+            self._composite_ring_cursors.popleft()
+
     def _current_display_cache_index(self) -> Optional[int]:
         cache = self._composite_cache
         if cache is None:
