@@ -543,7 +543,7 @@ def build_generator_preview_frames(
     eff_loss: Optional[float] = float(g_loss_avg) if math.isfinite(g_loss_avg) else None
 
     frames: List[Dict[str, Any]] = []
-    for payload in payload_batch[:1]:  # one frame per callback, first sample only
+    for payload in payload_batch:
         target_raw = payload.get("target_img", None)
         fake_raw = payload.get("fake_img", None)
         if target_raw is None or fake_raw is None:
@@ -581,6 +581,17 @@ def build_generator_preview_frames(
         if math.isfinite(g_loss):
             loss_scalars["loss"] = g_loss
 
+        # Per-channel stats for the fake panel (fake_chw: [3,H,W] float32 in [0,1])
+        ch_names = ("R", "G", "B")
+        fake_rows = []
+        for ci, cn in enumerate(ch_names):
+            ch = fake_chw[ci]
+            mu = float(ch.mean())
+            sd = float(ch.std())
+            lo = float(ch.min())
+            hi = float(ch.max())
+            fake_rows.append(f"{cn}: μ={mu:.2f} σ={sd:.2f} [{lo:.2f},{hi:.2f}]")
+
         frames.append({
             "images": [
                 _chw_to_u8_hwc(target_chw),
@@ -596,7 +607,7 @@ def build_generator_preview_frames(
             "rows": [
                 target_labels,
                 metric_rows,
-                [],
+                fake_rows,
             ],
             "loss_scalars": loss_scalars,
         })
@@ -616,13 +627,7 @@ def make_generator_step_preview_callback(ctx: Any, node_id: str, preview_every: 
     if not callable(enqueue_frame):
         return None
 
-    _counter = [0]
-    _every = max(1, int(preview_every))
-
     def _callback(payload_batch: Sequence[Dict[str, Any]]) -> None:
-        _counter[0] += 1
-        if _counter[0] % _every != 0:
-            return
         preview_check = getattr(ctx, "preview_enabled", None)
         if callable(preview_check) and not preview_check():
             return

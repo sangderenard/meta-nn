@@ -322,6 +322,7 @@ class PipelineContext:
     # ---- symbol / flashcard pools ---------------------------------------
     symbol_pool: Optional[Dict[str, Any]] = None
     flashcard_rows: List[Any] = field(default_factory=list)
+    flashcard_row_terms: List[List[str]] = field(default_factory=list)
     pregestation_logic_rows: Optional[Any] = None            # cached geometric images
 
     # ---- wave pool ------------------------------------------------------
@@ -367,6 +368,8 @@ class PipelineContext:
     vocab_lora_plan_registered_cycle: int = -1  # orchestrator cycle when plan_signature was last set
     vocab_lora_plan_registered_round: int = -1   # round_id when plan_signature was last set
     vocab_churn_activation_pending: bool = False  # set by activating sources; consumed+cleared by VocabChurnNode
+    vocab_churn_demand_registry: Dict[str, List[str]] = field(default_factory=dict)    # source → normalized terms
+    vocab_churn_demand_term_rows: Dict[str, List[List[str]]] = field(default_factory=dict)  # source → term rows
     last_node_statuses: Dict[str, str] = field(default_factory=dict)
     last_execution_trace: List[Dict[str, Any]] = field(default_factory=list)
     last_program_trace: List[Dict[str, Any]] = field(default_factory=list)
@@ -520,6 +523,18 @@ class PipelineContext:
         if proxy is None:
             return False
         fn = getattr(proxy, "suppress_rebuild_enabled", None)
+        if not callable(fn):
+            return False
+        try:
+            return bool(fn())
+        except Exception:
+            return False
+
+    def force_rebuild_enabled(self) -> bool:
+        proxy = self.viewer_proxy
+        if proxy is None:
+            return False
+        fn = getattr(proxy, "force_rebuild_enabled", None)
         if not callable(fn):
             return False
         try:

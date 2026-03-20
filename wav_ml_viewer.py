@@ -391,6 +391,7 @@ class _TransformerStatusOpenGLViewer:
         self._stage_roster: List[Tuple[str, str]] = []
         self._gate_override = False
         self._suppress_rebuild = False
+        self._force_rebuild = False
         self._paused = True
         self._preview_enabled = True
         self._scrub_editor_enabled = True
@@ -599,6 +600,9 @@ class _TransformerStatusOpenGLViewer:
 
     def suppress_rebuild_enabled(self) -> bool:
         return bool(self._suppress_rebuild)
+
+    def force_rebuild_enabled(self) -> bool:
+        return bool(self._force_rebuild)
 
     def set_ipc_server(self, server: "ViewerIPCServer") -> None:
         """Store a back-reference to the IPC server for connection checks."""
@@ -1126,6 +1130,18 @@ class _TransformerStatusOpenGLViewer:
                 fill_on=(60, 100, 120),
                 fill_off=(36, 40, 44),
                 text_on=(170, 210, 230),
+                text_off=(150, 160, 172),
+            )
+
+            _draw_check(
+                max(x + 4, self.window_w - 494),
+                row2_y,
+                "Force rebuild",
+                checked=bool(self._force_rebuild),
+                kind="force_rebuild",
+                fill_on=(140, 60, 60),
+                fill_off=(36, 40, 44),
+                text_on=(240, 180, 180),
                 text_off=(150, 160, 172),
             )
 
@@ -2681,6 +2697,14 @@ class _TransformerStatusOpenGLViewer:
                     return True
                 elif kind == "suppress_rebuild":
                     self._suppress_rebuild = not bool(self._suppress_rebuild)
+                    if self._suppress_rebuild:
+                        self._force_rebuild = False
+                    self._top_bar_dirty = True
+                    return True
+                elif kind == "force_rebuild":
+                    self._force_rebuild = not bool(self._force_rebuild)
+                    if self._force_rebuild:
+                        self._suppress_rebuild = False
                     self._top_bar_dirty = True
                     return True
                 elif kind == "pause":
@@ -4029,6 +4053,7 @@ class ViewerIPCServer:
             save_now = bool(self._viewer._save_now_pending)
             gate_override = self._viewer.gate_override_enabled()
             suppress_rebuild = self._viewer.suppress_rebuild_enabled()
+            force_rebuild = self._viewer.force_rebuild_enabled()
             cycle_selected = list(self._viewer._cycle_selected)
             node_selected = dict(self._viewer._stage_selected)
             weight_mode = int(weight_spec.get("mode", 1) or 1)
@@ -4037,7 +4062,7 @@ class ViewerIPCServer:
 
             # Only send if state changed or a one-shot signal is pending.
             snapshot = (
-                is_stopping, is_paused, gate_override, suppress_rebuild, is_preview, is_scrub_editor,
+                is_stopping, is_paused, gate_override, suppress_rebuild, force_rebuild, is_preview, is_scrub_editor,
                 tuple(cycle_selected), tuple(sorted(node_selected.items())),
                 weight_mode, weight_cw, weight_ch,
             )
@@ -4059,6 +4084,7 @@ class ViewerIPCServer:
                 "paused": is_paused,
                 "gate_override": gate_override,
                 "suppress_rebuild": suppress_rebuild,
+                "force_rebuild": force_rebuild,
                 "preview_enabled": is_preview,
                 "scrub_editor_enabled": is_scrub_editor,
                 "cycle_selected": cycle_selected,
@@ -4078,6 +4104,7 @@ class ViewerIPCServer:
                 selected_node_ids=self._viewer.selected_node_ids(),
                 gate_override=bool(status["gate_override"]),
                 suppress_rebuild=bool(status["suppress_rebuild"]),
+                force_rebuild=bool(status["force_rebuild"]),
                 preview_enabled=is_preview,
                 scrub_editor_enabled=is_scrub_editor,
                 metadata={
@@ -4242,6 +4269,7 @@ class ViewerIPCProxy:
         self._shutdown_save: Optional[bool] = None
         self._gate_override = False
         self._suppress_rebuild = False
+        self._force_rebuild = False
         self._paused = True
         self._preview_enabled = True
         self._scrub_editor_enabled = True
@@ -4502,6 +4530,7 @@ class ViewerIPCProxy:
                         self._paused = str(payload.command).lower() == "pause"
                         self._gate_override = bool(payload.gate_override)
                         self._suppress_rebuild = bool(getattr(payload, "suppress_rebuild", False))
+                        self._force_rebuild = bool(getattr(payload, "force_rebuild", False))
                         self._preview_enabled = bool(getattr(payload, "preview_enabled", True))
                         self._scrub_editor_enabled = bool(getattr(payload, "scrub_editor_enabled", True))
                         # Extract save preference from metadata
@@ -4538,6 +4567,7 @@ class ViewerIPCProxy:
                     self._stop_flag = msg.get("stop_requested", False)
                     self._gate_override = msg.get("gate_override", False)
                     self._suppress_rebuild = msg.get("suppress_rebuild", False)
+                    self._force_rebuild = msg.get("force_rebuild", False)
                     self._paused = msg.get("paused", False)
                     self._preview_enabled = msg.get("preview_enabled", True)
                     self._scrub_editor_enabled = msg.get("scrub_editor_enabled", True)
@@ -4813,6 +4843,9 @@ class ViewerIPCProxy:
 
     def suppress_rebuild_enabled(self) -> bool:
         return self._suppress_rebuild
+
+    def force_rebuild_enabled(self) -> bool:
+        return self._force_rebuild
 
     def paused(self) -> bool:
         return self._paused

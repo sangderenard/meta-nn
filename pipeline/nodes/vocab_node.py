@@ -393,7 +393,7 @@ class BuildFlashcardRowsNode(PipelineNode):
                     vec[idx] = 1.0
             return vec
 
-        flashcard_images, flashcard_conditions, info = _build_reference_flashcard_payload_rows(
+        flashcard_images, flashcard_conditions, flashcard_row_terms, info = _build_reference_flashcard_payload_rows(
             class_names=class_names_local,
             condition_num_classes=len(class_names_local),
             supervised_num_classes=len(ctx.supervised_class_names),
@@ -409,6 +409,7 @@ class BuildFlashcardRowsNode(PipelineNode):
         )
 
         ctx.flashcard_rows = list(zip(flashcard_images, flashcard_conditions))
+        ctx.flashcard_row_terms = list(flashcard_row_terms)
         _log(f"[flashcard] built {len(ctx.flashcard_rows)} rows "
              f"(info: {info.get('rows_added', 0)} added)")
 
@@ -606,6 +607,7 @@ def _build_reference_flashcard_payload_rows(
 
     cards_img: List[np.ndarray] = []
     cards_cond: List[np.ndarray] = []
+    cards_terms: List[List[str]] = []
     term_counts: Dict[str, int] = {}
 
     _sup_names_local: List[str] = [str(n) for n in supervised_class_names]
@@ -654,6 +656,7 @@ def _build_reference_flashcard_payload_rows(
                 raise RuntimeError(f"Berkeley/object flashcard row is missing required 'berkeley sbd dataset' target flag. term={str(term)!r}")
         cards_img.append(img_rgb)
         cards_cond.append(np.asarray(vec, dtype=np.float32).reshape(-1))
+        cards_terms.append(list(terms))
         term_counts[key] = int(term_counts.get(key, 0)) + 1
 
     for term in interruptible_tqdm(
@@ -753,6 +756,7 @@ def _build_reference_flashcard_payload_rows(
         perm = rng.permutation(np.arange(len(cards_cond), dtype=np.int64)).astype(np.int64).tolist()
         cards_img = [cards_img[int(i)] for i in perm]
         cards_cond = [cards_cond[int(i)] for i in perm]
+        cards_terms = [cards_terms[int(i)] for i in perm]
 
     info = {
         "enabled": True,
@@ -767,7 +771,7 @@ def _build_reference_flashcard_payload_rows(
     info["target_active_mean"] = float(target_stats.get("mean", 0.0))
     info["target_active_p50"] = float(target_stats.get("p50", 0.0))
     info["target_active_max"] = int(target_stats.get("max", 0))
-    return cards_img, cards_cond, info
+    return cards_img, cards_cond, cards_terms, info
 
 
 
@@ -958,10 +962,34 @@ def register_churn_requirement(
     stage_label: str = "",
     max_terms_per_slot: int = 0,
 ) -> Dict[str, Any]:
+    # ---- Accumulate this source's demands into the cumulative registry ----
+    _src_terms = _normalize_vocab_terms(required_terms)
+    _src_rows = _normalize_term_rows(term_rows)
+    if _src_terms:
+        ctx.vocab_churn_demand_registry[str(source)] = list(_src_terms)
+    if _src_rows:
+        ctx.vocab_churn_demand_term_rows[str(source)] = list(_src_rows)
+
+    # ---- Build unified plan from the UNION of all accumulated demands ----
+    _all_terms: List[str] = []
+    _seen_keys: set = set()
+    for _src_term_list in ctx.vocab_churn_demand_registry.values():
+        for _t in _src_term_list:
+            _k = _vocab_term_key(_t)
+            if _k and _k not in _seen_keys:
+                _seen_keys.add(_k)
+                _all_terms.append(_t)
+    _all_rows: List[List[str]] = []
+    for _src_row_list in ctx.vocab_churn_demand_term_rows.values():
+        _all_rows.extend(_src_row_list)
+
+    if not _all_terms:
+        return {"required_extra_term_count": 0, "current_vocab_fit": True, "slot_count": 0}
+
     plan = plan_vocab_lora_requirements(
         ctx=ctx,
-        required_terms=required_terms,
-        term_rows=term_rows,
+        required_terms=_all_terms,
+        term_rows=_all_rows if _all_rows else None,
         source=str(source),
         stage_label=str(stage_label),
         max_terms_per_slot=int(max_terms_per_slot),

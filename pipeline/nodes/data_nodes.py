@@ -615,6 +615,17 @@ class DataNode(PipelineNode):
         """
         any_expired = False
         _suppress = getattr(ctx, "suppress_rebuild_enabled", lambda: False)()
+        _force_all = getattr(ctx, "force_rebuild_enabled", lambda: False)()
+        if _force_all:
+            for name, poss in self.possessions.items():
+                poss.force_next_rebuild = True
+                for attr in poss.ctx_attrs:
+                    if hasattr(ctx, attr):
+                        setattr(ctx, attr, None)
+                if poss.built:
+                    poss.mark_expired()
+                    any_expired = True
+            _log("[data-node] force_rebuild active — all possessions marked for rebuild")
         for name, poss in self.possessions.items():
             if not poss.built:
                 continue
@@ -4078,6 +4089,33 @@ def _filter_stream_pool_for_chunk_samples(
     }
     return out_streams, out_labels, out_metas, out_targets, info
 
+
+def rebuild_conditions_from_terms(
+    payload_terms: Sequence[Sequence[str]],
+    class_names: Sequence[str],
+) -> List[np.ndarray]:
+    """Rebuild condition vectors from per-row term lists against the current vocabulary.
+
+    This closes the gap where payload condition vectors were built against an
+    earlier (narrower) vocabulary and therefore lack slots for terms that were
+    added later (e.g. by vocab churn / LoRA activation).  Any term in a row's
+    term list that maps into ``class_names`` gets its slot set to 1.0.
+    """
+    term_to_idx: Dict[str, int] = {}
+    for i, name in enumerate(class_names):
+        key = str(name).strip().lower()
+        if key and key not in term_to_idx:
+            term_to_idx[key] = int(i)
+    c = max(1, int(len(class_names)))
+    out: List[np.ndarray] = []
+    for row_terms in payload_terms:
+        vec = np.zeros((c,), dtype=np.float32)
+        for t in row_terms:
+            idx = term_to_idx.get(str(t).strip().lower(), -1)
+            if 0 <= idx < c:
+                vec[idx] = 1.0
+        out.append(vec)
+    return out
 
 def _expand_payload_conditions_with_semantic_bank(
     payload_conditions: Sequence[Any],

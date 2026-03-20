@@ -128,6 +128,19 @@ _LEASE_STORE = None   # type: Optional["pipeline.lease_store.LeaseStore"]
 _LEASE_STORE_LOCK = threading.Lock()
 _WEB_DATASET = None   # type: Optional["pipeline.web_dataset.WebDataset"]
 
+# ---------------------------------------------------------------------------
+# Checkpoint directory (optional — enables /api/model/latest/*)
+# ---------------------------------------------------------------------------
+
+_CHECKPOINT_DIR: Optional[str] = None
+# Cache: model_name → (mtime, onnx_bytes)
+_ONNX_CACHE: dict = {}
+_ONNX_CACHE_LOCK = threading.Lock()
+
+_LATEST_MODEL_ALLOWED = {
+    "classifier", "transformer", "generator", "discriminator", "wave_classifier",
+}
+
 
 def _lease_store():
     return _LEASE_STORE
@@ -243,6 +256,21 @@ class NodusHandler(BaseHTTPRequestHandler):
         if path == "/":
             return self._handle_index()
 
+        if path == "/train":
+            return self._handle_train_ui()
+
+        # -- Latest model (from checkpoint dir) --
+        if path == "/api/model/latest":
+            return self._handle_model_latest_list()
+
+        m = re.fullmatch(r"/api/model/latest/([^/]+)\.onnx", path)
+        if m:
+            return self._handle_model_latest_onnx(m.group(1), qs)
+
+        m = re.fullmatch(r"/api/model/latest/([^/]+)\.pt", path)
+        if m:
+            return self._handle_model_latest_pt(m.group(1))
+
         if path == "/api/status":
             return self._handle_status()
 
@@ -319,6 +347,10 @@ class NodusHandler(BaseHTTPRequestHandler):
         if m:
             return self._handle_web_lease_weights(m.group(1))
 
+        m = re.fullmatch(r"/api/web/lease/([^/]+)/weights\.onnx", path)
+        if m:
+            return self._handle_web_lease_weights_onnx(m.group(1))
+
         m = re.fullmatch(r"/api/web/lease/([^/]+)/dataset", path)
         if m:
             return self._handle_web_lease_dataset(m.group(1))
@@ -344,6 +376,162 @@ class NodusHandler(BaseHTTPRequestHandler):
     def _handle_index(self):
         html = _INDEX_HTML
         self._send(200, "text/html; charset=utf-8", html.encode())
+
+    def _handle_train_ui(self):
+        import pathlib
+        html_path = pathlib.Path(__file__).parent / "native" / "nodus_train.html"
+        if not html_path.exists():
+            self._send(404, "text/plain", b"nodus_train.html not found")
+            return
+        self._send(200, "text/html; charset=utf-8", html_path.read_bytes())
+
+    # ------------------------------------------------------------------ #
+    #  Latest model handlers (served from --checkpoint-dir)                #
+    # ------------------------------------------------------------------ #
+
+    def _handle_model_latest_list(self):
+        if not _CHECKPOINT_DIR:
+            self._send(503, "application/json",
+                       _json({"error": "checkpoint dir not configured (start with --checkpoint-dir)"}))
+            return
+        import pathlib
+        ckpt_dir = pathlib.Path(_CHECKPOINT_DIR)
+        available = {}
+        for name in _LATEST_MODEL_ALLOWED:
+            pt_path = ckpt_dir / f"{name}.pt"
+            if pt_path.exists():
+                st = pt_path.stat()
+                available[name] = {
+                    "pt_size_bytes": st.st_size,
+                    "modified": st.st_mtime,
+                    "onnx_url": f"/api/model/latest/{name}.onnx",
+                    "pt_url": f"/api/model/latest/{name}.pt",
+                }
+        self._send(200, "application/json", _json({"checkpoint_dir": _CHECKPOINT_DIR, "models": available}))
+
+    def _handle_model_latest_pt(self, name: str):
+        if not _CHECKPOINT_DIR:
+            self._send(503, "application/json",
+                       _json({"error": "checkpoint dir not configured"}))
+            return
+        if name not in _LATEST_MODEL_ALLOWED:
+            self._send(400, "application/json",
+                       _json({"error": f"model must be one of {sorted(_LATEST_MODEL_ALLOWED)}",
+                               "given": name}))
+            return
+        import pathlib
+        pt_path = pathlib.Path(_CHECKPOINT_DIR) / f"{name}.pt"
+        if not pt_path.exists():
+            self._send(404, "application/json", _json({"error": f"{name}.pt not found"}))
+            return
+        self._send(200, "application/octet-stream", pt_path.read_bytes())
+
+    def _handle_model_latest_onnx(self, name: str, qs: dict):
+        """On-demand ONNX conversion of the latest checkpoint.
+
+        Caches the .onnx bytes keyed on .pt mtime — only re-exports when the
+        checkpoint file changes.
+        """
+        if not _CHECKPOINT_DIR:
+            self._send(503, "application/json",
+                       _json({"error": "checkpoint dir not configured (start with --checkpoint-dir)"}))
+            return
+        if name not in _LATEST_MODEL_ALLOWED:
+            self._send(400, "application/json",
+                       _json({"error": f"model must be one of {sorted(_LATEST_MODEL_ALLOWED)}",
+                               "given": name}))
+            return
+
+        import pathlib
+        pt_path = pathlib.Path(_CHECKPOINT_DIR) / f"{name}.pt"
+        if not pt_path.exists():
+            self._send(404, "application/json", _json({"error": f"{name}.pt not found"}))
+            return
+
+        current_mtime = pt_path.stat().st_mtime
+
+        # Check cache
+        with _ONNX_CACHE_LOCK:
+            cached = _ONNX_CACHE.get(name)
+            if cached is not None and cached[0] == current_mtime:
+                self._send(200, "application/octet-stream", cached[1])
+                return
+
+        # Must convert — parse optional query params
+        model_class = (qs.get("model_class") or [""])[0].strip()
+        input_shape_str = (qs.get("input_shape") or [""])[0].strip()
+        opset = int((qs.get("opset") or ["17"])[0])
+
+        try:
+            import torch
+            import wav_ml_models as _models
+
+            checkpoint = torch.load(str(pt_path), map_location="cpu", weights_only=False)
+
+            ctor_kwargs = {}
+            state_dict = checkpoint
+            if isinstance(checkpoint, dict):
+                ctor_kwargs = checkpoint.get("ctor_kwargs", {})
+                state_dict = checkpoint.get("state_dict", checkpoint)
+                if "model_state_dict" in state_dict:
+                    state_dict = state_dict["model_state_dict"]
+                if not model_class:
+                    model_class = checkpoint.get("model_class", "")
+
+            # Infer model class from name if not explicitly given
+            _CLASS_HINTS = {
+                "classifier": "TinyConvClassifier",
+                "transformer": "WavePatchTransformer",
+                "generator": "ConditionalBitPlaneGenerator",
+                "discriminator": "ConditionalBitPlaneDiscriminator",
+                "wave_classifier": "DeskewFilterBundle",
+            }
+            if not model_class:
+                model_class = _CLASS_HINTS.get(name, "")
+            if not model_class:
+                self._send(400, "application/json",
+                           _json({"error": "cannot infer model_class — pass ?model_class=ClassName"}))
+                return
+
+            _ALLOWED = {
+                "TinyConvClassifier", "ConditionalBitPlaneGenerator",
+                "ConditionalBitPlaneDiscriminator", "WavePatchTransformer",
+                "DeskewFilterBundle",
+            }
+            if model_class not in _ALLOWED:
+                self._send(400, "application/json",
+                           _json({"error": f"model_class must be one of {sorted(_ALLOWED)}"}))
+                return
+
+            cls = getattr(_models, model_class)
+            model = cls(**ctor_kwargs) if ctor_kwargs else cls()
+            if isinstance(state_dict, dict):
+                model.load_state_dict(state_dict, strict=False)
+            model.eval()
+
+            if input_shape_str:
+                input_shape = [int(d) for d in input_shape_str.split(",")]
+            else:
+                input_shape = [1, 3, 64, 64]
+            dummy_input = torch.randn(*input_shape)
+
+            buf = io.BytesIO()
+            torch.onnx.export(
+                model, dummy_input, buf,
+                opset_version=opset,
+                input_names=["input"],
+                output_names=["output"],
+                dynamic_axes={"input": {0: "batch"}, "output": {0: "batch"}},
+            )
+            onnx_bytes = buf.getvalue()
+
+            with _ONNX_CACHE_LOCK:
+                _ONNX_CACHE[name] = (current_mtime, onnx_bytes)
+
+            self._send(200, "application/octet-stream", onnx_bytes)
+        except Exception as exc:
+            self._send(500, "application/json",
+                       _json({"error": f"ONNX conversion failed: {exc}"}))
 
     def _handle_status(self):
         try:
@@ -680,6 +868,131 @@ class NodusHandler(BaseHTTPRequestHandler):
         body = weights_path.read_bytes()
         self._send(200, "application/octet-stream", body)
 
+    def _handle_web_lease_weights_onnx(self, lease_id: str):
+        """Serve a previously-exported ONNX file for a lease."""
+        ls = _lease_store()
+        if ls is None:
+            self._send(503, "application/json", _json({"error": "lease store not configured"}))
+            return
+        lease = ls.get_lease(lease_id)
+        if lease is None:
+            self._send(404, "application/json", _json({"error": "lease not found"}))
+            return
+        onnx_path = (
+            __import__("pathlib").Path(ls._dir)
+            / "active_weights" / lease.collection_id / "model.onnx"
+        )
+        if not onnx_path.exists():
+            self._send(404, "application/json",
+                       _json({"error": "ONNX model not found — POST /api/onnx/export first",
+                               "collection_id": lease.collection_id}))
+            return
+        body = onnx_path.read_bytes()
+        self._send(200, "application/octet-stream", body)
+
+    def _handle_onnx_export(self, ls, body: bytes):
+        """Export a .pt checkpoint to ONNX via torch.onnx.export.
+
+        Body JSON::
+
+            {
+              "collection_id": "<id>",
+              "model_class": "TinyConvClassifier" | "ConditionalBitPlaneGenerator" | ...,
+              "input_shape": [1, 3, 64, 64],     // optional, default varies by class
+              "opset_version": 17                   // optional, default 17
+            }
+        """
+        if ls is None:
+            self._send(503, "application/json", _json({"error": "lease store not configured"}))
+            return
+        try:
+            req = json.loads(body or b"{}")
+        except Exception:
+            self._send(400, "application/json", _json({"error": "invalid JSON body"}))
+            return
+        collection_id = str(req.get("collection_id") or "").strip()
+        model_class_name = str(req.get("model_class") or "").strip()
+        if not collection_id or not model_class_name:
+            self._send(400, "application/json",
+                       _json({"error": "collection_id and model_class are required"}))
+            return
+
+        _ALLOWED_CLASSES = {
+            "TinyConvClassifier", "ConditionalBitPlaneGenerator",
+            "ConditionalBitPlaneDiscriminator", "WavePatchTransformer",
+            "DeskewFilterBundle",
+        }
+        if model_class_name not in _ALLOWED_CLASSES:
+            self._send(400, "application/json",
+                       _json({"error": f"model_class must be one of {sorted(_ALLOWED_CLASSES)}",
+                               "given": model_class_name}))
+            return
+
+        weights_dir = __import__("pathlib").Path(ls._dir) / "active_weights" / collection_id
+        pt_path = weights_dir / "weights.pt"
+        if not pt_path.exists():
+            self._send(404, "application/json",
+                       _json({"error": "weights.pt not found for this collection"}))
+            return
+
+        try:
+            import torch
+            import wav_ml_models as _models
+
+            checkpoint = torch.load(str(pt_path), map_location="cpu", weights_only=False)
+            cls = getattr(_models, model_class_name)
+
+            # Try to infer constructor args from checkpoint metadata
+            ctor_kwargs = {}
+            if isinstance(checkpoint, dict) and "ctor_kwargs" in checkpoint:
+                ctor_kwargs = checkpoint["ctor_kwargs"]
+            state_dict = checkpoint if isinstance(checkpoint, dict) and "state_dict" not in checkpoint else (
+                checkpoint.get("state_dict", checkpoint)
+            )
+            if isinstance(state_dict, dict) and "model_state_dict" in state_dict:
+                state_dict = state_dict["model_state_dict"]
+
+            model = cls(**ctor_kwargs) if ctor_kwargs else cls.__new__(cls)
+            if not ctor_kwargs:
+                # Attempt basic init for shape inference
+                try:
+                    model = cls()
+                except TypeError:
+                    self._send(400, "application/json",
+                               _json({"error": f"Cannot auto-instantiate {model_class_name} — "
+                                                f"include ctor_kwargs in checkpoint or request"}))
+                    return
+            if isinstance(state_dict, dict):
+                model.load_state_dict(state_dict, strict=False)
+            model.eval()
+
+            input_shape = req.get("input_shape") or [1, 3, 64, 64]
+            input_shape = [int(d) for d in input_shape]
+            dummy_input = torch.randn(*input_shape)
+            opset = int(req.get("opset_version") or 17)
+
+            onnx_path = weights_dir / "model.onnx"
+            torch.onnx.export(
+                model, dummy_input, str(onnx_path),
+                opset_version=opset,
+                input_names=["input"],
+                output_names=["output"],
+                dynamic_axes={"input": {0: "batch"}, "output": {0: "batch"}},
+            )
+            onnx_size = onnx_path.stat().st_size
+            self._send(200, "application/json", _json({
+                "ok": True,
+                "collection_id": collection_id,
+                "model_class": model_class_name,
+                "onnx_path": str(onnx_path),
+                "onnx_size_bytes": onnx_size,
+                "opset_version": opset,
+                "input_shape": input_shape,
+            }))
+        except Exception as exc:
+            self._send(500, "application/json",
+                       _json({"error": f"ONNX export failed: {exc}"}))
+
     def _handle_web_lease_dataset(self, lease_id: str):
         ls = _lease_store()
         wd = _web_dataset()
@@ -705,6 +1018,10 @@ class NodusHandler(BaseHTTPRequestHandler):
 
     def _dispatch_post(self, path: str, body: bytes):
         ls = _lease_store()
+
+        # ONNX export from a .pt checkpoint
+        if path == "/api/onnx/export":
+            return self._handle_onnx_export(ls, body)
 
         # Browser-submitted training sample
         m = re.fullmatch(r"/api/web/dataset/([^/]+)", path)
@@ -932,6 +1249,7 @@ _INDEX_HTML = """\
 <body>
 <h1>Nodus Data Server</h1>
 <p>Read-only HTTP interface to the nodus shared-memory training data stores.</p>
+<p><strong><a href="/train">&#9654; Open Browser Training Console</a></strong></p>
 
 <h2>Status</h2>
 <table>
@@ -984,7 +1302,25 @@ claims them into a collection.</p>
   <tr><td>GET</td><td><a href="/api/web/dataset/status">/api/web/dataset/status</a></td><td>Pending sample counts per slot</td></tr>
   <tr><td>GET</td><td>/api/web/dataset/&lt;slot&gt;/&lt;sample_id&gt;/image.png</td><td>Preview a submitted image (RGBA)</td></tr>
   <tr><td>GET</td><td>/api/web/lease/&lt;lease_id&gt;/weights</td><td>Download model weights for a lease (PyTorch .pt binary)</td></tr>
+  <tr><td>GET</td><td>/api/web/lease/&lt;lease_id&gt;/weights.onnx</td><td>Download model weights as ONNX (must export first)</td></tr>
   <tr><td>GET</td><td>/api/web/lease/&lt;lease_id&gt;/dataset</td><td>JSON list of dataset samples assigned to this lease</td></tr>
+</table>
+
+<h2>ONNX Export</h2>
+<p>Requires <code>--lease-store-dir</code>. Converts a <code>weights.pt</code> checkpoint into <code>model.onnx</code> for browser/native ONNX Runtime inference.</p>
+<table>
+  <tr><th>Method</th><th>Endpoint</th><th>Description</th></tr>
+  <tr><td>POST</td><td>/api/onnx/export</td><td>Export .pt to ONNX &mdash; body: <code>{"collection_id":"...","model_class":"TinyConvClassifier","input_shape":[1,3,64,64],"opset_version":17}</code></td></tr>
+</table>
+
+<h2>Latest Model (Live Weights)</h2>
+<p>Requires <code>--checkpoint-dir</code>. Serves the freshest model weights from the pipeline&rsquo;s
+output directory. ONNX conversion is done on-demand and cached until the <code>.pt</code> file changes.</p>
+<table>
+  <tr><th>Method</th><th>Endpoint</th><th>Description</th></tr>
+  <tr><td>GET</td><td><a href="/api/model/latest">/api/model/latest</a></td><td>List available model checkpoints with timestamps</td></tr>
+  <tr><td>GET</td><td>/api/model/latest/&lt;name&gt;.onnx</td><td>On-demand ONNX &mdash; <code>?model_class=&amp;input_shape=1,3,64,64&amp;opset=17</code></td></tr>
+  <tr><td>GET</td><td>/api/model/latest/&lt;name&gt;.pt</td><td>Raw PyTorch checkpoint</td></tr>
 </table>
 
 <h2>Distributed Gradient Leases</h2>
@@ -1021,6 +1357,10 @@ def main():
     parser.add_argument("--lease-store-dir", default="",
                         help="Directory for distributed gradient lease state. "
                              "If set, enables /api/lease/* endpoints.")
+    parser.add_argument("--checkpoint-dir", default="",
+                        help="Pipeline output directory containing latest .pt checkpoints. "
+                             "If set, enables /api/model/latest/* endpoints that serve "
+                             "the freshest weights with on-demand ONNX conversion.")
     args = parser.parse_args()
 
     # Eagerly load the shared-memory stores so startup errors surface immediately.
@@ -1059,6 +1399,12 @@ def main():
             t.start()
         except Exception as exc:
             print(f"[nodus] WARNING: Could not init lease store: {exc}", flush=True)
+
+    # Optionally set checkpoint directory for latest-model endpoints.
+    global _CHECKPOINT_DIR
+    if args.checkpoint_dir:
+        _CHECKPOINT_DIR = args.checkpoint_dir
+        print(f"[nodus] Checkpoint dir (latest model): {_CHECKPOINT_DIR}", flush=True)
 
     server = ThreadingHTTPServer((args.host, args.port), NodusHandler)
     url = f"http://{args.host}:{args.port}/"

@@ -97,6 +97,12 @@ class WebLeaseConfig:
     # pending (nothing for clients to train on).
     require_dataset: bool = False
 
+    # ONNX auto-export: when set, the node will also torch.onnx.export the
+    # model so browsers can load it directly without a separate API call.
+    # Provide the input shape as a list of ints, e.g. [1, 3, 64, 64].
+    # None / empty list disables auto-export.
+    onnx_input_shape: Optional[list] = None
+
     enabled: bool = True
 
 
@@ -199,8 +205,33 @@ class WebLeaseNode(PipelineNode):
         weights_path = weights_dir / "weights.pt"
         try:
             sd = model.state_dict()
-            torch.save({k: v.cpu() for k, v in sd.items()}, str(weights_path))
+            payload = {
+                "state_dict": {k: v.cpu() for k, v in sd.items()},
+                "model_class": type(model).__name__,
+            }
+            # Include constructor kwargs if the model exposes them
+            if hasattr(model, "ctor_kwargs"):
+                payload["ctor_kwargs"] = model.ctor_kwargs
+            torch.save(payload, str(weights_path))
             _log(f"weights exported: {weights_path}")
+
+            # Auto ONNX export if configured
+            if self.cfg.onnx_input_shape:
+                try:
+                    onnx_path = weights_dir / "model.onnx"
+                    dummy = torch.randn(*[int(d) for d in self.cfg.onnx_input_shape])
+                    model.eval()
+                    torch.onnx.export(
+                        model, dummy, str(onnx_path),
+                        opset_version=17,
+                        input_names=["input"],
+                        output_names=["output"],
+                        dynamic_axes={"input": {0: "batch"}, "output": {0: "batch"}},
+                    )
+                    _log(f"ONNX auto-exported: {onnx_path} ({onnx_path.stat().st_size} bytes)")
+                except Exception as onnx_exc:
+                    _log(f"WARNING: ONNX auto-export failed: {onnx_exc}")
+
         except Exception as exc:
             _log(f"WARNING: could not export weights: {exc}")
 
@@ -279,7 +310,13 @@ class WebLeaseNode(PipelineNode):
         # ----------------------------------------------------------------
         try:
             sd = model.state_dict()
-            torch.save({k: v.cpu() for k, v in sd.items()}, str(weights_path))
+            payload = {
+                "state_dict": {k: v.cpu() for k, v in sd.items()},
+                "model_class": type(model).__name__,
+            }
+            if hasattr(model, "ctor_kwargs"):
+                payload["ctor_kwargs"] = model.ctor_kwargs
+            torch.save(payload, str(weights_path))
         except Exception:
             pass
 

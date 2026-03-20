@@ -63,6 +63,59 @@ import hashlib
 import json
 import time
 import numpy as np
+import torch.nn.functional as F
+from torch.utils.data import Dataset
+
+
+# ---------------------------------------------------------------------------
+# Flashcard dataset helper
+# ---------------------------------------------------------------------------
+
+class _FlashcardDataset(Dataset):
+    """Wraps pre-built CHW float32 flashcard images with per-slot rebuilt conditions.
+
+    Returns ``(img [3,H,W] float32, cond [C] float32, mask [1,H,W] float32)``
+    where mask is all-zeros (flashcard rows carry no spatial annotation).
+    """
+
+    def __init__(
+        self,
+        images: list,
+        conditions: list,
+        num_classes: int,
+        image_hw: tuple,
+    ) -> None:
+        self._h = int(image_hw[0])
+        self._w = int(image_hw[1])
+        n = min(len(images), len(conditions))
+        c = max(1, int(num_classes))
+        cond_arr = np.zeros((n, c), dtype=np.float32)
+        for i in range(n):
+            vec = np.asarray(conditions[i], dtype=np.float32).reshape(-1)
+            end = min(int(vec.size), c)
+            cond_arr[i, :end] = vec[:end]
+        self._conds = torch.from_numpy(cond_arr)
+        self._imgs = [np.asarray(img, dtype=np.float32) for img in images[:n]]
+        self._n = n
+
+    def __len__(self) -> int:
+        return self._n
+
+    def __getitem__(self, idx: int):
+        img = torch.from_numpy(self._imgs[int(idx)])
+        # Accept both CHW (3,H,W) and HWC (H,W,3)
+        if img.ndim == 3 and img.shape[-1] == 3:
+            img = img.permute(2, 0, 1).contiguous()
+        if tuple(img.shape[-2:]) != (self._h, self._w):
+            img = F.interpolate(
+                img.unsqueeze(0), size=(self._h, self._w), mode="nearest"
+            ).squeeze(0)
+        zero_mask = torch.zeros((1, self._h, self._w), dtype=torch.float32)
+        return (
+            img.clamp(0.0, 1.0).contiguous(),
+            self._conds[int(idx)],
+            zero_mask,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -103,6 +156,7 @@ class GeneratorConfig:
 
     # ---- training schedule ----------------------------------------------
     steps_per_round: int = 64
+    batch_size: int = 64
     d_steps_per_g_step: int = 1     # how many D updates per G update
 
     # ---- loss weights ---------------------------------------------------
@@ -110,9 +164,22 @@ class GeneratorConfig:
     adv_weight: float = 1.0         # adversarial (non-saturating)
     feature_score_weight: float = 0.5  # classifier feature score guidance
     wave_recon_weight: float = 0.1  # bit-plane reconstruction fidelity
+    mask_weight: float = 0.0        # mask BCE supervision
+    outside_mask_weight: float = 0.0  # L1 reconstruction outside mask
+    disc_mask_weight: float = 0.0   # discriminator mask head adversarial
 
-    # Discriminator losses
-    r1_weight: float = 10.0         # R1 gradient penalty coefficient
+    # Anti-collapse losses
+    # diversity_weight > 0 adds a penalty when batch-level per-pixel std
+    # falls below diversity_target_std — directly fights mode collapse.
+    diversity_weight: float = 0.0
+    diversity_target_std: float = 0.15
+
+    # R1 gradient penalty weight on discriminator (0 = disabled)
+    r1_weight: float = 10.0
+
+    # Discriminator instance noise: add Gaussian noise (std) to D inputs
+    # so D cannot dominate G early; set to e.g. 0.05–0.10 to help escape.
+    d_instance_noise_std: float = 0.0
 
     # ---- vocab-snapshot library -----------------------------------------
     vocab_snapshot_enabled: bool = True
@@ -438,7 +505,8 @@ class GeneratorTrainNode(IRTrainingNode):
         return ctx.generator is not None and ctx.discriminator is not None
 
     def execute(self, ctx: PipelineContext) -> None:
-        from wav_ml_models import train_conditional_generator_discriminator, _payload_image_bank, _payload_mask_bank
+        from wav_ml_models import train_conditional_generator_discriminator
+        from pipeline.semantic_wheel_cache import SemanticWheelPayloadDataset
         from pipeline.preview import make_generator_step_preview_callback
         from pipeline.nodes.base import make_training_progress_callback
         from pipeline.nodes.vocab_node import activate_vocab_lora_slot, get_all_planned_lora_slots
@@ -469,76 +537,9 @@ class GeneratorTrainNode(IRTrainingNode):
 
         steps_per_slot = max(1, self.cfg.steps_per_round // max(1, len(planned_slots)))
 
-        # Build image and mask banks once — they don't depend on num_classes and are the
-        # same for every slot. The condition bank is cheap and rebuilt per slot (num_classes varies).
-        #
-        # Three-tier cache:
-        #   L1  in-memory ctx cache    — same process, same payload object
-        #   L2  contiguous .npy files  — persists across restarts, co-located with wheel cache
-        #   build  vectorized bulk-read from chunks + GPU resize (on cache miss)
         image_hw = (self.cfg.image_size, self.cfg.image_size)
-        _cache_key = (id(ctx.payload_bank), id(ctx.payload_masks), image_hw)
-        _bank_cache = getattr(ctx, "_generator_bank_cache", None)
-
-        if _bank_cache is not None and _bank_cache.get("key") == _cache_key:
-            # L1 hit
-            _prebuilt_image_bank = _bank_cache["images"]
-            _prebuilt_mask_bank  = _bank_cache["masks"]
-            _log(f"[stageG] bank L1 hit: images={tuple(_prebuilt_image_bank.shape)}")
-        else:
-            from pathlib import Path as _BankPath
-            import numpy as _np_bank
-
-            # Resolve disk cache dir from dataset (co-located → auto-invalidated on wheel rebuild)
-            _pv = ctx.payload_bank
-            _ds_dir = getattr(getattr(getattr(_pv, "bank", None), "dataset", None), "cache_dir", None)
-            if _ds_dir is None and getattr(ctx, "semantic_stage_cache_dir", None):
-                _ds_dir = _BankPath(str(ctx.semantic_stage_cache_dir)).resolve()
-            _dc_dir = _BankPath(str(_ds_dir)) if _ds_dir is not None else None
-
-            N = len(ctx.payload_bank or [])
-            _tag = f"{N}_{image_hw[0]}x{image_hw[1]}"
-            _img_cf = (_dc_dir / f"gen_bank_img_{_tag}.npy") if _dc_dir else None
-            _msk_cf = (_dc_dir / f"gen_bank_msk_{_tag}.npy") if _dc_dir else None
-
-            if _img_cf and _img_cf.exists() and _msk_cf and _msk_cf.exists():
-                # L2 hit — single mmap load, no per-item reads
-                _log(f"[stageG] bank L2 hit: {_img_cf.name}")
-                _prebuilt_image_bank = torch.from_numpy(
-                    _np_bank.ascontiguousarray(_np_bank.load(str(_img_cf), mmap_mode="r"))
-                ).pin_memory()
-                _prebuilt_mask_bank = torch.from_numpy(
-                    _np_bank.ascontiguousarray(_np_bank.load(str(_msk_cf), mmap_mode="r"))
-                ).pin_memory()
-            else:
-                # Build: vectorized bulk chunk read + GPU resize
-                _log(f"[stageG] building image/mask banks from {N} payload rows …")
-                _resize_dev = getattr(ctx, "device", None)
-                _prebuilt_image_bank = _payload_image_bank(
-                    payload_images=ctx.payload_bank or [],
-                    image_hw=image_hw,
-                    device=_resize_dev,
-                ).pin_memory()
-                _prebuilt_mask_bank = _payload_mask_bank(
-                    payload_masks=ctx.payload_masks or [],
-                    image_hw=image_hw,
-                    device=_resize_dev,
-                ).pin_memory()
-                # Save to disk cache for future runs
-                if _img_cf is not None:
-                    try:
-                        _np_bank.save(str(_img_cf), _prebuilt_image_bank.numpy())
-                        _np_bank.save(str(_msk_cf), _prebuilt_mask_bank.numpy())
-                        _log(f"[stageG] banks saved to disk cache: {_img_cf.name}")
-                    except Exception as _dc_err:
-                        _log(f"[stageG] bank disk cache write failed (non-fatal): {_dc_err}")
-
-            ctx._generator_bank_cache = {
-                "key":    _cache_key,
-                "images": _prebuilt_image_bank,
-                "masks":  _prebuilt_mask_bank,
-            }
-            _log(f"[stageG] banks ready: images={tuple(_prebuilt_image_bank.shape)} masks={tuple(_prebuilt_mask_bank.shape)}")
+        _payload_bank = ctx.payload_bank
+        _payload_bank_obj = getattr(_payload_bank, "bank", None)  # SemanticWheelPayloadBank
 
         all_metrics: List[Dict[str, Any]] = []
         slots_trained = 0
@@ -563,6 +564,81 @@ class GeneratorTrainNode(IRTrainingNode):
                 f"{len(ctx.payload_bank or [])} rows, {steps_per_slot} steps"
             )
 
+            if _payload_bank_obj is not None:
+                from torch.utils.data import ConcatDataset, DataLoader, RandomSampler, Subset
+                from pipeline.nodes.data_nodes import rebuild_conditions_from_terms
+                _slot_conditions = rebuild_conditions_from_terms(
+                    payload_terms=ctx.payload_terms or [],
+                    class_names=current_class_names,
+                ) if ctx.payload_terms else ctx.payload_conditions
+                _ds = SemanticWheelPayloadDataset(
+                    bank=_payload_bank_obj,
+                    conditions=_slot_conditions,
+                    num_classes=current_n_classes,
+                    image_hw=image_hw,
+                )
+                # ---- Slot-affinity filtering (CNC tool-changer) ----
+                # Select payload rows whose extra terms match the active slot.
+                # Rows with no extra terms (supervised-only) are included in
+                # every slot so the model keeps seeing diverse imagery.
+                _slot_extra_keys = {str(t).strip().lower() for t in slot_terms}
+                _supervised_keys = {str(n).strip().lower() for n in list(getattr(ctx, "supervised_class_names", []))}
+                _all_pt = ctx.payload_terms or []
+                _affine_idx: list = []
+                _neutral_idx: list = []
+                for _ri, _row_t in enumerate(_all_pt):
+                    if _ri >= len(_ds):
+                        break
+                    _row_extra = {str(t).strip().lower() for t in _row_t} - _supervised_keys
+                    if not _row_extra:
+                        _neutral_idx.append(_ri)
+                    elif _row_extra & _slot_extra_keys:
+                        _affine_idx.append(_ri)
+                    # rows with extra terms NOT in this slot → skip for this slot
+                _slot_idx = _affine_idx + _neutral_idx
+                if _slot_idx and len(_slot_idx) < len(_ds):
+                    _ds = Subset(_ds, _slot_idx)
+                    _log(
+                        f"[stageG] slot affinity: {len(_affine_idx)} matching + "
+                        f"{len(_neutral_idx)} neutral of {len(_all_pt)} rows"
+                    )
+                # Merge flashcard rows only when this slot covers flashcard terms.
+                _fc_terms = list(getattr(ctx, "flashcard_row_terms", []) or [])
+                _fc_rows  = list(getattr(ctx, "flashcard_rows", []) or [])
+                if _fc_terms and _fc_rows:
+                    _fc_has_affinity = any(
+                        any(str(t).strip().lower() in _slot_extra_keys for t in row_t)
+                        for row_t in _fc_terms
+                    )
+                    if _fc_has_affinity:
+                        _fc_conds = rebuild_conditions_from_terms(
+                            payload_terms=_fc_terms,
+                            class_names=current_class_names,
+                        )
+                        _fc_imgs = [img for img, _cond in _fc_rows]
+                        _fc_ds = _FlashcardDataset(
+                            images=_fc_imgs,
+                            conditions=_fc_conds,
+                            num_classes=current_n_classes,
+                            image_hw=image_hw,
+                        )
+                        _ds = ConcatDataset([_ds, _fc_ds])
+                        _log(
+                            f"[stageG] merged {len(_fc_ds)} flashcard rows into slot "
+                            f"{slot_name} dataset (total {len(_ds)} rows)"
+                        )
+                _slot_loader = DataLoader(
+                    _ds,
+                    batch_size=self.cfg.batch_size,
+                    sampler=RandomSampler(_ds, replacement=True),
+                    num_workers=1,
+                    pin_memory=True,
+                    prefetch_factor=2,
+                    persistent_workers=True,
+                )
+            else:
+                _slot_loader = None
+
             trained_g, trained_d, metrics_list = train_conditional_generator_discriminator(
                 generator=ctx.generator,
                 discriminator=ctx.discriminator,
@@ -572,9 +648,9 @@ class GeneratorTrainNode(IRTrainingNode):
                 payload_masks=ctx.payload_masks,
                 num_classes=current_n_classes,
                 image_hw=image_hw,
-                prebuilt_image_bank=_prebuilt_image_bank,
-                prebuilt_mask_bank=_prebuilt_mask_bank,
+                payload_loader=_slot_loader,
                 device=ctx.device,
+                batch_size=self.cfg.batch_size,
                 steps_per_epoch=steps_per_slot,
                 disc_steps_per_gen_step=self.cfg.d_steps_per_g_step,
                 z_dim=self.cfg.z_dim,
@@ -585,6 +661,12 @@ class GeneratorTrainNode(IRTrainingNode):
                 w_adv=self.cfg.adv_weight,
                 w_cls=self.cfg.feature_score_weight,
                 w_wave=self.cfg.wave_recon_weight,
+                w_mask=self.cfg.mask_weight,
+                w_outside_mask=self.cfg.outside_mask_weight,
+                w_disc_mask=self.cfg.disc_mask_weight,
+                w_diversity=self.cfg.diversity_weight,
+                diversity_target_std=self.cfg.diversity_target_std,
+                d_instance_noise_std=self.cfg.d_instance_noise_std,
                 amp=ctx.amp_enabled,
                 amp_dtype=str(ctx.amp_dtype or "float16"),
                 channels_last=False,

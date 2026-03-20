@@ -3882,33 +3882,7 @@ def collect_semantic_disk_rows(
         from berkeley_sbd_pretrain import VOC20_CLASSES as _VOC20_CLASSES
         voc20_names = [str(x) for x in list(_VOC20_CLASSES)]
     except Exception:
-        voc20_names = [
-            "aeroplane",
-            "bicycle",
-            "bird",
-            "boat",
-            "bottle",
-            "bus",
-            "car",
-            "cat",
-            "chair",
-            "cow",
-            "dining table",
-            "dog",
-            "horse",
-            "motorbike",
-            "person",
-            "potted plant",
-            "sheep",
-            "sofa",
-            "train",
-            "tv monitor",
-        ]
-    voc20_to_class_idx = {
-        int(voc_idx): int(class_lut[key])
-        for voc_idx, key in enumerate([_norm_txt(name) for name in voc20_names])
-        if key in class_lut
-    }
+        voc20_names = []
 
     def _augment_row_with_auto_color_terms(image_path: Path, label_vec: np.ndarray, terms_in: Sequence[str], mask_path: str = "") -> Tuple[np.ndarray, List[str]]:
         out_vec = np.asarray(label_vec, dtype=np.float32).reshape(-1).copy()
@@ -3973,13 +3947,10 @@ def collect_semantic_disk_rows(
                 continue
             yv = np.zeros((int(n_classes),), dtype=np.float32)
             voc_vec = np.asarray(labels_split[int(i)], dtype=np.float32).reshape(-1)
-            positive_voc20: List[str] = []
+            positive_voc_terms: List[str] = []
             for voc_idx in np.flatnonzero(voc_vec > 0.5):
-                cls_idx = int(voc20_to_class_idx.get(int(voc_idx), -1))
-                if 0 <= int(cls_idx) < int(n_classes):
-                    yv[int(cls_idx)] = 1.0
                 if 0 <= int(voc_idx) < int(len(voc20_names)):
-                    positive_voc20.append(str(voc20_names[int(voc_idx)]))
+                    positive_voc_terms.append(str(voc20_names[int(voc_idx)]))
             if int(berkeley_dataset_idx) >= 0:
                 yv[int(berkeley_dataset_idx)] = 1.0
             if int(object_idx) >= 0:
@@ -3993,7 +3964,7 @@ def collect_semantic_disk_rows(
                     str(_mask_paths[int(i)]) if int(i) < int(len(_mask_paths)) else "",
                     str(source_key),
                     str(split_name),
-                    positive_voc20,
+                    positive_voc_terms,
                 )
             )
         missing_images += int(split_missing)

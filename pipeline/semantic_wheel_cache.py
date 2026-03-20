@@ -1092,6 +1092,66 @@ class SemanticWheelPayloadView(Sequence[np.ndarray]):
         return np.concatenate(parts, axis=0)
 
 
+class SemanticWheelPayloadDataset(Dataset):
+    """torch.utils.data.Dataset over a SemanticWheelPayloadBank.
+
+    Returns ``(img [3,H,W] float32, cond [C] float32, mask [1,H,W] float32)``
+    per item.  Images and masks are loaded lazily from the bank in
+    ``__getitem__``; conditions are materialised once as a small tensor since
+    they are O(N × num_classes) bytes and do not cause OOM.
+    """
+
+    def __init__(
+        self,
+        bank: "SemanticWheelPayloadBank",
+        conditions: Sequence,
+        num_classes: int,
+        image_hw: Tuple[int, int],
+    ) -> None:
+        self._bank = bank
+        self._h = int(image_hw[0])
+        self._w = int(image_hw[1])
+        n = min(int(len(bank)), int(len(conditions)))
+        c = max(1, int(num_classes))
+        cond_arr = np.zeros((n, c), dtype=np.float32)
+        for i in range(n):
+            vec = np.asarray(conditions[i], dtype=np.float32).reshape(-1)
+            end = min(int(vec.size), c)
+            cond_arr[i, :end] = vec[:end]
+        self._conds: torch.Tensor = torch.from_numpy(cond_arr)
+        self._n = n
+
+    def __len__(self) -> int:
+        return self._n
+
+    def __getitem__(self, idx: int):
+        h, w = self._h, self._w
+
+        img_np = self._bank.get_image(int(idx))
+        img = torch.from_numpy(np.asarray(img_np, dtype=np.float32))
+        if img.ndim == 2:
+            img = img.unsqueeze(0).expand(3, -1, -1).contiguous()
+        elif img.ndim == 3 and img.shape[-1] == 3:
+            img = img.permute(2, 0, 1).contiguous()
+        if img.ndim == 3 and img.shape[0] == 1:
+            img = img.expand(3, -1, -1).contiguous()
+        if tuple(img.shape[-2:]) != (h, w):
+            img = F.interpolate(img.unsqueeze(0), size=(h, w), mode="nearest").squeeze(0)
+
+        msk_np = self._bank.get_mask(int(idx))
+        msk = torch.from_numpy(np.asarray(msk_np, dtype=np.float32))
+        if msk.ndim == 2:
+            msk = msk.unsqueeze(0)
+        if tuple(msk.shape[-2:]) != (h, w):
+            msk = F.interpolate(msk.unsqueeze(0), size=(h, w), mode="nearest").squeeze(0)
+
+        return (
+            img.clamp(0.0, 1.0).contiguous(),
+            self._conds[int(idx)],
+            msk.clamp(0.0, 1.0).contiguous(),
+        )
+
+
 class StatefulSequentialDeckSampler(Sampler[int]):
     def __init__(self, length: int):
         self.length = max(0, int(length))

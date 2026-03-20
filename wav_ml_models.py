@@ -1451,7 +1451,13 @@ def _payload_mask_bank(
         batch = torch.stack(items).unsqueeze(1)  # [N, 1, H, W]
     if tuple(batch.shape[-2:]) != (h, w):
         if device is not None:
-            batch = F.interpolate(batch.to(device), size=(h, w), mode="nearest").cpu()
+            _MB = 64
+            chunks = []
+            for _s in range(0, batch.shape[0], _MB):
+                chunks.append(
+                    F.interpolate(batch[_s:_s + _MB].to(device), size=(h, w), mode="nearest").cpu()
+                )
+            batch = torch.cat(chunks, dim=0)
         else:
             batch = F.interpolate(batch, size=(h, w), mode="nearest")
     return batch.clamp(0.0, 1.0).contiguous()
@@ -1493,7 +1499,14 @@ def _payload_image_bank(
         batch = torch.stack(items)  # [N, 3, H, W]
     if tuple(batch.shape[-2:]) != (h, w):
         if device is not None:
-            batch = F.interpolate(batch.to(device), size=(h, w), mode="nearest").cpu()
+            # Microbatch to avoid CUDA OOM on large payloads
+            _MB = 64
+            chunks = []
+            for _s in range(0, batch.shape[0], _MB):
+                chunks.append(
+                    F.interpolate(batch[_s:_s + _MB].to(device), size=(h, w), mode="nearest").cpu()
+                )
+            batch = torch.cat(chunks, dim=0)
         else:
             batch = F.interpolate(batch, size=(h, w), mode="nearest")
     return batch.clamp(0.0, 1.0).contiguous()
@@ -1741,6 +1754,10 @@ def train_conditional_generator_discriminator(
     grad_clip_d: float = 1.0,
     prebuilt_image_bank: Optional[torch.Tensor] = None,
     prebuilt_mask_bank: Optional[torch.Tensor] = None,
+    payload_loader: Optional[Any] = None,
+    w_diversity: float = 0.0,
+    diversity_target_std: float = 0.15,
+    d_instance_noise_std: float = 0.0,
 ) -> Tuple[nn.Module, nn.Module, List[Dict[str, float]]]:
     if len(payload_images) <= 0 or len(payload_conditions) <= 0 or len(payload_masks) <= 0:
         raise RuntimeError("Generator/discriminator training requires non-empty payload bank.")
@@ -1842,13 +1859,19 @@ def train_conditional_generator_discriminator(
     if int(n_payload) <= 0:
         raise RuntimeError("Generator/discriminator training requires non-empty payload bank.")
 
-    # Pre-convert entire payload bank to pinned CPU tensors once — no per-step conversion in the hot loop.
-    # Callers may pass prebuilt image/mask banks (built once outside a slot loop) to avoid per-slot disk reads.
-    _bank_images = (prebuilt_image_bank if prebuilt_image_bank is not None
-                    else _payload_image_bank(payload_images=list(payload_images), image_hw=image_hw).pin_memory())
-    _bank_conds  = _payload_condition_bank(payload_targets=list(payload_conditions), num_classes=int(num_classes)).pin_memory()
-    _bank_masks  = (prebuilt_mask_bank if prebuilt_mask_bank is not None
-                    else _payload_mask_bank(payload_masks=list(payload_masks), image_hw=image_hw).pin_memory())
+    # When a payload_loader (DataLoader) is provided it supplies batches from its own
+    # prefetch thread — nothing is materialised in the hot loop or pre-built in RAM.
+    # The legacy prebuilt-bank path is kept for callers that do not supply a loader.
+    _use_loader = payload_loader is not None
+    _loader_iter: Optional[Any] = iter(payload_loader) if _use_loader else None
+    if not _use_loader:
+        _bank_images = (prebuilt_image_bank if prebuilt_image_bank is not None
+                        else _payload_image_bank(payload_images=list(payload_images), image_hw=image_hw).pin_memory())
+        _bank_conds  = _payload_condition_bank(payload_targets=list(payload_conditions), num_classes=int(num_classes)).pin_memory()
+        _bank_masks  = (prebuilt_mask_bank if prebuilt_mask_bank is not None
+                        else _payload_mask_bank(payload_masks=list(payload_masks), image_hw=image_hw).pin_memory())
+    else:
+        _bank_images = _bank_conds = _bank_masks = None
 
     history: List[Dict[str, float]] = []
 
@@ -1903,17 +1926,100 @@ def train_conditional_generator_discriminator(
                     pass
                 if stop_now:
                     break
-            idx = rng.integers(0, int(n_payload), size=max(1, int(batch_size)))
-            real = _bank_images[idx].to(device=device, non_blocking=True)
-            cond = _bank_conds[idx].to(device=device, non_blocking=True, dtype=torch.float32)
-            real_mask = _bank_masks[idx].to(device=device, non_blocking=True, dtype=torch.float32)
+            if _use_loader:
+                try:
+                    _batch = next(_loader_iter)
+                except StopIteration:
+                    _loader_iter = iter(payload_loader)
+                    _batch = next(_loader_iter)
+                real      = _batch[0].to(device=device, non_blocking=True)
+                cond      = _batch[1].to(device=device, non_blocking=True, dtype=torch.float32)
+                real_mask = _batch[2].to(device=device, non_blocking=True, dtype=torch.float32)
+            else:
+                idx = rng.integers(0, int(n_payload), size=max(1, int(batch_size)))
+                real      = _bank_images[idx].to(device=device, non_blocking=True)
+                cond      = _bank_conds[idx].to(device=device, non_blocking=True, dtype=torch.float32)
+                real_mask = _bank_masks[idx].to(device=device, non_blocking=True, dtype=torch.float32)
             if channels_last:
                 real = real.contiguous(memory_format=torch.channels_last)
-            # Joint step — single generator forward, full graph retained.
-            # D and G co-learn through one unified backward: no detach, no discarded graphs.
-            d_opt.zero_grad(set_to_none=True)
-            g_opt.zero_grad(set_to_none=True)
+            # ---- Discriminator phase (disc_steps_per_gen_step updates) ----
             d_loss_step = 0.0
+            for _d_sub in range(disc_steps_per_gen_step):
+                if _d_sub > 0:
+                    if _use_loader:
+                        try:
+                            _batch = next(_loader_iter)
+                        except StopIteration:
+                            _loader_iter = iter(payload_loader)
+                            _batch = next(_loader_iter)
+                        real = _batch[0].to(device=device, non_blocking=True)
+                        cond = _batch[1].to(device=device, non_blocking=True, dtype=torch.float32)
+                        real_mask = _batch[2].to(device=device, non_blocking=True, dtype=torch.float32)
+                    else:
+                        _didx = rng.integers(0, int(n_payload), size=max(1, int(batch_size)))
+                        real = _bank_images[_didx].to(device=device, non_blocking=True)
+                        cond = _bank_conds[_didx].to(device=device, non_blocking=True, dtype=torch.float32)
+                        real_mask = _bank_masks[_didx].to(device=device, non_blocking=True, dtype=torch.float32)
+                    if channels_last:
+                        real = real.contiguous(memory_format=torch.channels_last)
+                d_opt.zero_grad(set_to_none=True)
+                _d_ranges = _chunk_ranges(total=int(real.shape[0]), chunks=grad_accum_steps)
+                for _dst, _ded in _d_ranges:
+                    _real_d = real[_dst:_ded]
+                    _cond_d = cond[_dst:_ded]
+                    _rmask_d = real_mask[_dst:_ded]
+                    _z_d = torch.randn((int(_real_d.shape[0]), int(z_dim)), device=device)
+                    with torch.no_grad():
+                        _gout_d = generator.forward_with_aux(_z_d, _cond_d) if hasattr(generator, "forward_with_aux") else {"image": generator(_z_d, _cond_d)}
+                        _fake_d = _gout_d["image"]
+                        _fml_d = _gout_d.get("mask_logits")
+                        if not isinstance(_fml_d, torch.Tensor):
+                            raise RuntimeError("Conditional generator training requires generator mask logits.")
+                        if tuple(_fml_d.shape[-2:]) != tuple(_rmask_d.shape[-2:]):
+                            _fml_d = F.interpolate(_fml_d, size=tuple(_rmask_d.shape[-2:]), mode="bilinear", align_corners=False)
+                        _fmp_d = torch.sigmoid(_fml_d)
+                        if channels_last:
+                            _fake_d = _fake_d.contiguous(memory_format=torch.channels_last)
+                    with _autocast_context(device=device, use_amp=use_amp, amp_dtype_t=amp_dtype_t):
+                        # Instance noise: add small Gaussian noise to D inputs so the
+                        # discriminator cannot rely on fine pixel details early in
+                        # training, preventing it from dominating the generator.
+                        if float(d_instance_noise_std) > 0.0:
+                            _inoise = float(d_instance_noise_std)
+                            _real_d_in = torch.clamp(_real_d.to(torch.float32) + torch.randn_like(_real_d.to(torch.float32)) * _inoise, 0.0, 1.0).to(_real_d.dtype)
+                            _fake_d_in = torch.clamp(_fake_d.to(torch.float32) + torch.randn_like(_fake_d.to(torch.float32)) * _inoise, 0.0, 1.0).to(_fake_d.dtype)
+                        else:
+                            _real_d_in = _real_d
+                            _fake_d_in = _fake_d
+                        _dr = discriminator.forward_with_aux(_real_d_in, _cond_d, _rmask_d)
+                        _df = discriminator.forward_with_aux(_fake_d_in, _cond_d, _fmp_d)
+                        _d_loss = 0.5 * (
+                            F.softplus(-_dr["subject_logits"]).mean()
+                            + F.softplus(_df["subject_logits"]).mean()
+                            + F.softplus(-_dr["mask_logits"]).mean()
+                            + F.softplus(_df["mask_logits"]).mean()
+                        )
+                    _d_back = _d_loss / float(max(1, len(_d_ranges)))
+                    if use_scaler:
+                        scaler_d.scale(_d_back).backward()
+                    else:
+                        _d_back.backward()
+                    d_loss_step += float(_d_loss.item()) * (float(_ded - _dst) / float(max(1, int(real.shape[0]))))
+                if use_scaler:
+                    scaler_d.unscale_(d_opt)
+                nn.utils.clip_grad_norm_(discriminator.parameters(), float(grad_clip_d))
+                if use_scaler:
+                    scaler_d.step(d_opt)
+                    scaler_d.update()
+                else:
+                    d_opt.step()
+                discriminator_step_count += 1
+            d_loss_step /= float(max(1, disc_steps_per_gen_step))
+
+            # ---- Generator phase ----
+            g_opt.zero_grad(set_to_none=True)
+            for _p in discriminator.parameters():
+                _p.requires_grad_(False)
             g_loss_step = 0.0
             adv_loss_step = 0.0
             target_prob_step = 0.0
@@ -1925,14 +2031,13 @@ def train_conditional_generator_discriminator(
             mask_iou_step = 0.0
             mask_dice_step = 0.0
             preview_items = []
-            joint_ranges = _chunk_ranges(total=int(real.shape[0]), chunks=grad_accum_steps)
-            for st, ed in joint_ranges:
+            g_ranges = _chunk_ranges(total=int(real.shape[0]), chunks=grad_accum_steps)
+            for st, ed in g_ranges:
                 real_m = real[st:ed]
                 cond_m = cond[st:ed]
                 real_mask_m = real_mask[st:ed]
                 z = torch.randn((int(real_m.shape[0]), int(z_dim)), device=device)
                 with _autocast_context(device=device, use_amp=use_amp, amp_dtype_t=amp_dtype_t):
-                    # One generator forward — graph kept for both D and G objectives.
                     gen_out = generator.forward_with_aux(z, cond_m) if hasattr(generator, "forward_with_aux") else {"image": generator(z, cond_m)}
                     fake = gen_out["image"]
                     fake_mask_logits = gen_out.get("mask_logits")
@@ -1943,17 +2048,8 @@ def train_conditional_generator_discriminator(
                     fake_mask_probs = torch.sigmoid(fake_mask_logits)
                     if channels_last:
                         fake = fake.contiguous(memory_format=torch.channels_last)
-                    # D sees both real and fake without detach — gradients flow back into G.
-                    d_real = discriminator.forward_with_aux(real_m, cond_m, real_mask_m)
+                    # Adversarial signal: D evaluates G output; grad flows into G only.
                     d_fake = discriminator.forward_with_aux(fake, cond_m, fake_mask_probs)
-                    # Discriminator objective: distinguish real from fake.
-                    d_loss = 0.5 * (
-                        F.softplus(-d_real["subject_logits"]).mean()
-                        + F.softplus(d_fake["subject_logits"]).mean()
-                        + F.softplus(-d_real["mask_logits"]).mean()
-                        + F.softplus(d_fake["mask_logits"]).mean()
-                    )
-                    # Generator objective: semantic coherence via D signal + classifier + mask fidelity.
                     adv_loss = F.softplus(-d_fake["subject_logits"]).mean()
                     disc_mask_loss = F.softplus(-d_fake["mask_logits"]).mean()
                     logits = _classifier_forward_chunked(fake)
@@ -1973,6 +2069,14 @@ def train_conditional_generator_discriminator(
                         + (float(w_mask) * mask_loss)
                         + (float(w_outside_mask) * outside_loss)
                     )
+                    # Diversity loss: penalise low batch-level per-pixel std across
+                    # all channels.  When the generator collapses to a near-constant
+                    # colour the std approaches zero; this pushes it back out.
+                    if float(w_diversity) > 0.0 and int(fake.shape[0]) > 1:
+                        _flat = fake.to(torch.float32).reshape(int(fake.shape[0]), 3, -1)  # [B,3,HW]
+                        _batch_std = _flat.std(dim=0).mean()  # scalar: mean per-pixel batch std
+                        _div_loss = F.relu(float(diversity_target_std) - _batch_std)
+                        g_loss = g_loss + float(w_diversity) * _div_loss
                     wave_loss = torch.zeros((), device=device, dtype=torch.float32)
                     if use_wave_loss and wave_shape_info is not None and wave_index is not None:
                         # Wave-coupled supervision is expensive at high resolutions.
@@ -2089,61 +2193,55 @@ def train_conditional_generator_discriminator(
                             denoise_term = F.l1_loss(wave_out.to(torch.float32), clean_wave.to(torch.float32))
                             wave_loss = score_gap + (float(max(0.0, float(wave_denoise_weight))) * denoise_term)
                             g_loss = g_loss + (float(w_wave) * wave_loss)
-                    # Unified loss — both networks learn from each other's full gradient landscape.
-                    combined_loss = d_loss + g_loss
-                combined_back = combined_loss / float(max(1, len(joint_ranges)))
+                g_loss_back = g_loss / float(max(1, len(g_ranges)))
                 if use_scaler:
-                    scaler_g.scale(combined_back).backward()
+                    scaler_g.scale(g_loss_back).backward()
                 else:
-                    combined_back.backward()
+                    g_loss_back.backward()
 
-                w = float(ed - st) / float(max(1, int(real.shape[0])))
-                d_loss_step += float(d_loss.detach().item()) * w
-                g_loss_step += float(g_loss.detach().item()) * w
-                adv_loss_step += float(adv_loss.detach().item()) * w
-                target_prob_step += float(target_prob.detach().mean().item()) * w
-                mask_loss_step += float(mask_loss.detach().item()) * w
-                outside_loss_step += float(outside_loss.detach().item()) * w
-                wave_loss_step += float(wave_loss.detach().item()) * w
-                disc_fake_pass = float((d_fake["subject_logits"].detach().to(torch.float32) > 0.0).to(torch.float32).mean().item())
-                disc_mask_fake_pass = float((d_fake["mask_logits"].detach().to(torch.float32) > 0.0).to(torch.float32).mean().item())
-                fake_mask_probs_f = fake_mask_probs.detach().to(torch.float32)
-                real_mask_f = real_mask_m.to(torch.float32)
-                inter = (fake_mask_probs_f * real_mask_f).sum(dim=(1, 2, 3))
-                union = (fake_mask_probs_f + real_mask_f - fake_mask_probs_f * real_mask_f).sum(dim=(1, 2, 3))
-                pred_mass = fake_mask_probs_f.sum(dim=(1, 2, 3))
-                tgt_mass = real_mask_f.sum(dim=(1, 2, 3))
-                mask_iou = torch.mean(inter / (union + 1e-8))
-                mask_dice = torch.mean((2.0 * inter) / (pred_mass + tgt_mass + 1e-8))
-                disc_fake_pass_step += float(disc_fake_pass) * w
-                disc_mask_fake_pass_step += float(disc_mask_fake_pass) * w
-                mask_iou_step += float(mask_iou.detach().item()) * w
-                mask_dice_step += float(mask_dice.detach().item()) * w
-                if step_preview_callback is not None:
-                    for _i in range(int(real_m.shape[0])):
-                        preview_items.append({
-                            "target_img": real_m[_i].detach().to(torch.float32).cpu(),
-                            "fake_img": fake[_i].detach().to(torch.float32).cpu(),
-                            "target_mask": real_mask_m[_i].detach().to(torch.float32).cpu(),
-                            "fake_mask": fake_mask_probs[_i].detach().to(torch.float32).cpu(),
-                            "probs": probs[_i].detach().to(torch.float32).cpu(),
-                            "target_condition": cond_m[_i].detach().to(torch.float32).cpu(),
-                            "target_prob": float(target_prob[_i].detach().to(torch.float32).item()),
-                        })
-            # Unscale and clip both networks, then step both from the same backward pass.
+                with torch.no_grad():
+                    w = float(ed - st) / float(max(1, int(real.shape[0])))
+                    g_loss_step += float(g_loss.item()) * w
+                    adv_loss_step += float(adv_loss.item()) * w
+                    target_prob_step += float(target_prob.mean().item()) * w
+                    mask_loss_step += float(mask_loss.item()) * w
+                    outside_loss_step += float(outside_loss.item()) * w
+                    wave_loss_step += float(wave_loss.item()) * w
+                    disc_fake_pass = float((d_fake["subject_logits"] > 0.0).to(torch.float32).mean().item())
+                    disc_mask_fake_pass = float((d_fake["mask_logits"] > 0.0).to(torch.float32).mean().item())
+                    fake_mask_probs_f = fake_mask_probs.to(torch.float32)
+                    real_mask_f = real_mask_m.to(torch.float32)
+                    inter = (fake_mask_probs_f * real_mask_f).sum(dim=(1, 2, 3))
+                    union = (fake_mask_probs_f + real_mask_f - fake_mask_probs_f * real_mask_f).sum(dim=(1, 2, 3))
+                    pred_mass = fake_mask_probs_f.sum(dim=(1, 2, 3))
+                    tgt_mass = real_mask_f.sum(dim=(1, 2, 3))
+                    mask_iou = torch.mean(inter / (union + 1e-8))
+                    mask_dice = torch.mean((2.0 * inter) / (pred_mass + tgt_mass + 1e-8))
+                    disc_fake_pass_step += float(disc_fake_pass) * w
+                    disc_mask_fake_pass_step += float(disc_mask_fake_pass) * w
+                    mask_iou_step += float(mask_iou.item()) * w
+                    mask_dice_step += float(mask_dice.item()) * w
+                    if step_preview_callback is not None:
+                        for _i in range(int(real_m.shape[0])):
+                            preview_items.append({
+                                "target_img": real_m[_i].to(torch.float32).cpu(),
+                                "fake_img": fake[_i].to(torch.float32).cpu(),
+                                "target_mask": real_mask_m[_i].to(torch.float32).cpu(),
+                                "fake_mask": fake_mask_probs[_i].to(torch.float32).cpu(),
+                                "probs": probs[_i].to(torch.float32).cpu(),
+                                "target_condition": cond_m[_i].to(torch.float32).cpu(),
+                                "target_prob": float(target_prob[_i].to(torch.float32).item()),
+                            })
+            for _p in discriminator.parameters():
+                _p.requires_grad_(True)
             if use_scaler:
-                scaler_g.unscale_(d_opt)
                 scaler_g.unscale_(g_opt)
-            nn.utils.clip_grad_norm_(discriminator.parameters(), float(grad_clip_d))
             nn.utils.clip_grad_norm_(generator.parameters(), float(grad_clip_g))
             if use_scaler:
-                scaler_g.step(d_opt)
                 scaler_g.step(g_opt)
                 scaler_g.update()
             else:
-                d_opt.step()
                 g_opt.step()
-            discriminator_step_count += 1
             generator_step_count += 1
             if discriminator_step_callback is not None:
                 try:
