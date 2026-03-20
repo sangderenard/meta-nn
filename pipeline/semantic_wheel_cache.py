@@ -218,14 +218,14 @@ def build_semantic_cache_entry(
     if mixed_mask is None:
         mixed_mask_arr = infer_semantic_support_mask(image=image_f32, terms=normalized_terms)
     else:
-        mixed_mask_arr = _fit_mask_array(np.asarray(mixed_mask, dtype=np.float32), image_size=size)
+        mixed_mask_arr = _fit_mask_letterbox(np.asarray(mixed_mask, dtype=np.float32), image_size=size)
     stack_arr = np.asarray(mask_stack) if mask_stack is not None else np.zeros((0, size, size), dtype=np.float32)
     idx_arr = np.asarray(mask_indices, dtype=np.int64).reshape(-1) if mask_indices is not None else np.zeros((0,), dtype=np.int64)
     if int(stack_arr.ndim) == 2:
         stack_arr = stack_arr[None, ...]
     if int(stack_arr.ndim) == 3 and int(stack_arr.shape[0]) > 0:
         fitted_parts = [
-            _fit_mask_array(np.asarray(stack_arr[int(i)], dtype=np.float32), image_size=size)
+            _fit_mask_letterbox(np.asarray(stack_arr[int(i)], dtype=np.float32), image_size=size)
             for i in range(int(stack_arr.shape[0]))
         ]
         stack_arr = np.stack(fitted_parts, axis=0).astype(np.float32, copy=False)
@@ -1066,6 +1066,30 @@ class SemanticWheelPayloadView(Sequence[np.ndarray]):
         if str(self.kind) == "mask":
             return self.bank.get_mask(int(index))
         raise KeyError(self.kind)
+
+    def read_bulk_arrays(self) -> np.ndarray:
+        """Read all entries in chunk order — O(n_chunks) disk reads, no per-item overhead.
+
+        Returns
+        -------
+        kind='image'  →  float32 array  [N, H, W, 3]  (uint8 /255 normalised)
+        kind='mask'   →  float32 array  [N, H, W]
+        """
+        ds = self.bank.dataset
+        parts: list = []
+        for chunk_idx in range(len(ds.chunk_rows)):
+            payload = ds._load_chunk(int(chunk_idx))
+            n = int(ds.chunk_rows[int(chunk_idx)])
+            if self.kind == "image":
+                raw = np.asarray(payload["images"][:n], dtype=np.float32) / 255.0
+            else:
+                raw = np.asarray(payload["mixed_masks"][:n], dtype=np.float32)
+            parts.append(raw)
+        if not parts:
+            h = int(ds.image_size)
+            extra = (h, h, 3) if self.kind == "image" else (h, h)
+            return np.zeros((0,) + extra, dtype=np.float32)
+        return np.concatenate(parts, axis=0)
 
 
 class StatefulSequentialDeckSampler(Sampler[int]):

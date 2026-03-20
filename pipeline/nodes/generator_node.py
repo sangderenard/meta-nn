@@ -471,17 +471,74 @@ class GeneratorTrainNode(IRTrainingNode):
 
         # Build image and mask banks once — they don't depend on num_classes and are the
         # same for every slot. The condition bank is cheap and rebuilt per slot (num_classes varies).
+        #
+        # Three-tier cache:
+        #   L1  in-memory ctx cache    — same process, same payload object
+        #   L2  contiguous .npy files  — persists across restarts, co-located with wheel cache
+        #   build  vectorized bulk-read from chunks + GPU resize (on cache miss)
         image_hw = (self.cfg.image_size, self.cfg.image_size)
-        _log(f"[stageG] building image/mask banks from {len(ctx.payload_bank or [])} payload rows …")
-        _prebuilt_image_bank = _payload_image_bank(
-            payload_images=list(ctx.payload_bank or []),
-            image_hw=image_hw,
-        ).pin_memory()
-        _prebuilt_mask_bank = _payload_mask_bank(
-            payload_masks=list(ctx.payload_masks or []),
-            image_hw=image_hw,
-        ).pin_memory()
-        _log(f"[stageG] banks ready: images={tuple(_prebuilt_image_bank.shape)} masks={tuple(_prebuilt_mask_bank.shape)}")
+        _cache_key = (id(ctx.payload_bank), id(ctx.payload_masks), image_hw)
+        _bank_cache = getattr(ctx, "_generator_bank_cache", None)
+
+        if _bank_cache is not None and _bank_cache.get("key") == _cache_key:
+            # L1 hit
+            _prebuilt_image_bank = _bank_cache["images"]
+            _prebuilt_mask_bank  = _bank_cache["masks"]
+            _log(f"[stageG] bank L1 hit: images={tuple(_prebuilt_image_bank.shape)}")
+        else:
+            from pathlib import Path as _BankPath
+            import numpy as _np_bank
+
+            # Resolve disk cache dir from dataset (co-located → auto-invalidated on wheel rebuild)
+            _pv = ctx.payload_bank
+            _ds_dir = getattr(getattr(getattr(_pv, "bank", None), "dataset", None), "cache_dir", None)
+            if _ds_dir is None and getattr(ctx, "semantic_stage_cache_dir", None):
+                _ds_dir = _BankPath(str(ctx.semantic_stage_cache_dir)).resolve()
+            _dc_dir = _BankPath(str(_ds_dir)) if _ds_dir is not None else None
+
+            N = len(ctx.payload_bank or [])
+            _tag = f"{N}_{image_hw[0]}x{image_hw[1]}"
+            _img_cf = (_dc_dir / f"gen_bank_img_{_tag}.npy") if _dc_dir else None
+            _msk_cf = (_dc_dir / f"gen_bank_msk_{_tag}.npy") if _dc_dir else None
+
+            if _img_cf and _img_cf.exists() and _msk_cf and _msk_cf.exists():
+                # L2 hit — single mmap load, no per-item reads
+                _log(f"[stageG] bank L2 hit: {_img_cf.name}")
+                _prebuilt_image_bank = torch.from_numpy(
+                    _np_bank.ascontiguousarray(_np_bank.load(str(_img_cf), mmap_mode="r"))
+                ).pin_memory()
+                _prebuilt_mask_bank = torch.from_numpy(
+                    _np_bank.ascontiguousarray(_np_bank.load(str(_msk_cf), mmap_mode="r"))
+                ).pin_memory()
+            else:
+                # Build: vectorized bulk chunk read + GPU resize
+                _log(f"[stageG] building image/mask banks from {N} payload rows …")
+                _resize_dev = getattr(ctx, "device", None)
+                _prebuilt_image_bank = _payload_image_bank(
+                    payload_images=ctx.payload_bank or [],
+                    image_hw=image_hw,
+                    device=_resize_dev,
+                ).pin_memory()
+                _prebuilt_mask_bank = _payload_mask_bank(
+                    payload_masks=ctx.payload_masks or [],
+                    image_hw=image_hw,
+                    device=_resize_dev,
+                ).pin_memory()
+                # Save to disk cache for future runs
+                if _img_cf is not None:
+                    try:
+                        _np_bank.save(str(_img_cf), _prebuilt_image_bank.numpy())
+                        _np_bank.save(str(_msk_cf), _prebuilt_mask_bank.numpy())
+                        _log(f"[stageG] banks saved to disk cache: {_img_cf.name}")
+                    except Exception as _dc_err:
+                        _log(f"[stageG] bank disk cache write failed (non-fatal): {_dc_err}")
+
+            ctx._generator_bank_cache = {
+                "key":    _cache_key,
+                "images": _prebuilt_image_bank,
+                "masks":  _prebuilt_mask_bank,
+            }
+            _log(f"[stageG] banks ready: images={tuple(_prebuilt_image_bank.shape)} masks={tuple(_prebuilt_mask_bank.shape)}")
 
         all_metrics: List[Dict[str, Any]] = []
         slots_trained = 0

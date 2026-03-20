@@ -1913,6 +1913,7 @@ def _run_fake_class_refresh_epochs(
         return {"ran": False, "loss": 0.0, "samples": 0, "source": "fake_vector"}
     if fake_label_vector is None:
         return {"ran": False, "loss": 0.0, "samples": 0, "source": "fake_vector", "reason": "missing_fake_vector"}
+    from wav_ml_models import TinyConvClassifier
     if not isinstance(classifier, TinyConvClassifier):
         return {
             "ran": False,

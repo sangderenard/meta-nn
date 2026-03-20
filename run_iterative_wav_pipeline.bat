@@ -7,6 +7,11 @@ set "LEGACY_SCRIPT=wav_config_transformer_pipeline.py"
 set "GRAPH_SCRIPT=wav_pipeline_graph.py"
 set "SCRIPT=%GRAPH_SCRIPT%"
 set "GUI_SCRIPT=wav_ml_gui_main.py"
+set "SERVER_SCRIPT=nodus_server.py"
+set "SERVER_HOST=127.0.0.1"
+set "SERVER_PORT=7272"
+REM Optional: set to a directory path to enable distributed gradient leasing (/api/lease/*)
+set "SERVER_LEASE_STORE_DIR="
 set "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True"
 set "HF_HUB_OFFLINE=1"
 set "TRANSFORMERS_OFFLINE=1"
@@ -433,6 +438,7 @@ if /I "%ORCH_MODE%"=="staged_cgrw" (
 
 set /a RUN_INDEX=0
 call :backup_weights startup
+call :launch_server
 call :launch_gui
 
 :run_loop
@@ -500,6 +506,28 @@ if exist "%VIEWER_PORT_FILE%" (
 echo [launcher] GUI port file missing; attempting to (re)launch standalone GUI...
 call :launch_gui
 exit /b !ERRORLEVEL!
+
+:launch_server
+if not exist "%SERVER_SCRIPT%" (
+  echo [launcher] server script not found: %SERVER_SCRIPT%
+  exit /b 0
+)
+call :probe_server
+if "!ERRORLEVEL!"=="0" (
+  echo [launcher] nodus server already reachable on %SERVER_HOST%:%SERVER_PORT%; skipping launch.
+  exit /b 0
+)
+echo [launcher] launching nodus server on %SERVER_HOST%:%SERVER_PORT% ...
+if not "%SERVER_LEASE_STORE_DIR%"=="" (
+  start "nodus-server" /B %PYTHON% %SERVER_SCRIPT% --host %SERVER_HOST% --port %SERVER_PORT% --lease-store-dir "%SERVER_LEASE_STORE_DIR%"
+) else (
+  start "nodus-server" /B %PYTHON% %SERVER_SCRIPT% --host %SERVER_HOST% --port %SERVER_PORT%
+)
+exit /b 0
+
+:probe_server
+%PYTHON% -c "import urllib.request, sys; urllib.request.urlopen('http://' + sys.argv[1] + ':' + sys.argv[2] + '/api/status', timeout=2).read()" "%SERVER_HOST%" "%SERVER_PORT%" >nul 2>&1
+exit /b %ERRORLEVEL%
 
 :launch_gui
 if not "%STAGE_OPENGL_LAUNCH_STANDALONE%"=="1" exit /b 0

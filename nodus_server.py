@@ -43,6 +43,7 @@ import json
 import re
 import struct
 import sys
+import threading
 import zlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Optional
@@ -119,6 +120,22 @@ def _get_stores():
 # Cached after first successful load.
 _STORES: tuple | None = None
 
+# ---------------------------------------------------------------------------
+# Lease store (optional — enabled via --lease-store-dir)
+# ---------------------------------------------------------------------------
+
+_LEASE_STORE = None   # type: Optional["pipeline.lease_store.LeaseStore"]
+_LEASE_STORE_LOCK = threading.Lock()
+_WEB_DATASET = None   # type: Optional["pipeline.web_dataset.WebDataset"]
+
+
+def _lease_store():
+    return _LEASE_STORE
+
+
+def _web_dataset():
+    return _WEB_DATASET
+
 
 def _stores():
     global _STORES
@@ -186,12 +203,32 @@ class NodusHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         path   = parsed.path.rstrip("/") or "/"
         qs     = parse_qs(parsed.query, keep_blank_values=False)
-
         try:
             self._dispatch(path, qs)
         except Exception as exc:
-            body = _json({"error": str(exc)})
-            self._send(500, "application/json", body)
+            self._send(500, "application/json", _json({"error": str(exc)}))
+
+    def do_POST(self):
+        parsed = urlparse(self.path)
+        path   = parsed.path.rstrip("/") or "/"
+        length = int(self.headers.get("Content-Length", 0) or 0)
+        body   = self.rfile.read(length) if length > 0 else b""
+        try:
+            self._dispatch_post(path, body)
+        except Exception as exc:
+            self._send(500, "application/json", _json({"error": str(exc)}))
+
+    def do_DELETE(self):
+        parsed = urlparse(self.path)
+        path   = parsed.path.rstrip("/") or "/"
+        try:
+            self._dispatch_delete(path)
+        except Exception as exc:
+            self._send(500, "application/json", _json({"error": str(exc)}))
+
+    def do_OPTIONS(self):
+        # CORS preflight — browsers send this before cross-origin POST/DELETE
+        self._send(204, "text/plain", b"")
 
     def log_message(self, fmt, *args):
         # Keep output minimal.
@@ -269,6 +306,34 @@ class NodusHandler(BaseHTTPRequestHandler):
         m = re.fullmatch(r"/api/weight/image/(\d+)\.png", path)
         if m:
             return self._handle_weight_image(int(m.group(1)))
+
+        # -- Web dataset / lease weights --
+        if path == "/api/web/dataset/status":
+            return self._handle_web_dataset_status()
+
+        m = re.fullmatch(r"/api/web/dataset/([^/]+)/([^/]+)/image\.png", path)
+        if m:
+            return self._handle_web_sample_image(m.group(1), m.group(2))
+
+        m = re.fullmatch(r"/api/web/lease/([^/]+)/weights", path)
+        if m:
+            return self._handle_web_lease_weights(m.group(1))
+
+        m = re.fullmatch(r"/api/web/lease/([^/]+)/dataset", path)
+        if m:
+            return self._handle_web_lease_dataset(m.group(1))
+
+        # -- Lease system --
+        if path == "/api/lease/status":
+            return self._handle_lease_status()
+
+        m = re.fullmatch(r"/api/lease/collection/([^/]+)", path)
+        if m:
+            return self._handle_lease_collection_detail(m.group(1))
+
+        m = re.fullmatch(r"/api/lease/([^/]+)", path)
+        if m:
+            return self._handle_lease_detail(m.group(1))
 
         self._send(404, "application/json", _json({"error": "not found", "path": path}))
 
@@ -525,6 +590,309 @@ class NodusHandler(BaseHTTPRequestHandler):
                        _json({"error": f"unexpected channel count {c}"}))
 
     # ------------------------------------------------------------------ #
+    #  Lease routes (GET)                                                  #
+    # ------------------------------------------------------------------ #
+
+    def _handle_lease_status(self):
+        ls = _lease_store()
+        if ls is None:
+            self._send(503, "application/json",
+                       _json({"error": "lease store not configured (start with --lease-store-dir)"}))
+            return
+        ls.expire_stale_leases()
+        self._send(200, "application/json", _json({
+            "slots": ls.slot_status(),
+            "locked": ls.locked_slots(),
+        }))
+
+    def _handle_lease_collection_detail(self, collection_id: str):
+        ls = _lease_store()
+        if ls is None:
+            self._send(503, "application/json", _json({"error": "lease store not configured"}))
+            return
+        detail = ls.collection_detail(collection_id)
+        if detail is None:
+            self._send(404, "application/json", _json({"error": "collection not found"}))
+            return
+        self._send(200, "application/json", _json(detail))
+
+    def _handle_lease_detail(self, lease_id: str):
+        ls = _lease_store()
+        if ls is None:
+            self._send(503, "application/json", _json({"error": "lease store not configured"}))
+            return
+        lease = ls.get_lease(lease_id)
+        if lease is None:
+            self._send(404, "application/json", _json({"error": "lease not found"}))
+            return
+        import dataclasses as _dc
+        self._send(200, "application/json", _json(_dc.asdict(lease)))
+
+    # ------------------------------------------------------------------ #
+    #  Web dataset + lease weight handlers (GET)                          #
+    # ------------------------------------------------------------------ #
+
+    def _handle_web_dataset_status(self):
+        wd = _web_dataset()
+        if wd is None:
+            self._send(503, "application/json", _json({"error": "web dataset not configured"}))
+            return
+        self._send(200, "application/json", _json(wd.status()))
+
+    def _handle_web_sample_image(self, slot_name: str, sample_id: str):
+        wd = _web_dataset()
+        if wd is None:
+            self._send(503, "application/json", _json({"error": "web dataset not configured"}))
+            return
+        sample = wd.get_sample(slot_name, sample_id)
+        if sample is None:
+            self._send(404, "application/json", _json({"error": "sample not found"}))
+            return
+        rgba = wd.load_rgba(slot_name, sample_id)
+        if rgba is None:
+            self._send(404, "application/json", _json({"error": "image data not found"}))
+            return
+        import struct as _struct, zlib as _zlib
+        # Encode float32 [H,W,4] → uint8 RGBA PNG
+        h, w = int(rgba.shape[0]), int(rgba.shape[1])
+        rgba_u8 = (rgba.clip(0, 1) * 255).astype("uint8").tobytes()
+        self._send(200, "image/png", _encode_png_rgba(w, h, rgba_u8))
+
+    def _handle_web_lease_weights(self, lease_id: str):
+        ls = _lease_store()
+        if ls is None:
+            self._send(503, "application/json", _json({"error": "lease store not configured"}))
+            return
+        lease = ls.get_lease(lease_id)
+        if lease is None:
+            self._send(404, "application/json", _json({"error": "lease not found"}))
+            return
+        import dataclasses as _dc
+        weights_path = (
+            __import__("pathlib").Path(ls._dir)
+            / "active_weights" / lease.collection_id / "weights.pt"
+        )
+        if not weights_path.exists():
+            self._send(503, "application/json",
+                       _json({"error": "weights not yet exported for this collection",
+                               "collection_id": lease.collection_id}))
+            return
+        body = weights_path.read_bytes()
+        self._send(200, "application/octet-stream", body)
+
+    def _handle_web_lease_dataset(self, lease_id: str):
+        ls = _lease_store()
+        wd = _web_dataset()
+        if ls is None or wd is None:
+            self._send(503, "application/json", _json({"error": "lease store or web dataset not configured"}))
+            return
+        lease = ls.get_lease(lease_id)
+        if lease is None:
+            self._send(404, "application/json", _json({"error": "lease not found"}))
+            return
+        import dataclasses as _dc
+        samples = wd.samples_for_collection(lease.slot_name, lease.collection_id)
+        self._send(200, "application/json", _json({
+            "collection_id": lease.collection_id,
+            "slot_name": lease.slot_name,
+            "generation": lease.generation,
+            "samples": [_dc.asdict(s) for s in samples],
+        }))
+
+    # ------------------------------------------------------------------ #
+    #  POST routing + handlers                                             #
+    # ------------------------------------------------------------------ #
+
+    def _dispatch_post(self, path: str, body: bytes):
+        ls = _lease_store()
+
+        # Browser-submitted training sample
+        m = re.fullmatch(r"/api/web/dataset/([^/]+)", path)
+        if m:
+            return self._handle_web_dataset_submit(m.group(1), body)
+
+        # Open a new collection (lock a slot, issue leases)
+        if path == "/api/lease/collection":
+            return self._handle_lease_open_collection(ls, body)
+
+        # Return a lease with optional gradient payload
+        m = re.fullmatch(r"/api/lease/([^/]+)/gradients", path)
+        if m:
+            return self._handle_lease_return(ls, m.group(1), body)
+
+        # Force-expire a collection (admin unlock)
+        m = re.fullmatch(r"/api/lease/collection/([^/]+)/expire", path)
+        if m:
+            return self._handle_lease_expire_collection(ls, m.group(1))
+
+        # Mark a collection as applied (pipeline consumed the gradients)
+        m = re.fullmatch(r"/api/lease/collection/([^/]+)/apply", path)
+        if m:
+            return self._handle_lease_mark_applied(ls, m.group(1))
+
+        self._send(404, "application/json", _json({"error": "not found", "path": path}))
+
+    def _handle_web_dataset_submit(self, slot_name: str, body: bytes):
+        """Accept a browser-submitted labeled image.
+
+        Body must be JSON::
+
+            {
+              "image_b64": "<base64 PNG/JPEG bytes>",
+              "labels":    ["cat", "dog", ...],
+              "client_hint": "optional string"
+            }
+
+        The image is decoded, converted to RGBA float32, and stored.
+        If the image has no alpha channel a fully opaque mask is synthesised.
+        """
+        wd = _web_dataset()
+        if wd is None:
+            self._send(503, "application/json", _json({"error": "web dataset not configured"}))
+            return
+        try:
+            req = json.loads(body or b"{}")
+        except Exception:
+            self._send(400, "application/json", _json({"error": "invalid JSON body"}))
+            return
+        image_b64 = req.get("image_b64") or ""
+        labels = list(req.get("labels") or [])
+        client_hint = str(req.get("client_hint") or "")
+        if not image_b64:
+            self._send(400, "application/json", _json({"error": "image_b64 required"}))
+            return
+        try:
+            import base64, io as _io
+            import numpy as _np
+            raw_bytes = base64.b64decode(image_b64)
+            # Decode image using stdlib struct + a minimal PNG/JPEG reader.
+            # We rely on PIL if available; otherwise return an error with instructions.
+            try:
+                from PIL import Image as _PilImage
+                img = _PilImage.open(_io.BytesIO(raw_bytes))
+                img_rgba = img.convert("RGBA")
+                rgba_arr = _np.asarray(img_rgba, dtype=_np.float32) / 255.0  # [H,W,4]
+            except ImportError:
+                self._send(503, "application/json",
+                           _json({"error": "Pillow not installed on server; cannot decode image"}))
+                return
+        except Exception as exc:
+            self._send(400, "application/json", _json({"error": f"image decode failed: {exc}"}))
+            return
+        try:
+            sample_id = wd.add_sample(
+                slot_name=str(slot_name),
+                rgba=rgba_arr,
+                labels=[str(l) for l in labels],
+                client_hint=client_hint,
+            )
+        except Exception as exc:
+            self._send(500, "application/json", _json({"error": f"store failed: {exc}"}))
+            return
+        self._send(200, "application/json", _json({
+            "sample_id": sample_id,
+            "slot_name": str(slot_name),
+            "labels": labels,
+            "width": int(rgba_arr.shape[1]),
+            "height": int(rgba_arr.shape[0]),
+        }))
+
+    def _handle_lease_open_collection(self, ls, body: bytes):
+        if ls is None:
+            self._send(503, "application/json", _json({"error": "lease store not configured"}))
+            return
+        try:
+            req = json.loads(body or b"{}")
+        except Exception:
+            self._send(400, "application/json", _json({"error": "invalid JSON body"}))
+            return
+        slot_name = str(req.get("slot_name") or "").strip()
+        if not slot_name:
+            self._send(400, "application/json", _json({"error": "slot_name required"}))
+            return
+        generation   = int(req.get("generation", 0))
+        count        = max(1, int(req.get("count", 1)))
+        ttl_seconds  = float(req.get("ttl_seconds", 3600))
+        deadline_sec = req.get("deadline_seconds")
+        note         = str(req.get("note", ""))
+        coll, leases = ls.open_collection(
+            slot_name=slot_name,
+            generation=generation,
+            count=count,
+            ttl_seconds=ttl_seconds,
+            deadline_seconds=float(deadline_sec) if deadline_sec is not None else None,
+            note=note,
+        )
+        import dataclasses as _dc
+        self._send(200, "application/json", _json({
+            "collection": _dc.asdict(coll),
+            "leases": [_dc.asdict(l) for l in leases],
+        }))
+
+    def _handle_lease_return(self, ls, lease_id: str, body: bytes):
+        if ls is None:
+            self._send(503, "application/json", _json({"error": "lease store not configured"}))
+            return
+        # Body may be raw npz bytes (application/octet-stream) or empty
+        gradient_data = body if body else None
+        lease, completed_coll = ls.return_lease(lease_id, gradient_data)
+        if lease is None:
+            self._send(404, "application/json",
+                       _json({"error": "lease not found or already resolved"}))
+            return
+        import dataclasses as _dc
+        self._send(200, "application/json", _json({
+            "lease": _dc.asdict(lease),
+            "collection_complete": completed_coll is not None,
+            "collection_id": lease.collection_id,
+        }))
+
+    def _handle_lease_expire_collection(self, ls, collection_id: str):
+        if ls is None:
+            self._send(503, "application/json", _json({"error": "lease store not configured"}))
+            return
+        n = ls.force_expire_collection(collection_id)
+        self._send(200, "application/json", _json({
+            "collection_id": collection_id,
+            "expired_count": n,
+        }))
+
+    def _handle_lease_mark_applied(self, ls, collection_id: str):
+        if ls is None:
+            self._send(503, "application/json", _json({"error": "lease store not configured"}))
+            return
+        ok = ls.mark_applied(collection_id)
+        self._send(200, "application/json", _json({
+            "collection_id": collection_id,
+            "applied": ok,
+        }))
+
+    # ------------------------------------------------------------------ #
+    #  DELETE routing + handlers                                           #
+    # ------------------------------------------------------------------ #
+
+    def _dispatch_delete(self, path: str):
+        ls = _lease_store()
+
+        # Abandon a lease (client gives up, no gradient)
+        m = re.fullmatch(r"/api/lease/([^/]+)", path)
+        if m:
+            return self._handle_lease_abandon(ls, m.group(1))
+
+        self._send(404, "application/json", _json({"error": "not found", "path": path}))
+
+    def _handle_lease_abandon(self, ls, lease_id: str):
+        if ls is None:
+            self._send(503, "application/json", _json({"error": "lease store not configured"}))
+            return
+        ok = ls.abandon_lease(lease_id)
+        if not ok:
+            self._send(404, "application/json",
+                       _json({"error": "lease not found or already resolved"}))
+            return
+        self._send(200, "application/json", _json({"abandoned": True, "lease_id": lease_id}))
+
+    # ------------------------------------------------------------------ #
     #  Response helper                                                     #
     # ------------------------------------------------------------------ #
 
@@ -533,6 +901,9 @@ class NodusHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-cache")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
         self.end_headers()
         self.wfile.write(body)
 
@@ -602,6 +973,35 @@ _INDEX_HTML = """\
   <tr><td><a href="/api/weight/image/latest.png">/api/weight/image/latest.png</a></td><td>Newest rendered weight image</td></tr>
   <tr><td>/api/weight/image/&lt;idx&gt;.png</td><td>Weight image by index</td></tr>
 </table>
+
+<h2>Browser Training Data</h2>
+<p>Requires <code>--lease-store-dir</code>.  Browser clients submit labeled RGBA images
+(alpha = mask).  Samples accumulate until the <em>WebLeaseNode</em> pipeline stage
+claims them into a collection.</p>
+<table>
+  <tr><th>Method</th><th>Endpoint</th><th>Description</th></tr>
+  <tr><td>POST</td><td>/api/web/dataset/&lt;slot&gt;</td><td>Submit labeled image — body: <code>{"image_b64":"&lt;base64 PNG/JPEG&gt;","labels":[...],"client_hint":"..."}</code></td></tr>
+  <tr><td>GET</td><td><a href="/api/web/dataset/status">/api/web/dataset/status</a></td><td>Pending sample counts per slot</td></tr>
+  <tr><td>GET</td><td>/api/web/dataset/&lt;slot&gt;/&lt;sample_id&gt;/image.png</td><td>Preview a submitted image (RGBA)</td></tr>
+  <tr><td>GET</td><td>/api/web/lease/&lt;lease_id&gt;/weights</td><td>Download model weights for a lease (PyTorch .pt binary)</td></tr>
+  <tr><td>GET</td><td>/api/web/lease/&lt;lease_id&gt;/dataset</td><td>JSON list of dataset samples assigned to this lease</td></tr>
+</table>
+
+<h2>Distributed Gradient Leases</h2>
+<p>Requires <code>--lease-store-dir</code>.  A <em>collection</em> is a batch of leases
+for one network slot at a fixed generation.  The slot is <strong>locked</strong> (local
+training paused) while any lease is outstanding.</p>
+<table>
+  <tr><th>Method</th><th>Endpoint</th><th>Description</th></tr>
+  <tr><td>GET</td><td><a href="/api/lease/status">/api/lease/status</a></td><td>All slots with lockout state</td></tr>
+  <tr><td>GET</td><td>/api/lease/collection/&lt;id&gt;</td><td>Collection detail + lease list</td></tr>
+  <tr><td>GET</td><td>/api/lease/&lt;lease_id&gt;</td><td>Single lease detail</td></tr>
+  <tr><td>POST</td><td>/api/lease/collection</td><td>Open collection, issue leases — body: <code>{"slot_name","generation","count","ttl_seconds","deadline_seconds","note"}</code></td></tr>
+  <tr><td>POST</td><td>/api/lease/&lt;lease_id&gt;/gradients</td><td>Return lease with optional gradient blob (raw npz bytes body)</td></tr>
+  <tr><td>POST</td><td>/api/lease/collection/&lt;id&gt;/expire</td><td>Force-expire all active leases, unlock slot immediately</td></tr>
+  <tr><td>POST</td><td>/api/lease/collection/&lt;id&gt;/apply</td><td>Mark collection as applied (gradients consumed by pipeline)</td></tr>
+  <tr><td>DELETE</td><td>/api/lease/&lt;lease_id&gt;</td><td>Abandon lease (no gradient returned)</td></tr>
+</table>
 </body>
 </html>
 """
@@ -613,20 +1013,22 @@ _INDEX_HTML = """\
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Serve nodus shared-memory data over HTTP (read-only).")
+        description="Serve nodus shared-memory data over HTTP.")
     parser.add_argument("--host", default="127.0.0.1",
                         help="Bind address (default: 127.0.0.1)")
     parser.add_argument("--port", type=int, default=7272,
                         help="TCP port (default: 7272)")
+    parser.add_argument("--lease-store-dir", default="",
+                        help="Directory for distributed gradient lease state. "
+                             "If set, enables /api/lease/* endpoints.")
     args = parser.parse_args()
 
-    # Eagerly load the stores so startup errors surface immediately.
+    # Eagerly load the shared-memory stores so startup errors surface immediately.
     print(f"[nodus] Loading shared-memory stores ...", flush=True)
     try:
         loss, scrub, wst, wim = _get_stores()
-        _STORES_ref = (loss, scrub, wst, wim)
         global _STORES
-        _STORES = _STORES_ref
+        _STORES = (loss, scrub, wst, wim)
         print(f"[nodus] Connected: {loss.channel_count()} loss channel(s), "
               f"scrub ring {scrub.length()}/{scrub.capacity()}, "
               f"{wim.length()} weight image(s).", flush=True)
@@ -634,6 +1036,29 @@ def main():
         print(f"[nodus] WARNING: Could not load stores: {exc}", flush=True)
         print(f"[nodus] Server will still start; store errors will be "
               f"reported per-request.", flush=True)
+
+    # Optionally init the lease store + web dataset.
+    global _LEASE_STORE, _WEB_DATASET
+    if args.lease_store_dir:
+        try:
+            from pipeline.lease_store import LeaseStore
+            from pipeline.web_dataset import WebDataset
+            _LEASE_STORE = LeaseStore(args.lease_store_dir)
+            _WEB_DATASET = WebDataset(args.lease_store_dir)
+            print(f"[nodus] Lease store + web dataset: {args.lease_store_dir}", flush=True)
+            # Background thread to expire stale leases every 60 s
+            def _expiry_loop():
+                import time as _time
+                while True:
+                    _time.sleep(60)
+                    try:
+                        _LEASE_STORE.expire_stale_leases()
+                    except Exception:
+                        pass
+            t = threading.Thread(target=_expiry_loop, daemon=True, name="lease-expiry")
+            t.start()
+        except Exception as exc:
+            print(f"[nodus] WARNING: Could not init lease store: {exc}", flush=True)
 
     server = ThreadingHTTPServer((args.host, args.port), NodusHandler)
     url = f"http://{args.host}:{args.port}/"

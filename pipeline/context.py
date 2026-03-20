@@ -421,6 +421,7 @@ class PipelineContext:
     # ---- misc flags -----------------------------------------------------
     berkeley_data_root: str = ""
     semantic_stage_cache_dir: str = ""
+    lease_store_dir: str = ""         # set to enable WebLeaseNode + /api/lease/* endpoints
 
     # ------------------------------------------------------------------
     # Convenience predicates (used as edge conditions in the graph)

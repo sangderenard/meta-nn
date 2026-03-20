@@ -902,6 +902,10 @@ typedef struct NodusScrubEntry {
     uint8_t  output_image[NODUS_SCRUB_IMAGE_BYTES];
     uint8_t  target_data[NODUS_SCRUB_TARGET_BYTES];
     uint8_t  thumbnails[NODUS_SCRUB_NUM_THUMBS][NODUS_SCRUB_THUMB_BYTES];
+    /* Frame text — parallel to images, written under ring lock. */
+    char     frame_caption[NODUS_SCRUB_CAPTION_BYTES];
+    char     frame_titles[NODUS_SCRUB_NUM_PANELS][NODUS_SCRUB_TITLE_BYTES];
+    char     frame_rows[NODUS_SCRUB_NUM_PANELS][NODUS_SCRUB_ROWS_BYTES];
 } NodusScrubEntry;
 
 struct NodusScrubRing {
@@ -915,8 +919,8 @@ struct NodusScrubRing {
     NodusScrubEntry entries[NODUS_SCRUB_RING_CAPACITY];
 };
 
-#define NODUS_SCRUB_SHM_NAME    "NodusScrubRingGlobal_v1"
-#define NODUS_SCRUB_MTX_NAME    "NodusScrubRingMutex_v1"
+#define NODUS_SCRUB_SHM_NAME    "NodusScrubRingGlobal_v2"
+#define NODUS_SCRUB_MTX_NAME    "NodusScrubRingMutex_v2"
 #define NODUS_SCRUB_SHM_SIZE    sizeof(NodusScrubRing)
 
 static NodusScrubRing *g_scrub_global = NULL;
@@ -1317,6 +1321,75 @@ NODUS_API int32_t nodus_scrub_ring_copy_thumbnail(
                ? NODUS_SCRUB_THUMB_BYTES : buf_size;
     memcpy(out_buf, e->thumbnails[thumb_idx], n);
     return (int32_t)n;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Scrub Ring text — parallel to images                             */
+/* ------------------------------------------------------------------ */
+
+NODUS_API void nodus_scrub_ring_write_text(
+        NodusScrubRing *ring, int32_t cursor,
+        const char *caption,
+        const char *title0, const char *title1, const char *title2,
+        const char *rows0,  const char *rows1,  const char *rows2)
+{
+    if (!ring || cursor < 0) return;
+    int slot = (int)(cursor % ring->capacity);
+    ring_lock(ring);
+    NodusScrubEntry *e = &ring->entries[slot];
+
+#define _NODUS_COPY_STR(dst, src, cap) \
+    if (src) { strncpy(dst, src, (cap) - 1); dst[(cap) - 1] = '\0'; } \
+    else { dst[0] = '\0'; }
+
+    _NODUS_COPY_STR(e->frame_caption,   caption, NODUS_SCRUB_CAPTION_BYTES)
+    _NODUS_COPY_STR(e->frame_titles[0], title0,  NODUS_SCRUB_TITLE_BYTES)
+    _NODUS_COPY_STR(e->frame_titles[1], title1,  NODUS_SCRUB_TITLE_BYTES)
+    _NODUS_COPY_STR(e->frame_titles[2], title2,  NODUS_SCRUB_TITLE_BYTES)
+    _NODUS_COPY_STR(e->frame_rows[0],   rows0,   NODUS_SCRUB_ROWS_BYTES)
+    _NODUS_COPY_STR(e->frame_rows[1],   rows1,   NODUS_SCRUB_ROWS_BYTES)
+    _NODUS_COPY_STR(e->frame_rows[2],   rows2,   NODUS_SCRUB_ROWS_BYTES)
+
+#undef _NODUS_COPY_STR
+
+    e->flags |= NODUS_SCRUB_FLAG_HAS_TEXT;
+    ring_unlock(ring);
+}
+
+NODUS_API int nodus_scrub_ring_read_text(
+        const NodusScrubRing *ring, int32_t cursor,
+        char *out_caption,  int caption_buf_size,
+        char *out_title0,   int title0_buf_size,
+        char *out_title1,   int title1_buf_size,
+        char *out_title2,   int title2_buf_size,
+        char *out_rows0,    int rows0_buf_size,
+        char *out_rows1,    int rows1_buf_size,
+        char *out_rows2,    int rows2_buf_size)
+{
+    if (!ring || cursor < 0) return -1;
+    int slot = (int)(cursor % ring->capacity);
+    ring_lock((NodusScrubRing*)ring);
+    const NodusScrubEntry *e = &ring->entries[slot];
+    if (!(e->flags & NODUS_SCRUB_FLAG_HAS_TEXT)) {
+        ring_unlock((NodusScrubRing*)ring);
+        return 0;
+    }
+
+#define _NODUS_READ_STR(out, bufsz, src) \
+    if (out && (bufsz) > 0) { strncpy(out, src, (bufsz) - 1); out[(bufsz) - 1] = '\0'; }
+
+    _NODUS_READ_STR(out_caption, caption_buf_size, e->frame_caption)
+    _NODUS_READ_STR(out_title0,  title0_buf_size,  e->frame_titles[0])
+    _NODUS_READ_STR(out_title1,  title1_buf_size,  e->frame_titles[1])
+    _NODUS_READ_STR(out_title2,  title2_buf_size,  e->frame_titles[2])
+    _NODUS_READ_STR(out_rows0,   rows0_buf_size,   e->frame_rows[0])
+    _NODUS_READ_STR(out_rows1,   rows1_buf_size,   e->frame_rows[1])
+    _NODUS_READ_STR(out_rows2,   rows2_buf_size,   e->frame_rows[2])
+
+#undef _NODUS_READ_STR
+
+    ring_unlock((NodusScrubRing*)ring);
+    return 1;
 }
 
 /* ------------------------------------------------------------------ */

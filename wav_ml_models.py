@@ -1424,58 +1424,78 @@ def _payload_condition_bank(
 def _payload_mask_bank(
     payload_masks: Sequence[Any],
     image_hw: Tuple[int, int],
+    device: Optional[Any] = None,
 ) -> torch.Tensor:
     h = max(1, int(image_hw[0]))
     w = max(1, int(image_hw[1]))
     if not payload_masks:
         return torch.zeros((0, 1, h, w), dtype=torch.float32)
-    items: list = []
-    for i, x in enumerate(payload_masks):
-        if isinstance(x, torch.Tensor):
-            t = x.detach().float().cpu()
-        else:
-            t = torch.from_numpy(np.asarray(x, dtype=np.float32))
-        if t.ndim == 3 and t.shape[0] == 1:
-            t = t[0]
-        elif t.ndim == 3:
-            t = t.mean(0)
-        elif t.ndim != 2:
-            raise RuntimeError(f"Semantic mask row {i} must be [H,W] or [1,H,W], got {tuple(t.shape)}")
-        items.append(t)
-    batch = torch.stack(items).unsqueeze(1)  # [N, 1, H, W]
+    # Fast path: SemanticWheelPayloadView supports bulk chunk-level read
+    if hasattr(payload_masks, "read_bulk_arrays"):
+        arr = np.ascontiguousarray(payload_masks.read_bulk_arrays(), dtype=np.float32)  # [N, H, W]
+        batch = torch.from_numpy(arr).unsqueeze(1)  # [N, 1, H, W]
+    else:
+        items: list = []
+        for i, x in enumerate(payload_masks):
+            if isinstance(x, torch.Tensor):
+                t = x.detach().float().cpu()
+            else:
+                t = torch.from_numpy(np.asarray(x, dtype=np.float32))
+            if t.ndim == 3 and t.shape[0] == 1:
+                t = t[0]
+            elif t.ndim == 3:
+                t = t.mean(0)
+            elif t.ndim != 2:
+                raise RuntimeError(f"Semantic mask row {i} must be [H,W] or [1,H,W], got {tuple(t.shape)}")
+            items.append(t)
+        batch = torch.stack(items).unsqueeze(1)  # [N, 1, H, W]
     if tuple(batch.shape[-2:]) != (h, w):
-        batch = F.interpolate(batch, size=(h, w), mode="nearest")
+        if device is not None:
+            batch = F.interpolate(batch.to(device), size=(h, w), mode="nearest").cpu()
+        else:
+            batch = F.interpolate(batch, size=(h, w), mode="nearest")
     return batch.clamp(0.0, 1.0).contiguous()
 
 
 def _payload_image_bank(
     payload_images: Sequence[Any],
     image_hw: Tuple[int, int],
+    device: Optional[Any] = None,
 ) -> torch.Tensor:
     h = max(1, int(image_hw[0]))
     w = max(1, int(image_hw[1]))
     if not payload_images:
         return torch.zeros((0, 3, h, w), dtype=torch.float32)
-    items: list = []
-    for i, x in enumerate(payload_images):
-        if isinstance(x, torch.Tensor):
-            t = x.detach().float().cpu()
-        else:
-            t = torch.from_numpy(np.asarray(x, dtype=np.float32))
-        if t.ndim == 2:
-            t = t.unsqueeze(0).expand(3, -1, -1).contiguous()
-        elif t.ndim == 3 and t.shape[0] == 1:
-            t = t.expand(3, -1, -1).contiguous()
-        elif t.ndim == 3 and t.shape[0] == 3:
-            pass
-        elif t.ndim == 3 and t.shape[-1] == 3:
-            t = t.permute(2, 0, 1)
-        else:
-            raise RuntimeError(f"Semantic payload image row {i} must be [3,H,W] or [H,W,3], got {tuple(t.shape)}")
-        items.append(t)
-    batch = torch.stack(items)  # [N, 3, H, W]
+    # Fast path: SemanticWheelPayloadView supports bulk chunk-level read → [N, H, W, 3] HWC
+    if hasattr(payload_images, "read_bulk_arrays"):
+        arr = np.ascontiguousarray(
+            payload_images.read_bulk_arrays().transpose(0, 3, 1, 2), dtype=np.float32
+        )  # [N, 3, H, W]
+        batch = torch.from_numpy(arr)
+    else:
+        items: list = []
+        for i, x in enumerate(payload_images):
+            if isinstance(x, torch.Tensor):
+                t = x.detach().float().cpu()
+            else:
+                t = torch.from_numpy(np.asarray(x, dtype=np.float32))
+            if t.ndim == 2:
+                t = t.unsqueeze(0).expand(3, -1, -1).contiguous()
+            elif t.ndim == 3 and t.shape[0] == 1:
+                t = t.expand(3, -1, -1).contiguous()
+            elif t.ndim == 3 and t.shape[0] == 3:
+                pass
+            elif t.ndim == 3 and t.shape[-1] == 3:
+                t = t.permute(2, 0, 1)
+            else:
+                raise RuntimeError(f"Semantic payload image row {i} must be [3,H,W] or [H,W,3], got {tuple(t.shape)}")
+            items.append(t)
+        batch = torch.stack(items)  # [N, 3, H, W]
     if tuple(batch.shape[-2:]) != (h, w):
-        batch = F.interpolate(batch, size=(h, w), mode="nearest")
+        if device is not None:
+            batch = F.interpolate(batch.to(device), size=(h, w), mode="nearest").cpu()
+        else:
+            batch = F.interpolate(batch, size=(h, w), mode="nearest")
     return batch.clamp(0.0, 1.0).contiguous()
 
 

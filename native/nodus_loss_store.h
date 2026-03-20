@@ -293,6 +293,13 @@ NODUS_API void nodus_loss_store_unlock(NodusLossStore *store);
 #define NODUS_SCRUB_FLAG_CHECKPOINT     0x10
 #define NODUS_SCRUB_FLAG_HAS_OUTPUT     0x20
 #define NODUS_SCRUB_FLAG_REDUCED        0x40
+#define NODUS_SCRUB_FLAG_HAS_TEXT       0x80
+
+/* Frame text buffers — parallel to images, one set per entry. */
+#define NODUS_SCRUB_NUM_PANELS          3
+#define NODUS_SCRUB_CAPTION_BYTES       256   /* single caption line, null-terminated */
+#define NODUS_SCRUB_TITLE_BYTES          64   /* per-panel title, null-terminated     */
+#define NODUS_SCRUB_ROWS_BYTES         1024   /* per-panel rows, '\n'-delimited       */
 
 /* Opaque handle. */
 typedef struct NodusScrubRing NodusScrubRing;
@@ -389,6 +396,32 @@ NODUS_API int nodus_scrub_ring_reduce_output(
 NODUS_API int nodus_scrub_ring_reduce_training(
         NodusScrubRing *ring, int32_t index,
         uint32_t target_w, uint32_t target_h);
+
+/* ------------------------------------------------------------------ */
+/*  Scrub Ring text — parallel to images, same lock                  */
+/* ------------------------------------------------------------------ */
+
+/* Write text fields into the slot for the given cursor (value returned by
+   nodus_scrub_ring_push).  All string pointers may be NULL to clear the field.
+   Sets NODUS_SCRUB_FLAG_HAS_TEXT.  Safe to call from any thread. */
+NODUS_API void nodus_scrub_ring_write_text(
+        NodusScrubRing *ring, int32_t cursor,
+        const char *caption,
+        const char *title0,  const char *title1,  const char *title2,
+        const char *rows0,   const char *rows1,   const char *rows2);
+
+/* Read text fields from the slot for the given cursor.  Any out_* pointer
+   may be NULL to skip that field.  Returns 1 if HAS_TEXT was set, 0 if the
+   slot has no text, -1 on error.  Safe to call from any thread. */
+NODUS_API int nodus_scrub_ring_read_text(
+        const NodusScrubRing *ring, int32_t cursor,
+        char *out_caption,  int caption_buf_size,
+        char *out_title0,   int title0_buf_size,
+        char *out_title1,   int title1_buf_size,
+        char *out_title2,   int title2_buf_size,
+        char *out_rows0,    int rows0_buf_size,
+        char *out_rows1,    int rows1_buf_size,
+        char *out_rows2,    int rows2_buf_size);
 
 /* ------------------------------------------------------------------ */
 /*  Scrub Ring locking                                                */

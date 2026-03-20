@@ -6,7 +6,8 @@
       "Bash(python -c \"import pipeline.orchestrator; print\\(''OK''\\)\")",
       "Bash(grep -rn \"GeneratorTrainNode\\\\|BuildGANNode\\\\|build_gan\\\\|stage_g_generator\" c:/dev/Powershell/meta-nn/ --include=*.py)",
       "Bash(python -c \"import ast, sys; ast.parse\\(open\\(''nodus_server.py''\\).read\\(\\)\\); print\\(''syntax OK''\\)\")",
-      "Bash(python -c \"import ast; ast.parse\\(open\\(''nodus_server.py''\\).read\\(\\)\\); print\\(''OK''\\)\")"
+      "Bash(python -c \"import ast; ast.parse\\(open\\(''nodus_server.py''\\).read\\(\\)\\); print\\(''OK''\\)\")",
+      "Bash(head -15 grep -n \"class.*Progress\\\\|stop\\\\|interrupt\" c:/dev/Powershell/meta-nn/pipeline/progress.py)"
     ]
   }
 }

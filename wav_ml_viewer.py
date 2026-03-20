@@ -447,11 +447,12 @@ class _TransformerStatusOpenGLViewer:
         self._ring_text_caption: str = ""
         self._ring_text_titles: List[str] = ["target", "input", "output"]
         self._ring_text_rows: List[List[str]] = [[], [], []]
-        self._pending_frame_text_by_cursor: "OrderedDict[int, Dict[str, Any]]" = OrderedDict()
+        # Text is now stored directly in the C ring alongside images.
+        # _composite_ring_cursors maps composite-cache index → ring cursor so
+        # that _apply_cached_frame_text can call ring.read_text(cursor).
         _composite_text_capacity = (
             self._composite_cache.capacity() if self._composite_cache is not None else 512
         )
-        self._composite_frame_text: deque = deque(maxlen=max(1, int(_composite_text_capacity)))
         self._composite_ring_cursors: deque = deque(maxlen=max(1, int(_composite_text_capacity)))
 
         # -- Sidebar state -----------------------------------------------------
@@ -903,25 +904,7 @@ class _TransformerStatusOpenGLViewer:
             self._top_bar_dirty = True
 
     def _clear_frame_text_cache(self) -> None:
-        self._pending_frame_text_by_cursor.clear()
-        self._composite_frame_text.clear()
         self._composite_ring_cursors.clear()
-
-    def _prune_pending_frame_text(self, *, min_cursor: Optional[int] = None) -> None:
-        if min_cursor is not None:
-            while self._pending_frame_text_by_cursor:
-                first_cursor = next(iter(self._pending_frame_text_by_cursor))
-                if int(first_cursor) >= int(min_cursor):
-                    break
-                self._pending_frame_text_by_cursor.popitem(last=False)
-        max_pending = max(
-            64,
-            (
-                int(self._scrub_ring.capacity()) if self._scrub_ring is not None else 1536
-            ) * 2,
-        )
-        while len(self._pending_frame_text_by_cursor) > max_pending:
-            self._pending_frame_text_by_cursor.popitem(last=False)
 
     def _current_display_cache_index(self) -> Optional[int]:
         cache = self._composite_cache
@@ -943,47 +926,37 @@ class _TransformerStatusOpenGLViewer:
         titles: Optional[Sequence[str]] = None,
         rows: Optional[Sequence[Sequence[str]]] = None,
     ) -> None:
-        meta = self._frame_text_meta(caption=caption, titles=titles, rows=rows)
-        if ring_cursor is None:
-            self._apply_frame_text_meta(meta)
-            return
-        try:
-            cursor = int(ring_cursor)
-        except Exception:
-            self._apply_frame_text_meta(meta)
-            return
-        if cursor < 0:
-            self._apply_frame_text_meta(meta)
-            return
-        try:
-            cache_idx = list(self._composite_ring_cursors).index(cursor)
-        except ValueError:
-            cache_idx = -1
-        if cache_idx >= 0 and cache_idx < len(self._composite_frame_text):
-            self._composite_frame_text[cache_idx] = meta
-            if self._current_display_cache_index() == cache_idx:
-                self._apply_frame_text_meta(meta)
-            return
-        self._pending_frame_text_by_cursor[cursor] = meta
-        self._prune_pending_frame_text()
+        """Apply text for a just-arrived frame.  Reads from the ring when possible;
+        falls back to the provided kwargs for the no-ring / no-text case."""
+        meta = None
+        if ring_cursor is not None:
+            try:
+                cursor = int(ring_cursor)
+                if cursor >= 0 and self._scrub_ring is not None:
+                    meta = self._scrub_ring.read_text(cursor)
+            except Exception:
+                pass
+        if meta is None:
+            meta = self._frame_text_meta(caption=caption, titles=titles, rows=rows)
+        self._apply_frame_text_meta(meta)
 
     def _cache_frame_text_for_cursor(self, ring_cursor: int) -> None:
-        cursor = int(ring_cursor)
-        meta = self._pending_frame_text_by_cursor.pop(cursor, None)
-        if not isinstance(meta, dict):
-            meta = {
-                "caption": str(self._last_applied_frame_text.get("caption", "")),
-                "titles": [str(x) for x in self._last_applied_frame_text.get("titles", self._panel_titles)],
-                "rows": [list(r) for r in self._last_applied_frame_text.get("rows", self._panel_rows)],
-            }
-        self._composite_ring_cursors.append(cursor)
-        self._composite_frame_text.append(meta)
-        self._prune_pending_frame_text(min_cursor=cursor)
+        """Record the ring cursor for a newly composited frame."""
+        self._composite_ring_cursors.append(int(ring_cursor))
 
     def _apply_cached_frame_text(self, cache_index: int) -> None:
-        if cache_index < 0 or cache_index >= len(self._composite_frame_text):
+        cursors = list(self._composite_ring_cursors)
+        if cache_index < 0 or cache_index >= len(cursors):
             return
-        self._apply_frame_text_meta(self._composite_frame_text[cache_index])
+        cursor = cursors[cache_index]
+        meta = None
+        if self._scrub_ring is not None:
+            try:
+                meta = self._scrub_ring.read_text(cursor)
+            except Exception:
+                pass
+        if meta is not None:
+            self._apply_frame_text_meta(meta)
 
     def _render_top_bar(self) -> np.ndarray:
         out = np.full((self.top_bar_h, self.window_w, 3), 18, dtype=np.uint8)
@@ -3828,12 +3801,13 @@ class _TransformerStatusOpenGLViewer:
                 thumb1=None,
                 thumb2=None,
             )
-        self._stage_frame_text(
-            ring_cursor,
-            caption=str(frame_dict.get("caption", "")),
-            titles=frame_dict.get("titles", self._panel_titles),
-            rows=frame_dict.get("rows", self._panel_rows),
-        )
+            self._scrub_ring.write_text(
+                ring_cursor,
+                caption=str(frame_dict.get("caption", "")),
+                titles=frame_dict.get("titles", self._panel_titles),
+                rows=frame_dict.get("rows", self._panel_rows),
+            )
+        self._stage_frame_text(ring_cursor)
 
     def update(
         self,
@@ -4162,12 +4136,7 @@ class ViewerIPCServer:
         elif t == "frame_signal":
             stage_fn = getattr(v, "_stage_frame_text", None)
             if callable(stage_fn):
-                stage_fn(
-                    msg.get("ring_cursor"),
-                    caption=str(msg.get("caption", "")),
-                    titles=msg.get("titles", ["target", "input", "output"]),
-                    rows=msg.get("rows", [[], [], []]),
-                )
+                stage_fn(msg.get("ring_cursor"))
         elif t == "checkpoint_saved":
             v.notify_pipeline_checkpoint_saved()
         elif t == "checkpoint_at_walltime":
@@ -4672,7 +4641,7 @@ class ViewerIPCProxy:
         pass
 
     def enqueue_frame(self, frame_dict: dict):
-        """Push images to scrub ring if present, send text metadata via IPC."""
+        """Push images and text to shared ring, signal GUI with just the cursor."""
         if not self.preview_enabled():
             return
         images = frame_dict.get("images")
@@ -4696,12 +4665,15 @@ class ViewerIPCProxy:
                 thumb1=None,
                 thumb2=None,
             )
+            ring.write_text(
+                ring_cursor,
+                caption=str(frame_dict.get("caption", "")),
+                titles=frame_dict.get("titles", ["target", "input", "output"]),
+                rows=frame_dict.get("rows", [[], [], []]),
+            )
         self._send({
             "type": "frame_signal",
             "ring_cursor": (int(ring_cursor) if ring_cursor is not None else None),
-            "caption": str(frame_dict.get("caption", "")),
-            "titles": list(frame_dict.get("titles", ["target", "input", "output"])),
-            "rows": [list(r) for r in frame_dict.get("rows", [[], [], []])],
         })
 
     def update(
@@ -4742,12 +4714,10 @@ class ViewerIPCProxy:
         )
         titles = list(panel_titles) if panel_titles else ["target", "input", "output"]
         rows = [list(r) for r in panel_rows] if panel_rows else [[], [], []]
+        ring.write_text(ring_cursor, caption=str(caption), titles=titles, rows=rows)
         self._send({
             "type": "frame_signal",
             "ring_cursor": int(ring_cursor),
-            "caption": str(caption),
-            "titles": titles,
-            "rows": rows,
         })
 
     def notify_pipeline_checkpoint_saved(self) -> None:

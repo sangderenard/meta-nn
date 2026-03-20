@@ -303,6 +303,32 @@ def _setup_signatures(lib: ctypes.CDLL) -> None:
     lib.nodus_scrub_ring_unlock.argtypes = [c_ring_p]
     lib.nodus_scrub_ring_unlock.restype  = None
 
+    lib.nodus_scrub_ring_write_text.argtypes = [
+        c_ring_p,
+        ctypes.c_int32,   # cursor
+        ctypes.c_char_p,  # caption
+        ctypes.c_char_p,  # title0
+        ctypes.c_char_p,  # title1
+        ctypes.c_char_p,  # title2
+        ctypes.c_char_p,  # rows0
+        ctypes.c_char_p,  # rows1
+        ctypes.c_char_p,  # rows2
+    ]
+    lib.nodus_scrub_ring_write_text.restype = None
+
+    lib.nodus_scrub_ring_read_text.argtypes = [
+        c_ring_p,
+        ctypes.c_int32,               # cursor
+        ctypes.c_char_p, ctypes.c_int,  # out_caption, caption_buf_size
+        ctypes.c_char_p, ctypes.c_int,  # out_title0,  title0_buf_size
+        ctypes.c_char_p, ctypes.c_int,  # out_title1,  title1_buf_size
+        ctypes.c_char_p, ctypes.c_int,  # out_title2,  title2_buf_size
+        ctypes.c_char_p, ctypes.c_int,  # out_rows0,   rows0_buf_size
+        ctypes.c_char_p, ctypes.c_int,  # out_rows1,   rows1_buf_size
+        ctypes.c_char_p, ctypes.c_int,  # out_rows2,   rows2_buf_size
+    ]
+    lib.nodus_scrub_ring_read_text.restype = ctypes.c_int
+
     # -- Composite cache signatures ----------------------------------------
 
     c_cache_p = ctypes.c_void_p
@@ -1228,6 +1254,67 @@ class NodusScrubRing:
 
     def clear(self) -> None:
         self._lib.nodus_scrub_ring_clear(self._handle)
+
+    def write_text(
+        self,
+        cursor: int,
+        caption: str = "",
+        titles: "Optional[Sequence[str]]" = None,
+        rows: "Optional[Sequence[Sequence[str]]]" = None,
+    ) -> None:
+        """Write frame text into the ring slot at *cursor* (value from push())."""
+        def _enc(s: str) -> bytes:
+            return s.encode("utf-8") if s else b""
+        def _rows_pack(row_list) -> bytes:
+            if not row_list:
+                return b""
+            return "\n".join(str(r) for r in row_list).encode("utf-8")
+        t = list(titles) if titles else ["", "", ""]
+        while len(t) < 3:
+            t.append("")
+        r = [list(x) for x in rows] if rows else [[], [], []]
+        while len(r) < 3:
+            r.append([])
+        self._lib.nodus_scrub_ring_write_text(
+            self._handle,
+            ctypes.c_int32(int(cursor)),
+            _enc(caption),
+            _enc(t[0]), _enc(t[1]), _enc(t[2]),
+            _rows_pack(r[0]), _rows_pack(r[1]), _rows_pack(r[2]),
+        )
+
+    def read_text(self, cursor: int) -> "Optional[Dict[str, Any]]":
+        """Read frame text for the ring slot at *cursor*.  Returns None if no text."""
+        cap_buf = ctypes.create_string_buffer(256)
+        t0_buf  = ctypes.create_string_buffer(64)
+        t1_buf  = ctypes.create_string_buffer(64)
+        t2_buf  = ctypes.create_string_buffer(64)
+        r0_buf  = ctypes.create_string_buffer(1024)
+        r1_buf  = ctypes.create_string_buffer(1024)
+        r2_buf  = ctypes.create_string_buffer(1024)
+        ret = self._lib.nodus_scrub_ring_read_text(
+            self._handle,
+            ctypes.c_int32(int(cursor)),
+            cap_buf,  256,
+            t0_buf,    64,
+            t1_buf,    64,
+            t2_buf,    64,
+            r0_buf,  1024,
+            r1_buf,  1024,
+            r2_buf,  1024,
+        )
+        if ret <= 0:
+            return None
+        def _s(b) -> str:
+            return b.value.decode("utf-8", errors="replace")
+        def _rows(b) -> "List[str]":
+            s = _s(b)
+            return [x for x in s.split("\n") if x] if s else []
+        return {
+            "caption": _s(cap_buf),
+            "titles":  [_s(t0_buf), _s(t1_buf), _s(t2_buf)],
+            "rows":    [_rows(r0_buf), _rows(r1_buf), _rows(r2_buf)],
+        }
 
     # -- read --
 
