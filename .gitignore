@@ -4,6 +4,7 @@ _tmp_graph_smoke/
 __pycache__/
 *.py[cod]
 node_modules/
+native/build/
 native/build-debug/
 native/build-*/
 native/.cmake/
