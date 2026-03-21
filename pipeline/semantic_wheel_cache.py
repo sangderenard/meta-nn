@@ -26,18 +26,15 @@ from pipeline.progress import interruptible_tqdm
 from semantic_dataset_loaders import (
     SemanticDiskRow,
     _apply_degrade as _canonical_apply_degrade,
-    _composite_mask_stack,
     _norm_txt,
     _resolve_processing_device,
-    build_creation_label_mask_stack,
-    build_label_mask_stack,
+    build_combined_mask_stacks,
     build_layout_mask,
     build_term_mask_stack_from_image,
     build_term_mask_stacks_from_images,
-    combine_label_mask_stacks,
-    infer_semantic_support_mask,
-    infer_semantic_support_masks,
+
     normalize_vocab_terms,
+    targets_from_terms,
     term_mask_map_to_label_stack,
 )
 
@@ -135,10 +132,6 @@ def _fit_mask_letterbox(mask: np.ndarray, image_size: int) -> np.ndarray:
     return out
 
 
-def _positive_label_bits(label_vec: np.ndarray) -> np.ndarray:
-    return (np.asarray(label_vec, dtype=np.float32).reshape(-1) >= 0.5).astype(np.uint8, copy=False)
-
-
 def _resolve_preload_workers(row_count: int, requested_workers: int = 0, max_cap: int = 32) -> int:
     if int(row_count) <= 1:
         return 1
@@ -203,22 +196,14 @@ def _fit_image_array_u8(image: Any, image_size: int) -> np.ndarray:
 def build_semantic_cache_entry(
     *,
     image: Any,
-    label_vec: Any,
     image_size: int,
     terms: Optional[Sequence[str]] = None,
-    mixed_mask: Optional[Any] = None,
     mask_stack: Optional[Any] = None,
     mask_indices: Optional[Any] = None,
 ) -> Dict[str, Any]:
     size = max(8, int(image_size))
     image_u8 = _fit_image_array_u8(image=image, image_size=size)
-    image_f32 = np.clip(np.asarray(image_u8, dtype=np.float32) / 255.0, 0.0, 1.0).astype(np.float32, copy=False)
-    label_arr = np.asarray(label_vec, dtype=np.float32).reshape(-1)
     normalized_terms = list(normalize_vocab_terms([str(x) for x in list(terms or [])]))
-    if mixed_mask is None:
-        mixed_mask_arr = infer_semantic_support_mask(image=image_f32, terms=normalized_terms)
-    else:
-        mixed_mask_arr = _fit_mask_letterbox(np.asarray(mixed_mask, dtype=np.float32), image_size=size)
     stack_arr = np.asarray(mask_stack) if mask_stack is not None else np.zeros((0, size, size), dtype=np.float32)
     idx_arr = np.asarray(mask_indices, dtype=np.int64).reshape(-1) if mask_indices is not None else np.zeros((0,), dtype=np.int64)
     if int(stack_arr.ndim) == 2:
@@ -234,12 +219,8 @@ def build_semantic_cache_entry(
     pair_count = min(int(stack_arr.shape[0]), int(idx_arr.size))
     stack_arr = np.asarray(stack_arr[: int(pair_count)], dtype=np.float32)
     idx_arr = np.asarray(idx_arr[: int(pair_count)], dtype=np.int64)
-    if int(stack_arr.shape[0]) > 0:
-        mixed_mask_arr = _composite_mask_stack(stack_arr)
     return {
         "image_u8": np.asarray(image_u8, dtype=np.uint8),
-        "label_vec_u8": _positive_label_bits(label_arr),
-        "mixed_mask": np.clip(np.asarray(mixed_mask_arr, dtype=np.float32), 0.0, 1.0),
         "mask_stack": np.asarray(stack_arr, dtype=np.float32),
         "mask_indices": np.asarray(idx_arr, dtype=np.int32).reshape(-1),
         "terms": list(normalized_terms),
@@ -463,20 +444,17 @@ def _build_clean_entries_batch(
         preload_workers=int(preload_workers),
     )
     image_batch = np.clip(np.asarray(image_u8_batch, dtype=np.float32) / 255.0, 0.0, 1.0).astype(np.float32, copy=False)
-    label_batch = np.stack(
-        [np.asarray(row.label_vec, dtype=np.float32).reshape(-1) for row in rows],
-        axis=0,
-    ).astype(np.float32, copy=False)
 
     # Enrich each row with tonal/color terms using the same function pregestation uses,
-    # then update label_batch so build_term_mask_stacks_from_images generates spatial
-    # masks for those terms.
+    # then build local-vocab label_batch so build_term_mask_stacks_from_images generates
+    # spatial masks for those terms.
     _tonal_enrich = None
     try:
         from pipeline.nodes.vocab_node import _semantic_terms_with_tonal_masks as _tonal_enrich
     except Exception:
         pass
     term_to_idx: Dict[str, int] = {str(v).strip().lower(): int(k) for k, v in idx_to_term.items()}
+    n_local = len(idx_to_term)
     tonal_masks_per_row: List[Dict[str, np.ndarray]] = [{} for _ in rows]
     enriched_terms_per_row: List[List[str]] = [list(row.terms) for row in rows]
     if _tonal_enrich is not None:
@@ -489,19 +467,15 @@ def _build_clean_entries_batch(
                 )
                 enriched_terms_per_row[int(_ri)] = list(_enriched)
                 tonal_masks_per_row[int(_ri)] = dict(_tmasks)
-                for _term in _enriched:
-                    _t = str(_term).strip().lower()
-                    _tidx = int(term_to_idx.get(_t, -1))
-                    if 0 <= _tidx < int(label_batch.shape[1]):
-                        label_batch[int(_ri), _tidx] = 1.0
             except Exception:
                 pass
 
-    fallback_masks = infer_semantic_support_masks(
-        images=image_batch,
-        terms_batch=enriched_terms_per_row,
-        processing_device=processing_device,
-    )
+    # Build label_batch from enriched terms using LOCAL vocab — transient, not stored.
+    label_batch = np.stack(
+        targets_from_terms(enriched_terms_per_row, term_to_idx, n_local),
+        axis=0,
+    ).astype(np.float32, copy=False)
+
     heuristic_stacks, heuristic_indices = build_term_mask_stacks_from_images(
         images=image_batch,
         label_vecs=label_batch,
@@ -521,60 +495,25 @@ def _build_clean_entries_batch(
     ):
         label_vec = np.asarray(label_batch[int(row_idx)], dtype=np.float32)
         creation_mask_u8 = creation_masks_u8[int(row_idx)]
-        creation_mask = np.asarray(creation_mask_u8, dtype=np.float32) if creation_mask_u8 is not None else None
-        creation_stack = np.zeros((0, size, size), dtype=np.float32)
-        creation_idx = np.zeros((0,), dtype=np.int64)
-        if creation_mask is not None:
-            creation_stack, creation_idx = build_creation_label_mask_stack(
-                label_vec=label_vec,
-                height=size,
-                width=size,
-                creation_mask=np.asarray(creation_mask, dtype=np.float32),
-                processing_device=processing_device,
-            )
-        # Build tonal mask stack from per-image color/tonal detections
-        _tmasks = tonal_masks_per_row[int(row_idx)]
-        _tonal_slices: List[np.ndarray] = []
-        _tonal_idxs: List[int] = []
-        for _tterm, _tmask in _tmasks.items():
-            _t = str(_tterm).strip().lower()
-            _tidx = int(term_to_idx.get(_t, -1))
-            if _tidx < 0:
-                continue
-            _tmask_np = np.asarray(_tmask, dtype=np.float32)
-            if int(_tmask_np.ndim) == 2 and int(_tmask_np.size) > 0:
-                _tonal_slices.append(_tmask_np)
-                _tonal_idxs.append(_tidx)
-        if _tonal_slices:
-            tonal_stack = np.stack(_tonal_slices, axis=0).astype(np.float32, copy=False)
-            tonal_idx = np.asarray(_tonal_idxs, dtype=np.int64)
-        else:
-            tonal_stack = np.zeros((0, size, size), dtype=np.float32)
-            tonal_idx = np.zeros((0,), dtype=np.int64)
-        heuristic_stack = np.asarray(heuristic_stacks[int(row_idx)], dtype=np.float32)
-        heuristic_idx = np.asarray(heuristic_indices[int(row_idx)], dtype=np.int64)
-        mask_stack, mask_indices = combine_label_mask_stacks(
-            label_vec,
-            (creation_stack, creation_idx),
-            (tonal_stack, tonal_idx),
-            (heuristic_stack, heuristic_idx),
-            height=size,
-            width=size,
-            processing_device=processing_device,
-            strict=True,
-        )
-        mixed_mask = (
-            _composite_mask_stack(mask_stack, processing_device=processing_device)
-            if int(mask_stack.shape[0]) > 0
+        creation_mask = (
+            np.asarray(creation_mask_u8, dtype=np.float32)
+            if creation_mask_u8 is not None
             else np.zeros((size, size), dtype=np.float32)
         )
-        mixed_mask = np.asarray(mixed_mask, dtype=np.float32)
-        mask_stack = np.asarray(mask_stack, dtype=np.float32)
+        mask_stack, mask_indices = build_combined_mask_stacks(
+            label_vec=label_vec,
+            idx_to_term=idx_to_term,
+            height=size,
+            width=size,
+            heuristic_stack=np.asarray(heuristic_stacks[int(row_idx)], dtype=np.float32),
+            heuristic_idx=np.asarray(heuristic_indices[int(row_idx)], dtype=np.int64),
+            tonal_masks=tonal_masks_per_row[int(row_idx)],
+            term_to_idx=term_to_idx,
+            processing_device=processing_device,
+        )
         out.append(
             {
                 "image_u8": np.asarray(image_u8_batch[int(row_idx)], dtype=np.uint8),
-                "label_vec_u8": _positive_label_bits(label_vec),
-                "mixed_mask": np.asarray(mixed_mask, dtype=np.float32),
                 "mask_stack": np.asarray(mask_stack, dtype=np.float32),
                 "mask_indices": np.asarray(mask_indices, dtype=np.int32).reshape(-1),
                 "terms": list(normalize_vocab_terms(enriched_terms_per_row[int(row_idx)])),
@@ -593,21 +532,22 @@ def _build_deformed_entry(
     processing_device: Optional[Any] = None,
 ) -> Dict[str, Any]:
     image = np.clip(np.asarray(clean_entry["image_u8"], dtype=np.float32) / 255.0, 0.0, 1.0).astype(np.float32, copy=False)
-    base_mask = np.asarray(clean_entry["mixed_mask"], dtype=np.float32)
-    x, mask_out, term_masks = _apply_degrade(
+    x, _mask_out, term_masks = _apply_degrade(
         x=image,
-        mask=base_mask,
+        mask=None,
         idx=int(base_row_position),
         seed=int(seed) + (int(variant_idx) + 1) * 7919,
         degrade_config=degrade_config,
         processing_device=processing_device,
     )
-    label_vec = np.asarray(clean_entry["label_vec_u8"], dtype=np.uint8).astype(np.float32, copy=False)
-    for term in normalize_vocab_terms(list(term_masks.keys())):
-        ti = int(term_to_idx.get(_norm_txt(term), -1))
-        if 0 <= int(ti) < int(label_vec.size):
-            label_vec[int(ti)] = 1.0
+    # Rebuild transient label_vec from the union of clean + deformation terms using local vocab.
+    all_terms = list(normalize_vocab_terms(
+        list(clean_entry.get("terms") or []) + [str(x) for x in list(term_masks.keys())]
+    ))
+    n_local = max(len(term_to_idx), 1)
+    label_vec = targets_from_terms([all_terms], term_to_idx, n_local)[0]
     size = int(x.shape[1])
+    idx_to_term_local = {int(v): str(k) for k, v in term_to_idx.items()}
     base_stack = np.asarray(clean_entry["mask_stack"], dtype=np.float32)
     base_idx = np.asarray(clean_entry["mask_indices"], dtype=np.int64).reshape(-1)
     distortion_stack, distortion_idx = term_mask_map_to_label_stack(
@@ -618,23 +558,20 @@ def _build_deformed_entry(
         width=size,
         processing_device=processing_device,
     )
-    mask_stack, mask_indices = combine_label_mask_stacks(
-        label_vec,
-        (base_stack, base_idx),
-        (distortion_stack, distortion_idx),
+    mask_stack, mask_indices = build_combined_mask_stacks(
+        label_vec=label_vec,
+        idx_to_term=idx_to_term_local,
         height=size,
         width=size,
+        extra_parts=[
+            (base_stack, base_idx),
+            (distortion_stack, distortion_idx),
+        ],
+        term_to_idx=term_to_idx,
         processing_device=processing_device,
-    )
-    mixed_mask = (
-        _composite_mask_stack(mask_stack, processing_device=processing_device)
-        if int(mask_stack.shape[0]) > 0
-        else np.zeros((size, size), dtype=np.float32)
     )
     return {
         "image_u8": np.clip(np.rint(np.clip(x, 0.0, 1.0) * 255.0), 0.0, 255.0).astype(np.uint8, copy=False),
-        "label_vec_u8": _positive_label_bits(label_vec),
-        "mixed_mask": np.clip(np.asarray(mixed_mask, dtype=np.float32), 0.0, 1.0),
         "mask_stack": np.asarray(mask_stack, dtype=np.float32),
         "mask_indices": np.asarray(mask_indices, dtype=np.int32).reshape(-1),
         "terms": list(
@@ -793,16 +730,12 @@ def _wheel_signature(config_blob: Dict[str, Any]) -> str:
     return str(hashlib.sha256(json.dumps(config_blob, sort_keys=True, ensure_ascii=True).encode("utf-8")).hexdigest())
 
 
-def _chunk_payload(entries: Sequence[Dict[str, Any]], label_dim: int, image_size: int) -> Tuple[Dict[str, np.ndarray], Dict[str, Any]]:
+def _chunk_payload(entries: Sequence[Dict[str, Any]], image_size: int) -> Tuple[Dict[str, np.ndarray], Dict[str, Any]]:
     n = int(len(entries))
     if int(n) <= 0:
         raise RuntimeError("semantic wheel chunk payload requires at least one entry")
     size = max(8, int(image_size))
     images = np.stack([np.asarray(entry["image_u8"], dtype=np.uint8) for entry in entries], axis=0).astype(np.uint8, copy=False)
-    mixed_masks = np.stack([np.asarray(entry["mixed_mask"], dtype=np.float32) for entry in entries], axis=0).astype(np.float16, copy=False)
-    label_bank_rows: List[np.ndarray] = []
-    label_bank_lut: Dict[bytes, int] = {}
-    label_refs: List[int] = []
     terms_bank_rows: List[str] = []
     terms_bank_lut: Dict[str, int] = {}
     terms_refs: List[int] = []
@@ -824,17 +757,6 @@ def _chunk_payload(entries: Sequence[Dict[str, Any]], label_dim: int, image_size
             terms_bank_rows.append(str(terms_json))
         terms_refs.append(int(term_id))
 
-        label_vec = np.asarray(entry["label_vec_u8"], dtype=np.uint8).reshape(-1)
-        if int(label_vec.size) != int(label_dim):
-            raise RuntimeError(f"semantic wheel label width mismatch: got={int(label_vec.size)} expected={int(label_dim)}")
-        label_key = bytes(label_vec.tobytes())
-        label_id = label_bank_lut.get(label_key, -1)
-        if int(label_id) < 0:
-            label_id = int(len(label_bank_rows))
-            label_bank_lut[label_key] = int(label_id)
-            label_bank_rows.append(np.asarray(label_vec, dtype=np.uint8))
-        label_refs.append(int(label_id))
-
         stack_f = np.asarray(entry["mask_stack"], dtype=np.float32)
         stack_idx = np.asarray(entry["mask_indices"], dtype=np.int32).reshape(-1)
         if int(stack_f.ndim) == 2:
@@ -854,15 +776,11 @@ def _chunk_payload(entries: Sequence[Dict[str, Any]], label_dim: int, image_size
             assoc_label_indices.append(int(stack_idx[int(pos)]))
         assoc_offsets.append(int(len(assoc_mask_ids)))
 
-    label_bank = np.stack(label_bank_rows, axis=0).astype(np.uint8, copy=False) if len(label_bank_rows) > 0 else np.zeros((0, int(label_dim)), dtype=np.uint8)
     max_terms_len = max((len(str(x)) for x in terms_bank_rows), default=1)
     terms_bank = np.asarray(terms_bank_rows, dtype=f"<U{int(max_terms_len)}") if len(terms_bank_rows) > 0 else np.asarray([], dtype="<U1")
     mask_bank = np.stack(mask_bank_rows, axis=0).astype(np.float16, copy=False) if len(mask_bank_rows) > 0 else np.zeros((0, size, size), dtype=np.float16)
     payload = {
         "images": images,
-        "mixed_masks": mixed_masks,
-        "label_bank": label_bank,
-        "label_refs": np.asarray(label_refs, dtype=np.int32),
         "terms_bank": terms_bank,
         "terms_refs": np.asarray(terms_refs, dtype=np.int32),
         "mask_bank": mask_bank,
@@ -873,7 +791,6 @@ def _chunk_payload(entries: Sequence[Dict[str, Any]], label_dim: int, image_size
     raw_bytes = int(sum(int(arr.nbytes) for arr in payload.values()))
     info = {
         "rows": int(n),
-        "unique_labels": int(label_bank.shape[0]),
         "unique_masks": int(mask_bank.shape[0]),
         "associations": int(len(assoc_mask_ids)),
         "raw_bytes": int(raw_bytes),
@@ -929,7 +846,8 @@ class SemanticWheelDataset(Dataset):
         self.return_mask_stack = bool(return_mask_stack)
         self.use_semantic_mask_stack_collate = bool(self.return_mask_stack)
         self.image_size = int(self.manifest.get("image_size", 0))
-        self.label_dim = int(self.manifest.get("label_dim", 0))
+        self.local_vocab: List[str] = [str(t) for t in list(self.manifest.get("local_vocab", []))]
+        self.label_dim = len(self.local_vocab)
         self.chunk_rows = [int(x) for x in list(self.manifest.get("chunk_rows", []))]
         self.chunk_offsets: List[int] = [0]
         for count in self.chunk_rows:
@@ -983,21 +901,12 @@ class SemanticWheelDataset(Dataset):
         chunk_idx, row_offset = self._locate(int(index))
         payload = self._load_chunk(int(chunk_idx))
         images = np.asarray(payload["images"], dtype=np.uint8)
-        mixed_masks = np.asarray(payload["mixed_masks"], dtype=np.float32)
-        label_bank = np.asarray(payload["label_bank"], dtype=np.uint8)
-        label_refs = np.asarray(payload["label_refs"], dtype=np.int32).reshape(-1)
         terms_bank = np.asarray(payload.get("terms_bank", np.asarray([], dtype="<U1")))
         terms_refs = np.asarray(payload.get("terms_refs", np.zeros((0,), dtype=np.int32)), dtype=np.int32).reshape(-1)
         mask_bank = np.asarray(payload["mask_bank"], dtype=np.float32)
         assoc_offsets = np.asarray(payload["assoc_offsets"], dtype=np.int64).reshape(-1)
         assoc_mask_ids = np.asarray(payload["assoc_mask_ids"], dtype=np.int32).reshape(-1)
         assoc_label_indices = np.asarray(payload["assoc_label_indices"], dtype=np.int32).reshape(-1)
-        label_ref = int(label_refs[int(row_offset)]) if 0 <= int(row_offset) < int(label_refs.size) else -1
-        label_vec = (
-            np.asarray(label_bank[int(label_ref)], dtype=np.uint8)
-            if 0 <= int(label_ref) < int(label_bank.shape[0])
-            else np.zeros((int(self.label_dim),), dtype=np.uint8)
-        )
         term_ref = int(terms_refs[int(row_offset)]) if 0 <= int(row_offset) < int(terms_refs.size) else -1
         if 0 <= int(term_ref) < int(terms_bank.shape[0]):
             try:
@@ -1017,8 +926,6 @@ class SemanticWheelDataset(Dataset):
         )
         return {
             "image_u8": np.asarray(images[int(row_offset)], dtype=np.uint8),
-            "label_vec_u8": np.asarray(label_vec, dtype=np.uint8),
-            "mixed_mask": np.asarray(mixed_masks[int(row_offset)], dtype=np.float32),
             "mask_stack": np.asarray(stack_f32, dtype=np.float32),
             "mask_indices": np.asarray(label_indices, dtype=np.int32),
             "terms": list(terms),
@@ -1027,13 +934,15 @@ class SemanticWheelDataset(Dataset):
     def __getitem__(self, index: int):
         item = self.read_numpy_entry(int(index))
         x_t = torch.from_numpy(np.asarray(item["image_u8"], dtype=np.float32) / 255.0)
-        y_t = torch.from_numpy(np.asarray(item["label_vec_u8"], dtype=np.float32))
-        mask_t = torch.from_numpy(np.asarray(item["mixed_mask"], dtype=np.float32)).unsqueeze(0)
+        h_img = int(item["image_u8"].shape[1]) if int(np.asarray(item["image_u8"]).ndim) >= 3 else int(self.image_size)
+        w_img = int(item["image_u8"].shape[2]) if int(np.asarray(item["image_u8"]).ndim) >= 3 else int(self.image_size)
+        mask_t = torch.zeros(1, h_img, w_img, dtype=torch.float32)
+        terms = list(item.get("terms") or [])
         if bool(self.return_mask_stack):
             stack_t = torch.from_numpy(np.asarray(item["mask_stack"], dtype=np.float32))
             idx_t = torch.from_numpy(np.asarray(item["mask_indices"], dtype=np.int64))
-            return x_t, y_t, mask_t, stack_t, idx_t, list(item.get("terms") or [])
-        return x_t, y_t, mask_t
+            return x_t, mask_t, stack_t, idx_t, terms
+        return x_t, mask_t, terms
 
 
 class SemanticWheelPayloadBank:
@@ -1049,7 +958,9 @@ class SemanticWheelPayloadBank:
 
     def get_mask(self, index: int) -> np.ndarray:
         item = self.dataset.read_numpy_entry(int(index))
-        return np.asarray(item["mixed_mask"], dtype=np.float32)
+        h = int(item["image_u8"].shape[1]) if int(np.asarray(item["image_u8"]).ndim) >= 3 else int(self.dataset.image_size)
+        w = int(item["image_u8"].shape[2]) if int(np.asarray(item["image_u8"]).ndim) >= 3 else int(self.dataset.image_size)
+        return np.zeros((h, w), dtype=np.float32)
 
 
 class SemanticWheelPayloadView(Sequence[np.ndarray]):
@@ -1083,7 +994,9 @@ class SemanticWheelPayloadView(Sequence[np.ndarray]):
             if self.kind == "image":
                 raw = np.asarray(payload["images"][:n], dtype=np.float32) / 255.0
             else:
-                raw = np.asarray(payload["mixed_masks"][:n], dtype=np.float32)
+                h = int(payload["images"].shape[2]) if int(np.asarray(payload["images"]).ndim) >= 4 else int(ds.image_size)
+                w = int(payload["images"].shape[3]) if int(np.asarray(payload["images"]).ndim) >= 4 else int(ds.image_size)
+                raw = np.zeros((int(n), h, w), dtype=np.float32)
             parts.append(raw)
         if not parts:
             h = int(ds.image_size)
@@ -1186,7 +1099,7 @@ def ensure_semantic_candidate_cache(
     candidate_indices: Sequence[int],
     build_entry_group: Callable[[int, int], Sequence[Dict[str, Any]]],
     build_entry_groups_batch: Optional[Callable[[Sequence[Tuple[int, int]]], Sequence[Sequence[Dict[str, Any]]]]] = None,
-    label_dim: int,
+    local_vocab: Sequence[str],
     config: SemanticWheelConfig,
 ) -> Dict[str, Any]:
     if len(candidates) <= 0 or len(candidate_indices) <= 0:
@@ -1211,7 +1124,7 @@ def ensure_semantic_candidate_cache(
         "lookahead_batches": int(config.lookahead_batches),
         "deformations_per_clean": int(config.deformations_per_clean),
         "include_clean": bool(config.include_clean),
-        "label_dim": int(label_dim),
+        "local_vocab": [str(t) for t in local_vocab],
         "explicit_max_bytes": int(config.explicit_max_bytes),
         "sanity_cap_bytes": int(config.sanity_cap_bytes),
         "allow_large_override": bool(config.allow_large_override),
@@ -1236,7 +1149,7 @@ def ensure_semantic_candidate_cache(
         manifest
         and str(manifest.get("signature", "")) == str(signature)
         and str(manifest.get("candidate_signature", "")) == str(candidate_sig)
-        and int(manifest.get("label_dim", 0)) == int(label_dim)
+        and list(manifest.get("local_vocab", [])) == [str(t) for t in local_vocab]
         and int(manifest.get("image_size", 0)) == int(config.image_size)
         and not bool(expired_by_use)
     )
@@ -1370,7 +1283,6 @@ def ensure_semantic_candidate_cache(
         "chunk_rows": [],
         "chunk_bytes": [],
         "total_raw_bytes": 0,
-        "total_unique_labels": 0,
         "total_unique_masks": 0,
         "total_associations": 0,
         "error": None,
@@ -1397,7 +1309,6 @@ def ensure_semantic_candidate_cache(
                     continue
                 payload, chunk_info = _chunk_payload(
                     entries_to_flush,
-                    label_dim=int(label_dim),
                     image_size=int(config.image_size),
                 )
                 on_disk = _write_chunk(
@@ -1408,7 +1319,6 @@ def ensure_semantic_candidate_cache(
                 writer_state["chunk_rows"].append(int(len(entries_to_flush)))
                 writer_state["chunk_bytes"].append(int(on_disk))
                 writer_state["total_raw_bytes"] += int(chunk_info.get("raw_bytes", 0))
-                writer_state["total_unique_labels"] += int(chunk_info.get("unique_labels", 0))
                 writer_state["total_unique_masks"] += int(chunk_info.get("unique_masks", 0))
                 writer_state["total_associations"] += int(chunk_info.get("associations", 0))
                 writer_state["chunk_idx"] += 1
@@ -1427,8 +1337,6 @@ def ensure_semantic_candidate_cache(
     def _estimate_chunk_bytes(entries: Sequence[Dict[str, Any]]) -> int:
         return int(sum(
             int(np.asarray(e.get("image_u8", np.zeros(0)), dtype=np.uint8).nbytes)
-            + int(np.asarray(e.get("mixed_mask", np.zeros(0)), dtype=np.float32).nbytes)
-            + int(np.asarray(e.get("label_vec_u8", np.zeros(0)), dtype=np.uint8).nbytes)
             + int(np.asarray(e.get("mask_stack", np.zeros(0)), dtype=np.float32).nbytes)
             for e in entries
         ))
@@ -1510,7 +1418,7 @@ def ensure_semantic_candidate_cache(
         "purpose": str(config.purpose),
         "candidate_signature": str(candidate_sig),
         "image_size": int(config.image_size),
-        "label_dim": int(label_dim),
+        "local_vocab": [str(t) for t in local_vocab],
         "batch_size": int(config.batch_size),
         "lookahead_batches": int(config.lookahead_batches),
         "deformations_per_clean": int(config.deformations_per_clean),
@@ -1529,7 +1437,6 @@ def ensure_semantic_candidate_cache(
         "base_row_count": int(len(selected_base_rows)),
         "base_row_indices": [int(x) for x in selected_base_rows],
         "base_candidate_indices": [int(x) for x in selected_base_rows],
-        "total_unique_labels": int(writer_state["total_unique_labels"]),
         "total_unique_masks": int(writer_state["total_unique_masks"]),
         "total_associations": int(writer_state["total_associations"]),
         "deck_epoch_start": int(epoch),
@@ -1603,13 +1510,18 @@ def ensure_semantic_candidate_cache(
 def ensure_semantic_wheel_cache(
     rows: Sequence[SemanticDiskRow],
     candidate_indices: Sequence[int],
-    class_names: Sequence[str],
     config: SemanticWheelConfig,
 ) -> Dict[str, Any]:
     if len(rows) <= 0 or len(candidate_indices) <= 0:
         raise RuntimeError(f"{str(config.purpose)} requires non-empty semantic rows")
-    term_to_idx = {_norm_txt(str(name)): int(i) for i, name in enumerate(class_names) if str(name).strip()}
-    idx_to_term = {int(i): str(name) for i, name in enumerate(class_names) if str(name).strip()}
+    # Build local vocabulary from the union of all row terms.
+    local_vocab_set: set = set()
+    for row in rows:
+        for t in normalize_vocab_terms([str(x) for x in list(row.terms)]):
+            local_vocab_set.add(str(t))
+    local_vocab: List[str] = sorted(local_vocab_set)
+    term_to_idx = {str(name): int(i) for i, name in enumerate(local_vocab)}
+    idx_to_term = {int(i): str(name) for i, name in enumerate(local_vocab)}
     candidates: List[SemanticWheelCandidate] = []
     for row in interruptible_tqdm(
         rows,
@@ -1625,7 +1537,6 @@ def ensure_semantic_wheel_cache(
             "mask_path": str(row.mask_path or ""),
             "terms": list(normalize_vocab_terms([str(x) for x in list(row.terms)])),
             "source": str(row.source),
-            "labels": _positive_label_bits(np.asarray(row.label_vec, dtype=np.float32)).tolist(),
         }
         candidates.append(
             SemanticWheelCandidate(
@@ -1695,6 +1606,6 @@ def ensure_semantic_wheel_cache(
         candidate_indices=candidate_indices,
         build_entry_group=_entry_group,
         build_entry_groups_batch=_entry_groups_batch,
-        label_dim=int(len(class_names)),
+        local_vocab=local_vocab,
         config=config,
     )

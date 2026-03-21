@@ -11,6 +11,7 @@ import ctypes
 import ctypes.util
 import os
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -605,6 +606,55 @@ def _setup_signatures(lib: ctypes.CDLL) -> None:
         ctypes.c_int32,
     ]
     lib.nodus_weight_image_store_mark_checkpoint.restype = ctypes.c_int
+
+    # -- runtime control store --
+    c_runtime_control_p = ctypes.c_void_p
+
+    lib.nodus_runtime_control_store_get_global.argtypes = []
+    lib.nodus_runtime_control_store_get_global.restype = c_runtime_control_p
+
+    lib.nodus_runtime_control_store_clear.argtypes = [c_runtime_control_p]
+    lib.nodus_runtime_control_store_clear.restype = None
+
+    lib.nodus_runtime_control_store_begin_service.argtypes = [
+        c_runtime_control_p,
+        c_char_p,
+        ctypes.c_double,
+    ]
+    lib.nodus_runtime_control_store_begin_service.restype = None
+
+    lib.nodus_runtime_control_store_end_service.argtypes = [
+        c_runtime_control_p,
+        c_char_p,
+        ctypes.c_double,
+    ]
+    lib.nodus_runtime_control_store_end_service.restype = None
+
+    lib.nodus_runtime_control_store_active_services.argtypes = [c_runtime_control_p]
+    lib.nodus_runtime_control_store_active_services.restype = ctypes.c_int32
+
+    lib.nodus_runtime_control_store_set_exit.argtypes = [
+        c_runtime_control_p,
+        ctypes.c_int32,
+        c_char_p,
+        ctypes.c_double,
+    ]
+    lib.nodus_runtime_control_store_set_exit.restype = None
+
+    lib.nodus_runtime_control_store_get_state.argtypes = [
+        c_runtime_control_p,
+        ctypes.POINTER(ctypes.c_int32),
+        ctypes.POINTER(ctypes.c_uint64),
+        ctypes.POINTER(ctypes.c_uint64),
+        ctypes.POINTER(ctypes.c_int32),
+        ctypes.POINTER(ctypes.c_double),
+        ctypes.POINTER(ctypes.c_double),
+        c_char_p,
+        ctypes.c_int,
+        c_char_p,
+        ctypes.c_int,
+    ]
+    lib.nodus_runtime_control_store_get_state.restype = ctypes.c_int
 
 
 # -- Python dataclass for query results --
@@ -1699,6 +1749,18 @@ class WeightImageStoreStats:
     total_bytes: int = 0
 
 
+@dataclass(slots=True)
+class RuntimeControlState:
+    active_service_count: int = 0
+    service_enter_count: int = 0
+    service_exit_count: int = 0
+    exit_requested: bool = False
+    last_service_ts: float = 0.0
+    exit_ts: float = 0.0
+    last_source: str = ""
+    exit_reason: str = ""
+
+
 def _pack_weight_state_dict(
     state_dict: Dict[str, object],
     *,
@@ -2322,3 +2384,88 @@ class NodusWeightImageStore:
             ctypes.c_int32(int(cycle)),
         )
         return int(rc) == 0
+
+
+class NodusRuntimeControlStore:
+    """Cross-process runtime control block for service priority and shutdown."""
+
+    def __init__(self, _raw_handle: ctypes.c_void_p):
+        self._lib = _get_lib()
+        self._handle = _raw_handle
+
+    @classmethod
+    def get_global(cls) -> "NodusRuntimeControlStore":
+        lib = _get_lib()
+        handle = lib.nodus_runtime_control_store_get_global()
+        if not handle:
+            raise MemoryError("nodus_runtime_control_store_get_global returned NULL")
+        return cls(_raw_handle=handle)
+
+    def clear(self) -> None:
+        self._lib.nodus_runtime_control_store_clear(self._handle)
+
+    def begin_service(self, source: str, *, ts: Optional[float] = None) -> None:
+        when = time.time() if ts is None else float(ts)
+        self._lib.nodus_runtime_control_store_begin_service(
+            self._handle,
+            str(source or "").encode("utf-8"),
+            ctypes.c_double(float(when)),
+        )
+
+    def end_service(self, source: str, *, ts: Optional[float] = None) -> None:
+        when = time.time() if ts is None else float(ts)
+        self._lib.nodus_runtime_control_store_end_service(
+            self._handle,
+            str(source or "").encode("utf-8"),
+            ctypes.c_double(float(when)),
+        )
+
+    def active_services(self) -> int:
+        return int(self._lib.nodus_runtime_control_store_active_services(self._handle))
+
+    def set_exit_requested(self, requested: bool, *, reason: str = "", ts: Optional[float] = None) -> None:
+        when = time.time() if ts is None else float(ts)
+        self._lib.nodus_runtime_control_store_set_exit(
+            self._handle,
+            ctypes.c_int32(1 if requested else 0),
+            str(reason or "").encode("utf-8"),
+            ctypes.c_double(float(when)),
+        )
+
+    def clear_exit_requested(self) -> None:
+        self.set_exit_requested(False, reason="")
+
+    def get_state(self) -> Optional[RuntimeControlState]:
+        active_service_count = ctypes.c_int32(0)
+        service_enter_count = ctypes.c_uint64(0)
+        service_exit_count = ctypes.c_uint64(0)
+        exit_requested = ctypes.c_int32(0)
+        last_service_ts = ctypes.c_double(0.0)
+        exit_ts = ctypes.c_double(0.0)
+        last_source = ctypes.create_string_buffer(64)
+        exit_reason = ctypes.create_string_buffer(160)
+        rc = self._lib.nodus_runtime_control_store_get_state(
+            self._handle,
+            ctypes.byref(active_service_count),
+            ctypes.byref(service_enter_count),
+            ctypes.byref(service_exit_count),
+            ctypes.byref(exit_requested),
+            ctypes.byref(last_service_ts),
+            ctypes.byref(exit_ts),
+            last_source,
+            len(last_source),
+            exit_reason,
+            len(exit_reason),
+        )
+        if int(rc) != 0:
+            return None
+        return RuntimeControlState(
+            active_service_count=int(active_service_count.value),
+            service_enter_count=int(service_enter_count.value),
+            service_exit_count=int(service_exit_count.value),
+            exit_requested=bool(int(exit_requested.value)),
+            last_service_ts=float(last_service_ts.value),
+            exit_ts=float(exit_ts.value),
+            last_source=last_source.value.decode("utf-8", errors="replace"),
+            exit_reason=exit_reason.value.decode("utf-8", errors="replace"),
+        )

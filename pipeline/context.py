@@ -396,6 +396,7 @@ class PipelineContext:
 
     # ---- viewer / preview -----------------------------------------------
     viewer_proxy: Optional[Any] = None
+    runtime_control_store: Optional[Any] = None
     loss_logger: Optional[Any] = None
     save_restore_node: Optional[Any] = None
 
@@ -515,6 +516,18 @@ class PipelineContext:
             return False
         try:
             return bool(fn())
+        except Exception:
+            return False
+
+    def runtime_service_priority_requested(self) -> bool:
+        store = getattr(self, "runtime_control_store", None)
+        if store is None:
+            return False
+        fn = getattr(store, "active_services", None)
+        if not callable(fn):
+            return False
+        try:
+            return int(fn()) > 0
         except Exception:
             return False
 
@@ -750,7 +763,9 @@ class PipelineContext:
     # ------------------------------------------------------------------
 
     def paused(self) -> bool:
-        """True when the GUI has requested a pause (graph should spin-wait)."""
+        """True when the GUI or runtime service-priority path has requested a pause."""
+        if self.runtime_service_priority_requested():
+            return True
         proxy = self.viewer_proxy
         if proxy is None:
             return False

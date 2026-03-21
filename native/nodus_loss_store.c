@@ -3373,3 +3373,224 @@ NODUS_API int nodus_weight_image_store_mark_checkpoint(
     weight_image_store_unlock(store);
     return -1;
 }
+
+/* ================================================================== */
+/*  Runtime Control Store                                             */
+/* ================================================================== */
+
+#define NODUS_RUNTIME_CONTROL_SHM_NAME   "NodusRuntimeControlStore_v1"
+#define NODUS_RUNTIME_CONTROL_MTX_NAME   "NodusRuntimeControlStoreMutex_v1"
+#define NODUS_RUNTIME_CONTROL_INIT_MAGIC 0x4e525443u
+
+struct NodusRuntimeControlStore {
+    uint32_t initialized;
+    nodus_mutex_t lock;
+    int32_t  active_service_count;
+    uint64_t service_enter_count;
+    uint64_t service_exit_count;
+    int32_t  exit_requested;
+    double   last_service_ts;
+    double   exit_ts;
+    char     last_source[NODUS_RUNTIME_CONTROL_SOURCE_MAX];
+    char     exit_reason[NODUS_RUNTIME_CONTROL_REASON_MAX];
+};
+
+static NodusRuntimeControlStore *g_runtime_control_global = NULL;
+#ifdef _WIN32
+static HANDLE g_runtime_control_shm_mutex = NULL;
+#endif
+
+static void runtime_control_store_zero_fields(NodusRuntimeControlStore *store) {
+    if (!store) return;
+    store->active_service_count = 0;
+    store->service_enter_count = 0u;
+    store->service_exit_count = 0u;
+    store->exit_requested = 0;
+    store->last_service_ts = 0.0;
+    store->exit_ts = 0.0;
+    memset(store->last_source, 0, sizeof(store->last_source));
+    memset(store->exit_reason, 0, sizeof(store->exit_reason));
+}
+
+static void runtime_control_store_init(NodusRuntimeControlStore *store, int cross_process) {
+#ifdef _WIN32
+    (void)cross_process;
+    mutex_init(&store->lock);
+#else
+    if (cross_process) mutex_init_shared(&store->lock);
+    else mutex_init(&store->lock);
+#endif
+    store->initialized = NODUS_RUNTIME_CONTROL_INIT_MAGIC;
+    runtime_control_store_zero_fields(store);
+}
+
+#ifdef _WIN32
+static void runtime_control_store_lock(NodusRuntimeControlStore *store) {
+    if (store == g_runtime_control_global && g_runtime_control_shm_mutex)
+        WaitForSingleObject(g_runtime_control_shm_mutex, INFINITE);
+    else
+        EnterCriticalSection(&store->lock);
+}
+static void runtime_control_store_unlock(NodusRuntimeControlStore *store) {
+    if (store == g_runtime_control_global && g_runtime_control_shm_mutex)
+        ReleaseMutex(g_runtime_control_shm_mutex);
+    else
+        LeaveCriticalSection(&store->lock);
+}
+#else
+static void runtime_control_store_lock(NodusRuntimeControlStore *store)   { pthread_mutex_lock(&store->lock); }
+static void runtime_control_store_unlock(NodusRuntimeControlStore *store) { pthread_mutex_unlock(&store->lock); }
+#endif
+
+NODUS_API NodusRuntimeControlStore* nodus_runtime_control_store_get_global(void) {
+    if (g_runtime_control_global) return g_runtime_control_global;
+#ifdef _WIN32
+    {
+        HANDLE shm = NULL;
+        int created = 0;
+        g_runtime_control_shm_mutex = CreateMutexA(NULL, FALSE, NODUS_RUNTIME_CONTROL_MTX_NAME);
+        if (!g_runtime_control_shm_mutex) {
+            fprintf(stderr, "[nodus] FATAL: CreateMutexA runtime control failed (%lu)\n", (unsigned long)GetLastError());
+            abort();
+        }
+        shm = CreateFileMappingA(
+            INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE, 0,
+            (DWORD)sizeof(NodusRuntimeControlStore),
+            NODUS_RUNTIME_CONTROL_SHM_NAME
+        );
+        if (!shm) {
+            fprintf(stderr, "[nodus] FATAL: CreateFileMappingA runtime control failed (%lu)\n", (unsigned long)GetLastError());
+            abort();
+        }
+        created = (GetLastError() != ERROR_ALREADY_EXISTS);
+        g_runtime_control_global = (NodusRuntimeControlStore*)MapViewOfFile(
+            shm, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(NodusRuntimeControlStore));
+        if (!g_runtime_control_global) {
+            fprintf(stderr, "[nodus] FATAL: MapViewOfFile runtime control failed (%lu)\n", (unsigned long)GetLastError());
+            abort();
+        }
+        if (created || g_runtime_control_global->initialized != NODUS_RUNTIME_CONTROL_INIT_MAGIC) {
+            memset(g_runtime_control_global, 0, sizeof(NodusRuntimeControlStore));
+            runtime_control_store_init(g_runtime_control_global, 1);
+        }
+    }
+#else
+    {
+        int fd = shm_open("/" NODUS_RUNTIME_CONTROL_SHM_NAME, O_CREAT | O_RDWR, 0600);
+        if (fd < 0) {
+            perror("[nodus] FATAL: shm_open runtime control");
+            abort();
+        }
+        if (ftruncate(fd, (off_t)sizeof(NodusRuntimeControlStore)) != 0) {
+            perror("[nodus] FATAL: ftruncate runtime control");
+            abort();
+        }
+        g_runtime_control_global = (NodusRuntimeControlStore*)mmap(
+            NULL, sizeof(NodusRuntimeControlStore), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+        if (g_runtime_control_global == MAP_FAILED) {
+            perror("[nodus] FATAL: mmap runtime control");
+            abort();
+        }
+        close(fd);
+        if (g_runtime_control_global->initialized != NODUS_RUNTIME_CONTROL_INIT_MAGIC) {
+            memset(g_runtime_control_global, 0, sizeof(NodusRuntimeControlStore));
+            runtime_control_store_init(g_runtime_control_global, 1);
+        }
+    }
+#endif
+    return g_runtime_control_global;
+}
+
+NODUS_API void nodus_runtime_control_store_clear(NodusRuntimeControlStore *store) {
+    if (!store) return;
+    runtime_control_store_lock(store);
+    runtime_control_store_zero_fields(store);
+    runtime_control_store_unlock(store);
+}
+
+NODUS_API void nodus_runtime_control_store_begin_service(
+        NodusRuntimeControlStore *store,
+        const char *source,
+        double ts)
+{
+    if (!store) return;
+    runtime_control_store_lock(store);
+    if (store->active_service_count < INT32_MAX) {
+        store->active_service_count += 1;
+    }
+    store->service_enter_count += 1u;
+    store->last_service_ts = ts;
+    copy_cstr_trunc(store->last_source, sizeof(store->last_source), source ? source : "");
+    runtime_control_store_unlock(store);
+}
+
+NODUS_API void nodus_runtime_control_store_end_service(
+        NodusRuntimeControlStore *store,
+        const char *source,
+        double ts)
+{
+    if (!store) return;
+    runtime_control_store_lock(store);
+    if (store->active_service_count > 0) {
+        store->active_service_count -= 1;
+    }
+    store->service_exit_count += 1u;
+    store->last_service_ts = ts;
+    copy_cstr_trunc(store->last_source, sizeof(store->last_source), source ? source : "");
+    runtime_control_store_unlock(store);
+}
+
+NODUS_API int32_t nodus_runtime_control_store_active_services(
+        const NodusRuntimeControlStore *store)
+{
+    int32_t count = 0;
+    NodusRuntimeControlStore *st = (NodusRuntimeControlStore*)store;
+    if (!st) return 0;
+    runtime_control_store_lock(st);
+    count = st->active_service_count;
+    runtime_control_store_unlock(st);
+    return count;
+}
+
+NODUS_API void nodus_runtime_control_store_set_exit(
+        NodusRuntimeControlStore *store,
+        int32_t requested,
+        const char *reason,
+        double ts)
+{
+    if (!store) return;
+    runtime_control_store_lock(store);
+    store->exit_requested = requested ? 1 : 0;
+    store->exit_ts = requested ? ts : 0.0;
+    copy_cstr_trunc(store->exit_reason, sizeof(store->exit_reason),
+                    requested ? (reason ? reason : "") : "");
+    runtime_control_store_unlock(store);
+}
+
+NODUS_API int nodus_runtime_control_store_get_state(
+        const NodusRuntimeControlStore *store,
+        int32_t *out_active_service_count,
+        uint64_t *out_service_enter_count,
+        uint64_t *out_service_exit_count,
+        int32_t *out_exit_requested,
+        double *out_last_service_ts,
+        double *out_exit_ts,
+        char *out_last_source,
+        int out_last_source_buflen,
+        char *out_exit_reason,
+        int out_exit_reason_buflen)
+{
+    NodusRuntimeControlStore *st = (NodusRuntimeControlStore*)store;
+    if (!st) return -1;
+    runtime_control_store_lock(st);
+    if (out_active_service_count) *out_active_service_count = st->active_service_count;
+    if (out_service_enter_count) *out_service_enter_count = st->service_enter_count;
+    if (out_service_exit_count) *out_service_exit_count = st->service_exit_count;
+    if (out_exit_requested) *out_exit_requested = st->exit_requested;
+    if (out_last_service_ts) *out_last_service_ts = st->last_service_ts;
+    if (out_exit_ts) *out_exit_ts = st->exit_ts;
+    copy_out_string(st->last_source, out_last_source, out_last_source_buflen);
+    copy_out_string(st->exit_reason, out_exit_reason, out_exit_reason_buflen);
+    runtime_control_store_unlock(st);
+    return 0;
+}

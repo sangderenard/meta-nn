@@ -145,6 +145,7 @@ class WebLeaseNode(PipelineNode):
         import torch
         from pipeline.lease_store import LeaseStore
         from pipeline.web_dataset import WebDataset
+        from pipeline.nodes.save_restore_node import _classifier_checkpoint_metadata
 
         def _log(msg: str) -> None:
             print(f"[web-lease] {msg}", flush=True)
@@ -209,6 +210,8 @@ class WebLeaseNode(PipelineNode):
                 "state_dict": {k: v.cpu() for k, v in sd.items()},
                 "model_class": type(model).__name__,
             }
+            if str(self.cfg.target_model) == "classifier":
+                payload.update(_classifier_checkpoint_metadata(model, ctx))
             # Include constructor kwargs if the model exposes them
             if hasattr(model, "ctor_kwargs"):
                 payload["ctor_kwargs"] = model.ctor_kwargs
@@ -314,6 +317,8 @@ class WebLeaseNode(PipelineNode):
                 "state_dict": {k: v.cpu() for k, v in sd.items()},
                 "model_class": type(model).__name__,
             }
+            if str(self.cfg.target_model) == "classifier":
+                payload.update(_classifier_checkpoint_metadata(model, ctx))
             if hasattr(model, "ctor_kwargs"):
                 payload["ctor_kwargs"] = model.ctor_kwargs
             torch.save(payload, str(weights_path))

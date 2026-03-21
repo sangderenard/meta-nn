@@ -2,13 +2,13 @@
 <Project>
   <ProjectOutputs>
     <ProjectOutput>
-      <FullPath>C:\dev\Powershell\meta-nn\native\build\x64\Release\ZERO_CHECK</FullPath>
+      <FullPath>C:\dev\Powershell\meta-nn\native\build\x64\release\ZERO_CHECK</FullPath>
     </ProjectOutput>
     <ProjectOutput>
       <FullPath>C:\dev\Powershell\meta-nn\pipeline\nodus_loss_store.dll</FullPath>
     </ProjectOutput>
     <ProjectOutput>
-      <FullPath>C:\dev\Powershell\meta-nn\native\build\x64\Release\ALL_BUILD</FullPath>
+      <FullPath>C:\dev\Powershell\meta-nn\native\build\x64\release\ALL_BUILD</FullPath>
     </ProjectOutput>
   </ProjectOutputs>
   <ContentFiles />

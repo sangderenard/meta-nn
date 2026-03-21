@@ -28,7 +28,6 @@ from pipeline.semantic_wheel_cache import (
 from semantic_dataset_loaders import (
     build_term_mask_stacks_from_images,
     collect_semantic_disk_rows,
-    infer_semantic_support_masks,
 )
 from wav_ml_models import TinyConvClassifier, prime_tiny_classifier_label_bank_for_state_dict
 
@@ -139,12 +138,14 @@ def test_collect_semantic_disk_rows_remaps_voc_bits_by_name() -> None:
         train_row = next(row for row in rows if str(row.source) == "berkeley_sbd_train")
         val_row = next(row for row in rows if str(row.source) == "berkeley_sbd_val")
 
-        assert float(train_row.label_vec[0]) == 1.0
-        assert float(train_row.label_vec[1]) == 1.0
-        assert float(train_row.label_vec[2]) == 1.0
-        assert float(train_row.label_vec[3]) == 1.0
-        assert float(train_row.label_vec[4]) == 0.0
-        assert float(val_row.label_vec[4]) == 1.0
+        train_terms_norm = {t.strip().lower() for t in train_row.terms}
+        val_terms_norm = {t.strip().lower() for t in val_row.terms}
+        assert "berkeley sbd dataset" in train_terms_norm
+        assert "object" in train_terms_norm
+        assert "signal" in train_terms_norm
+        assert "car" in train_terms_norm
+        assert "person" not in train_terms_norm
+        assert "person" in val_terms_norm
         _ok("Berkeley multilabel rows remap VOC cache bits by class name instead of raw position")
 
 
@@ -173,17 +174,14 @@ def test_semantic_candidate_cache_batch_build_preserves_order() -> None:
     with tempfile.TemporaryDirectory(dir=".") as td:
         root = Path(td)
         label_dim = 4
+        local_vocab = [f"term-{i}" for i in range(label_dim)]
         images: list[np.ndarray] = []
-        targets: list[np.ndarray] = []
         candidates: list[SemanticWheelCandidate] = []
         for i in range(label_dim):
             img = np.zeros((3, 12, 12), dtype=np.float32)
             img[0, :, :] = float(i + 1) / 10.0
             img[1, 2:10, 2:10] = 1.0
-            y = np.zeros((label_dim,), dtype=np.float32)
-            y[i] = 1.0
             images.append(img)
-            targets.append(y)
             candidates.append(
                 SemanticWheelCandidate(
                     cache_key=f"batch-{i}",
@@ -211,8 +209,8 @@ def test_semantic_candidate_cache_batch_build_preserves_order() -> None:
                     [
                         build_semantic_cache_entry(
                             image=images[int(base_idx)],
-                            label_vec=targets[int(base_idx)],
                             image_size=16,
+                            terms=[f"term-{base_idx}"],
                         )
                     ]
                 )
@@ -239,7 +237,7 @@ def test_semantic_candidate_cache_batch_build_preserves_order() -> None:
             candidate_indices=list(range(label_dim)),
             build_entry_group=_entry_group,
             build_entry_groups_batch=_entry_groups_batch,
-            label_dim=label_dim,
+            local_vocab=local_vocab,
             config=cfg,
         )
 
@@ -252,28 +250,10 @@ def test_semantic_candidate_cache_batch_build_preserves_order() -> None:
         assert int(len(ds)) == int(len(selected)), (len(ds), selected)
         for row_idx, candidate_idx in enumerate(selected):
             entry = ds.read_numpy_entry(int(row_idx))
-            observed = int(np.argmax(np.asarray(entry["label_vec_u8"], dtype=np.uint8)))
-            assert observed == int(candidate_idx), (row_idx, observed, candidate_idx, selected)
+            observed_terms = list(entry.get("terms") or [])
+            expected_term = f"term-{candidate_idx}"
+            assert expected_term in observed_terms, (row_idx, observed_terms, candidate_idx, selected)
         _ok("semantic candidate cache dispatches ordered multi-image batch builders without reordering rows")
-
-
-def test_semantic_support_masks_torch_path_matches_default() -> None:
-    print("\n--- test_semantic_support_masks_torch_path_matches_default ---")
-    images = np.zeros((2, 3, 12, 12), dtype=np.float32)
-    images[0, 0, :, :] = 1.0
-    images[1, 1, :, :] = 1.0
-    terms = [["red", "signal"], ["green", "signal"]]
-
-    base = infer_semantic_support_masks(images=images, terms_batch=terms)
-    torch_cpu = infer_semantic_support_masks(
-        images=images,
-        terms_batch=terms,
-        processing_device=torch.device("cpu"),
-    )
-
-    assert tuple(base.shape) == tuple(torch_cpu.shape), (base.shape, torch_cpu.shape)
-    assert np.allclose(base, torch_cpu, atol=1e-5), float(np.max(np.abs(base - torch_cpu)))
-    _ok("torch-backed semantic support mask path matches default CPU implementation")
 
 
 def test_term_mask_stacks_torch_path_matches_default() -> None:

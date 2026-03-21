@@ -318,6 +318,33 @@ def _initialize_loss_logger(ctx: PipelineContext) -> None:
         _log(f"[loss-logger] WARNING: could not open loss log: {exc}")
 
 
+def _signal_runtime_exit(store: Any, reason: str) -> None:
+    if store is None:
+        return
+    fn = getattr(store, "set_exit_requested", None)
+    if not callable(fn):
+        return
+    try:
+        fn(True, reason=str(reason or "training_exit"))
+    except Exception:
+        pass
+
+
+def _initialize_runtime_control(ctx: PipelineContext) -> None:
+    try:
+        import atexit
+        from pipeline.nodus_loss_store import NodusRuntimeControlStore
+
+        store = NodusRuntimeControlStore.get_global()
+        store.clear()
+        store.clear_exit_requested()
+        ctx.runtime_control_store = store
+        atexit.register(_signal_runtime_exit, store, "training_process_exit")
+        _log("[orchestrator] runtime control store connected")
+    except Exception as exc:
+        _log(f"[orchestrator] WARNING: could not initialize runtime control store: {exc}")
+
+
 def _restore_context_from_resume(ctx: PipelineContext) -> None:
     from wav_ml_core import RenderConfig
 
@@ -1725,12 +1752,15 @@ def build_pipeline_graph(
 
     # Berkeley refresh: predicate graph governs activate vs on_traverse so
     # stage 2 still trains on cached loaders between refresh intervals.
+    # Without per_round, data.berkeley_refresh_due enters the execution-program guard and
+    # prevents stage_2_berkeley from running after the first data build (same issue as stage_1_gestation).
     g.add_edge("data_node", "stage_2_berkeley",
                condition=_berk_refresh_cond, label="provides:berkeley_refresh_loader",
                condition_id=_CONDITION_ID_BERKELEY_REFRESH,
                on_traverse=_data_node.provide_berkeley_data,
                predicate_graph_id="pg:berkeley_refresh_flow",
                pin_effects=_DATA_FLOW_PIN_EFFECTS)
+    g.add_edge("data_node", "stage_2_berkeley", label="per_round")
 
     # Gate 2 eval: data_node provides berkeley loaders + payload validation loader.
     # Predicate graph distinguishes hold / pass_cached / rebuild so we don't
@@ -2016,6 +2046,7 @@ def run(args, output_dir: Path, initial_plan=None) -> None:
         ctx.amp_dtype = resolve_amp_dtype(str(_arg_value(args, "amp_dtype", default="float16")))
 
     _restore_context_from_resume(ctx)
+    _initialize_runtime_control(ctx)
 
     # -- GPU residence manager (VRAM budget enforcement) ------------------
     stage_offload = bool(_arg_value(args, "stage_module_offload", default=False))
@@ -2187,6 +2218,7 @@ def run(args, output_dir: Path, initial_plan=None) -> None:
         stop_context="initialization",
     )
     if interrupted or statuses is None:
+        _signal_runtime_exit(getattr(ctx, "runtime_control_store", None), "training_initialization_interrupted")
         return
     _log_statuses("init", statuses)
     _save_runtime_snapshot(
@@ -2418,6 +2450,7 @@ def run(args, output_dir: Path, initial_plan=None) -> None:
             ctx.loss_logger.close()
         except Exception:
             pass
+    _signal_runtime_exit(getattr(ctx, "runtime_control_store", None), f"training_{final_execution_state}")
     _log(f"[orchestrator] run complete. summary -> {summary_path}")
     return stop_requested
 

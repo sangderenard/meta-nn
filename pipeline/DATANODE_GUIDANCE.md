@@ -115,28 +115,24 @@ using `DiskSemanticRowsDataset._apply_degrade()` from `semantic_dataset_loaders.
 function applies a stochastic combination of: blur (avg_pool2d), stride-skew (odd-row shift),
 pixel dropout, quantization, and Gaussian noise to the image. Critically, degrade also
 **produces its own mask**: each degradation operation accumulates a "touch" map recording
-where and how strongly the image was modified. This touch map is then blended with the
-original mask via `_composite_mask_stack()` to produce a new composite mask for the
-deformed variant. The mask is not merely transformed geometrically — **each deformation
-supplies its own mask contribution**.
+where and how strongly the image was modified. This touch map is appended to the per-label
+mask stack as an additional slot so the spatial deformation evidence is preserved. The mask
+is not merely transformed geometrically — **each deformation supplies its own mask slot**.
 
-For each deformed variant, composite mask regeneration is mandatory:
+For each deformed variant:
 
-1. Apply `_apply_degrade(image_chw, mask_hw, idx)` → `(deformed_image, degrade_blended_mask)`
-2. The deformed variant's mask goes into the label stack alongside all other masks:
-   run `build_term_mask_stack_from_image(deformed_image, label_vec, ...)` or
-   `build_label_mask_stack(degrade_blended_mask, label_vec, ...)` from
-   `semantic_dataset_loaders.py` → per-label mask stack `[K, H, W]`
-3. Call `_composite_mask_stack(stack)` (canonical function in `semantic_dataset_loaders.py:403`)
-   → specially normalized gestalt composite `[H, W]`
-4. Store: `(deformed_image, label_vec, composite_mask, per_label_stack)` as a committed row
+1. Apply `_apply_degrade(image_chw, mask=None, idx)` → `(deformed_image, touch_map)`
+2. Assemble the per-label mask stack: run `build_term_mask_stack_from_image(deformed_image,
+   label_vec, ...)` from `semantic_dataset_loaders.py` → per-label stack `[K, H, W]`
+3. Append the touch map as an additional slot if it has non-trivial spatial signal
+4. Store `(deformed_image, label_vec, per_label_stack, mask_indices)` as a committed row
 
-Each deformed variant is a full row in the dataset. It carries its own label (same as source),
-its own per-label mask stack (incorporating the deformation touch map), and its own composite
-regenerated directly from `_composite_mask_stack()`. **The composite from the original
-undeformed image is never reused for any deformed variant.** When rows are pruned for
-reduced representation, the composite must be regenerated in full because the composite
-is the full vocabulary state.
+**No composite mask is computed at storage time.** The gestalt composite `[H, W]` is
+assembled on the training device inside `_expand_semantic_mask_supervision_batch` by summing
+the surviving stack slots and normalising. This is where label+mask dropout
+(`LabelMaskDropoutConfig`) is applied before the sum, ensuring the composite reflects only
+the labels actively participating in that training step. The composite from any prior or
+original row is never reused — it is always freshly derived from the current stack.
 
 The hot-loop degrade flag (`degrade=True`) is retired for Berkeley. The loader becomes a
 simple indexed reader over pre-built rows.
@@ -217,10 +213,10 @@ Add an edge from `data_node` to the new node with `on_traverse=_data_node.provid
 **Adding a new deformation type:**
 It must go through `DiskSemanticRowsDataset._apply_degrade()` in `semantic_dataset_loaders.py`
 or follow the same protocol: apply the deformation to the image, accumulate a touch map
-recording where and how strongly the image was modified, stack the touch map with the mask
-and call `_composite_mask_stack()`, then recompute the per-label mask stack and call
-`_composite_mask_stack()` to regenerate the gestalt composite. Every deformation supplies
-its own mask. Do not reuse the original undeformed composite.
+recording where and how strongly the image was modified, and append the touch map as a new
+mask slot in the per-label stack. Every deformation supplies its own mask slot. Do not
+pre-compute a gestalt composite — compositing happens on the training device at batch
+preparation time inside `_expand_semantic_mask_supervision_batch`.
 
 **Adding a new GAN loss:**
 It must be classifier-mediated. The classifier's sigmoid output on the generated image,

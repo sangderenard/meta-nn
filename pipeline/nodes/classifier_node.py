@@ -71,6 +71,9 @@ from pipeline.nodes.base import (
     _try_partial_classifier_head_load,
 )
 from pipeline.nodes.data_nodes import (
+    LabelMaskDropoutConfig,
+    _apply_label_mask_dropout,
+    _apply_network_dropout_rate,
     _auto_berkeley_refresh_batch_size,
     _expand_semantic_mask_supervision_batch,
     _forward_classifier_outputs_require_mask,
@@ -78,7 +81,6 @@ from pipeline.nodes.data_nodes import (
     _semantic_mask_bce_loss,
     _unpack_masked_semantic_batch,
 )
-from pipeline.nodes.vocab_node import _label_knockout_tensor_batch
 from pipeline.preview import make_classifier_step_preview_callback
 from pipeline.utils import (
     _classifier_supervision_loss,
@@ -87,11 +89,8 @@ from pipeline.utils import (
     _unwrap_module_for_replica,
 )
 from semantic_dataset_loaders import (
-    _composite_mask_stack,
-    _is_dataset_label_term,
-    build_creation_label_mask_stack,
-    build_label_mask_stack,
     combine_label_mask_stacks,
+    targets_from_terms,
 )
 import gc
 import math
@@ -422,6 +421,8 @@ class PregestationTrainNode(IRTrainingNode):
             pause_requested=ctx.paused,
             ipc_pump=getattr(ctx.viewer_proxy, "pump", None),
             weight_update_callback=weight_update_callback,
+            active_term_to_idx=dict(ctx.semantic_term_to_idx),
+            n_active_classes=len(ctx.class_names),
             args=ctx.args,
         )
 
@@ -544,6 +545,8 @@ class GestationTrainNode(IRTrainingNode):
             pause_requested=ctx.paused,
             ipc_pump=getattr(ctx.viewer_proxy, "pump", None),
             weight_update_callback=weight_update_callback,
+            active_term_to_idx=dict(ctx.semantic_term_to_idx),
+            n_active_classes=len(ctx.class_names),
             args=ctx.args,
         )
 
@@ -663,9 +666,8 @@ class BerkeleyRefreshTrainNode(IRTrainingNode):
             ipc_pump=getattr(ctx.viewer_proxy, "pump", None),
             weight_update_callback=weight_update_callback,
             args=ctx.args,
-            remap_targets_from_terms=True,
-            active_class_names=list(ctx.class_names),
-            source_class_names=list(ctx.class_names),
+            active_term_to_idx=dict(ctx.semantic_term_to_idx),
+            n_active_classes=len(ctx.class_names),
         )
 
         loss = float(result.get("loss", float("inf")))
@@ -828,9 +830,8 @@ class LoRARoundNode(IRTrainingNode):
                 stage_label=f"stageC_lora_{slot_name}",
                 weight_update_callback=weight_update_callback,
                 args=ctx.args,
-                remap_targets_from_terms=True,
-                active_class_names=list(ctx.class_names),
-                source_class_names=list(ctx.supervised_class_names),
+                active_term_to_idx=dict(ctx.semantic_term_to_idx),
+                n_active_classes=len(ctx.class_names),
                 stop_requested=ctx.stop_requested,
                 pause_requested=ctx.paused,
                 ipc_pump=getattr(ctx.viewer_proxy, "pump", None),
@@ -1281,143 +1282,15 @@ def _term_key(term: str) -> str:
     return re.sub(r"\s+", " ", str(term)).strip().lower()
 
 
-def _remap_semantic_batch_to_active_vocab(
-    yb: torch.Tensor,
-    mb: torch.Tensor,
-    batch_meta: Optional[Dict[str, Any]],
-    *,
-    active_class_names: Sequence[str],
-    source_class_names: Optional[Sequence[str]] = None,
-) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, Any]]:
-    meta = dict(batch_meta or {})
-    terms_rows = list(meta.get("terms_rows") or [])
-    if int(len(terms_rows)) != int(yb.shape[0]) or int(len(active_class_names)) <= 0:
-        return yb, mb, meta
-    active_names = [str(x) for x in list(active_class_names)]
-    active_term_to_idx = {_term_key(name): int(i) for i, name in enumerate(active_names) if _term_key(name)}
-    active_idx_to_term = {int(i): str(name) for i, name in enumerate(active_names)}
-    source_names = list(source_class_names or [])
-    if int(len(source_names)) != int(yb.shape[1]):
-        source_names = active_names[: int(yb.shape[1])]
-    source_idx_to_term = {
-        int(i): str(name)
-        for i, name in enumerate(source_names)
-        if _term_key(name)
-    }
-    stack_list = list(meta.get("mask_stacks") or [])
-    index_list = list(meta.get("mask_indices") or [])
 
-    out_y_rows: List[torch.Tensor] = []
-    out_m_rows: List[torch.Tensor] = []
-    out_stack_rows: List[torch.Tensor] = []
-    out_index_rows: List[torch.Tensor] = []
-
-    for bi in range(int(yb.shape[0])):
-        row_terms = [
-            str(term)
-            for term in list(terms_rows[int(bi)] or [])
-            if _term_key(str(term))
-        ]
-        y_active_np = np.zeros((int(len(active_names)),), dtype=np.float32)
-        for term in row_terms:
-            dst_idx = int(active_term_to_idx.get(_term_key(term), -1))
-            if 0 <= int(dst_idx) < int(y_active_np.size):
-                y_active_np[int(dst_idx)] = 1.0
-        src_positive = torch.nonzero(yb[int(bi)].detach().to(torch.float32) >= 0.5, as_tuple=False).reshape(-1).tolist()
-        for src_idx in src_positive:
-            src_term = str(source_idx_to_term.get(int(src_idx), "") or "")
-            dst_idx = int(active_term_to_idx.get(_term_key(src_term), -1))
-            if 0 <= int(dst_idx) < int(y_active_np.size):
-                y_active_np[int(dst_idx)] = 1.0
-
-        base_mask_np = np.asarray(mb[int(bi)].detach().to(torch.float32).cpu().numpy(), dtype=np.float32)
-        if int(base_mask_np.ndim) == 3 and int(base_mask_np.shape[0]) == 1:
-            base_mask_np = np.asarray(base_mask_np[0], dtype=np.float32)
-        if int(base_mask_np.ndim) != 2:
-            raise RuntimeError(f"Active-vocab remap requires [1,H,W] or [H,W] masks, got {tuple(base_mask_np.shape)}")
-        height = int(base_mask_np.shape[0])
-        width = int(base_mask_np.shape[1])
-
-        mapped_stack_rows: List[np.ndarray] = []
-        mapped_idx_rows: List[int] = []
-        sample_stack = stack_list[int(bi)] if int(bi) < int(len(stack_list)) else None
-        sample_idx = index_list[int(bi)] if int(bi) < int(len(index_list)) else None
-        if sample_stack is not None and sample_idx is not None:
-            stack_np = np.asarray(sample_stack, dtype=np.float32)
-            idx_np = np.asarray(sample_idx, dtype=np.int64).reshape(-1)
-            if int(stack_np.ndim) == 2:
-                stack_np = stack_np[None, ...]
-            pair_count = min(int(stack_np.shape[0]), int(idx_np.size)) if int(stack_np.ndim) == 3 else 0
-            for si in range(int(pair_count)):
-                src_term = str(source_idx_to_term.get(int(idx_np[int(si)]), "") or "")
-                dst_idx = int(active_term_to_idx.get(_term_key(src_term), -1))
-                if dst_idx < 0 or float(y_active_np[int(dst_idx)]) < 0.5:
-                    continue
-                mapped_stack_rows.append(np.asarray(stack_np[int(si)], dtype=np.float32))
-                mapped_idx_rows.append(int(dst_idx))
-        mapped_stack = (
-            np.stack(mapped_stack_rows, axis=0).astype(np.float32, copy=False)
-            if mapped_stack_rows
-            else np.zeros((0, int(height), int(width)), dtype=np.float32)
-        )
-        mapped_idx = np.asarray(mapped_idx_rows, dtype=np.int64)
-
-        # Only generate special masks for labels not already covered by the
-        # wheel's mapped_stack — prevents global ones-fallback from overriding
-        # the spatial masks that the wheel already stored for built-in terms.
-        y_needs_special = np.zeros_like(y_active_np, dtype=np.float32)
-        already_mapped = set(int(i) for i in mapped_idx_rows)
-        for _ci in np.where(y_active_np >= 0.5)[0]:
-            if int(_ci) not in already_mapped:
-                y_needs_special[int(_ci)] = 1.0
-        special_stack, special_idx = build_label_mask_stack(
-            mixed_mask=base_mask_np,
-            label_vec=y_needs_special,
-            idx_to_term=active_idx_to_term,
-            treat_mixed_mask_as_creation=True,
-        )
-        covered = set(np.asarray(mapped_idx, dtype=np.int64).reshape(-1).tolist())
-        covered.update(np.asarray(special_idx, dtype=np.int64).reshape(-1).tolist())
-        missing = [
-            int(idx)
-            for idx in np.where(np.asarray(y_active_np, dtype=np.float32) >= 0.5)[0].astype(np.int64).tolist()
-            if int(idx) not in covered
-        ]
-        if missing:
-            missing_y = np.zeros_like(y_active_np, dtype=np.float32)
-            missing_y[np.asarray(missing, dtype=np.int64)] = 1.0
-            creation_stack, creation_idx = build_creation_label_mask_stack(
-                missing_y,
-                height=int(height),
-                width=int(width),
-                creation_mask=base_mask_np,
-            )
-        else:
-            creation_stack = np.zeros((0, int(height), int(width)), dtype=np.float32)
-            creation_idx = np.zeros((0,), dtype=np.int64)
-        remapped_stack, remapped_idx = combine_label_mask_stacks(
-            y_active_np,
-            (mapped_stack, mapped_idx),
-            (special_stack, special_idx),
-            (creation_stack, creation_idx),
-            height=int(height),
-            width=int(width),
-            strict=True,
-            idx_to_term=active_idx_to_term,
-        )
-        _nds_keep = [i for i in range(min(int(remapped_stack.shape[0]), int(remapped_idx.size))) if not _is_dataset_label_term(str((active_idx_to_term or {}).get(int(remapped_idx[i]), "")))]
-        mixed_mask_np = _composite_mask_stack(remapped_stack[np.asarray(_nds_keep, dtype=np.int64)]) if _nds_keep else np.asarray(base_mask_np, dtype=np.float32)
-        out_y_rows.append(torch.from_numpy(np.asarray(y_active_np, dtype=np.float32)))
-        out_m_rows.append(torch.from_numpy(np.asarray(mixed_mask_np, dtype=np.float32)).unsqueeze(0))
-        out_stack_rows.append(torch.from_numpy(np.asarray(remapped_stack, dtype=np.float32)))
-        out_index_rows.append(torch.from_numpy(np.asarray(remapped_idx, dtype=np.int64)))
-
-    meta["terms_rows"] = [list(row) for row in list(terms_rows)]
-    meta["mask_stacks"] = out_stack_rows
-    meta["mask_indices"] = out_index_rows
-    y_out = torch.stack(out_y_rows, dim=0).to(device=yb.device, dtype=torch.float32)
-    m_out = torch.stack(out_m_rows, dim=0).to(device=mb.device, dtype=torch.float32)
-    return y_out, m_out, meta
+def _yb_from_terms(
+    terms_rows: Sequence[Sequence[str]],
+    active_term_to_idx: Dict[str, int],
+    n_active_classes: int,
+    device: torch.device,
+) -> torch.Tensor:
+    vecs = targets_from_terms(list(terms_rows), active_term_to_idx, n_active_classes)
+    return torch.from_numpy(np.stack(vecs, axis=0).astype(np.float32)).to(device=device)
 
 
 def _run_classifier_refresh_epochs(
@@ -1450,10 +1323,6 @@ def _run_classifier_refresh_epochs(
     vram_fraction: float = 0.35,
     activation_multiplier: float = 18.0,
     max_forward_batch_cap: int = 0,
-    target_label_knockout_prob: float = 0.0,
-    target_label_knockout_min_keep: int = 1,
-    target_label_knockout_max_drop_frac: float = 0.5,
-    target_label_knockout_seed: int = 0,
     step_preview_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
     progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
     stop_requested: Optional[Callable[[], bool]] = None,
@@ -1461,14 +1330,23 @@ def _run_classifier_refresh_epochs(
     grad_clip: float = 1.0,
     semantic_soft_target_max: float = 0.0,
     semantic_cosine_weight: float = CLASSIFIER_SEMANTIC_COSINE_WEIGHT,
-    remap_targets_from_terms: bool = False,
-    active_class_names: Optional[Sequence[str]] = None,
-    source_class_names: Optional[Sequence[str]] = None,
+    active_term_to_idx: Optional[Dict[str, int]] = None,
+    n_active_classes: int = 0,
+    label_mask_dropout_cfg: Optional[LabelMaskDropoutConfig] = None,
     pause_requested: Optional[Callable[[], bool]] = None,
     ipc_pump: Optional[Callable[[], None]] = None,
 ):
+    from pipeline.progress import control_callable, control_pump, wait_for_resume
+
     if epochs <= 0:
         return {"ran": False, "loss": 0.0}
+
+    if stop_requested is None:
+        stop_requested = control_callable("stop_requested")
+    if pause_requested is None:
+        pause_requested = control_callable("paused")
+    if ipc_pump is None:
+        ipc_pump = control_pump()
 
     # A prior transformer stage may have frozen this classifier for feature scoring.
     # Ensure refresh has trainable params before building autograd graph.
@@ -1509,11 +1387,12 @@ def _run_classifier_refresh_epochs(
     refresh_source = "cache" if use_cache else "loader"
     if bool(use_cache) and cache_x is not None and str(cache_x.device) != str(device):
         refresh_source = f"cache-staging:{str(cache_x.device)}->{str(device)}"
-    knockout_prob = float(max(0.0, min(1.0, float(target_label_knockout_prob))))
-    knockout_enabled = bool(knockout_prob > 0.0)
-    knockout_rng = np.random.default_rng(max(0, int(target_label_knockout_seed)))
-    knockout_rows_applied = 0
-    knockout_labels_dropped = 0
+    _dropout_cfg = label_mask_dropout_cfg
+    _dropout_rng: Optional[np.random.Generator] = None
+    if _dropout_cfg is not None:
+        _seed = _dropout_cfg.seed
+        _dropout_rng = (np.random.default_rng(int(_seed)) if _seed is not None
+                        else np.random.default_rng())
     opt = optimizer
     min_steps = max(0, int(min_steps))
     if use_cache:
@@ -1555,30 +1434,14 @@ def _run_classifier_refresh_epochs(
                             break
                     except Exception:
                         pass
-                # Batch-level pause: spin here so the GUI can pause/resume
-                # between any two batches (and during dataloader pre-fetch waits).
-                if pause_requested is not None:
-                    try:
-                        while bool(pause_requested()):
-                            if stop_requested is not None:
-                                try:
-                                    if bool(stop_requested()):
-                                        stop_now = True
-                                        break
-                                except Exception:
-                                    pass
-                            if stop_now:
-                                break
-                            if ipc_pump is not None:
-                                try:
-                                    ipc_pump()
-                                except Exception:
-                                    pass
-                            time.sleep(0.05)
-                    except Exception:
-                        pass
-                    if stop_now:
-                        break
+                if wait_for_resume(
+                    pause_requested=pause_requested,
+                    stop_requested=stop_requested,
+                    pump=ipc_pump,
+                    pause_poll_s=0.05,
+                ):
+                    stop_now = True
+                    break
                 if use_cache:
                     idx_parts: List[torch.Tensor] = []
                     need = int(cache_batch_size)
@@ -1597,18 +1460,15 @@ def _run_classifier_refresh_epochs(
                     batch_meta = None
                 else:
                     try:
-                        xb, yb, mb, batch_meta = _unpack_masked_semantic_batch(next(loader_iter), context="berkeley refresh training")
+                        xb, mb, batch_meta = _unpack_masked_semantic_batch(next(loader_iter), context="berkeley refresh training")
                     except StopIteration:
                         loader_iter = iter(loader)
-                        xb, yb, mb, batch_meta = _unpack_masked_semantic_batch(next(loader_iter), context="berkeley refresh training")
-                if bool(remap_targets_from_terms) and isinstance(batch_meta, dict):
-                    yb, mb, batch_meta = _remap_semantic_batch_to_active_vocab(
-                        yb,
-                        mb,
-                        batch_meta,
-                        active_class_names=list(active_class_names or []),
-                        source_class_names=list(source_class_names or []),
-                    )
+                        xb, mb, batch_meta = _unpack_masked_semantic_batch(next(loader_iter), context="berkeley refresh training")
+                    # Build yb from textual terms using active vocabulary.
+                    _tti = active_term_to_idx or {}
+                    _nac = int(n_active_classes) if int(n_active_classes) > 0 else len(_tti)
+                    _terms = list(batch_meta.get("terms_rows") or [[] for _ in range(int(xb.shape[0]))])
+                    yb = _yb_from_terms(_terms, _tti, _nac, xb.device)
                 if not bool(use_cache):
                     xb, yb, mb = _expand_semantic_mask_supervision_batch(
                         xb=xb,
@@ -1617,7 +1477,11 @@ def _run_classifier_refresh_epochs(
                         batch_meta=batch_meta,
                         mode=str(semantic_mask_supervision_mode),
                         context="berkeley refresh training",
+                        dropout_cfg=_dropout_cfg,
+                        dropout_rng=_dropout_rng,
                     )
+                if _dropout_cfg is not None and _dropout_cfg.network_dropout is not None:
+                    _apply_network_dropout_rate(classifier, float(_dropout_cfg.network_dropout))
                 total_batch_n = int(idx.numel()) if use_cache else max(1, int(xb.shape[0]))
                 slice_cap = _auto_berkeley_refresh_batch_size(
                     cache_x=(cache_x if use_cache else xb),
@@ -1663,17 +1527,6 @@ def _run_classifier_refresh_epochs(
                                 yb_part = yb_part.to(device, non_blocking=True)
                             if mb_part.device != device:
                                 mb_part = mb_part.to(device, non_blocking=True)
-                            if bool(knockout_enabled):
-                                yb_part, rows_drop, labels_drop = _label_knockout_tensor_batch(
-                                    yb=yb_part,
-                                    rng=knockout_rng,
-                                    prob=float(knockout_prob),
-                                    min_keep=int(target_label_knockout_min_keep),
-                                    max_drop_frac=float(target_label_knockout_max_drop_frac),
-                                    threshold=0.5,
-                                )
-                                knockout_rows_applied += int(rows_drop)
-                                knockout_labels_dropped += int(labels_drop)
                             if bool(runtime_channels_last) and xb_part.device == device:
                                 xb_part = xb_part.contiguous(memory_format=torch.channels_last)
                             with autocast_context(device=device, enabled=amp_enabled, amp_dtype=amp_dtype_t):
@@ -1839,8 +1692,6 @@ def _run_classifier_refresh_epochs(
                         "stopped_early": False,
                         "elapsed_sec": float(time.time() - t_start),
                         "source": refresh_source,
-                        "target_knockout_rows_applied": int(knockout_rows_applied),
-                        "target_knockout_labels_dropped": int(knockout_labels_dropped),
                     }
             if stop_now:
                 break
@@ -1860,8 +1711,6 @@ def _run_classifier_refresh_epochs(
         "stopped_early": bool(stop_now),
         "elapsed_sec": float(time.time() - t_start),
         "source": refresh_source,
-        "target_knockout_rows_applied": int(knockout_rows_applied),
-        "target_knockout_labels_dropped": int(knockout_labels_dropped),
     }
 
 

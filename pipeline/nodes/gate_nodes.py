@@ -44,6 +44,7 @@ from pipeline.nodes.base import (
     resolve_non_training_device,
     _save_pipeline_checkpoint,
 )
+from pipeline.nodes.save_restore_node import _classifier_checkpoint_metadata
 from pipeline.nodes.data_nodes import (
     _expand_semantic_mask_supervision_batch,
     _forward_classifier_outputs_require_mask,
@@ -261,8 +262,8 @@ class BerkeleyGateNode(GatedNode):
                 channels_last=False,
                 semantic_mask_supervision_mode=str(getattr(ctx.args, "semantic_mask_supervision_mode", "multihot_mix") or "multihot_mix"),
                 semantic_cosine_weight=float(CLASSIFIER_SEMANTIC_COSINE_WEIGHT),
-                active_class_names=list(ctx.class_names),
-                source_class_names=list(ctx.supervised_class_names),
+                active_term_to_idx=dict(ctx.semantic_term_to_idx),
+                n_active_classes=len(ctx.class_names),
             )
 
         confidence = float(result.get("mean_confidence", 0.0))
@@ -803,6 +804,7 @@ def _save_training_segment_snapshot(
             {
                 "state_dict": classifier.state_dict(),
                 "classifier_lora": _snapshot_classifier_lora(classifier),
+                **_classifier_checkpoint_metadata(classifier, ctx),
             },
             out_dir / "classifier.pt",
         )
@@ -828,10 +830,10 @@ def _evaluate_berkeley_classifier_gate(
     semantic_mask_supervision_mode: str = "multihot_mix",
     preview_sink: Optional[Dict[str, Any]] = None,
     semantic_cosine_weight: float = CLASSIFIER_SEMANTIC_COSINE_WEIGHT,
-    active_class_names: Optional[Sequence[str]] = None,
-    source_class_names: Optional[Sequence[str]] = None,
+    active_term_to_idx: Optional[Dict[str, int]] = None,
+    n_active_classes: int = 0,
 ):
-    from pipeline.nodes.classifier_node import _remap_semantic_batch_to_active_vocab
+    from pipeline.nodes.classifier_node import _yb_from_terms
 
     classifier.eval()
     amp_dtype_t = resolve_amp_dtype(amp_dtype) if amp_enabled else torch.float16
@@ -859,15 +861,11 @@ def _evaluate_berkeley_classifier_gate(
     mask_loss_total = 0.0
     for batch in loader:
         batch_idx += 1
-        xb, yb, mb, batch_meta = _unpack_masked_semantic_batch(batch, context="berkeley gate evaluation")
-        if isinstance(batch_meta, dict) and int(len(active_class_names or [])) > 0:
-            yb, mb, batch_meta = _remap_semantic_batch_to_active_vocab(
-                yb,
-                mb,
-                batch_meta,
-                active_class_names=list(active_class_names or []),
-                source_class_names=list(source_class_names or []),
-            )
+        xb, mb, batch_meta = _unpack_masked_semantic_batch(batch, context="berkeley gate evaluation")
+        _tti = active_term_to_idx or {}
+        _nac = int(n_active_classes) if int(n_active_classes) > 0 else len(_tti)
+        _terms = list(batch_meta.get("terms_rows") or [[] for _ in range(int(xb.shape[0]))])
+        yb = _yb_from_terms(_terms, _tti, _nac, xb.device)
         xb, yb, mb = _expand_semantic_mask_supervision_batch(
             xb=xb,
             yb=yb,

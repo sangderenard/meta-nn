@@ -4,7 +4,7 @@ import numpy as np
 import torch
 
 from pipeline.context import PipelineContext
-from pipeline.nodes.classifier_node import _remap_semantic_batch_to_active_vocab
+from pipeline.nodes.classifier_node import _yb_from_terms
 from pipeline.nodes.vocab_node import (
     activate_vocab_lora_slot,
     register_churn_requirement,
@@ -98,39 +98,29 @@ def test_vocab_plan_select_and_activate() -> None:
     _ok("Churn plan splits oversized vocab requirement into activatable slots")
 
 
-def test_remap_semantic_batch_to_active_vocab() -> None:
-    print("\n--- test_remap_semantic_batch_to_active_vocab ---")
-    yb = torch.tensor([[1.0, 0.0]], dtype=torch.float32)
-    mb = torch.zeros((1, 1, 8, 8), dtype=torch.float32)
-    mb[:, :, 2:6, 1:5] = 1.0
-    batch_meta = {
-        "terms_rows": [["signal", "alpha", "mnist dataset"]],
-        "mask_stacks": [],
-        "mask_indices": [],
-    }
-    y_out, m_out, meta_out = _remap_semantic_batch_to_active_vocab(
-        yb,
-        mb,
-        batch_meta,
-        active_class_names=["signal", "object", "alpha", "mnist dataset", "legacy slot"],
-        source_class_names=["signal", "cat"],
+def test_yb_from_terms() -> None:
+    print("\n--- test_yb_from_terms ---")
+    active_term_to_idx = {"signal": 0, "object": 1, "alpha": 2, "mnist dataset": 3, "legacy slot": 4}
+    terms_rows = [["signal", "alpha", "mnist dataset"]]
+    yb = _yb_from_terms(
+        terms_rows=terms_rows,
+        active_term_to_idx=active_term_to_idx,
+        n_active_classes=5,
+        device=torch.device("cpu"),
     )
-    y_np = y_out.detach().cpu().numpy()
+    y_np = yb.detach().cpu().numpy()
     assert tuple(y_np.shape) == (1, 5), y_np.shape
-    assert float(y_np[0, 0]) > 0.5
-    assert float(y_np[0, 2]) > 0.5
-    assert float(y_np[0, 3]) > 0.5
-    assert float(np.max(m_out.detach().cpu().numpy())) > 0.9
-    remapped_idx = meta_out["mask_indices"][0].detach().cpu().numpy().astype(np.int64).tolist()
-    assert 0 in remapped_idx, remapped_idx
-    assert 2 in remapped_idx, remapped_idx
-    assert 3 in remapped_idx, remapped_idx
-    _ok("Active-vocab remap rebuilds targets and masks from terms rows")
+    assert float(y_np[0, 0]) > 0.5   # signal
+    assert float(y_np[0, 1]) < 0.5   # object — not in terms
+    assert float(y_np[0, 2]) > 0.5   # alpha
+    assert float(y_np[0, 3]) > 0.5   # mnist dataset
+    assert float(y_np[0, 4]) < 0.5   # legacy slot — not in terms
+    _ok("_yb_from_terms builds multi-hot targets from terms rows")
 
 
 if __name__ == "__main__":
     test_lora_snapshot_roundtrip()
     test_lora_slot_inherits_base_placement()
     test_vocab_plan_select_and_activate()
-    test_remap_semantic_batch_to_active_vocab()
+    test_yb_from_terms()
     print("\nALL TESTS PASSED")

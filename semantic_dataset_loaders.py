@@ -159,6 +159,35 @@ def normalize_vocab_terms(terms: Sequence[str]) -> List[str]:
     return out
 
 
+def targets_from_terms(
+    terms_rows: Sequence[Sequence[str]],
+    term_to_idx: Dict[str, int],
+    n_classes: int,
+) -> List[np.ndarray]:
+    """Canonical multi-hot target builder.  ALL loaders MUST use this.
+
+    Parameters
+    ----------
+    terms_rows : per-image lists of semantic term strings.
+    term_to_idx : mapping from normalised term string → class index.
+    n_classes : width of the target vector.
+
+    Returns
+    -------
+    List of float32 multi-hot vectors, one per row.
+    """
+    out: List[np.ndarray] = []
+    nc = max(1, int(n_classes))
+    for terms in terms_rows:
+        y = np.zeros(nc, dtype=np.float32)
+        for term in terms:
+            idx = term_to_idx.get(re.sub(r"\s+", " ", str(term)).strip().lower(), -1)
+            if 0 <= idx < nc:
+                y[idx] = 1.0
+        out.append(y)
+    return out
+
+
 def convert_sbd_mat_to_npz(root, progress_control: Any = None) -> None:
     """One-time conversion of {root}/cls/*.mat → {root}/cls/*.npz.
 
@@ -295,7 +324,6 @@ def _read_sbd_split_file(root, split_name: str):
 @dataclass
 class SemanticDiskRow:
     image_path: str
-    label_vec: np.ndarray
     terms: List[str]
     source: str
     mask_path: str = ""
@@ -309,7 +337,6 @@ class SemanticDiskRow:
 def _clone_semantic_disk_row(row: SemanticDiskRow) -> SemanticDiskRow:
     return SemanticDiskRow(
         image_path=str(row.image_path),
-        label_vec=np.asarray(row.label_vec, dtype=np.float32).reshape(-1).copy(),
         terms=list(row.terms),
         source=str(row.source),
         mask_path=str(row.mask_path or ""),
@@ -608,36 +635,6 @@ def _normalize_stack_row_batch(
     return clamped
 
 
-def build_creation_label_mask_stack(
-    label_vec: Any,
-    *,
-    height: int = 0,
-    width: int = 0,
-    creation_mask: Optional[Any] = None,
-    processing_device: Optional[Any] = None,
-) -> Tuple[np.ndarray, np.ndarray]:
-    positive_idx = _positive_label_indices(label_vec)
-    if creation_mask is not None:
-        base = np.asarray(creation_mask, dtype=np.float32)
-        if int(base.ndim) == 3:
-            base = np.mean(base, axis=0).astype(np.float32, copy=False)
-        if int(height) <= 0 or int(width) <= 0:
-            height = int(base.shape[-2]) if int(base.ndim) >= 2 else int(height)
-            width = int(base.shape[-1]) if int(base.ndim) >= 2 else int(width)
-        base_mask = _normalize_stack_row(
-            base,
-            height=int(height),
-            width=int(width),
-            processing_device=processing_device,
-        )
-    else:
-        return np.zeros((0, int(max(0, height)), int(max(0, width))), dtype=np.float32), np.zeros((0,), dtype=np.int64)
-    if int(positive_idx.size) <= 0:
-        return np.zeros((0, int(base_mask.shape[0]), int(base_mask.shape[1])), dtype=np.float32), np.zeros((0,), dtype=np.int64)
-    stack = np.repeat(base_mask[None, :, :], int(positive_idx.size), axis=0).astype(np.float32, copy=False)
-    return stack, np.asarray(positive_idx, dtype=np.int64)
-
-
 def term_mask_map_to_label_stack(
     term_mask_map: Optional[Dict[str, Any]],
     label_vec: Any,
@@ -816,128 +813,96 @@ def _is_dataset_label_term(term: str) -> bool:
     return bool(_norm_txt(str(term)).endswith(_DATASET_LABEL_SUFFIX))
 
 
-def _resolve_creation_mask(
-    mixed_mask: Any,
-    *,
+def build_combined_mask_stacks(
+    label_vec: Any,
+    idx_to_term: Dict[int, str],
     height: int,
     width: int,
-    mask_stack_array: Optional[Any] = None,
-    processing_device: Optional[Any] = None,
-) -> np.ndarray:
-    mixed_arr = np.asarray(mixed_mask, dtype=np.float32)
-    if int(mixed_arr.ndim) >= 2 and float(np.max(mixed_arr)) > 1e-8:
-        return _normalize_mask_array(mixed_arr, height=int(height), width=int(width))
-    if mask_stack_array is None:
-        return np.zeros((int(max(0, height)), int(max(0, width))), dtype=np.float32)
-    stack_arr = np.asarray(mask_stack_array, dtype=np.float32)
-    if int(stack_arr.ndim) == 2:
-        stack_arr = stack_arr[None, ...]
-    if int(stack_arr.ndim) != 3 or int(stack_arr.shape[0]) <= 0:
-        return np.zeros((int(max(0, height)), int(max(0, width))), dtype=np.float32)
-    if int(height) <= 0 or int(width) <= 0:
-        height = int(stack_arr.shape[-2])
-        width = int(stack_arr.shape[-1])
-    return _normalize_mask_array(
-        _composite_mask_stack(stack_arr, processing_device=processing_device),
-        height=int(height),
-        width=int(width),
-    )
-
-
-def _build_special_label_mask_stack(
-    label_vec: Any,
     *,
-    idx_to_term: Optional[Dict[int, str]] = None,
-    height: int,
-    width: int,
-    creation_mask: Optional[Any] = None,
-) -> Tuple[np.ndarray, np.ndarray]:
-    positive_idx = _positive_label_indices(label_vec)
-    if int(positive_idx.size) <= 0 or int(height) <= 0 or int(width) <= 0:
-        return np.zeros((0, int(max(0, height)), int(max(0, width))), dtype=np.float32), np.zeros((0,), dtype=np.int64)
-    if not isinstance(idx_to_term, dict) or not idx_to_term:
-        return np.zeros((0, int(height), int(width)), dtype=np.float32), np.zeros((0,), dtype=np.int64)
-    creation = np.asarray(creation_mask, dtype=np.float32) if creation_mask is not None else np.zeros((int(height), int(width)), dtype=np.float32)
-    creation_ok = int(creation.ndim) == 2 and float(np.max(creation)) > 1e-8
-    full_frame = np.ones((int(height), int(width)), dtype=np.float32)
-    rows: List[np.ndarray] = []
-    indices: List[int] = []
-    for cls_idx in positive_idx.tolist():
-        term_key = _norm_txt(str(idx_to_term.get(int(cls_idx), "")))
-        if not term_key:
-            continue
-        if term_key in _INGESTED_ITEM_MASK_TERMS:
-            if not creation_ok:
-                continue
-            rows.append(creation)
-            indices.append(int(cls_idx))
-            continue
-        if _is_dataset_label_term(term_key):
-            rows.append(full_frame)
-            indices.append(int(cls_idx))
-    if len(rows) <= 0:
-        return np.zeros((0, int(height), int(width)), dtype=np.float32), np.zeros((0,), dtype=np.int64)
-    return np.stack(rows, axis=0).astype(np.float32, copy=False), np.asarray(indices, dtype=np.int64)
-
-
-
-def build_label_mask_stack(
-    mixed_mask: Any,
-    label_vec: Any,
-    mask_stack_array: Optional[Any] = None,
-    mask_stack_indices: Optional[Any] = None,
-    *,
-    idx_to_term: Optional[Dict[int, str]] = None,
-    treat_mixed_mask_as_creation: bool = False,
+    elem_stack: Optional[Any] = None,
+    elem_term_lists: Optional[Sequence[Sequence[str]]] = None,
+    term_to_idx: Optional[Dict[str, int]] = None,
+    heuristic_stack: Optional[Any] = None,
+    heuristic_idx: Optional[Any] = None,
+    tonal_masks: Optional[Dict[str, Any]] = None,
+    extra_parts: Optional[Sequence[Tuple[Any, Any]]] = None,
     processing_device: Optional[Any] = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
+    """Unified per-row mask-building pipeline.
+
+    Combines explicit-element, heuristic, tonal, and any caller-supplied
+    ``extra_parts`` mask sources into ``(mask_stack, mask_indices)``.  Each
+    label receives only the spatial masks that directly correspond to it.
+    Compositing is deferred to batch-preparation time on the training device.
+    """
     y = np.asarray(label_vec, dtype=np.float32).reshape(-1)
-    mixed_arr = np.asarray(mixed_mask, dtype=np.float32)
-    h = int(mixed_arr.shape[-2]) if int(mixed_arr.ndim) >= 2 else 0
-    w = int(mixed_arr.shape[-1]) if int(mixed_arr.ndim) >= 2 else 0
-    if (int(h) <= 0 or int(w) <= 0) and mask_stack_array is not None:
-        stack_ref = np.asarray(mask_stack_array, dtype=np.float32)
-        if int(stack_ref.ndim) == 2:
-            h = int(stack_ref.shape[-2])
-            w = int(stack_ref.shape[-1])
-        elif int(stack_ref.ndim) == 3 and int(stack_ref.shape[0]) > 0:
-            h = int(stack_ref.shape[-2])
-            w = int(stack_ref.shape[-1])
-    creation_mask = (
-        _resolve_creation_mask(
-            mixed_mask,
-            height=int(h),
-            width=int(w),
-            mask_stack_array=mask_stack_array,
-            processing_device=processing_device,
-        )
-        if bool(treat_mixed_mask_as_creation)
-        else np.zeros((int(max(0, h)), int(max(0, w))), dtype=np.float32)
-    )
-    special_stack, special_idx = _build_special_label_mask_stack(
-        y,
-        idx_to_term=idx_to_term,
-        height=int(h),
-        width=int(w),
-        creation_mask=creation_mask,
-    )
+    h = int(max(1, height))
+    w = int(max(1, width))
+    if term_to_idx is None:
+        term_to_idx = {str(v).strip().lower(): int(k) for k, v in idx_to_term.items()}
+
     parts: List[Tuple[Any, Any]] = []
-    if mask_stack_array is not None and mask_stack_indices is not None:
-        parts.append((mask_stack_array, mask_stack_indices))
-    if int(special_stack.shape[0]) > 0 and int(special_idx.size) > 0:
-        parts.append((special_stack, special_idx))
-    if parts:
-        out_stack, out_idx = combine_label_mask_stacks(
-            y,
-            *parts,
-            height=int(h),
-            width=int(w),
-            processing_device=processing_device,
-            idx_to_term=idx_to_term,
+    has_elem = elem_stack is not None and elem_term_lists is not None
+
+    # -- 1. Explicit element stacks (pregestation synthetic geometry) --
+    if has_elem:
+        explicit_stack, explicit_idx = elem_stacks_to_label_stacks(
+            elem_stack=elem_stack,
+            elem_term_lists=elem_term_lists,
+            label_vec=y,
+            term_to_idx=term_to_idx,
         )
-        if int(out_stack.shape[0]) > 0 and int(out_idx.size) > 0:
-            return out_stack, out_idx
-    return np.zeros((0, int(max(0, h)), int(max(0, w))), dtype=np.float32), np.zeros((0,), dtype=np.int64)
+        parts.append((explicit_stack, explicit_idx))
+
+    # -- 4. Tonal masks --
+    if tonal_masks:
+        _tonal_slices: List[np.ndarray] = []
+        _tonal_idxs: List[int] = []
+        for _tterm, _tmask in tonal_masks.items():
+            _tidx = int(term_to_idx.get(str(_tterm).strip().lower(), -1))
+            if _tidx < 0:
+                continue
+            _tmask_np = np.asarray(_tmask, dtype=np.float32)
+            if int(_tmask_np.ndim) == 2 and int(_tmask_np.size) > 0:
+                _tonal_slices.append(_tmask_np)
+                _tonal_idxs.append(_tidx)
+        if _tonal_slices:
+            parts.append((
+                np.stack(_tonal_slices, axis=0).astype(np.float32, copy=False),
+                np.asarray(_tonal_idxs, dtype=np.int64),
+            ))
+
+    # -- 5. Heuristic stacks (from image analysis, pre-computed) --
+    if heuristic_stack is not None and heuristic_idx is not None:
+        parts.append((
+            np.asarray(heuristic_stack, dtype=np.float32),
+            np.asarray(heuristic_idx, dtype=np.int64),
+        ))
+
+    # -- 6. Extra caller-supplied (stack, idx) pairs --
+    if extra_parts:
+        for ep_stack, ep_idx in extra_parts:
+            if ep_stack is not None and ep_idx is not None:
+                parts.append((
+                    np.asarray(ep_stack, dtype=np.float32),
+                    np.asarray(ep_idx, dtype=np.int64),
+                ))
+
+    # -- 7. Combine --
+    merged_stack, merged_idx = combine_label_mask_stacks(
+        y,
+        *parts,
+        height=h,
+        width=w,
+        processing_device=processing_device,
+        strict=True,
+        idx_to_term=idx_to_term,
+    )
+
+    return (
+        np.asarray(merged_stack, dtype=np.float32),
+        np.asarray(merged_idx, dtype=np.int64),
+    )
 
 
 def build_term_mask_stack_from_image(
@@ -960,12 +925,11 @@ def augment_label_vec_with_detected_color_terms(
     image: Any,
     label_vec: Any,
     term_to_idx: Optional[Dict[str, int]] = None,
-    valid_mask: Optional[Any] = None,
 ) -> np.ndarray:
     y = np.asarray(label_vec, dtype=np.float32).reshape(-1).copy()
     if int(y.size) <= 0 or not isinstance(term_to_idx, dict) or not term_to_idx:
         return y
-    detected_terms = detect_semantic_color_terms(image=image, mask=valid_mask)
+    detected_terms = detect_semantic_color_terms(image=image)
     for term in normalize_vocab_terms([str(x) for x in list(detected_terms)]):
         ti = int(term_to_idx.get(_norm_txt(term), -1))
         if 0 <= int(ti) < int(y.size):
@@ -986,10 +950,9 @@ def assemble_semantic_mask_layers(
     label_vec: Any,
     idx_to_term: Optional[Dict[int, str]] = None,
     term_to_idx: Optional[Dict[str, int]] = None,
-    original_mixed_mask: Optional[Any] = None,
     original_parts: Optional[Sequence[Tuple[Any, Any]]] = None,
     deformation_term_masks: Optional[Dict[str, Any]] = None,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     chw = _image_to_chw01(image)
     h = int(chw.shape[1])
     w = int(chw.shape[2])
@@ -998,37 +961,6 @@ def assemble_semantic_mask_layers(
     parts: List[Tuple[Any, Any]] = []
     for raw_stack, raw_idx in (list(original_parts) if original_parts is not None else []):
         parts.append((raw_stack, raw_idx))
-
-    has_original_parts = any(
-        raw_stack is not None and raw_idx is not None and int(np.asarray(raw_idx).size) > 0
-        for raw_stack, raw_idx in parts
-    )
-    creation_seed_mask = np.asarray(original_mixed_mask, dtype=np.float32) if original_mixed_mask is not None else np.zeros((int(h), int(w)), dtype=np.float32)
-    if float(np.max(np.asarray(creation_seed_mask, dtype=np.float32))) <= 1e-8 and has_original_parts:
-        stacked_parts: List[np.ndarray] = []
-        for raw_stack, _raw_idx in parts:
-            part_arr = np.asarray(raw_stack, dtype=np.float32)
-            if int(part_arr.ndim) == 2:
-                part_arr = part_arr[None, ...]
-            if int(part_arr.ndim) == 3 and int(part_arr.shape[0]) > 0:
-                stacked_parts.append(
-                    _normalize_stack_row_batch(
-                        part_arr,
-                        height=int(h),
-                        width=int(w),
-                    )
-                )
-        if stacked_parts:
-            creation_seed_mask = _composite_mask_stack(np.concatenate(stacked_parts, axis=0))
-    if original_mixed_mask is not None or float(np.max(np.asarray(creation_seed_mask, dtype=np.float32))) > 1e-8:
-        original_stack, original_idx = build_label_mask_stack(
-            mixed_mask=np.asarray(creation_seed_mask, dtype=np.float32),
-            label_vec=y,
-            idx_to_term=idx_to_term,
-            treat_mixed_mask_as_creation=True,
-        )
-        if int(original_stack.shape[0]) > 0 and int(original_idx.size) > 0:
-            parts.append((original_stack, original_idx))
 
     if isinstance(deformation_term_masks, dict) and deformation_term_masks and isinstance(term_to_idx, dict):
         for term in normalize_vocab_terms([str(x) for x in list(deformation_term_masks.keys())]):
@@ -1045,28 +977,10 @@ def assemble_semantic_mask_layers(
         if int(deformation_stack.shape[0]) > 0 and int(deformation_idx.size) > 0:
             parts.append((deformation_stack, deformation_idx))
 
-    pre_detect_stack, pre_detect_idx = combine_label_mask_stacks(
-        y,
-        *parts,
-        height=int(h),
-        width=int(w),
-        fallback_creation_mask=None,
-    ) if len(parts) > 0 else (
-        np.zeros((0, int(h), int(w)), dtype=np.float32),
-        np.zeros((0,), dtype=np.int64),
-    )
-    if int(pre_detect_stack.shape[0]) > 0:
-        _nds_keep = [i for i in range(min(int(pre_detect_stack.shape[0]), int(pre_detect_idx.size))) if not _is_dataset_label_term(str((idx_to_term or {}).get(int(pre_detect_idx[i]), "")))]
-        detect_mask = _composite_mask_stack(pre_detect_stack[np.asarray(_nds_keep, dtype=np.int64)]) if _nds_keep else (
-            _normalize_stack_row(original_mixed_mask, height=int(h), width=int(w)) if original_mixed_mask is not None else None
-        )
-    else:
-        detect_mask = _normalize_stack_row(original_mixed_mask, height=int(h), width=int(w)) if original_mixed_mask is not None else None
     y = augment_label_vec_with_detected_color_terms(
         image=chw,
         label_vec=y,
         term_to_idx=term_to_idx,
-        valid_mask=detect_mask,
     )
     detected_stack, detected_idx = build_term_mask_stack_from_image(
         image=chw,
@@ -1089,14 +1003,7 @@ def assemble_semantic_mask_layers(
         np.zeros((0, int(h), int(w)), dtype=np.float32),
         np.zeros((0,), dtype=np.int64),
     )
-    if int(final_stack.shape[0]) > 0:
-        _nds_keep = [i for i in range(min(int(final_stack.shape[0]), int(final_idx.size))) if not _is_dataset_label_term(str((idx_to_term or {}).get(int(final_idx[i]), "")))]
-        mixed_mask = _composite_mask_stack(final_stack[np.asarray(_nds_keep, dtype=np.int64)]) if _nds_keep else (
-            _normalize_stack_row(original_mixed_mask, height=int(h), width=int(w)) if original_mixed_mask is not None else np.zeros((int(h), int(w)), dtype=np.float32)
-        )
-    else:
-        mixed_mask = _normalize_stack_row(original_mixed_mask, height=int(h), width=int(w)) if original_mixed_mask is not None else np.zeros((int(h), int(w)), dtype=np.float32)
-    return y, np.asarray(mixed_mask, dtype=np.float32), np.asarray(final_stack, dtype=np.float32), np.asarray(final_idx, dtype=np.int64)
+    return y, np.asarray(final_stack, dtype=np.float32), np.asarray(final_idx, dtype=np.int64)
 
 
 def semantic_mask_stack_collate(batch: Sequence[Any]) -> Any:
@@ -1106,28 +1013,25 @@ def semantic_mask_stack_collate(batch: Sequence[Any]) -> Any:
     if not isinstance(first, (tuple, list)) or int(len(first)) < 5:
         return default_collate(batch)
     xs: List[torch.Tensor] = []
-    ys: List[torch.Tensor] = []
     ms: List[torch.Tensor] = []
     mask_stacks: List[torch.Tensor] = []
     mask_indices: List[torch.Tensor] = []
     terms_rows: List[List[str]] = []
     for sample in batch:
         if not isinstance(sample, (tuple, list)) or int(len(sample)) < 5:
-            raise RuntimeError("semantic_mask_stack_collate requires 5+-tuple samples.")
+            raise RuntimeError("semantic_mask_stack_collate requires 5-tuple samples: (x, mask, stack, idx, terms).")
         xs.append(sample[0])
-        ys.append(sample[1])
-        ms.append(sample[2])
-        stack_t = sample[3] if torch.is_tensor(sample[3]) else torch.as_tensor(sample[3])
-        idx_t = sample[4] if torch.is_tensor(sample[4]) else torch.as_tensor(sample[4], dtype=torch.long)
+        ms.append(sample[1])
+        stack_t = sample[2] if torch.is_tensor(sample[2]) else torch.as_tensor(sample[2])
+        idx_t = sample[3] if torch.is_tensor(sample[3]) else torch.as_tensor(sample[3], dtype=torch.long)
         mask_stacks.append(stack_t)
         mask_indices.append(idx_t.to(dtype=torch.long))
-        if int(len(sample)) >= 6 and isinstance(sample[5], (list, tuple)):
-            terms_rows.append(normalize_vocab_terms([str(x) for x in list(sample[5])]))
+        if int(len(sample)) >= 5 and isinstance(sample[4], (list, tuple)):
+            terms_rows.append(normalize_vocab_terms([str(x) for x in list(sample[4])]))
         else:
             terms_rows.append([])
     return {
         "x": torch.stack(xs, dim=0),
-        "y": torch.stack(ys, dim=0),
         "mask": torch.stack(ms, dim=0),
         "mask_stacks": mask_stacks,
         "mask_indices": mask_indices,
@@ -1292,15 +1196,8 @@ def _semantic_color_mask_from_score_batch_torch(
     n = int(arr.shape[0])
     if int(n) <= 0 or int(arr.numel()) <= 0:
         return arr[0] if bool(squeeze) else arr
-    flat = arr.view(int(n), -1)
-    try:
-        thr = torch.quantile(flat, q=0.82, dim=1)
-    except Exception:
-        thr = torch.as_tensor(np.percentile(flat.detach().cpu().numpy(), 82, axis=1), dtype=torch.float32, device=resolved)
-    thr = torch.clamp(thr * 0.75, min=0.20)
-    exact = (arr >= thr[:, None, None]).to(dtype=torch.float32) * arr
-    vmax = torch.amax(exact.view(int(n), -1), dim=1, keepdim=True).unsqueeze(-1)
-    out = torch.where(vmax > 1e-8, exact / torch.where(vmax > 1e-8, vmax, torch.ones_like(vmax)), torch.zeros_like(exact))
+    vmax = torch.amax(arr.view(int(n), -1), dim=1, keepdim=True).unsqueeze(-1)
+    out = torch.where(vmax > 1e-8, arr / torch.where(vmax > 1e-8, vmax, torch.ones_like(vmax)), torch.zeros_like(arr))
     return out[0] if bool(squeeze) else out
 
 
@@ -1376,9 +1273,6 @@ def _semantic_color_score_maps_batch(chw_batch: Any) -> Dict[str, np.ndarray]:
 
 def detect_semantic_color_terms(
     image: Any,
-    mask: Optional[Any] = None,
-    coverage_threshold: float = 0.06,
-    dominance_threshold: float = 0.22,
 ) -> List[str]:
     try:
         chw = _image_to_chw01(image)
@@ -1387,28 +1281,12 @@ def detect_semantic_color_terms(
     maps = _semantic_color_score_maps(chw)
     if len(maps) <= 0:
         return []
-    valid = None
-    if mask is not None:
-        try:
-            valid = _normalize_mask_array(mask, height=int(chw.shape[1]), width=int(chw.shape[2]))
-        except Exception:
-            valid = None
-    if valid is None or float(np.mean(valid)) <= 0.01:
-        valid = np.ones((int(chw.shape[1]), int(chw.shape[2])), dtype=np.float32)
-    valid_mask = np.asarray(valid, dtype=np.float32) >= 0.15
-    valid_count = int(np.sum(valid_mask))
-    if valid_count <= 0:
-        valid_mask = np.ones((int(chw.shape[1]), int(chw.shape[2])), dtype=bool)
-        valid_count = int(np.sum(valid_mask))
-
     out: List[str] = []
     for term in ["red", "orange", "green", "blue", "yellow", "cyan", "magenta", "brown", "black", "white", "gray", "neutral", "edge"]:
         score = np.asarray(maps.get(term), dtype=np.float32)
         if int(score.size) <= 0:
             continue
-        frac = float(np.mean(score[valid_mask] >= float(dominance_threshold))) if int(valid_count) > 0 else 0.0
-        mean_score = float(np.mean(score[valid_mask])) if int(valid_count) > 0 else 0.0
-        if frac >= float(coverage_threshold) or mean_score >= float(max(0.10, dominance_threshold * 0.72)):
+        if float(np.max(score)) > 1e-8:
             out.append(str(term))
     return normalize_vocab_terms(out)
 
@@ -1431,10 +1309,8 @@ def _semantic_color_mask_from_score(color_score: Any) -> np.ndarray:
     score = np.asarray(color_score, dtype=np.float32)
     if int(score.ndim) != 2 or int(score.size) <= 0:
         return np.zeros((0, 0), dtype=np.float32)
-    thr = max(0.20, float(np.percentile(score.reshape(-1), 82)) * 0.75)
-    exact = (score >= float(thr)).astype(np.float32, copy=False) * score
-    vmax = float(np.max(exact))
-    return (exact / vmax).astype(np.float32) if vmax > 1e-8 else np.zeros_like(exact, dtype=np.float32)
+    vmax = float(np.max(score))
+    return (score / vmax).astype(np.float32) if vmax > 1e-8 else np.zeros_like(score, dtype=np.float32)
 
 
 def _semantic_color_mask_from_score_batch(scores: Any) -> np.ndarray:
@@ -1452,81 +1328,9 @@ def _semantic_color_mask_from_score_batch(scores: Any) -> np.ndarray:
     n = int(arr.shape[0])
     if n == 0 or int(arr.size) == 0:
         return arr[0] if squeeze else arr
-    flat = arr.reshape(n, -1)  # [N, H*W]
-    # percentile per image — [N]
-    thr = np.percentile(flat, 82, axis=1).astype(np.float32) * 0.75
-    thr = np.maximum(0.20, thr)  # [N]
-    # broadcast threshold over [N, H, W]
-    exact = (arr >= thr[:, None, None]) * arr  # [N, H, W]
-    vmax = np.max(exact.reshape(n, -1), axis=1, keepdims=True).reshape(n, 1, 1)
-    out = np.where(vmax > 1e-8, exact / np.where(vmax > 1e-8, vmax, 1.0), 0.0).astype(np.float32)
+    vmax = np.max(arr.reshape(n, -1), axis=1, keepdims=True).reshape(n, 1, 1)
+    out = np.where(vmax > 1e-8, arr / np.where(vmax > 1e-8, vmax, 1.0), 0.0).astype(np.float32)
     return np.asarray(out[0], dtype=np.float32) if squeeze else out
-
-
-def infer_semantic_support_masks(
-    images: Any,
-    terms_batch: Optional[Sequence[Optional[Sequence[str]]]] = None,
-    processing_device: Optional[Any] = None,
-) -> np.ndarray:
-    bchw = _image_batch_to_bchw01(images)
-    bsz = int(bchw.shape[0]) if int(bchw.ndim) == 4 else 0
-    h = int(bchw.shape[2]) if int(bchw.ndim) == 4 else 0
-    w = int(bchw.shape[3]) if int(bchw.ndim) == 4 else 0
-    if int(bsz) <= 0 or int(h) <= 0 or int(w) <= 0:
-        return np.zeros((int(max(0, bsz)), int(max(0, h)), int(max(0, w))), dtype=np.float32)
-    term_rows = _normalize_semantic_terms_batch(terms_batch, batch_size=int(bsz))
-    resolved = _resolve_processing_device(processing_device)
-    if resolved is not None:
-        color_maps_t = _semantic_color_score_maps_batch_torch(bchw, device=resolved)
-        score_acc_t = torch.zeros((int(bsz), int(h), int(w)), dtype=torch.float32, device=resolved)
-        _color_term_set = set(_SEMANTIC_COLOR_TERMS)
-        for term_key, term_scores_t in color_maps_t.items():
-            if term_key not in _color_term_set:
-                continue
-            wants = torch.as_tensor(
-                [term_key in {_norm_txt(t) for t in (row or []) if str(t).strip()} for row in term_rows],
-                dtype=torch.bool,
-                device=resolved,
-            )
-            if not bool(torch.any(wants).item()):
-                continue
-            score_acc_t[wants] = torch.maximum(score_acc_t[wants], term_scores_t[wants])
-        has_signal = torch.amax(score_acc_t.view(int(bsz), -1), dim=1) > 1e-8
-        out_t = torch.zeros((int(bsz), int(h), int(w)), dtype=torch.float32, device=resolved)
-        if bool(torch.any(has_signal).item()):
-            out_t[has_signal] = _semantic_color_mask_from_score_batch_torch(score_acc_t[has_signal], device=resolved)
-        return np.asarray(out_t.detach().cpu().numpy(), dtype=np.float32)
-    color_maps = _semantic_color_score_maps_batch(bchw)
-    # Accumulate max color score per image across relevant terms — no per-image loop.
-    # For each color term present in color_maps, find which images request it, then
-    # max-accumulate that term's [N, H, W] score map into those image slots at once.
-    score_acc = np.zeros((int(bsz), int(h), int(w)), dtype=np.float32)
-    _color_term_set = set(_SEMANTIC_COLOR_TERMS)
-    for term_key, term_scores in color_maps.items():
-        if term_key not in _color_term_set:
-            continue
-        # which images mention this color term — build boolean mask [N]
-        wants = np.array(
-            [term_key in {_norm_txt(t) for t in (row or []) if str(t).strip()} for row in term_rows],
-            dtype=bool,
-        )
-        if not np.any(wants):
-            continue
-        # max-accumulate across the entire [N, H, W] slice in one numpy op
-        score_acc[wants] = np.maximum(score_acc[wants], np.asarray(term_scores, dtype=np.float32)[wants])
-    # Apply batch threshold+normalise only to images that have any signal
-    has_signal = np.max(score_acc.reshape(int(bsz), -1), axis=1) > 1e-8  # [N]
-    out = np.zeros((int(bsz), int(h), int(w)), dtype=np.float32)
-    if np.any(has_signal):
-        out[has_signal] = _semantic_color_mask_from_score_batch(score_acc[has_signal])
-    return out.astype(np.float32, copy=False)
-
-
-def infer_semantic_support_mask(image: Any, terms: Optional[Sequence[str]] = None) -> np.ndarray:
-    return np.asarray(
-        infer_semantic_support_masks(images=np.asarray(image, dtype=np.float32)[None, ...], terms_batch=[terms or []])[0],
-        dtype=np.float32,
-    )
 
 
 def build_term_mask_stacks_from_images(
@@ -1996,797 +1800,6 @@ def augment_bootstrap_chw01(
     return out
 
 
-def _cache_encode_image_u8(img: np.ndarray) -> np.ndarray:
-    arr = np.clip(np.asarray(img, dtype=np.float32), 0.0, 1.0)
-    return np.round(arr * 255.0).astype(np.uint8, copy=False)
-
-
-def _cache_decode_image_u8(img: np.ndarray) -> np.ndarray:
-    return (np.asarray(img, dtype=np.float32) / 255.0).astype(np.float32, copy=False)
-
-
-def _cache_encode_mask_f16(mask: np.ndarray) -> np.ndarray:
-    return np.clip(np.asarray(mask, dtype=np.float32), 0.0, 1.0).astype(np.float16, copy=False)
-
-
-def _cache_decode_mask_f16(mask: np.ndarray) -> np.ndarray:
-    return np.asarray(mask, dtype=np.float32)
-
-
-def _cache_encode_target_f16(target: np.ndarray) -> np.ndarray:
-    return np.asarray(target, dtype=np.float16)
-
-
-def _cache_decode_target_f16(target: np.ndarray) -> np.ndarray:
-    return np.asarray(target, dtype=np.float32)
-
-
-def _estimate_target_positive_count(targets: Sequence[np.ndarray], max_rows: int = 16) -> float:
-    if len(targets) <= 0:
-        return 1.0
-    counts: List[int] = []
-    for row in list(targets)[: max(1, int(max_rows))]:
-        arr = np.asarray(row, dtype=np.float32).reshape(-1)
-        counts.append(max(1, int(np.count_nonzero(arr >= 0.5))))
-    if len(counts) <= 0:
-        return 1.0
-    return float(max(1.0, float(np.mean(np.asarray(counts, dtype=np.float32)))))
-
-
-def _update_signature_with_array(hasher: "hashlib._Hash", arr: np.ndarray) -> None:
-    arr_np = np.asarray(arr, dtype=np.float32)
-    hasher.update(np.asarray(arr_np.shape, dtype=np.int64).tobytes())
-    hasher.update(_cache_encode_image_u8(arr_np).tobytes())
-
-
-def _bootstrap_dataset_signature(
-    images: Sequence[np.ndarray],
-    targets: Sequence[np.ndarray],
-    total_rows: int,
-    seed: int,
-    augment: bool,
-    augment_apply_terms: bool,
-    return_masks: bool,
-    return_mask_stack: bool,
-    dataset_name: str,
-) -> str:
-    hasher = hashlib.sha256()
-    payload = {
-        "dataset_name": str(dataset_name),
-        "base_rows": int(min(len(images), len(targets))),
-        "total_rows": int(total_rows),
-        "seed": int(seed),
-        "augment": bool(augment),
-        "augment_apply_terms": bool(augment_apply_terms),
-        "return_masks": bool(return_masks),
-        "return_mask_stack": bool(return_mask_stack),
-    }
-    hasher.update(json.dumps(payload, sort_keys=True, ensure_ascii=True).encode("utf-8"))
-    n = min(int(len(images)), int(len(targets)))
-    for i in range(int(n)):
-        _update_signature_with_array(hasher, np.asarray(images[int(i)], dtype=np.float32))
-        tgt = np.asarray(targets[int(i)], dtype=np.float32).reshape(-1)
-        hasher.update(np.asarray(tgt.shape, dtype=np.int64).tobytes())
-        hasher.update(_cache_encode_target_f16(tgt).tobytes())
-    return str(hasher.hexdigest())
-
-
-class BootstrapDynamicDataset(Dataset):
-    def __init__(
-        self,
-        images: Sequence[np.ndarray],
-        targets: Sequence[np.ndarray],
-        total_rows: int,
-        seed: int,
-        augment: bool,
-        expected_target_dim: int = 0,
-        semantic_term_to_idx: Optional[Dict[str, int]] = None,
-        augment_apply_terms: bool = True,
-        return_masks: bool = False,
-        return_mask_stack: bool = False,
-        dataset_name: str = "bootstrap_dynamic",
-        persistent_cache_dir: str = "",
-        persistent_cache_max_rows: int = 0,
-        persistent_cache_rebuild: bool = False,
-        persistent_cache_max_bytes: int = 0,
-        persistent_cache_overflow_strategy: str = "loop",
-        persistent_cache_slot_lifespan: int = 0,
-        base_masks: Optional[Sequence[np.ndarray]] = None,
-        progress_control: Any = None,
-    ):
-        n = min(int(len(images)), int(len(targets)))
-        if n <= 0:
-            raise RuntimeError(f"{str(dataset_name)} requires non-empty images/targets.")
-        self.images = [np.asarray(images[i], dtype=np.float32) for i in range(int(n))]
-        self.targets = [np.asarray(targets[i], dtype=np.float32).reshape(-1) for i in range(int(n))]
-        self.base_rows = int(n)
-        self.total_rows = max(int(self.base_rows), int(total_rows))
-        self.seed = int(seed)
-        self.augment = bool(augment)
-        self.return_masks = bool(return_masks)
-        self.return_mask_stack = bool(return_mask_stack)
-        self.use_semantic_mask_stack_collate = bool(self.return_mask_stack)
-        y_sizes = sorted({int(v.size) for v in self.targets})
-        if len(y_sizes) != 1:
-            raise RuntimeError(f"{str(dataset_name)} target width mismatch: {y_sizes}")
-        self.target_dim = int(y_sizes[0])
-        if int(expected_target_dim) > 0 and int(self.target_dim) != int(expected_target_dim):
-            raise RuntimeError(
-                f"{str(dataset_name)} target width mismatch: got={int(self.target_dim)} expected={int(expected_target_dim)}"
-            )
-        self.semantic_term_to_idx = {
-            re.sub(r"\s+", " ", str(k)).strip().lower(): int(v)
-            for k, v in (semantic_term_to_idx.items() if isinstance(semantic_term_to_idx, dict) else [])
-            if str(k).strip()
-        }
-        self.idx_to_term = {
-            int(v): re.sub(r"\s+", " ", str(k)).strip()
-            for k, v in self.semantic_term_to_idx.items()
-            if 0 <= int(v) < int(self.target_dim)
-        }
-        self.augment_apply_terms = bool(augment_apply_terms)
-        self.base_masks: List[Optional[np.ndarray]] = [None] * int(self.base_rows)
-        if base_masks is not None:
-            for _bm_i in range(min(int(self.base_rows), int(len(base_masks)))):
-                if base_masks[_bm_i] is not None:
-                    self.base_masks[_bm_i] = np.asarray(base_masks[_bm_i], dtype=np.float32)
-        self.base_mask_stacks: List[Optional[np.ndarray]] = [None] * int(self.base_rows)
-        self.base_mask_stack_indices: List[Optional[np.ndarray]] = [None] * int(self.base_rows)
-        self.dataset_name = str(dataset_name)
-        self.progress_control = progress_control
-        self.persistent_cache_dir = str(persistent_cache_dir).strip()
-        self.persistent_cache_max_rows = int(persistent_cache_max_rows)
-        self.persistent_cache_rebuild = bool(persistent_cache_rebuild)
-        self.persistent_cache_max_bytes = max(0, int(persistent_cache_max_bytes))
-        strategy_key = re.sub(r"\s+", "_", str(persistent_cache_overflow_strategy)).strip().lower()
-        self.persistent_cache_overflow_strategy = strategy_key if strategy_key in ("loop", "evict") else "loop"
-        self.persistent_cache_slot_lifespan = max(0, int(persistent_cache_slot_lifespan))
-        self.persistent_cache_signature = _bootstrap_dataset_signature(
-            images=self.images,
-            targets=self.targets,
-            total_rows=int(self.total_rows),
-            seed=int(self.seed),
-            augment=bool(self.augment),
-            augment_apply_terms=bool(self.augment_apply_terms),
-            return_masks=bool(self.return_masks),
-            return_mask_stack=bool(self.return_mask_stack),
-            dataset_name=str(self.dataset_name),
-        )
-        self.cached_rows = 0
-        # In-memory eager cache: populated at construction for non-augmented datasets
-        # so that __getitem__ is a pure list lookup with zero recomputation per epoch.
-        self._eager_row_cache: List[Optional[tuple]] = [None] * int(self.total_rows)
-        self._eager_row_cache_ready = False
-        self._cache_manifest_path = ""
-        self._cache_images_path = ""
-        self._cache_targets_path = ""
-        self._cache_masks_path = ""
-        self._cache_mask_stacks_path = ""
-        self._cache_mask_indices_path = ""
-        self._cache_mask_offsets_path = ""
-        self._cache_images_mm = None
-        self._cache_targets_mm = None
-        self._cache_masks_mm = None
-        self._cache_mask_stacks_mm = None
-        self._cache_mask_indices_mm = None
-        self._cache_mask_offsets_mm = None
-        self.persistent_cache_info: Dict[str, Any] = {
-            "enabled": False,
-            "cache_dir": str(self.persistent_cache_dir),
-            "signature": str(self.persistent_cache_signature),
-            "desired_rows": 0,
-            "cached_rows": 0,
-            "cache_hit": False,
-            "rebuilt": False,
-            "generated_rows": 0,
-            "max_bytes": int(self.persistent_cache_max_bytes),
-            "overflow_strategy": str(self.persistent_cache_overflow_strategy),
-            "estimated_bytes": 0,
-            "loop_slots": 0,
-            "loop_slot": -1,
-            "slot_lifespan": int(self.persistent_cache_slot_lifespan),
-        }
-        self._initialize_persistent_cache()
-        # For non-augmented datasets with no disk cache: pre-materialise every row
-        # once now so each subsequent __getitem__ is a zero-cost list lookup.
-        if not bool(self.augment) and int(self.cached_rows) < int(self.total_rows):
-            for _ei in interruptible_tqdm(
-                range(int(self.total_rows)),
-                desc=f"[{self.dataset_name}] materializing",
-                unit="row",
-                leave=False,
-                dynamic_ncols=True,
-                control=self.progress_control,
-            ):
-                self._eager_row_cache[_ei] = self._materialize_numpy_row(_ei)
-            self._eager_row_cache_ready = True
-
-    def __getstate__(self):
-        state = dict(self.__dict__)
-        state["_cache_images_mm"] = None
-        state["_cache_targets_mm"] = None
-        state["_cache_masks_mm"] = None
-        state["_cache_mask_stacks_mm"] = None
-        state["_cache_mask_indices_mm"] = None
-        state["_cache_mask_offsets_mm"] = None
-        # Don't ship the eager cache across process boundaries — workers re-derive
-        # on demand via _materialize_numpy_row (num_workers=0 on Windows/CUDA anyway).
-        state["_eager_row_cache"] = [None] * int(len(state.get("_eager_row_cache", [])))
-        state["_eager_row_cache_ready"] = False
-        return state
-
-    def __setstate__(self, state):
-        self.__dict__.update(state)
-        self._cache_images_mm = None
-        self._cache_targets_mm = None
-        self._cache_masks_mm = None
-        self._cache_mask_stacks_mm = None
-        self._cache_mask_indices_mm = None
-        self._cache_mask_offsets_mm = None
-        self._eager_row_cache_ready = False
-
-    def _desired_cached_rows(self) -> int:
-        if not self.persistent_cache_dir:
-            return 0
-        cap = int(self.persistent_cache_max_rows)
-        if int(cap) <= 0:
-            cap = int(self.total_rows)
-        return max(0, min(int(self.total_rows), int(cap)))
-
-    def _estimated_persistent_cache_bytes(self, desired_rows: int) -> int:
-        rows = max(0, int(desired_rows))
-        if rows <= 0 or int(len(self.images)) <= 0:
-            return 0
-        sample_img = np.asarray(self.images[0], dtype=np.float32)
-        if int(sample_img.ndim) != 3:
-            raise RuntimeError(f"{str(self.dataset_name)} cache sizing requires CHW image rows; got {tuple(sample_img.shape)}")
-        img_bytes = int(rows) * int(sample_img.size)
-        tgt_bytes = int(rows) * int(self.target_dim) * int(np.dtype(np.float16).itemsize)
-        mask_bytes = 0
-        if bool(self.return_masks):
-            mask_bytes = int(rows) * int(sample_img.shape[1]) * int(sample_img.shape[2])
-        stack_bytes = 0
-        if bool(self.return_mask_stack):
-            avg_positive = _estimate_target_positive_count(self.targets)
-            stack_rows = int(rows * max(1.0, float(avg_positive)))
-            stack_bytes = int(stack_rows) * int(sample_img.shape[1]) * int(sample_img.shape[2])
-            stack_bytes += int(stack_rows) * int(np.dtype(np.int64).itemsize)
-            stack_bytes += int(rows + 1) * int(np.dtype(np.int64).itemsize)
-        return int(img_bytes + tgt_bytes + mask_bytes + stack_bytes + 4096)
-
-    def _ensure_persistent_cache_open(self) -> None:
-        if int(self.cached_rows) <= 0:
-            return
-        if self._cache_images_mm is None and str(self._cache_images_path).strip():
-            self._cache_images_mm = np.load(str(self._cache_images_path), mmap_mode="r")
-        if self._cache_targets_mm is None and str(self._cache_targets_path).strip():
-            self._cache_targets_mm = np.load(str(self._cache_targets_path), mmap_mode="r")
-        if bool(self.return_masks) and self._cache_masks_mm is None and str(self._cache_masks_path).strip():
-            self._cache_masks_mm = np.load(str(self._cache_masks_path), mmap_mode="r")
-        if bool(self.return_mask_stack) and self._cache_mask_stacks_mm is None and str(self._cache_mask_stacks_path).strip():
-            self._cache_mask_stacks_mm = np.load(str(self._cache_mask_stacks_path), mmap_mode="r")
-        if bool(self.return_mask_stack) and self._cache_mask_indices_mm is None and str(self._cache_mask_indices_path).strip():
-            self._cache_mask_indices_mm = np.load(str(self._cache_mask_indices_path), mmap_mode="r")
-        if bool(self.return_mask_stack) and self._cache_mask_offsets_mm is None and str(self._cache_mask_offsets_path).strip():
-            self._cache_mask_offsets_mm = np.load(str(self._cache_mask_offsets_path), mmap_mode="r")
-
-    def _load_existing_persistent_cache(self, manifest_path: Path, desired_rows: int) -> int:
-        if not manifest_path.exists() or bool(self.persistent_cache_rebuild):
-            return 0
-        images_path = manifest_path.with_name("images.npy")
-        targets_path = manifest_path.with_name("targets.npy")
-        masks_path = manifest_path.with_name("masks.npy")
-        mask_stacks_path = manifest_path.with_name("mask_stacks.npy")
-        mask_indices_path = manifest_path.with_name("mask_indices.npy")
-        mask_offsets_path = manifest_path.with_name("mask_offsets.npy")
-        if not images_path.exists() or not targets_path.exists():
-            return 0
-        try:
-            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        except Exception:
-            return 0
-        manifest_version = int(manifest.get("version", -1))
-        if int(manifest_version) not in (3,):
-            return 0
-        if str(manifest.get("signature", "")) != str(self.persistent_cache_signature):
-            return 0
-        if int(manifest.get("target_dim", -1)) != int(self.target_dim):
-            return 0
-        if bool(self.return_mask_stack) and int(manifest_version) < 3:
-            return 0
-        cached_rows = int(manifest.get("cached_rows", 0))
-        if int(cached_rows) <= 0:
-            return 0
-        try:
-            mm_images = np.load(str(images_path), mmap_mode="r")
-            mm_targets = np.load(str(targets_path), mmap_mode="r")
-            if int(getattr(mm_images, "ndim", 0)) != 4 or int(getattr(mm_targets, "ndim", 0)) != 2:
-                return 0
-            usable = min(int(cached_rows), int(mm_images.shape[0]), int(mm_targets.shape[0]), int(desired_rows))
-            if int(usable) <= 0:
-                return 0
-            if bool(self.return_masks):
-                if not masks_path.exists():
-                    return 0
-                mm_masks = np.load(str(masks_path), mmap_mode="r")
-                if int(getattr(mm_masks, "ndim", 0)) != 3:
-                    return 0
-                usable = min(int(usable), int(mm_masks.shape[0]))
-                self._cache_masks_mm = mm_masks
-                self._cache_masks_path = str(masks_path)
-            if bool(self.return_mask_stack):
-                if not mask_stacks_path.exists() or not mask_indices_path.exists() or not mask_offsets_path.exists():
-                    return 0
-                mm_mask_stacks = np.load(str(mask_stacks_path), mmap_mode="r")
-                mm_mask_indices = np.load(str(mask_indices_path), mmap_mode="r")
-                mm_mask_offsets = np.load(str(mask_offsets_path), mmap_mode="r")
-                if int(getattr(mm_mask_stacks, "ndim", 0)) != 3 or int(getattr(mm_mask_indices, "ndim", 0)) != 1 or int(getattr(mm_mask_offsets, "ndim", 0)) != 1:
-                    return 0
-                if int(mm_mask_offsets.shape[0]) < int(usable + 1):
-                    return 0
-                self._cache_mask_stacks_mm = mm_mask_stacks
-                self._cache_mask_indices_mm = mm_mask_indices
-                self._cache_mask_offsets_mm = mm_mask_offsets
-                self._cache_mask_stacks_path = str(mask_stacks_path)
-                self._cache_mask_indices_path = str(mask_indices_path)
-                self._cache_mask_offsets_path = str(mask_offsets_path)
-            self._cache_images_mm = mm_images
-            self._cache_targets_mm = mm_targets
-            self._cache_images_path = str(images_path)
-            self._cache_targets_path = str(targets_path)
-            self._cache_manifest_path = str(manifest_path)
-            self.cached_rows = int(usable)
-            self.persistent_cache_info.update(
-                {
-                    "enabled": True,
-                    "desired_rows": int(desired_rows),
-                    "cached_rows": int(usable),
-                    "cache_hit": bool(int(usable) >= int(desired_rows)),
-                    "rebuilt": False,
-                    "generated_rows": 0,
-                    "manifest": str(manifest_path),
-                }
-            )
-            return int(usable)
-        except Exception:
-            self._cache_images_mm = None
-            self._cache_targets_mm = None
-            self._cache_masks_mm = None
-            return 0
-
-    def _write_persistent_cache(self, cache_dir: Path, desired_rows: int) -> int:
-        try:
-            _reset_cache_dir(cache_dir)
-        except Exception as exc:
-            raise_if_filesystem_space_emergency(
-                self.progress_control,
-                exc,
-                note=f"{self.dataset_name} persistent cache write",
-                write_path=cache_dir,
-            )
-            raise
-        self._cache_images_mm = None
-        self._cache_targets_mm = None
-        self._cache_masks_mm = None
-        self._cache_mask_stacks_mm = None
-        self._cache_mask_indices_mm = None
-        self._cache_mask_offsets_mm = None
-        images_rows: List[np.ndarray] = []
-        target_rows: List[np.ndarray] = []
-        mask_rows: List[np.ndarray] = []
-        mask_stack_rows: List[np.ndarray] = []
-        mask_index_rows: List[np.ndarray] = []
-        mask_offsets: List[int] = [0]
-        for idx in interruptible_tqdm(
-            range(int(desired_rows)),
-            desc=f"[{self.dataset_name}] building cache",
-            unit="row",
-            leave=False,
-            dynamic_ncols=True,
-            control=self.progress_control,
-        ):
-            img_np, tgt_np, mask_np, mask_stack_np, mask_idx_np = self._materialize_numpy_row(int(idx))
-            images_rows.append(_cache_encode_image_u8(img_np))
-            target_rows.append(_cache_encode_target_f16(tgt_np))
-            if bool(self.return_masks):
-                mask_rows.append(_cache_encode_mask_f16(mask_np))
-            if bool(self.return_mask_stack):
-                stack_f16 = _cache_encode_mask_f16(mask_stack_np) if int(np.asarray(mask_stack_np).size) > 0 else np.zeros((0, int(img_np.shape[1]), int(img_np.shape[2])), dtype=np.float16)
-                idx_np = np.asarray(mask_idx_np, dtype=np.int64).reshape(-1)
-                if int(stack_f16.shape[0]) != int(idx_np.size):
-                    raise RuntimeError(f"{str(self.dataset_name)} mask stack cache mismatch: stack_rows={int(stack_f16.shape[0])} idx={int(idx_np.size)}")
-                mask_stack_rows.append(np.asarray(stack_f16, dtype=np.float16))
-                mask_index_rows.append(idx_np)
-                mask_offsets.append(int(mask_offsets[-1] + int(stack_f16.shape[0])))
-        if int(len(images_rows)) <= 0:
-            return 0
-        images_np = np.stack(images_rows, axis=0).astype(np.uint8, copy=False)
-        targets_np = np.stack(target_rows, axis=0).astype(np.float16, copy=False)
-        masks_np = np.stack(mask_rows, axis=0).astype(np.float16, copy=False) if bool(self.return_masks) else None
-        if bool(self.return_mask_stack):
-            if int(mask_offsets[-1]) > 0:
-                mask_stacks_np = np.concatenate(mask_stack_rows, axis=0).astype(np.float16, copy=False)
-                mask_indices_np = np.concatenate(mask_index_rows, axis=0).astype(np.int64, copy=False)
-            else:
-                mask_stacks_np = np.zeros((0, int(images_np.shape[2]), int(images_np.shape[3])), dtype=np.float16)
-                mask_indices_np = np.zeros((0,), dtype=np.int64)
-            mask_offsets_np = np.asarray(mask_offsets, dtype=np.int64)
-        else:
-            mask_stacks_np = None
-            mask_indices_np = None
-            mask_offsets_np = None
-        images_path = cache_dir / "images.npy"
-        targets_path = cache_dir / "targets.npy"
-        masks_path = cache_dir / "masks.npy"
-        mask_stacks_path = cache_dir / "mask_stacks.npy"
-        mask_indices_path = cache_dir / "mask_indices.npy"
-        mask_offsets_path = cache_dir / "mask_offsets.npy"
-        manifest_path = cache_dir / "manifest.json"
-        try:
-            np.save(str(images_path), images_np)
-            np.save(str(targets_path), targets_np)
-            if masks_np is not None:
-                np.save(str(masks_path), masks_np)
-            elif masks_path.exists():
-                masks_path.unlink()
-            if mask_stacks_np is not None and mask_indices_np is not None and mask_offsets_np is not None:
-                np.save(str(mask_stacks_path), mask_stacks_np)
-                np.save(str(mask_indices_path), mask_indices_np)
-                np.save(str(mask_offsets_path), mask_offsets_np)
-            else:
-                for orphan_path in (mask_stacks_path, mask_indices_path, mask_offsets_path):
-                    if orphan_path.exists():
-                        orphan_path.unlink()
-            manifest = {
-                "version": 3,
-                "dataset_name": str(self.dataset_name),
-                "signature": str(self.persistent_cache_signature),
-                "cached_rows": int(images_np.shape[0]),
-                "target_dim": int(self.target_dim),
-                "return_masks": bool(self.return_masks),
-                "return_mask_stack": bool(self.return_mask_stack),
-            }
-            manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
-        except Exception as exc:
-            raise_if_filesystem_space_emergency(
-                self.progress_control,
-                exc,
-                note=f"{self.dataset_name} persistent cache write",
-                write_path=cache_dir,
-            )
-            raise
-        self._cache_images_mm = None
-        self._cache_targets_mm = None
-        self._cache_masks_mm = None
-        self._cache_mask_stacks_mm = None
-        self._cache_mask_indices_mm = None
-        self._cache_mask_offsets_mm = None
-        self._cache_images_path = str(images_path)
-        self._cache_targets_path = str(targets_path)
-        self._cache_masks_path = str(masks_path if masks_np is not None else "")
-        self._cache_mask_stacks_path = str(mask_stacks_path if mask_stacks_np is not None else "")
-        self._cache_mask_indices_path = str(mask_indices_path if mask_indices_np is not None else "")
-        self._cache_mask_offsets_path = str(mask_offsets_path if mask_offsets_np is not None else "")
-        self._cache_manifest_path = str(manifest_path)
-        self.cached_rows = int(images_np.shape[0])
-        self.persistent_cache_info.update(
-            {
-                "enabled": True,
-                "desired_rows": int(desired_rows),
-                "cached_rows": int(self.cached_rows),
-                "cache_hit": False,
-                "rebuilt": True,
-                "generated_rows": int(self.cached_rows),
-                "manifest": str(manifest_path),
-            }
-        )
-        return int(self.cached_rows)
-
-    def _initialize_loop_persistent_cache(self, cache_root: Path, desired_rows: int) -> bool:
-        loop_root = Path(cache_root) / "_loop_pool"
-        try:
-            loop_root.mkdir(parents=True, exist_ok=True)
-        except Exception as exc:
-            raise_if_filesystem_space_emergency(
-                self.progress_control,
-                exc,
-                note=f"{self.dataset_name} persistent cache root write",
-                write_path=loop_root,
-            )
-            raise
-        estimated_bytes = int(self._estimated_persistent_cache_bytes(int(desired_rows)))
-        self.persistent_cache_info["estimated_bytes"] = int(estimated_bytes)
-        cap_bytes = max(0, int(self.persistent_cache_max_bytes))
-        slot_count = 1
-        if int(cap_bytes) > 0 and int(estimated_bytes) > 0:
-            slot_count = max(1, int(cap_bytes // max(1, int(estimated_bytes))))
-        self.persistent_cache_info["loop_slots"] = int(slot_count)
-        lifespan = max(0, int(self.persistent_cache_slot_lifespan))
-        control = _load_cache_control(loop_root)
-        slot_use_counts: Dict[str, int] = {
-            str(k): max(0, int(v))
-            for k, v in control.get("slot_use_counts", {}).items()
-        }
-        for slot_idx in range(int(slot_count)):
-            slot_dir = _loop_slot_dir(loop_root, slot_idx)
-            manifest_path = slot_dir / "manifest.json"
-            # Skip expired slots (lifespan > 0 and use count has reached the limit).
-            uses = int(slot_use_counts.get(str(slot_idx), 0))
-            if int(lifespan) > 0 and int(uses) >= int(lifespan):
-                continue
-            loaded_rows = self._load_existing_persistent_cache(manifest_path=manifest_path, desired_rows=int(desired_rows))
-            if int(loaded_rows) >= int(desired_rows):
-                # Increment the use count for the chosen slot.
-                slot_use_counts[str(slot_idx)] = int(uses) + 1
-                control["slot_use_counts"] = slot_use_counts
-                _store_cache_control(loop_root, control, progress_control=self.progress_control)
-                self.persistent_cache_info["cache_dir"] = str(slot_dir)
-                self.persistent_cache_info["loop_slot"] = int(slot_idx)
-                self.persistent_cache_info["slot_uses"] = int(uses) + 1
-                self.persistent_cache_info["slot_lifespan"] = int(lifespan)
-                self.persistent_cache_info["pool_bytes"] = int(_directory_size_bytes(loop_root))
-                return True
-        cursor = int(control.get("loop_cursor", 0))
-        slot_idx = int(cursor % max(1, int(slot_count)))
-        control["loop_cursor"] = int((slot_idx + 1) % max(1, int(slot_count)))
-        control["slot_count"] = int(slot_count)
-        # Reset use count for the slot being rebuilt.
-        slot_use_counts[str(slot_idx)] = 0
-        control["slot_use_counts"] = slot_use_counts
-        _store_cache_control(loop_root, control, progress_control=self.progress_control)
-        slot_dir = _loop_slot_dir(loop_root, slot_idx)
-        self._write_persistent_cache(cache_dir=slot_dir, desired_rows=int(desired_rows))
-        self.persistent_cache_info["cache_dir"] = str(slot_dir)
-        self.persistent_cache_info["loop_slot"] = int(slot_idx)
-        self.persistent_cache_info["slot_uses"] = 0
-        self.persistent_cache_info["slot_lifespan"] = int(lifespan)
-        self.persistent_cache_info["pool_bytes"] = int(_directory_size_bytes(loop_root))
-        return True
-
-    def _initialize_evicting_persistent_cache(self, cache_root: Path, desired_rows: int) -> bool:
-        estimated_bytes = int(self._estimated_persistent_cache_bytes(int(desired_rows)))
-        self.persistent_cache_info["estimated_bytes"] = int(estimated_bytes)
-        cache_dir = Path(cache_root) / str(self.persistent_cache_signature)[:24]
-        manifest_path = cache_dir / "manifest.json"
-        loaded_rows = self._load_existing_persistent_cache(manifest_path=manifest_path, desired_rows=int(desired_rows))
-        if int(loaded_rows) >= int(desired_rows):
-            self.persistent_cache_info["cache_dir"] = str(cache_dir)
-            self.persistent_cache_info["pool_bytes"] = int(_directory_size_bytes(cache_root))
-            return True
-        cap_bytes = max(0, int(self.persistent_cache_max_bytes))
-        if int(cap_bytes) > 0:
-            pool_bytes = int(_directory_size_bytes(cache_root))
-            current_dir_bytes = int(_directory_size_bytes(cache_dir)) if cache_dir.exists() else 0
-            candidate_dirs = [p for p in Path(cache_root).iterdir() if p.is_dir() and p != cache_dir]
-            candidate_dirs = sorted(candidate_dirs, key=_cache_dir_mtime_ns)
-            while int(pool_bytes - current_dir_bytes + estimated_bytes) > int(cap_bytes) and len(candidate_dirs) > 0:
-                victim = candidate_dirs.pop(0)
-                victim_bytes = int(_directory_size_bytes(victim))
-                try:
-                    _remove_tree(victim)
-                    pool_bytes -= int(victim_bytes)
-                except Exception:
-                    break
-        self._write_persistent_cache(cache_dir=cache_dir, desired_rows=int(desired_rows))
-        self.persistent_cache_info["cache_dir"] = str(cache_dir)
-        self.persistent_cache_info["pool_bytes"] = int(_directory_size_bytes(cache_root))
-        return True
-
-    def _initialize_persistent_cache(self) -> None:
-        desired_rows = int(self._desired_cached_rows())
-        self.persistent_cache_info["desired_rows"] = int(desired_rows)
-        if int(desired_rows) <= 0:
-            return
-        cache_root = Path(str(self.persistent_cache_dir)).resolve()
-        try:
-            cache_root.mkdir(parents=True, exist_ok=True)
-        except Exception as exc:
-            raise_if_filesystem_space_emergency(
-                self.progress_control,
-                exc,
-                note=f"{self.dataset_name} persistent cache root write",
-                write_path=cache_root,
-            )
-            raise
-        if str(self.persistent_cache_overflow_strategy) == "loop":
-            self._initialize_loop_persistent_cache(cache_root=cache_root, desired_rows=int(desired_rows))
-            return
-        self._initialize_evicting_persistent_cache(cache_root=cache_root, desired_rows=int(desired_rows))
-
-    def _materialize_numpy_row(self, index: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-        idx = int(index)
-        if idx < 0:
-            idx = int(self.total_rows) + idx
-        if idx < 0 or idx >= int(self.total_rows):
-            raise IndexError(idx)
-        if bool(self._eager_row_cache_ready) and self._eager_row_cache[idx] is not None:
-            return self._eager_row_cache[idx]  # type: ignore[return-value]
-        cycle = int(idx // max(1, int(self.base_rows)))
-        off = int(idx % max(1, int(self.base_rows)))
-        base_idx = int((off + (cycle * 17) + int(self.seed % max(1, int(self.base_rows)))) % int(self.base_rows))
-        img = np.asarray(self.images[int(base_idx)], dtype=np.float32)
-        tgt = np.asarray(self.targets[int(base_idx)], dtype=np.float32).copy()
-        exact_term_masks: Dict[str, Any] = {}
-        if bool(self.return_masks):
-            mask_base, mask_stack_base, mask_idx_base = self._get_base_mask_bundle(int(base_idx))
-            mask = np.asarray(mask_base, dtype=np.float32).copy()
-            mask_stack_np = np.asarray(mask_stack_base, dtype=np.float32).copy()
-            mask_idx_np = np.asarray(mask_idx_base, dtype=np.int64).copy()
-        else:
-            mask = np.zeros((int(img.shape[1]), int(img.shape[2])), dtype=np.float32)
-            mask_stack_np = np.zeros((0, int(img.shape[1]), int(img.shape[2])), dtype=np.float32)
-            mask_idx_np = np.zeros((0,), dtype=np.int64)
-        if bool(self.augment) and int(self.total_rows) > int(self.base_rows):
-            aug_seed = int((int(self.seed) * 2654435761 + int(idx) * 1103515245 + int(base_idx) * 122949829) % (2**32 - 1))
-            img, aug_terms, touched, aug_term_masks = augment_bootstrap_chw01(
-                img=img,
-                seed=int(aug_seed),
-                return_terms=True,
-                return_touch_mask=True,
-                return_term_masks=True,
-            )
-            mask = _composite_mask_stack(np.stack([
-                np.asarray(mask, dtype=np.float32),
-                np.asarray(touched, dtype=np.float32),
-            ])).astype(np.float32, copy=False)
-            aug_term_set = {
-                re.sub(r"\s+", " ", str(term)).strip().lower()
-                for term in (aug_terms if isinstance(aug_terms, list) else [])
-                if str(term).strip()
-            }
-            if bool(self.augment_apply_terms) and int(len(self.semantic_term_to_idx)) > 0 and isinstance(aug_terms, list):
-                for term in aug_terms:
-                    tk = re.sub(r"\s+", " ", str(term)).strip().lower()
-                    if not tk:
-                        continue
-                    ti = int(self.semantic_term_to_idx.get(tk, -1))
-                    if 0 <= int(ti) < int(tgt.size):
-                        tgt[int(ti)] = 1.0
-        if bool(self.return_masks):
-            tgt, mask, mask_stack_np, mask_idx_np = assemble_semantic_mask_layers(
-                image=img,
-                label_vec=tgt,
-                idx_to_term=self.idx_to_term,
-                term_to_idx=self.semantic_term_to_idx,
-                original_mixed_mask=np.asarray(mask, dtype=np.float32),
-                original_parts=[(mask_stack_np, mask_idx_np)],
-                deformation_term_masks=aug_term_masks if bool(self.augment) and int(self.total_rows) > int(self.base_rows) else None,
-            )
-        return (
-            np.asarray(img, dtype=np.float32),
-            np.asarray(tgt, dtype=np.float32),
-            np.asarray(mask, dtype=np.float32),
-            np.asarray(mask_stack_np, dtype=np.float32),
-            np.asarray(mask_idx_np, dtype=np.int64),
-        )
-
-    def _materialize_cached_row(self, index: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-        self._ensure_persistent_cache_open()
-        if self._cache_images_mm is None or self._cache_targets_mm is None:
-            raise RuntimeError(f"{str(self.dataset_name)} persistent cache is unavailable.")
-        img = _cache_decode_image_u8(self._cache_images_mm[int(index)])
-        tgt = _cache_decode_target_f16(self._cache_targets_mm[int(index)]).reshape(-1)
-        if bool(self.return_masks) and self._cache_masks_mm is not None:
-            mask = _cache_decode_mask_f16(self._cache_masks_mm[int(index)])
-        else:
-            mask = np.zeros((int(img.shape[1]), int(img.shape[2])), dtype=np.float32)
-        if bool(self.return_mask_stack):
-            if self._cache_mask_offsets_mm is None or self._cache_mask_indices_mm is None or self._cache_mask_stacks_mm is None:
-                mask_stack_np, mask_idx_np = build_label_mask_stack(
-                    mixed_mask=np.asarray(mask, dtype=np.float32),
-                    label_vec=tgt,
-                    idx_to_term=self.idx_to_term,
-                    treat_mixed_mask_as_creation=bool(float(np.max(np.asarray(mask, dtype=np.float32))) > 1e-8),
-                )
-            else:
-                start = int(self._cache_mask_offsets_mm[int(index)])
-                stop = int(self._cache_mask_offsets_mm[int(index) + 1])
-                if int(stop) > int(start):
-                    mask_stack_np = _cache_decode_mask_f16(self._cache_mask_stacks_mm[int(start):int(stop)])
-                    mask_idx_np = np.asarray(self._cache_mask_indices_mm[int(start):int(stop)], dtype=np.int64)
-                else:
-                    mask_stack_np = np.zeros((0, int(mask.shape[0]), int(mask.shape[1])), dtype=np.float32)
-                    mask_idx_np = np.zeros((0,), dtype=np.int64)
-                if int(mask_stack_np.shape[0]) <= 0 or int(mask_idx_np.size) <= 0:
-                    mask_stack_np, mask_idx_np = build_label_mask_stack(
-                        mixed_mask=np.asarray(mask, dtype=np.float32),
-                        label_vec=tgt,
-                        idx_to_term=self.idx_to_term,
-                        treat_mixed_mask_as_creation=bool(float(np.max(np.asarray(mask, dtype=np.float32))) > 1e-8),
-                    )
-            if float(np.max(np.asarray(mask, dtype=np.float32))) <= 1e-8 and int(mask_stack_np.shape[0]) > 0 and int(mask_idx_np.size) > 0:
-                _nds_keep = [i for i in range(min(int(mask_stack_np.shape[0]), int(mask_idx_np.size))) if not _is_dataset_label_term(str((self.idx_to_term or {}).get(int(mask_idx_np[i]), "")))]
-                mask = _composite_mask_stack(mask_stack_np[np.asarray(_nds_keep, dtype=np.int64)]) if _nds_keep else _normalize_mask_array(mask, height=int(img.shape[1]), width=int(img.shape[2]))
-        else:
-            mask_stack_np = np.zeros((0, int(mask.shape[0]), int(mask.shape[1])), dtype=np.float32)
-            mask_idx_np = np.zeros((0,), dtype=np.int64)
-        return (
-            np.asarray(img, dtype=np.float32),
-            np.asarray(tgt, dtype=np.float32),
-            np.asarray(mask, dtype=np.float32),
-            np.asarray(mask_stack_np, dtype=np.float32),
-            np.asarray(mask_idx_np, dtype=np.int64),
-        )
-
-    def _get_base_mask_bundle(self, base_idx: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        idx = int(base_idx)
-        cached_mask = self.base_masks[int(idx)]
-        cached_stack = self.base_mask_stacks[int(idx)]
-        cached_stack_idx = self.base_mask_stack_indices[int(idx)]
-        if cached_mask is None:
-            # Derive composite mask from the element stack if the builder
-            # provided one. For a single-label sample with no explicit mask,
-            # treat the whole image as the source mask.
-            if cached_stack is not None and int(np.asarray(cached_stack).ndim) == 3 and int(np.asarray(cached_stack).shape[0]) > 0:
-                cached_mask = _composite_mask_stack(np.asarray(cached_stack, dtype=np.float32))
-            else:
-                img_ref = np.asarray(self.images[int(idx)], dtype=np.float32)
-                cached_mask = _single_label_whole_image_mask(
-                    self.targets[int(idx)],
-                    height=int(img_ref.shape[1]),
-                    width=int(img_ref.shape[2]),
-                )
-                if cached_mask is None:
-                    cached_mask = np.zeros((int(img_ref.shape[1]), int(img_ref.shape[2])), dtype=np.float32)
-            self.base_masks[int(idx)] = np.asarray(cached_mask, dtype=np.float32)
-        if bool(self.return_mask_stack) and (cached_stack is None or cached_stack_idx is None):
-            tgt = np.asarray(self.targets[int(idx)], dtype=np.float32).reshape(-1)
-            cached_stack, cached_stack_idx = build_label_mask_stack(
-                mixed_mask=np.asarray(cached_mask, dtype=np.float32),
-                label_vec=tgt,
-                idx_to_term=self.idx_to_term,
-                treat_mixed_mask_as_creation=bool(float(np.max(np.asarray(cached_mask, dtype=np.float32))) > 1e-8),
-            )
-            self.base_mask_stacks[int(idx)] = np.asarray(cached_stack, dtype=np.float32)
-            self.base_mask_stack_indices[int(idx)] = np.asarray(cached_stack_idx, dtype=np.int64)
-        mask_np = np.asarray(self.base_masks[int(idx)], dtype=np.float32)
-        if bool(self.return_mask_stack):
-            stack_np = np.asarray(self.base_mask_stacks[int(idx)], dtype=np.float32)
-            stack_idx_np = np.asarray(self.base_mask_stack_indices[int(idx)], dtype=np.int64)
-            if float(np.max(mask_np)) <= 1e-8 and int(stack_np.shape[0]) > 0 and int(stack_idx_np.size) > 0:
-                _nds_keep = [i for i in range(min(int(stack_np.shape[0]), int(stack_idx_np.size))) if not _is_dataset_label_term(str((self.idx_to_term or {}).get(int(stack_idx_np[i]), "")))]
-                mask_np = _composite_mask_stack(stack_np[np.asarray(_nds_keep, dtype=np.int64)]) if _nds_keep else _normalize_mask_array(mask_np, height=int(mask_np.shape[0]), width=int(mask_np.shape[1]))
-                self.base_masks[int(idx)] = np.asarray(mask_np, dtype=np.float32)
-        else:
-            stack_np = np.zeros((0, int(mask_np.shape[0]), int(mask_np.shape[1])), dtype=np.float32)
-            stack_idx_np = np.zeros((0,), dtype=np.int64)
-        return mask_np, stack_np, stack_idx_np
-
-    def __len__(self) -> int:
-        return int(self.total_rows)
-
-    def __getitem__(self, index: int):
-        idx = int(index)
-        if idx < 0:
-            idx = int(self.total_rows) + idx
-        if idx < 0 or idx >= int(self.total_rows):
-            raise IndexError(idx)
-        if int(idx) < int(self.cached_rows):
-            img, tgt, mask, mask_stack_np, mask_idx_np = self._materialize_cached_row(int(idx))
-        else:
-            img, tgt, mask, mask_stack_np, mask_idx_np = self._materialize_numpy_row(int(idx))
-        x_t = torch.from_numpy(np.asarray(img, dtype=np.float32))
-        y_t = torch.from_numpy(np.asarray(tgt, dtype=np.float32))
-        if bool(self.return_masks):
-            mask_t = torch.from_numpy(np.asarray(mask, dtype=np.float32)[None, ...])
-            if bool(self.return_mask_stack):
-                if int(mask_stack_np.shape[0]) <= 0 or int(mask_idx_np.size) <= 0:
-                    mask_stack_np, mask_idx_np = build_label_mask_stack(
-                        mixed_mask=np.asarray(mask, dtype=np.float32),
-                        label_vec=tgt,
-                        idx_to_term=self.idx_to_term,
-                        treat_mixed_mask_as_creation=bool(float(np.max(np.asarray(mask, dtype=np.float32))) > 1e-8),
-                    )
-                return (
-                    x_t,
-                    y_t,
-                    mask_t,
-                    torch.from_numpy(np.asarray(mask_stack_np, dtype=np.float32)),
-                    torch.from_numpy(np.asarray(mask_idx_np, dtype=np.int64)),
-                )
-            return x_t, y_t, mask_t
-        return x_t, y_t
-
 
 class DiskSemanticRowsDataset(Dataset):
     def __init__(
@@ -2803,7 +1816,6 @@ class DiskSemanticRowsDataset(Dataset):
         self.rows = [
             SemanticDiskRow(
                 image_path=str(r.image_path),
-                label_vec=np.asarray(r.label_vec, dtype=np.float32).reshape(-1),
                 terms=list(normalize_vocab_terms(r.terms)),
                 source=str(r.source),
                 mask_path=str(r.mask_path or ""),
@@ -2924,13 +1936,10 @@ class DiskSemanticRowsDataset(Dataset):
         creation_mask = self._load_creation_mask01(row, h=int(h), w=int(w))
         if creation_mask is not None:
             return np.asarray(creation_mask, dtype=np.float32)
-        cached_bundle = _load_row_mask_cache_bundle(getattr(row, "mask_cache_file", ""))
-        if isinstance(cached_bundle, dict) and cached_bundle.get("mixed_mask", None) is not None:
-            arr = np.asarray(cached_bundle.get("mixed_mask"), dtype=np.float32)
-            if int(arr.ndim) == 3:
-                arr = np.mean(arr, axis=0).astype(np.float32, copy=False)
-            return _normalize_mask_array(arr, height=int(h), width=int(w))
-        single_mask = _single_label_whole_image_mask(row.label_vec, height=int(h), width=int(w))
+        single_mask = _single_label_whole_image_mask(
+            targets_from_terms([row.terms], self.term_to_idx, len(self.class_names))[0],
+            height=int(h), width=int(w),
+        )
         if single_mask is not None:
             return np.asarray(single_mask, dtype=np.float32)
         return np.zeros((int(h), int(w)), dtype=np.float32)
@@ -2949,7 +1958,7 @@ class DiskSemanticRowsDataset(Dataset):
     def __getitem__(self, index: int):
         row = self.rows[int(index)]
         x = self._load_rgb01(row.image_path)
-        y = np.asarray(row.label_vec, dtype=np.float32).reshape(-1)
+        y = targets_from_terms([row.terms], self.term_to_idx, len(self.class_names))[0]
         if bool(self.return_masks):
             base_mask_np = self._load_mask01(row, h=int(x.shape[1]), w=int(x.shape[2]), image_rgb01=x)
             cached_bundle = _load_row_mask_cache_bundle(getattr(row, "mask_cache_file", ""))
@@ -2961,18 +1970,19 @@ class DiskSemanticRowsDataset(Dataset):
                 if cached_stack_indices is None:
                     cached_stack_indices = cached_bundle.get("mask_indices")
             x, base_mask_np, degrade_term_masks = self._apply_degrade(x=x, mask=base_mask_np, idx=int(index))
-            y, mask_np, mask_stack_np, mask_idx_np = assemble_semantic_mask_layers(
+            y, mask_stack_np, mask_idx_np = assemble_semantic_mask_layers(
                 image=x,
                 label_vec=y,
                 idx_to_term=self.idx_to_term,
                 term_to_idx=self.term_to_idx,
-                original_mixed_mask=np.asarray(base_mask_np, dtype=np.float32),
                 original_parts=[(cached_stack_array, cached_stack_indices)],
                 deformation_term_masks=degrade_term_masks,
             )
             x_t = torch.from_numpy(np.asarray(x, dtype=np.float32))
             y_t = torch.from_numpy(np.asarray(y, dtype=np.float32))
-            mask_t = torch.from_numpy(np.asarray(mask_np, dtype=np.float32)[None, ...])
+            h_img = int(x.shape[1]) if int(np.asarray(x).ndim) >= 3 else int(self.image_size)
+            w_img = int(x.shape[2]) if int(np.asarray(x).ndim) >= 3 else int(self.image_size)
+            mask_t = torch.zeros(1, h_img, w_img, dtype=torch.float32)
             if bool(self.return_mask_stack):
                 return (
                     x_t,
@@ -3122,11 +2132,9 @@ def _load_mask_cache_npz(cache_file: Path) -> Optional[Dict[str, np.ndarray]]:
         return None
     try:
         with np.load(str(cache_file), allow_pickle=False) as z:
-            mixed = np.asarray(z["mixed_mask"], dtype=np.float32)
             stack = np.asarray(z["mask_stack"], dtype=np.float32)
             indices = np.asarray(z["mask_indices"], dtype=np.int64)
         return {
-            "mixed_mask": mixed,
             "mask_stack": stack,
             "mask_indices": indices,
         }
@@ -3144,7 +2152,6 @@ def _load_row_mask_cache_bundle(cache_file: str) -> Optional[Dict[str, np.ndarra
 def _build_and_store_row_mask_cache(
     cache_root: Path,
     image_path: Path,
-    label_vec: np.ndarray,
     idx_to_term: Optional[Dict[int, str]],
     terms: Sequence[str],
     mask_path: str = "",
@@ -3170,7 +2177,7 @@ def _build_and_store_row_mask_cache(
     )
     cached = _load_mask_cache_npz(cache_file)
     if isinstance(cached, dict):
-        return cached.get("mixed_mask"), cached.get("mask_stack"), cached.get("mask_indices"), False
+        return cached.get("mask_stack"), cached.get("mask_indices"), False
     with Image.open(str(image_path)) as im:
         rgb = np.asarray(im.convert("RGB"), dtype=np.float32)
     chw = np.transpose(np.clip(rgb / 255.0, 0.0, 1.0).astype(np.float32, copy=False), (2, 0, 1)).astype(np.float32, copy=False)
@@ -3222,22 +2229,18 @@ def _build_and_store_row_mask_cache(
         for idx, term in ((idx_to_term or {}).items() if isinstance(idx_to_term, dict) else [])
         if str(term).strip()
     }
-    _, mixed_mask, inferred_stack, inferred_idx = assemble_semantic_mask_layers(
+    label_vec = targets_from_terms([list(terms)], term_to_idx, max(len(term_to_idx), 1))[0]
+    _, inferred_stack, inferred_idx = assemble_semantic_mask_layers(
         image=chw,
         label_vec=label_vec,
         idx_to_term=idx_to_term,
         term_to_idx=term_to_idx,
-        original_mixed_mask=np.asarray(explicit_mask, dtype=np.float32) if explicit_mask is not None else None,
         original_parts=None,
         deformation_term_masks=None,
     )
-    _mm_arr = np.maximum(np.asarray(mixed_mask, dtype=np.float32), 0.0)
-    _mm_vm = float(np.max(_mm_arr))
-    mixed_mask = (_mm_arr / _mm_vm).astype(np.float32) if _mm_vm > 1e-8 else np.zeros_like(_mm_arr, dtype=np.float32)
     try:
         np.savez_compressed(
             str(cache_file),
-            mixed_mask=np.asarray(mixed_mask, dtype=np.float32),
             mask_stack=np.asarray(inferred_stack, dtype=np.float32),
             mask_indices=np.asarray(inferred_idx, dtype=np.int64),
         )
@@ -3249,7 +2252,7 @@ def _build_and_store_row_mask_cache(
             write_path=cache_file,
         )
         pass
-    return np.asarray(mixed_mask, dtype=np.float32), np.asarray(inferred_stack, dtype=np.float32), np.asarray(inferred_idx, dtype=np.int64), True
+    return np.asarray(inferred_stack, dtype=np.float32), np.asarray(inferred_idx, dtype=np.int64), True
 
 
 def _resolve_semantic_mask_cache_root(root: Path) -> Path:
@@ -3281,7 +2284,7 @@ def _materialize_semantic_row_mask_cache(
         workers = min(8, max(1, (os.cpu_count() or 1)))
     info["mask_cache_threads"] = int(workers)
 
-    def _job(row_index: int) -> Tuple[int, Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray], bool]:
+    def _job(row_index: int) -> Tuple[int, Optional[np.ndarray], Optional[np.ndarray], bool]:
         row = rows[int(row_index)]
         cache_file = _mask_cache_file_path(
             cache_root=cache_root,
@@ -3291,23 +2294,22 @@ def _materialize_semantic_row_mask_cache(
             layout=(dict(row.layout) if isinstance(row.layout, dict) else None),
         )
         if cache_file.exists():
-            return int(row_index), None, None, None, False
-        mixed, stack, indices, created = _build_and_store_row_mask_cache(
+            return int(row_index), None, None, False
+        stack, indices, created = _build_and_store_row_mask_cache(
             cache_root=cache_root,
             image_path=Path(str(row.image_path)),
-            label_vec=np.asarray(row.label_vec, dtype=np.float32).reshape(-1),
             idx_to_term=idx_to_term,
             terms=row.terms,
             mask_path=str(row.mask_path or ""),
             layout=(dict(row.layout) if isinstance(row.layout, dict) else None),
             progress_control=None,
         )
-        return int(row_index), mixed, stack, indices, bool(created)
+        return int(row_index), stack, indices, bool(created)
 
     if int(workers) <= 1:
         for row_index in range(int(len(rows))):
             try:
-                ridx, mixed, stack, indices, created = _job(row_index)
+                ridx, stack, indices, created = _job(row_index)
                 row = rows[int(ridx)]
                 row.mask_cache_file = str(
                     _mask_cache_file_path(
@@ -3346,7 +2348,7 @@ def _materialize_semantic_row_mask_cache(
             done_batch = next(as_completed(list(pending.keys())))
             pending.pop(done_batch, None)
             try:
-                ridx, mixed, stack, indices, created = done_batch.result()
+                ridx, stack, indices, created = done_batch.result()
                 row = rows[int(ridx)]
                 row.mask_cache_file = str(
                     _mask_cache_file_path(
@@ -3511,8 +2513,7 @@ def collect_semantic_disk_rows(
     except Exception:
         voc20_names = []
 
-    def _augment_row_with_auto_color_terms(image_path: Path, label_vec: np.ndarray, terms_in: Sequence[str], mask_path: str = "") -> Tuple[np.ndarray, List[str]]:
-        out_vec = np.asarray(label_vec, dtype=np.float32).reshape(-1).copy()
+    def _augment_row_with_auto_color_terms(image_path: Path, terms_in: Sequence[str], mask_path: str = "") -> List[str]:
         out_terms = normalize_vocab_terms([str(x) for x in list(terms_in)])
         try:
             with Image.open(str(image_path)) as im:
@@ -3531,12 +2532,8 @@ def collect_semantic_disk_rows(
         except Exception:
             color_terms = []
         if len(color_terms) <= 0:
-            return out_vec, out_terms
-        for term in color_terms:
-            idx = int(class_lut.get(_norm_txt(term), -1))
-            if 0 <= int(idx) < int(out_vec.size):
-                out_vec[int(idx)] = 1.0
-        return out_vec, normalize_vocab_terms(list(out_terms) + list(color_terms))
+            return out_terms
+        return normalize_vocab_terms(list(out_terms) + list(color_terms))
 
     convert_sbd_mat_to_npz(root, progress_control=progress_control)
     split_specs = [("train", "berkeley_sbd_train"), ("val", "berkeley_sbd_val")]
@@ -3602,19 +2599,14 @@ def collect_semantic_disk_rows(
         def _build_berkeley_row(spec: Tuple[Path, np.ndarray, str, str, str, List[str]]) -> SemanticDiskRow:
             ip, yv_base, mask_path_local, source_key_local, _, voc_terms = spec
             base_terms = ["berkeley sbd dataset", "object", "signal"] + [str(t) for t in voc_terms]
-            yv_local, row_terms = _augment_row_with_auto_color_terms(
+            terms = list(normalize_vocab_terms(_augment_row_with_auto_color_terms(
                 image_path=ip,
-                label_vec=yv_base,
                 terms_in=base_terms,
                 mask_path=str(mask_path_local),
-            )
-            pos = np.where(np.asarray(yv_local, dtype=np.float32) > 0.5)[0].astype(np.int64).tolist()
-            label_terms = [str(class_names[int(j)]) for j in pos if 0 <= int(j) < int(len(class_names))]
-            terms = normalize_vocab_terms(list(row_terms) + list(label_terms))
+            )))
             return SemanticDiskRow(
                 image_path=str(ip),
-                label_vec=np.asarray(yv_local, dtype=np.float32).reshape(-1),
-                terms=list(terms),
+                terms=terms,
                 source=str(source_key_local),
                 mask_path=str(mask_path_local),
             )
@@ -3655,11 +2647,6 @@ def collect_semantic_disk_rows(
 
         def _build_external_row(spec: Tuple[Path, str, str]) -> Tuple[Optional[SemanticDiskRow], int]:
             fp, dataset_name_local, label_term_local = spec
-            vec = np.zeros((int(n_classes),), dtype=np.float32)
-            if int(berkeley_dataset_idx) >= 0:
-                vec[int(berkeley_dataset_idx)] = 1.0
-            if int(signal_idx) >= 0:
-                vec[int(signal_idx)] = 1.0
             dataset_terms = [str(dataset_name_local)]
             if not str(dataset_name_local).strip().lower().endswith("dataset"):
                 dataset_terms.append(f"{dataset_name_local} dataset")
@@ -3672,23 +2659,19 @@ def collect_semantic_disk_rows(
             for cand in (["berkeley sbd dataset", "signal"] + list(specific_candidates)):
                 key = _norm_txt(cand)
                 if key in class_lut:
-                    cls_idx = int(class_lut[key])
-                    vec[int(cls_idx)] = 1.0
-                    mapped_terms.append(str(class_names[int(cls_idx)]))
+                    mapped_terms.append(str(class_names[int(class_lut[key])]))
                     if str(cand) in specific_set:
                         specific_hits += 1
             if int(specific_hits) <= 0:
                 return None, 1
-            vec, auto_terms = _augment_row_with_auto_color_terms(
+            terms = list(normalize_vocab_terms(_augment_row_with_auto_color_terms(
                 image_path=fp,
-                label_vec=vec,
                 terms_in=mapped_terms,
                 mask_path=_sidecar_mask_path(fp),
-            )
+            )))
             return SemanticDiskRow(
                 image_path=str(fp),
-                label_vec=np.asarray(vec, dtype=np.float32).reshape(-1),
-                terms=list(normalize_vocab_terms(auto_terms)),
+                terms=terms,
                 source=str(dataset_name_local),
                 mask_path=_sidecar_mask_path(fp),
                 layout=_sidecar_layout(fp),

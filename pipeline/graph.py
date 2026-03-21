@@ -1218,10 +1218,13 @@ def _execute_with_residence(node: PipelineNode, ctx: "PipelineContext") -> None:
     the listed models are pinned on ``ctx.device`` for the duration of
     ``node.execute(ctx)`` and released (eviction-eligible) afterwards.
     """
+    from pipeline.progress import register_progress_control
+
     mgr = getattr(ctx, "gpu_residence", None)
     model_names = node.gpu_models
     if mgr is None or not getattr(mgr, "enabled", False) or not model_names:
-        node.execute(ctx)
+        with register_progress_control(ctx):
+            node.execute(ctx)
         return
 
     device = ctx.device or __import__("torch").device("cpu")
@@ -1232,14 +1235,16 @@ def _execute_with_residence(node: PipelineNode, ctx: "PipelineContext") -> None:
             models.append((module, attr_name))
 
     if not models:
-        node.execute(ctx)
+        with register_progress_control(ctx):
+            node.execute(ctx)
         return
 
-    mgr.require_many(models, device)
-    try:
-        node.execute(ctx)
-    finally:
-        mgr.release_many([name for _, name in models])
+    with register_progress_control(ctx):
+        mgr.require_many(models, device)
+        try:
+            node.execute(ctx)
+        finally:
+            mgr.release_many([name for _, name in models])
 
 
 def _gate_status_snapshot(ctx: "PipelineContext") -> Dict[str, bool]:  # noqa: F821

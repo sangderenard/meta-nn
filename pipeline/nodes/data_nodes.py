@@ -66,21 +66,14 @@ from pipeline.nodes.vocab_node import (
     select_active_vocab_lora_slot,
 )
 from semantic_dataset_loaders import (
-    BootstrapDynamicDataset,
     DiskSemanticRowsDataset,
-    _build_special_label_mask_stack,
-    _composite_mask_stack,
-    _is_dataset_label_term,
-    build_label_mask_stack,
+    build_combined_mask_stacks,
     build_loader_from_manifest,
     build_term_mask_stack_from_image,
     build_term_mask_stacks_from_images,
-    combine_label_mask_stacks,
     collect_semantic_disk_rows,
-    elem_stacks_to_label_stacks,
-    infer_semantic_support_mask,
-    infer_semantic_support_masks,
     StageDatasetManifest,
+    targets_from_terms,
 )
 
 
@@ -407,6 +400,53 @@ class BerkeleyDataConfig:
 
 
 # ---------------------------------------------------------------------------
+# Label + mask dropout  (applied pre-compositing, inside batch preparation)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class LabelMaskDropoutConfig:
+    """Pre-compositing (label, mask) pair dropout for semantic supervision.
+
+    Each positive label and all of its mask slots are treated as a single unit.
+    With probability ``drop_rate`` the pair is dropped: the label is set to
+    ``false_neg_target`` in yb and every mask slot for that label is evicted
+    from the stack before compositing.  The composite therefore only contains
+    spatial evidence for labels that yb says are present — the two are always
+    consistent.
+
+    ``false_neg_target=0.0`` (default) grades dropped labels as hard negatives,
+    producing stochastic label noise that regularises the network toward
+    distributed representations.  Values in (0, 1) act as a soft damper.
+    """
+
+    drop_rate: float = 0.0
+    """Per-label probability that a (label, mask slots) pair is dropped.
+    0.0 = disabled."""
+
+    false_neg_target: float = 0.0
+    """Target value written to yb for dropped labels.  0.0 = hard false
+    negative.  Values in (0, 1) are soft dampers.  1.0 is a no-op."""
+
+    min_keep_labels: int = 0
+    """Minimum positive labels guaranteed to survive per sample."""
+
+    network_dropout: Optional[float] = None
+    """If set, all nn.Dropout / nn.Dropout2d modules on the target model are
+    updated to this rate before the forward pass.  None = leave unchanged."""
+
+    seed: Optional[int] = None
+    """Optional base seed.  None = caller-supplied rng is used as-is."""
+
+
+def _apply_network_dropout_rate(model: nn.Module, rate: float) -> None:
+    """Set the dropout probability on every Dropout module in *model* in-place."""
+    r = float(max(0.0, min(1.0, rate)))
+    for m in model.modules():
+        if isinstance(m, (nn.Dropout, nn.Dropout2d, nn.Dropout3d)):
+            m.p = r
+
+
+# ---------------------------------------------------------------------------
 # DataNode — single graph node owning all training dataloaders
 # ---------------------------------------------------------------------------
 
@@ -709,7 +749,6 @@ class DataNode(PipelineNode):
         from pipeline.nodes.vocab_node import (
             _build_pregestation_logic_rows,
             _enrich_pregestation_stack_with_observed_color_masks,
-            _PREGESTATION_OBSERVED_COLOR_TERMS,
             _normalize_vocab_terms as _preg_normalize_vocab_terms,
         )
 
@@ -725,7 +764,7 @@ class DataNode(PipelineNode):
             "samples_per_combo": self.preg_cfg.samples_per_combo,
             "mode_sequence": sorted(_mode_seq),
             "image_size": self.preg_cfg.image_size,
-            "mask_semantics_version": 4,
+            "mask_semantics_version": 6,
         })
         _raw_cached = _load_raw_stage_cache(_raw_cache_dir, _raw_cache_key)
         if _raw_cached is not None:
@@ -734,7 +773,6 @@ class DataNode(PipelineNode):
             all_masks = _raw_cached["all_masks"]
             all_label_stacks = _raw_cached["all_label_stacks"]
             all_label_indices = _raw_cached["all_label_indices"]
-            all_targets = _raw_cached["all_targets"]
             all_term_rows = _raw_cached["all_term_rows"]
             all_mask_stacks = all_label_stacks
         else:
@@ -743,7 +781,6 @@ class DataNode(PipelineNode):
             all_masks: list = []
             all_mask_stacks: list = []
             all_elem_term_lists: list = []
-            all_targets: list = []
             all_term_rows: list = []
             all_tonal_masks: list = []  # List[Dict[str, np.ndarray]] — tonal masks per row
             for mode in interruptible_tqdm(
@@ -771,34 +808,31 @@ class DataNode(PipelineNode):
                     # spatial evidence directly from rendered pixels, covering color terms
                     # (red, black, gray, etc.) that appear in elem_term_lists but whose
                     # geometric masks (disk/bg) are only approximate.
-                    enr_stk, enr_comp = _enrich_pregestation_stack_with_observed_color_masks(
+                    enr_stk, _observed_colors = _enrich_pregestation_stack_with_observed_color_masks(
                         image_chw01=img_np,
                         elem_stack=elem_stk,
                         term_row=term_row,
                     )
-                    norm_set = {re.sub(r"\s+", " ", str(t)).strip().lower() for t in term_row}
-                    enr_tl = list(elem_tl) + [
-                        [str(c)] for c in _PREGESTATION_OBSERVED_COLOR_TERMS if str(c) in norm_set
-                    ]
+                    enr_tl = list(elem_tl) + [[str(c)] for c in _observed_colors]
                     all_images.append(img_np)
-                    all_masks.append(enr_comp)
+                    all_masks.append(np.zeros((int(enr_stk.shape[1]), int(enr_stk.shape[2])), dtype=np.float32))
                     all_mask_stacks.append(enr_stk)
                     all_elem_term_lists.append(enr_tl)
                     all_term_rows.append(_preg_normalize_vocab_terms(list(term_row)))
                     all_tonal_masks.append({})  # color coverage handled by enrichment above
-                    y = np.zeros((target_dim,), dtype=np.float32)
-                    for term in term_row:
-                        idx = ctx.semantic_term_to_idx.get(str(term).strip().lower(), -1)
-                        if int(idx) >= 0:
-                            y[int(idx)] = 1.0
-                    all_targets.append(y)
 
             if not all_images:
                 _log("[data-node] WARNING: no pregestation images built")
                 return
 
+            # ---- Build LOCAL vocabulary for mask stack indices ----
+            _local_vocab = sorted({t for row in all_term_rows for t in _preg_normalize_vocab_terms(row)})
+            _local_term_to_idx: Dict[str, int] = {t: i for i, t in enumerate(_local_vocab)}
+            _n_local = len(_local_vocab)
+            all_targets = targets_from_terms(all_term_rows, _local_term_to_idx, _n_local)
+
             # ---- Precompute per-label mask stacks from element stacks ----
-            idx_to_term = {int(i): str(name) for i, name in enumerate(ctx.class_names)}
+            idx_to_term = {int(i): str(name) for i, name in enumerate(_local_vocab)}
             all_label_stacks: list = []
             all_label_indices: list = []
             for i in interruptible_tqdm(
@@ -814,64 +848,18 @@ class DataNode(PipelineNode):
                     base_mask_np = np.asarray(all_masks[i], dtype=np.float32)
                 else:
                     base_mask_np = np.ones((int(img_np.shape[1]), int(img_np.shape[2])), dtype=np.float32)
-                if i < len(all_mask_stacks) and i < len(all_elem_term_lists):
-                    explicit_stack, explicit_idx = elem_stacks_to_label_stacks(
-                        elem_stack=all_mask_stacks[i],
-                        elem_term_lists=all_elem_term_lists[i],
-                        label_vec=all_targets[i],
-                        term_to_idx=ctx.semantic_term_to_idx,
-                    )
-                else:
-                    explicit_stack = np.zeros((0, int(base_mask_np.shape[0]), int(base_mask_np.shape[1])), dtype=np.float32)
-                    explicit_idx = np.zeros((0,), dtype=np.int64)
-                # Build tonal mask stack from heuristic detections — each term the
-                # tonal enrichment added carries its own spatial evidence mask.
-                _tonal_dict = all_tonal_masks[i] if i < len(all_tonal_masks) else {}
-                _tonal_slices: list = []
-                _tonal_idxs: list = []
-                for _tterm, _tmask in _tonal_dict.items():
-                    _tidx = int(ctx.semantic_term_to_idx.get(str(_tterm).strip().lower(), -1))
-                    if _tidx < 0:
-                        continue
-                    _tmask_np = np.asarray(_tmask, dtype=np.float32)
-                    if int(_tmask_np.ndim) == 2 and int(_tmask_np.size) > 0:
-                        _tonal_slices.append(_tmask_np)
-                        _tonal_idxs.append(_tidx)
-                if _tonal_slices:
-                    tonal_stack = np.stack(_tonal_slices, axis=0)
-                    tonal_idx = np.asarray(_tonal_idxs, dtype=np.int64)
-                else:
-                    tonal_stack = np.zeros((0, int(base_mask_np.shape[0]), int(base_mask_np.shape[1])), dtype=np.float32)
-                    tonal_idx = np.zeros((0,), dtype=np.int64)
-                creation_mask_np = np.asarray(base_mask_np, dtype=np.float32)
-                if float(np.max(creation_mask_np)) <= 1e-8 and int(np.asarray(explicit_stack).shape[0]) > 0:
-                    creation_mask_np = _composite_mask_stack(np.asarray(explicit_stack, dtype=np.float32))
-                # Use _build_special_label_mask_stack directly — avoids the internal
-                # combine_label_mask_stacks call inside build_label_mask_stack, which
-                # would warn about all non-signal/object terms it doesn't know about.
-                special_stack, special_idx = _build_special_label_mask_stack(
-                    all_targets[i],
+                merged_stack, merged_idx = build_combined_mask_stacks(
+                    label_vec=all_targets[i],
                     idx_to_term=idx_to_term,
-                    height=int(creation_mask_np.shape[0]),
-                    width=int(creation_mask_np.shape[1]),
-                    creation_mask=creation_mask_np,
-                )
-                merged_stack, merged_idx = combine_label_mask_stacks(
-                    all_targets[i],
-                    (explicit_stack, explicit_idx),
-                    (special_stack, special_idx),
-                    (tonal_stack, tonal_idx),
                     height=int(base_mask_np.shape[0]),
                     width=int(base_mask_np.shape[1]),
-                    strict=True,
-                    idx_to_term=idx_to_term,
+                    elem_stack=all_mask_stacks[i] if i < len(all_mask_stacks) else None,
+                    elem_term_lists=all_elem_term_lists[i] if i < len(all_elem_term_lists) else None,
+                    term_to_idx=_local_term_to_idx,
+                    tonal_masks=all_tonal_masks[i] if i < len(all_tonal_masks) else None,
                 )
                 if i < len(all_masks):
-                    if int(np.asarray(merged_stack).size) > 0:
-                        _nds_keep = [si for si in range(min(int(merged_stack.shape[0]), int(merged_idx.size))) if not _is_dataset_label_term(str((idx_to_term or {}).get(int(merged_idx[si]), "")))]
-                        all_masks[i] = _composite_mask_stack(merged_stack[np.asarray(_nds_keep, dtype=np.int64)]) if _nds_keep else np.asarray(base_mask_np, dtype=np.float32)
-                    else:
-                        all_masks[i] = np.asarray(base_mask_np, dtype=np.float32)
+                    all_masks[i] = np.zeros((int(base_mask_np.shape[0]), int(base_mask_np.shape[1])), dtype=np.float32)
                 all_label_stacks.append(np.asarray(merged_stack, dtype=np.float32))
                 all_label_indices.append(np.asarray(merged_idx, dtype=np.int64))
 
@@ -890,7 +878,6 @@ class DataNode(PipelineNode):
                     "all_masks": [np.asarray(m, dtype=np.float32) for m in all_masks],
                     "all_label_stacks": list(all_label_stacks),
                     "all_label_indices": list(all_label_indices),
-                    "all_targets": list(all_targets),
                     "all_term_rows": list(all_term_rows),
                 }, progress_control=ctx)
                 _pbar.update(1)
@@ -898,6 +885,10 @@ class DataNode(PipelineNode):
         if not all_images:
             _log("[data-node] WARNING: no pregestation images built")
             return
+
+        # ---- Canonical target construction from terms (unified path) ----
+        all_targets = targets_from_terms(all_term_rows, ctx.semantic_term_to_idx, target_dim)
+
         _register_churn_terms(
             ctx,
             term_rows=all_term_rows,
@@ -910,7 +901,6 @@ class DataNode(PipelineNode):
                 ctx=ctx,
                 stage_name="pregestation",
                 images=all_images,
-                targets=all_targets,
                 masks=all_masks,
                 mask_stacks=all_label_stacks,
                 mask_indices=all_label_indices,
@@ -919,8 +909,6 @@ class DataNode(PipelineNode):
                 image_size=int(self.preg_cfg.image_size),
                 batch_size=max(1, int(self.preg_cfg.batch_size)),
                 seed=int(self.preg_cfg.seed),
-                target_dim=int(target_dim),
-                semantic_term_to_idx=ctx.semantic_term_to_idx,
                 stage_cache_mb=int(self.preg_cfg.cache_mb),
                 processing_device=_processing_device,
                 force_rebuild=bool(self.possessions["pregestation"].force_next_rebuild),
@@ -1020,7 +1008,7 @@ class DataNode(PipelineNode):
             stage_label="stage1_gestation_requirements",
         )
 
-        images, targets = _flatten_symbol_pool(
+        images, initial_terms = _flatten_symbol_pool(
             symbol_pool=symbol_pool, class_names=ctx.class_names,
             semantic_term_to_idx=ctx.semantic_term_to_idx,
             samples_per_term=self.gest_cfg.samples_per_term,
@@ -1029,8 +1017,7 @@ class DataNode(PipelineNode):
             _log("[data-node] WARNING: no gestation symbol images")
             return
 
-        idx_to_term = {int(i): str(name) for i, name in enumerate(ctx.class_names)}
-        _n_gest = int(min(len(images), len(targets)))
+        _n_gest = int(len(images))
 
         # ---- Raw-data disk cache (keyed by vocab + symbol pool composition) ----
         _pool_sig = sorted((str(k), int(len(v))) for k, v in symbol_pool.items())
@@ -1042,7 +1029,7 @@ class DataNode(PipelineNode):
             "samples_per_term": self.gest_cfg.samples_per_term,
             "image_size": self.gest_cfg.image_size,
             "pool_sig": _pool_sig,
-            "mask_semantics_version": 2,
+            "mask_semantics_version": 4,
         })
         _raw_cached = _load_raw_stage_cache(_raw_cache_dir, _raw_cache_key)
         if _raw_cached is not None:
@@ -1056,10 +1043,9 @@ class DataNode(PipelineNode):
 
             # --- Step 1: terms per image (sequential — lightweight string ops only) ---
             _gest_image_size = int(self.gest_cfg.image_size)
-            _class_names_snap = list(ctx.class_names)
             _all_terms = [
                 list(_semantic_terms_with_tonal_tags(
-                    terms=_positive_terms_from_target(np.asarray(targets[i], dtype=np.float32).reshape(-1), _class_names_snap),
+                    terms=initial_terms[i],
                     image=images[i],
                     image_size=_gest_image_size,
                 ))
@@ -1073,21 +1059,21 @@ class DataNode(PipelineNode):
                 )
             ]
 
-            # --- Step 2: infer support masks — one vectorised call for ALL images ---
+            # --- Step 2: build LOCAL vocabulary and targets ---
+            _local_vocab_gest = sorted({t for row in _all_terms for t in _normalize_vocab_terms(row)})
+            _local_t2i_gest: Dict[str, int] = {t: i for i, t in enumerate(_local_vocab_gest)}
+            _local_i2t_gest = {int(i): str(name) for i, name in enumerate(_local_vocab_gest)}
+            _n_local_gest = len(_local_vocab_gest)
+            targets = targets_from_terms(_all_terms, _local_t2i_gest, _n_local_gest)
+
+            # --- Step 3: heuristic term-mask stacks — one vectorised call for ALL images ---
             _images_np = np.stack([np.asarray(images[i], dtype=np.float32) for i in range(_n_gest)], axis=0)
             _targets_np = np.stack([np.asarray(targets[i], dtype=np.float32).reshape(-1) for i in range(_n_gest)], axis=0)
             with semantic_processing_device(ctx, enabled=bool(self.gest_cfg.gpu_preprocess)) as _processing_device:
-                _base_masks = infer_semantic_support_masks(
-                    images=_images_np,
-                    terms_batch=_all_terms,
-                    processing_device=_processing_device,
-                )  # [N, H, W]
-
-                # --- Step 3: heuristic term-mask stacks — one vectorised call for ALL images ---
                 _heuristic_stacks, _heuristic_indices = build_term_mask_stacks_from_images(
                     images=_images_np,
                     label_vecs=_targets_np,
-                    idx_to_term=idx_to_term,
+                    idx_to_term=_local_i2t_gest,
                     processing_device=_processing_device,
                 )
                 # --- Step 4: combine/fallback/composite per image ---
@@ -1103,31 +1089,21 @@ class DataNode(PipelineNode):
                     dynamic_ncols=True,
                     control=ctx,
                 ):
-                    y = np.asarray(targets[int(i)], dtype=np.float32).reshape(-1)
-                    base_mask = np.asarray(_base_masks[i], dtype=np.float32)
-                    special_stack, special_idx = build_label_mask_stack(
-                        mixed_mask=base_mask,
-                        label_vec=y,
-                        idx_to_term=idx_to_term,
-                        treat_mixed_mask_as_creation=True,
-                    )
-                    merged_stack, merged_idx = combine_label_mask_stacks(
-                        y,
-                        (np.asarray(_heuristic_stacks[i], dtype=np.float32), np.asarray(_heuristic_indices[i], dtype=np.int64)),
-                        (special_stack, special_idx),
-                        height=int(base_mask.shape[0]),
-                        width=int(base_mask.shape[1]),
+                    h_stack = np.asarray(_heuristic_stacks[i], dtype=np.float32)
+                    h_idx = np.asarray(_heuristic_indices[i], dtype=np.int64)
+                    _h = int(h_stack.shape[-2]) if int(h_stack.ndim) >= 2 else int(_images_np.shape[2])
+                    _w = int(h_stack.shape[-1]) if int(h_stack.ndim) >= 2 else int(_images_np.shape[3])
+                    merged_stack, merged_idx = build_combined_mask_stacks(
+                        label_vec=targets[int(i)],
+                        idx_to_term=_local_i2t_gest,
+                        height=_h,
+                        width=_w,
+                        heuristic_stack=h_stack,
+                        heuristic_idx=h_idx,
                         processing_device=_processing_device,
-                        strict=True,
-                        idx_to_term=idx_to_term,
                     )
-                    if int(np.asarray(merged_stack).size) > 0:
-                        _nds_keep = [si for si in range(min(int(merged_stack.shape[0]), int(merged_idx.size))) if not _is_dataset_label_term(str((idx_to_term or {}).get(int(merged_idx[si]), "")))]
-                        mixed_mask = _composite_mask_stack(merged_stack[np.asarray(_nds_keep, dtype=np.int64)]) if _nds_keep else np.asarray(base_mask, dtype=np.float32)
-                    else:
-                        mixed_mask = np.asarray(base_mask, dtype=np.float32)
                     terms_rows.append(_all_terms[i])
-                    masks.append(np.asarray(mixed_mask, dtype=np.float32))
+                    masks.append(np.zeros((_h, _w), dtype=np.float32))
                     mask_stacks.append(np.asarray(merged_stack, dtype=np.float32))
                     mask_indices.append(np.asarray(merged_idx, dtype=np.int64))
 
@@ -1148,6 +1124,10 @@ class DataNode(PipelineNode):
                     "terms_rows": list(terms_rows),
                 }, progress_control=ctx)
                 _pbar.update(1)
+
+        # ---- Canonical target construction from terms (unified path) ----
+        targets = targets_from_terms(terms_rows, ctx.semantic_term_to_idx, len(ctx.class_names))
+
         _register_churn_terms(
             ctx,
             term_rows=terms_rows,
@@ -1160,7 +1140,6 @@ class DataNode(PipelineNode):
                 ctx=ctx,
                 stage_name="gestation",
                 images=images,
-                targets=targets,
                 masks=masks,
                 mask_stacks=mask_stacks,
                 mask_indices=mask_indices,
@@ -1169,8 +1148,6 @@ class DataNode(PipelineNode):
                 image_size=int(self.gest_cfg.image_size),
                 batch_size=max(1, int(self.gest_cfg.batch_size)),
                 seed=int(getattr(ctx.args, "seed", 0) or 0),
-                target_dim=max(1, int(len(ctx.class_names))),
-                semantic_term_to_idx=ctx.semantic_term_to_idx,
                 stage_cache_mb=int(self.gest_cfg.cache_mb),
                 deformations_per_clean=max(0, int(self.gest_cfg.deformations_per_clean)),
                 processing_device=_processing_device,
@@ -1313,6 +1290,8 @@ class DataNode(PipelineNode):
                 cache_batches=self.bdata_cfg.prebuild_batches,
                 cache_device=self.bdata_cfg.cache_device,
                 channels_last=self.bdata_cfg.channels_last,
+                active_term_to_idx=dict(ctx.semantic_term_to_idx),
+                n_active_classes=len(ctx.class_names),
                 preferred_device=getattr(ctx, "non_training_device", None),
                 gpu_residence=getattr(ctx, "gpu_residence", None),
             )
@@ -1372,7 +1351,7 @@ class DataNode(PipelineNode):
         convert_sbd_mat_to_npz(_broot, progress_control=ctx)
 
         with semantic_processing_device(ctx, enabled=bool(self.bdata_cfg.gpu_preprocess)) as _processing_device:
-            out_images, out_targets, _info, _out_terms, out_masks, out_per_row_terms = _build_berkeley_payload_bank(
+            out_images, _info, _out_terms, out_masks, out_per_row_terms = _build_berkeley_payload_bank(
                 ctx=ctx,
                 data_root=data_root,
                 image_size=self.payload_cfg.image_size,
@@ -1402,8 +1381,9 @@ class DataNode(PipelineNode):
         )
 
         # Build payload conditions vector
-        if out_images and out_targets and ctx.label_embedding_bank is not None:
+        if out_images and out_per_row_terms and ctx.label_embedding_bank is not None:
             n_classes = max(1, len(ctx.class_names)) if ctx.class_names else 1
+            out_targets = targets_from_terms(out_per_row_terms, ctx.semantic_term_to_idx, n_classes)
             conditions, _expansion_info = _expand_payload_conditions_with_semantic_bank(
                 payload_conditions=out_targets,
                 condition_num_classes=n_classes,
@@ -2022,10 +2002,14 @@ def _flatten_symbol_pool(
     class_names: List[str],
     semantic_term_to_idx: Dict[str, int],
     samples_per_term: int,
-) -> tuple:
-    images = []
-    targets = []
-    n_classes = len(class_names)
+) -> Tuple[List[Any], List[List[str]]]:
+    """Return (images, initial_terms) — one seed-term list per image.
+
+    Targets are NOT built here.  Callers derive targets via
+    ``targets_from_terms`` after enriching the term lists.
+    """
+    images: List[Any] = []
+    initial_terms: List[List[str]] = []
     _skipped_terms: List[str] = []
 
     for term, term_images in symbol_pool.items():
@@ -2036,15 +2020,13 @@ def _flatten_symbol_pool(
             continue
         term_imgs = list(term_images)[:samples_per_term]
         for img in term_imgs:
-            target = np.zeros(n_classes, dtype=np.float32)
-            target[idx] = 1.0
             images.append(img)
-            targets.append(target)
+            initial_terms.append([term_lc])
 
     if _skipped_terms:
         _log(f"[data-node] _flatten_symbol_pool: {len(_skipped_terms)} pool terms not in vocab: {sorted(set(_skipped_terms))}")
-    _log(f"[data-node] _flatten_symbol_pool: pool_terms={len(symbol_pool)} matched={len(images)} n_classes={n_classes}")
-    return images, targets
+    _log(f"[data-node] _flatten_symbol_pool: pool_terms={len(symbol_pool)} matched={len(images)} n_classes={len(class_names)}")
+    return images, initial_terms
 
 
 def _get_deck_sampler(loader: Any) -> Optional[StatefulSequentialDeckSampler]:
@@ -2191,10 +2173,9 @@ def _positive_terms_from_target(target: Any, class_names: Sequence[str]) -> List
     return list(_normalize_vocab_terms(out))
 
 
-def _semantic_stage_candidate_key(stage_name: str, image: Any, target: Any, terms: Sequence[str]) -> str:
+def _semantic_stage_candidate_key(stage_name: str, image: Any, terms: Sequence[str]) -> str:
     hasher = hashlib.sha256()
     arr = np.asarray(image, dtype=np.float32)
-    tgt = (np.asarray(target, dtype=np.float32).reshape(-1) >= 0.5).astype(np.uint8, copy=False)
     hasher.update(str(stage_name).encode("utf-8"))
     hasher.update(np.asarray(arr.shape, dtype=np.int64).tobytes())
     if int(arr.ndim) == 3 and int(arr.shape[0]) in (1, 3, 4):
@@ -2203,45 +2184,8 @@ def _semantic_stage_candidate_key(stage_name: str, image: Any, target: Any, term
         img_bytes = np.clip(np.rint(np.clip(np.asarray(arr, dtype=np.float32), 0.0, 1.0) * 255.0), 0.0, 255.0).astype(np.uint8, copy=False)
     hasher.update(np.asarray(img_bytes.shape, dtype=np.int64).tobytes())
     hasher.update(img_bytes.tobytes())
-    hasher.update(tgt.tobytes())
     hasher.update(json.dumps(list(_normalize_vocab_terms(terms)), sort_keys=True, ensure_ascii=True).encode("utf-8"))
     return str(hasher.hexdigest())
-
-
-def _build_inmemory_semantic_stage_dataset(
-    *,
-    images: Sequence[Any],
-    targets: Sequence[Any],
-    masks: Sequence[Any],
-    mask_stacks: Sequence[Any],
-    mask_indices: Sequence[Any],
-    seed: int,
-    target_dim: int,
-    semantic_term_to_idx: Dict[str, int],
-    dataset_name: str,
-    progress_control: Any = None,
-) -> Dataset:
-    dataset = BootstrapDynamicDataset(
-        images=images,
-        targets=targets,
-        total_rows=int(len(images)),
-        seed=int(seed),
-        augment=False,
-        expected_target_dim=int(target_dim),
-        semantic_term_to_idx=semantic_term_to_idx,
-        augment_apply_terms=False,
-        return_masks=True,
-        return_mask_stack=True,
-        dataset_name=str(dataset_name),
-        base_masks=(list(masks) if int(len(masks)) == int(len(images)) else None),
-        progress_control=progress_control,
-    )
-    for i in range(int(len(images))):
-        if int(i) < int(len(mask_stacks)) and mask_stacks[int(i)] is not None:
-            dataset.base_mask_stacks[int(i)] = np.asarray(mask_stacks[int(i)], dtype=np.float32)
-        if int(i) < int(len(mask_indices)) and mask_indices[int(i)] is not None:
-            dataset.base_mask_stack_indices[int(i)] = np.asarray(mask_indices[int(i)], dtype=np.int64)
-    return dataset
 
 
 def build_stage_loaders(
@@ -2395,7 +2339,6 @@ def _build_semantic_stage_cache_dataset(
     ctx: PipelineContext,
     stage_name: str,
     images: Sequence[Any],
-    targets: Sequence[Any],
     masks: Sequence[Any],
     mask_stacks: Sequence[Any],
     mask_indices: Sequence[Any],
@@ -2404,8 +2347,6 @@ def _build_semantic_stage_cache_dataset(
     image_size: int,
     batch_size: int,
     seed: int,
-    target_dim: int,
-    semantic_term_to_idx: Dict[str, int],
     stage_cache_mb: int,
     deformations_per_clean: int = 2,
     include_clean: bool = True,
@@ -2415,7 +2356,6 @@ def _build_semantic_stage_cache_dataset(
     cache_args = _semantic_stage_cache_args(ctx=ctx, stage_cache_mb=int(stage_cache_mb))
     total_rows = min(
         int(len(images)),
-        int(len(targets)),
         int(len(masks)),
         int(len(mask_stacks)),
         int(len(mask_indices)),
@@ -2423,20 +2363,10 @@ def _build_semantic_stage_cache_dataset(
     )
     if int(total_rows) <= 0:
         raise RuntimeError(f"{str(stage_name)} requires non-empty semantic stage rows")
-    if not bool(cache_args.get("enabled", True)):
-        ds = _build_inmemory_semantic_stage_dataset(
-            images=list(images)[: int(total_rows)],
-            targets=list(targets)[: int(total_rows)],
-            masks=list(masks)[: int(total_rows)],
-            mask_stacks=list(mask_stacks)[: int(total_rows)],
-            mask_indices=list(mask_indices)[: int(total_rows)],
-            seed=int(seed),
-            target_dim=int(target_dim),
-            semantic_term_to_idx=semantic_term_to_idx,
-            dataset_name=str(stage_name),
-            progress_control=ctx,
-        )
-        return ds, list(range(int(total_rows))), {"cache_enabled": False, "total_rows": int(total_rows)}
+
+    # Build local vocabulary from the union of all terms across rows.
+    local_vocab = sorted({t for row in terms_rows for t in _normalize_vocab_terms(row)})
+    local_term_to_idx: Dict[str, int] = {t: i for i, t in enumerate(local_vocab)}
 
     candidates: List[SemanticWheelCandidate] = []
     for i in interruptible_tqdm(
@@ -2453,7 +2383,6 @@ def _build_semantic_stage_cache_dataset(
                 cache_key=_semantic_stage_candidate_key(
                     stage_name=str(stage_name),
                     image=images[int(i)],
-                    target=targets[int(i)],
                     terms=term_row,
                 ),
                 terms=list(term_row),
@@ -2465,17 +2394,14 @@ def _build_semantic_stage_cache_dataset(
         term_row = list(_normalize_vocab_terms(terms_rows[int(base_idx)])) if 0 <= int(base_idx) < int(len(terms_rows)) else []
         clean = build_semantic_cache_entry(
             image=images[int(base_idx)],
-            label_vec=targets[int(base_idx)],
             image_size=int(image_size),
             terms=term_row,
-            mixed_mask=masks[int(base_idx)],
             mask_stack=mask_stacks[int(base_idx)],
             mask_indices=mask_indices[int(base_idx)],
         )
         out: List[Dict[str, Any]] = []
         if bool(include_clean):
             out.append(dict(clean))
-        _term_to_idx = dict(semantic_term_to_idx)
         for vi in range(max(0, int(deformations_per_clean))):
             out.append(
                 _build_deformed_entry(
@@ -2483,7 +2409,7 @@ def _build_semantic_stage_cache_dataset(
                     variant_idx=int(vi),
                     base_row_position=int(_base_pos),
                     seed=int(seed),
-                    term_to_idx=_term_to_idx,
+                    term_to_idx=local_term_to_idx,
                     processing_device=processing_device,
                 )
             )
@@ -2497,7 +2423,7 @@ def _build_semantic_stage_cache_dataset(
         candidates=candidates,
         candidate_indices=list(range(int(total_rows))),
         build_entry_group=_entry_group,
-        label_dim=int(target_dim),
+        local_vocab=local_vocab,
         config=SemanticWheelConfig(
             purpose=str(stage_name),
             cache_root=_resolve_semantic_stage_cache_root(ctx=ctx, stage_name=str(stage_name)),
@@ -2681,7 +2607,6 @@ def _ensure_berkeley_semantic_wheel(
     wheel_expiry_uses: int,
     max_base_rows: int,
     wheel_use_rare_term_deck: bool,
-    class_names: Optional[Sequence[str]] = None,
     force_rebuild: bool = False,
     processing_device: Optional[Any] = None,
     preload_workers: int = 0,
@@ -2710,12 +2635,9 @@ def _ensure_berkeley_semantic_wheel(
         preload_workers=max(0, int(preload_workers)),
         progress_control=progress_control,
     )
-    from pipeline.vocabulary_defaults import DEFAULT_VOCABULARY
-    _cn = list(class_names) if class_names is not None else list(DEFAULT_VOCABULARY)
     wheel_result = ensure_semantic_wheel_cache(
         rows=rows,
         candidate_indices=[int(i) for i in candidate_indices],
-        class_names=_cn,
         config=wheel_cfg,
     )
     wheel_info = dict(wheel_result.get("info") or {})
@@ -2934,7 +2856,6 @@ def _build_berkeley_wheel_loader(
         wheel_expiry_uses=int(wheel_expiry_uses),
         max_base_rows=int(max_rows),
         wheel_use_rare_term_deck=bool(wheel_use_rare_term_deck),
-        class_names=_cn,
         force_rebuild=bool(force_rebuild),
         processing_device=processing_device,
         preload_workers=int(preload_workers),
@@ -2970,6 +2891,8 @@ def _build_berkeley_refresh_cache(
     cache_batches: int,
     cache_device: str,
     channels_last: bool,
+    active_term_to_idx: Dict[str, int],
+    n_active_classes: int,
     preferred_device: Optional[torch.device] = None,
     gpu_residence: Optional[Any] = None,
 ):
@@ -2989,7 +2912,14 @@ def _build_berkeley_refresh_cache(
     ys = []
     ms = []
     for i, batch in enumerate(loader, start=1):
-        xb, yb, mb, _ = _unpack_masked_semantic_batch(batch, context="berkeley refresh cache")
+        xb, mb, batch_meta = _unpack_masked_semantic_batch(batch, context="berkeley refresh cache")
+        _terms = list(batch_meta.get("terms_rows") or [[] for _ in range(int(xb.shape[0]))])
+        yb = torch.from_numpy(
+            np.stack(
+                targets_from_terms(_terms, active_term_to_idx, n_active_classes),
+                axis=0,
+            ).astype(np.float32)
+        ).to(device=xb.device)
         xs.append(xb)
         ys.append(yb)
         ms.append(mb)
@@ -3705,7 +3635,6 @@ def _build_payload_validation_gate_dataset(
         wheel_expiry_uses=int(wheel_expiry_uses),
         max_base_rows=0,
         wheel_use_rare_term_deck=bool(wheel_use_rare_term_deck),
-        class_names=_cn,
         force_rebuild=bool(force_rebuild),
         processing_device=processing_device,
         preload_workers=int(preload_workers),
@@ -3716,12 +3645,7 @@ def _build_payload_validation_gate_dataset(
         return_mask_stack=bool(return_mask_stack),
     )
     selected_base_rows = [int(x) for x in list(wheel_result.get("base_row_indices") or [])]
-    terms_rows = [
-        list(_normalize_vocab_terms(getattr(rows[int(idx)], "terms", [])))
-        for idx in selected_base_rows
-        if 0 <= int(idx) < int(len(rows))
-    ]
-    label_rows = []
+    terms_rows: List[List[str]] = []
     for i in interruptible_tqdm(
         range(int(len(ds))),
         desc="[payload val] reading labels",
@@ -3731,20 +3655,15 @@ def _build_payload_validation_gate_dataset(
         control=ctx,
     ):
         item = ds.read_numpy_entry(int(i))
-        label_rows.append(np.asarray(item["label_vec_u8"], dtype=np.float32).reshape(-1))
-    label_dim = int(label_rows[0].size) if int(len(label_rows)) > 0 else 0
-    labels_np = (
-        np.stack(label_rows, axis=0).astype(np.float32, copy=False)
-        if int(len(label_rows)) > 0
-        else np.zeros((0, int(label_dim)), dtype=np.float32)
-    )
+        terms_rows.append(list(_normalize_vocab_terms(item.get("terms") or [])))
+    labels_np = np.zeros((int(len(ds)), 0), dtype=np.float32)
     refresh_rows_total = int(sum(int(v.get("refresh_selected", 0)) for v in source_stats.values()))
     refresh_rows_berkeley_train = int(source_stats.get("berkeley_sbd_train", {}).get("refresh_selected", 0))
     refresh_rows_berkeley_val = int(source_stats.get("berkeley_sbd_val", {}).get("refresh_selected", 0))
     info = {
         "available_rows": int(rows_info.get("available_rows", len(rows))),
         "selected_rows": int(len(ds)),
-        "label_dim": int(label_dim),
+        "label_dim": int(len(_cn)),
         "selected_berkeley_val": int(source_stats.get("berkeley_sbd_val", {}).get("gate_selected", 0)),
         "selected_berkeley_train": int(source_stats.get("berkeley_sbd_train", {}).get("gate_selected", 0)),
         "refresh_rows_total": int(refresh_rows_total),
@@ -3771,11 +3690,10 @@ def _build_payload_validation_gate_dataset(
     return ds, labels_np, terms_rows, info
 
 
-def _unpack_masked_semantic_batch(batch: Any, context: str) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, Any]]:
+def _unpack_masked_semantic_batch(batch: Any, context: str) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, Any]]:
     meta: Dict[str, Any] = {}
     if isinstance(batch, dict):
         xb = batch.get("x")
-        yb = batch.get("y")
         mb = batch.get("mask")
         if "mask_stacks" in batch:
             meta["mask_stacks"] = list(batch.get("mask_stacks") or [])
@@ -3784,25 +3702,95 @@ def _unpack_masked_semantic_batch(batch: Any, context: str) -> Tuple[torch.Tenso
         if "terms_rows" in batch:
             meta["terms_rows"] = [list(x) for x in list(batch.get("terms_rows") or [])]
     elif isinstance(batch, (tuple, list)) and int(len(batch)) >= 3:
-        xb, yb, mb = batch[0], batch[1], batch[2]
-        if int(len(batch)) >= 5:
-            meta["mask_stacks"] = batch[3]
-            meta["mask_indices"] = batch[4]
-        if int(len(batch)) >= 6 and isinstance(batch[5], (list, tuple)):
-            meta["terms_rows"] = [list(x) if isinstance(x, (list, tuple)) else [] for x in list(batch[5])]
+        xb, mb = batch[0], batch[1]
+        if int(len(batch)) >= 4:
+            meta["mask_stacks"] = batch[2]
+            meta["mask_indices"] = batch[3]
+        if int(len(batch)) >= 5 and isinstance(batch[4], (list, tuple)):
+            meta["terms_rows"] = [list(x) if isinstance(x, (list, tuple)) else [] for x in list(batch[4])]
     else:
-        raise RuntimeError(f"{str(context)} requires (image, target, mask) batches.")
-    if not (torch.is_tensor(xb) and torch.is_tensor(yb) and torch.is_tensor(mb)):
+        raise RuntimeError(f"{str(context)} requires (image, mask, ...) batches.")
+    if not (torch.is_tensor(xb) and torch.is_tensor(mb)):
         raise RuntimeError(f"{str(context)} received non-tensor batch members.")
     if int(mb.ndim) == 3:
         mb = mb.unsqueeze(1)
     elif int(mb.ndim) != 4:
         raise RuntimeError(f"{str(context)} requires mask tensors with shape [B,1,H,W]; got {tuple(mb.shape)}")
-    if int(xb.shape[0]) != int(yb.shape[0]) or int(xb.shape[0]) != int(mb.shape[0]):
+    if int(xb.shape[0]) != int(mb.shape[0]):
         raise RuntimeError(
-            f"{str(context)} batch size mismatch: x={int(xb.shape[0])} y={int(yb.shape[0])} m={int(mb.shape[0])}"
+            f"{str(context)} batch size mismatch: x={int(xb.shape[0])} m={int(mb.shape[0])}"
         )
-    return xb, yb, _mask_tensor_to_float01(mb), meta
+    return xb, _mask_tensor_to_float01(mb), meta
+
+
+def _apply_label_mask_dropout(
+    yb: torch.Tensor,
+    stack_list: List[Any],
+    index_list: List[Any],
+    cfg: LabelMaskDropoutConfig,
+    rng: np.random.Generator,
+) -> Tuple[torch.Tensor, List[Any], List[Any]]:
+    """Drop (label, mask slots) pairs before compositing.
+
+    For each positive label, with probability ``cfg.drop_rate`` the pair is
+    dropped: the label is set to ``cfg.false_neg_target`` in yb and all mask
+    slots for that label are evicted from the stack.  The composite therefore
+    only contains spatial evidence for labels that yb says are present.
+
+    Stops dropping once ``cfg.min_keep_labels`` active labels remain.
+    """
+    p = float(max(0.0, min(1.0, cfg.drop_rate)))
+    if p <= 0.0:
+        return yb, stack_list, index_list
+
+    yb_out = yb.to(dtype=torch.float32).clone()
+    out_stacks: List[Any] = list(stack_list)
+    out_indices: List[Any] = list(index_list)
+    keep_min = max(0, int(cfg.min_keep_labels))
+    fn_target = float(max(0.0, min(1.0, cfg.false_neg_target)))
+
+    for bi in range(int(yb_out.shape[0])):
+        row = yb_out[bi]
+        active = torch.nonzero(row >= 0.5, as_tuple=False).reshape(-1)
+        n_active = int(active.numel())
+
+        dropped_labels: set = set()
+        if n_active > keep_min:
+            remaining = int(n_active)
+            for li_t in active.tolist():
+                li = int(li_t)
+                if remaining <= keep_min:
+                    break
+                if float(rng.random()) < p:
+                    row[li] = fn_target
+                    dropped_labels.add(li)
+                    remaining -= 1
+
+        if dropped_labels and bi < len(out_stacks) and out_stacks[bi] is not None:
+            raw_st = out_stacks[bi]
+            raw_ix = out_indices[bi] if bi < len(out_indices) else None
+            if raw_st is not None and raw_ix is not None:
+                st_t = (raw_st if torch.is_tensor(raw_st)
+                        else torch.as_tensor(raw_st, dtype=torch.float32))
+                ix_t = ((raw_ix if torch.is_tensor(raw_ix)
+                         else torch.as_tensor(raw_ix, dtype=torch.long))
+                        .reshape(-1))
+                if int(st_t.ndim) == 2:
+                    st_t = st_t.unsqueeze(0)
+                n_slots = min(int(st_t.shape[0]), int(ix_t.numel()))
+                keep_slots = [si for si in range(n_slots)
+                              if int(ix_t[si].item()) not in dropped_labels]
+                if len(keep_slots) < n_slots:
+                    if len(keep_slots) == 0:
+                        h_, w_ = int(st_t.shape[1]), int(st_t.shape[2])
+                        out_stacks[bi] = torch.zeros(0, h_, w_, dtype=torch.float32)
+                        out_indices[bi] = torch.zeros(0, dtype=torch.long)
+                    else:
+                        kept_idx_t = torch.tensor(keep_slots, dtype=torch.long)
+                        out_stacks[bi] = st_t.index_select(0, kept_idx_t)
+                        out_indices[bi] = ix_t.index_select(0, kept_idx_t)
+
+    return yb_out, out_stacks, out_indices
 
 
 def _expand_semantic_mask_supervision_batch(
@@ -3812,9 +3800,54 @@ def _expand_semantic_mask_supervision_batch(
     batch_meta: Optional[Dict[str, Any]],
     mode: str,
     context: str,
+    dropout_cfg: Optional[LabelMaskDropoutConfig] = None,
+    dropout_rng: Optional[np.random.Generator] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     mode_key = re.sub(r"\s+", "_", str(mode)).strip().lower()
+
+    # --- pre-compositing label + mask dropout ----------------------------
+    if dropout_cfg is not None and float(dropout_cfg.drop_rate) > 0.0 and isinstance(batch_meta, dict):
+        _rng = dropout_rng
+        if _rng is None:
+            _seed = dropout_cfg.seed
+            _rng = (np.random.default_rng(int(_seed)) if _seed is not None
+                    else np.random.default_rng())
+        _stacks = list(batch_meta.get("mask_stacks") or [])
+        _indices = list(batch_meta.get("mask_indices") or [])
+        yb, _stacks, _indices = _apply_label_mask_dropout(
+            yb=yb, stack_list=_stacks, index_list=_indices,
+            cfg=dropout_cfg, rng=_rng,
+        )
+        batch_meta = dict(batch_meta)
+        batch_meta["mask_stacks"] = _stacks
+        batch_meta["mask_indices"] = _indices
+
     if mode_key in ("", "multihot_mix", "multihot", "mixed"):
+        # Composite each sample's mask stack on-device; deferred from data loading.
+        stack_list = []
+        if isinstance(batch_meta, dict):
+            stack_list = list(batch_meta.get("mask_stacks") or [])
+        h = int(mb.shape[-2]) if int(mb.ndim) >= 3 else int(xb.shape[-2])
+        w = int(mb.shape[-1]) if int(mb.ndim) >= 3 else int(xb.shape[-1])
+        composite_masks = []
+        for bi in range(int(xb.shape[0])):
+            sample_stack = stack_list[bi] if bi < len(stack_list) else None
+            composite = None
+            if sample_stack is not None:
+                stack_t = sample_stack if torch.is_tensor(sample_stack) else torch.as_tensor(sample_stack, dtype=torch.float32)
+                stack_t = stack_t.to(device=xb.device, dtype=torch.float32)
+                if int(stack_t.ndim) == 2:
+                    stack_t = stack_t.unsqueeze(0)
+                if int(stack_t.shape[0]) > 0:
+                    composite = stack_t.sum(dim=0)
+                    vmax = torch.amax(composite)
+                    if bool(torch.isfinite(vmax)) and float(vmax.item()) > 1e-8:
+                        composite = composite / vmax
+                    composite = torch.clamp(composite, 0.0, 1.0).unsqueeze(0)
+            if composite is None:
+                composite = torch.zeros(1, h, w, device=xb.device, dtype=torch.float32)
+            composite_masks.append(composite)
+        mb = torch.stack(composite_masks, dim=0)
         return xb, yb, mb
     if mode_key not in ("single_label_passes", "single_passes", "single_label"):
         raise RuntimeError(f"{str(context)} received unsupported semantic mask supervision mode: {mode!r}")
@@ -4099,7 +4132,7 @@ def _build_berkeley_payload_bank(
         progress_control=ctx,
     )
     if int(len(rows)) <= 0:
-        return [], [], {"available": 0, "used": 0, "available_train": 0, "available_val": 0}, [], [], []
+        return [], {"available": 0, "used": 0, "available_train": 0, "available_val": 0}, [], [], []
     wheel_result, wheel_info = _ensure_berkeley_semantic_wheel(
         rows=rows,
         candidate_indices=list(range(int(len(rows)))),
@@ -4118,7 +4151,6 @@ def _build_berkeley_payload_bank(
         wheel_expiry_uses=int(wheel_expiry_uses),
         max_base_rows=int(max_samples),
         wheel_use_rare_term_deck=bool(wheel_use_rare_term_deck),
-        class_names=_cn,
         force_rebuild=bool(force_cache_rebuild),
         processing_device=processing_device,
         preload_workers=int(preload_workers),
@@ -4126,7 +4158,6 @@ def _build_berkeley_payload_bank(
     )
     ds = SemanticWheelDataset(cache_dir=str(wheel_result.get("cache_dir", "")), return_mask_stack=False)
     selected_base_rows = [int(x) for x in list(wheel_result.get("base_row_indices") or [])]
-    out_targets: List[np.ndarray] = []
     out_per_row_terms: List[List[str]] = []
     for i in interruptible_tqdm(
         range(int(len(ds))),
@@ -4137,7 +4168,6 @@ def _build_berkeley_payload_bank(
         control=ctx,
     ):
         item = ds.read_numpy_entry(int(i))
-        out_targets.append(np.asarray(item["label_vec_u8"], dtype=np.float32).reshape(-1))
         out_per_row_terms.append(list(item.get("terms") or []))
     out_terms = [
         list(_normalize_vocab_terms(getattr(rows[int(idx)], "terms", [])))
@@ -4177,4 +4207,4 @@ def _build_berkeley_payload_bank(
         "inprocess_cache_hit": bool(rows_info.get("inprocess_cache_hit", False)),
         "total_raw_bytes": int(wheel_info.get("total_raw_bytes", 0)),
     }
-    return out_images, out_targets, info, out_terms, out_masks, out_per_row_terms
+    return out_images, info, out_terms, out_masks, out_per_row_terms

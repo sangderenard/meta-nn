@@ -68,17 +68,13 @@ from wav_ml_models import (
     train_transformer_feature_metric,
 )
 from semantic_dataset_loaders import (
-        BootstrapDynamicDataset,
         DiskSemanticRowsDataset,
         OverrideTargetSubsetDataset,
         StageDatasetManifest,
-        _composite_mask_stack,
         _semantic_color_score_maps,
-        build_label_mask_stack,
         build_loader_from_manifest,
         collect_semantic_disk_rows,
         detect_semantic_color_terms,
-        infer_semantic_support_mask,
         maybe_wrap_loader_with_threaded_prefetch,
         semantic_mask_stack_collate,
     )
@@ -196,10 +192,6 @@ _EXTRACTED_SYMBOLS = {
     "_build_synthetic_semantic_symbol_pool": "pipeline.nodes.vocab_node",
     "_enrich_pregestation_stack_with_observed_color_masks": "pipeline.nodes.vocab_node",
     "_image_any_to_rgb_chw01": "pipeline.nodes.vocab_node",
-    "_label_knockout_optional_rows_np": "pipeline.nodes.vocab_node",
-    "_label_knockout_row_np": "pipeline.nodes.vocab_node",
-    "_label_knockout_rows_np": "pipeline.nodes.vocab_node",
-    "_label_knockout_tensor_batch": "pipeline.nodes.vocab_node",
     "_load_vocab_terms_json": "pipeline.nodes.vocab_node",
     "_merge_symbol_term_pools": "pipeline.nodes.vocab_node",
     "_merge_vocab_terms": "pipeline.nodes.vocab_node",

@@ -761,6 +761,62 @@ NODUS_API int nodus_weight_image_store_mark_checkpoint(
         int32_t                round_id,
         int32_t                cycle);
 
+/* ================================================================== */
+/*  Runtime Control Store                                             */
+/* ================================================================== */
+
+#define NODUS_RUNTIME_CONTROL_SOURCE_MAX 64
+#define NODUS_RUNTIME_CONTROL_REASON_MAX 160
+
+typedef struct NodusRuntimeControlStore NodusRuntimeControlStore;
+
+/* Global cross-process runtime control block used for cooperative
+   scheduling between the trainer and auxiliary services such as the
+   web server. */
+NODUS_API NodusRuntimeControlStore* nodus_runtime_control_store_get_global(void);
+
+/* Reset the runtime-control block to a neutral state. */
+NODUS_API void nodus_runtime_control_store_clear(NodusRuntimeControlStore *store);
+
+/* Mark a high-priority service task as active/inactive. Trainers may treat
+   active_service_count > 0 as a pause request and resume when it returns to 0. */
+NODUS_API void nodus_runtime_control_store_begin_service(
+        NodusRuntimeControlStore *store,
+        const char               *source,
+        double                    ts);
+
+NODUS_API void nodus_runtime_control_store_end_service(
+        NodusRuntimeControlStore *store,
+        const char               *source,
+        double                    ts);
+
+/* Read the current active-service count. Returns 0 when unset/error. */
+NODUS_API int32_t nodus_runtime_control_store_active_services(
+        const NodusRuntimeControlStore *store);
+
+/* Set or clear the process-exit request that auxiliary services can honor
+   cooperatively. */
+NODUS_API void nodus_runtime_control_store_set_exit(
+        NodusRuntimeControlStore *store,
+        int32_t                   requested,
+        const char               *reason,
+        double                    ts);
+
+/* Read the full runtime-control state. Any output pointer may be NULL.
+   Returns 0 on success, -1 on error. */
+NODUS_API int nodus_runtime_control_store_get_state(
+        const NodusRuntimeControlStore *store,
+        int32_t                        *out_active_service_count,
+        uint64_t                       *out_service_enter_count,
+        uint64_t                       *out_service_exit_count,
+        int32_t                        *out_exit_requested,
+        double                         *out_last_service_ts,
+        double                         *out_exit_ts,
+        char                           *out_last_source,
+        int                             out_last_source_buflen,
+        char                           *out_exit_reason,
+        int                             out_exit_reason_buflen);
+
 #ifdef __cplusplus
 }
 #endif

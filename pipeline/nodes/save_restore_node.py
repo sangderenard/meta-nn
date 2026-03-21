@@ -54,6 +54,58 @@ from pipeline.weight_map import parameter_plan_from_render_spec, resolve_weight_
 from wav_ml_models import prime_tiny_classifier_label_bank_for_state_dict
 
 
+def _classifier_checkpoint_metadata(model: Any, ctx: PipelineContext) -> Dict[str, Any]:
+    meta: Dict[str, Any] = {
+        "model_name": "tiny",
+        "num_classes": int(len(getattr(ctx, "class_names", []) or [])),
+        "class_names": [str(x) for x in list(getattr(ctx, "class_names", []) or [])],
+        "label_texts": [str(x) for x in list(getattr(ctx, "label_texts", []) or [])],
+        "input_shape": [1, 3, 64, 64],
+    }
+    try:
+        features = getattr(model, "features", None)
+        head = getattr(model, "head", None)
+        mask_head = getattr(model, "mask_head", None)
+        base_ch = int(getattr(features[0], "out_channels", 64))
+        max_ch = max(
+            base_ch,
+            int(getattr(features[4], "out_channels", base_ch)),
+            int(getattr(features[8], "out_channels", base_ch)),
+            int(getattr(features[12], "out_channels", base_ch)),
+        )
+        context_blocks = int(sum(1 for m in list(features or []) if hasattr(m, "conv1") and hasattr(m, "conv2")))
+        mask_decoder_channels = int(getattr(mask_head[0], "out_channels", 0)) if mask_head is not None else 0
+        context_dropout = 0.05
+        if context_blocks > 0:
+            for m in list(features):
+                drop = getattr(m, "drop", None)
+                if drop is not None and hasattr(drop, "p"):
+                    context_dropout = float(getattr(drop, "p", 0.05))
+                    break
+        head_linear = head[-1] if head is not None and len(head) > 0 else None
+        if head_linear is not None and hasattr(head_linear, "out_features"):
+            meta["num_classes"] = int(getattr(head_linear, "out_features", meta["num_classes"]))
+        meta["ctor_kwargs"] = {
+            "num_classes": int(meta["num_classes"]),
+            "base_ch": int(base_ch),
+            "max_ch": int(max_ch),
+            "context_blocks": int(context_blocks),
+            "context_dropout": float(context_dropout),
+            "mask_decoder_channels": int(mask_decoder_channels),
+        }
+    except Exception:
+        pass
+    if len(meta["label_texts"]) != int(meta["num_classes"]):
+        names = list(meta["class_names"])
+        if len(names) == int(meta["num_classes"]):
+            meta["label_texts"] = list(names)
+        else:
+            meta["label_texts"] = [f"class_{i}" for i in range(int(meta["num_classes"]))]
+    if len(meta["class_names"]) != int(meta["num_classes"]):
+        meta["class_names"] = [f"class_{i}" for i in range(int(meta["num_classes"]))]
+    return meta
+
+
 def _log(msg: str) -> None:
     print(msg, flush=True)
 
@@ -982,10 +1034,10 @@ class SaveRestoreNode(PipelineNode):
                     _state_blob = model.state_dict()
                     if name == "classifier":
                         _state_blob = self._strip_lora_from_state_dict(model, _state_blob)
-                torch.save(
-                    {"state_dict": _state_blob, **extra},
-                    out_dir / f"{name}.pt",
-                )
+                payload = {"state_dict": _state_blob, **extra}
+                if name == "classifier":
+                    payload.update(_classifier_checkpoint_metadata(model, ctx))
+                torch.save(payload, out_dir / f"{name}.pt")
 
         # 4. Save seed bank
         if self.seed_bank is not None:

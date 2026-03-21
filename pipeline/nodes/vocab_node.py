@@ -46,7 +46,6 @@ from pipeline.graph import PipelineNode
 from pipeline.nodes.base import OneTimeNode
 from pipeline.progress import interruptible_tqdm
 from semantic_dataset_loaders import (
-    _composite_mask_stack,
     _semantic_color_score_maps,
     detect_semantic_color_terms,
 )
@@ -1422,16 +1421,11 @@ def _semantic_tonal_tags_from_image(
         return []
     lo_t = float(low_threshold)
     hi_t = float(high_threshold)
-    cov_t = float(coverage_threshold)
     tags: List[str] = []
-    low_frac = float(np.mean(flat <= lo_t))
-    high_frac = float(np.mean(flat >= hi_t))
     mean_v = float(np.mean(flat))
     std_v = float(np.std(flat))
-    if low_frac >= cov_t:
-        tags.extend(["black", "dark"])
-    if high_frac >= cov_t:
-        tags.extend(["white", "bright"])
+    tags.extend(["black", "dark"])
+    tags.extend(["white", "bright"])
     if (abs(mean_v - 0.5) <= float(gray_mean_tolerance)) and (std_v <= float(gray_std_threshold)):
         tags.append("gray")
     # fast edge detection: Sobel gradient magnitude
@@ -1446,13 +1440,8 @@ def _semantic_tonal_tags_from_image(
             tags.append("edge")
     # warm/cool color temperature: compare mean R vs mean B channel balance
     if int(arr.shape[0]) >= 3:
-        _r_mean = float(np.mean(arr[0]))
-        _b_mean = float(np.mean(arr[2]))
-        _temp_diff = _r_mean - _b_mean
-        if _temp_diff >= 0.10:
-            tags.append("warm")
-        elif _temp_diff <= -0.10:
-            tags.append("cool")
+        tags.append("warm")
+        tags.append("cool")
     tags.extend(detect_semantic_color_terms(rgb))
     return _normalize_vocab_terms(tags)
 
@@ -1572,147 +1561,6 @@ def _semantic_active_target_stats(
     out["p50"] = float(np.percentile(c_np, 50))
     out["max"] = int(c_np.max())
     return out
-
-
-def _label_knockout_row_np(
-    row: Any,
-    rng: np.random.Generator,
-    prob: float,
-    min_keep: int,
-    max_drop_frac: float,
-    threshold: float = 0.5,
-) -> Tuple[np.ndarray, int]:
-    arr = np.asarray(row, dtype=np.float32).reshape(-1).copy()
-    p = float(max(0.0, min(1.0, float(prob))))
-    keep_min = max(0, int(min_keep))
-    frac = float(max(0.0, min(1.0, float(max_drop_frac))))
-    if int(arr.size) <= 0 or p <= 0.0:
-        return arr, 0
-    if float(rng.random()) >= p:
-        return arr, 0
-    active = np.where(np.asarray(arr, dtype=np.float32) >= float(threshold))[0].astype(np.int64)
-    n_active = int(active.size)
-    if int(n_active) <= int(keep_min):
-        return arr, 0
-    max_drop_by_frac = int(math.floor(float(n_active) * float(frac)))
-    max_drop = int(n_active - int(keep_min))
-    if int(max_drop_by_frac) > 0:
-        max_drop = min(int(max_drop), int(max_drop_by_frac))
-    max_drop = max(1, int(max_drop))
-    drop_n = int(rng.integers(1, int(max_drop) + 1))
-    pick = rng.choice(active, size=int(drop_n), replace=False).astype(np.int64)
-    arr[pick] = 0.0
-    return arr.astype(np.float32, copy=False), int(drop_n)
-
-
-def _label_knockout_rows_np(
-    rows: Sequence[Any],
-    prob: float,
-    seed: int,
-    min_keep: int,
-    max_drop_frac: float,
-    threshold: float = 0.5,
-) -> Tuple[List[np.ndarray], Dict[str, Any]]:
-    rng = np.random.default_rng(max(0, int(seed)))
-    out_rows: List[np.ndarray] = []
-    rows_total = int(len(rows))
-    rows_applied = 0
-    labels_dropped = 0
-    p = float(max(0.0, min(1.0, float(prob))))
-    for row in rows:
-        out_row, dropped = _label_knockout_row_np(
-            row=row,
-            rng=rng,
-            prob=float(p),
-            min_keep=int(min_keep),
-            max_drop_frac=float(max_drop_frac),
-            threshold=float(threshold),
-        )
-        out_rows.append(np.asarray(out_row, dtype=np.float32).reshape(-1))
-        if int(dropped) > 0:
-            rows_applied += 1
-            labels_dropped += int(dropped)
-    info = {
-        "enabled": bool(float(p) > 0.0),
-        "prob": float(p),
-        "rows_total": int(rows_total),
-        "rows_applied": int(rows_applied),
-        "labels_dropped": int(labels_dropped),
-        "min_keep": int(max(0, int(min_keep))),
-        "max_drop_frac": float(max(0.0, min(1.0, float(max_drop_frac)))),
-    }
-    return out_rows, info
-
-
-def _label_knockout_optional_rows_np(
-    rows: Sequence[Any],
-    prob: float,
-    seed: int,
-    min_keep: int,
-    max_drop_frac: float,
-    threshold: float = 0.5,
-) -> Tuple[List[Any], Dict[str, Any]]:
-    real_rows = [np.asarray(r, dtype=np.float32).reshape(-1) for r in rows if r is not None]
-    knocked_rows, info = _label_knockout_rows_np(
-        rows=real_rows,
-        prob=float(prob),
-        seed=int(seed),
-        min_keep=int(min_keep),
-        max_drop_frac=float(max_drop_frac),
-        threshold=float(threshold),
-    )
-    out: List[Any] = []
-    real_idx = 0
-    for r in rows:
-        if r is None:
-            out.append(None)
-            continue
-        out.append(np.asarray(knocked_rows[int(real_idx)], dtype=np.float32).reshape(-1))
-        real_idx += 1
-    info = dict(info)
-    info["rows_with_targets"] = int(len(real_rows))
-    return out, info
-
-
-def _label_knockout_tensor_batch(
-    yb: torch.Tensor,
-    rng: np.random.Generator,
-    prob: float,
-    min_keep: int,
-    max_drop_frac: float,
-    threshold: float = 0.5,
-) -> Tuple[torch.Tensor, int, int]:
-    if (not torch.is_tensor(yb)) or int(getattr(yb, "ndim", 0)) != 2 or int(yb.shape[0]) <= 0:
-        return yb, 0, 0
-    p = float(max(0.0, min(1.0, float(prob))))
-    if float(p) <= 0.0:
-        return yb, 0, 0
-    keep_min = max(0, int(min_keep))
-    frac = float(max(0.0, min(1.0, float(max_drop_frac))))
-    out = yb.to(dtype=torch.float32).clone()
-    rows_applied = 0
-    labels_dropped = 0
-    for bi in range(int(out.shape[0])):
-        if float(rng.random()) >= float(p):
-            continue
-        row = out[int(bi)]
-        active = torch.nonzero(row >= float(threshold), as_tuple=False).reshape(-1)
-        n_active = int(active.numel())
-        if int(n_active) <= int(keep_min):
-            continue
-        max_drop_by_frac = int(math.floor(float(n_active) * float(frac)))
-        max_drop = int(n_active - int(keep_min))
-        if int(max_drop_by_frac) > 0:
-            max_drop = min(int(max_drop), int(max_drop_by_frac))
-        max_drop = max(1, int(max_drop))
-        drop_n = int(rng.integers(1, int(max_drop) + 1))
-        pos = rng.choice(np.arange(int(n_active), dtype=np.int64), size=int(drop_n), replace=False).astype(np.int64)
-        pos_t = torch.from_numpy(pos).to(device=active.device, dtype=torch.long)
-        drop_idx = active.index_select(0, pos_t)
-        row[drop_idx] = 0.0
-        rows_applied += 1
-        labels_dropped += int(drop_n)
-    return out.to(dtype=yb.dtype), int(rows_applied), int(labels_dropped)
 
 
 def _build_auto_symbol_term_pool(
@@ -2758,13 +2606,10 @@ def _build_pregestation_logic_rows(
                     elem_term_lists = [bg_terms, circle_terms]
                     merged = _normalize_vocab_terms(bg_terms + circle_terms)
 
-                # Composite mask: additive-sum all per-element masks, normalized
-                # to [0, 1].  This is the mask the dataloader sees at training time.
                 elem_stack = np.stack(elem_masks, axis=0)  # [k, H, W]
-                composite_mask = _composite_mask_stack(elem_stack)
 
                 out_images.append(img)
-                out_masks.append(composite_mask)
+                out_masks.append(np.zeros((int(elem_stack.shape[1]), int(elem_stack.shape[2])), dtype=np.float32))
                 out_mask_stacks.append(elem_stack)
                 out_elem_term_lists.append(elem_term_lists)
                 out_terms.append(merged)
@@ -2811,28 +2656,25 @@ def _enrich_pregestation_stack_with_observed_color_masks(
     image_chw01: np.ndarray,
     elem_stack: np.ndarray,
     term_row: Sequence[str],
-) -> Tuple[np.ndarray, np.ndarray]:
+) -> Tuple[np.ndarray, List[str]]:
     """Extend a geometric mask stack with pixel-observed color masks.
 
     For each color term present in *term_row* that belongs to the known
     colorimetric vocabulary, extract the corresponding per-pixel color score
     map from *image_chw01* and append it to *elem_stack* as an additional
     mask slot.  The output ``extended_stack`` has shape ``[k + k', H, W]``
-    where ``k'`` is the number of matched color terms.  The composite
-    normalization is recomputed from the extended stack.
+    where ``k'`` is the number of matched color terms.
 
-    This solves the denormalization problem cleanly: because the raw
-    per-element geometric masks are available in *elem_stack* we never need
-    to invert the normalized composite.  We simply append to the raw stack
-    and let ``_composite_mask_stack`` renormalize the combined result.
-
-    Returns ``(extended_stack, composite)`` — terms are not modified.
+    Returns ``(extended_stack, observed_colors)``.
+    ``observed_colors`` lists the color names whose score maps were actually
+    appended (only those with non-trivial spatial signal).
     """
     chw = np.asarray(image_chw01, dtype=np.float32)
     color_maps = _semantic_color_score_maps(chw)
     norm_terms = {re.sub(r"\s+", " ", str(t)).strip().lower() for t in term_row}
 
     observed: List[np.ndarray] = []
+    observed_colors: List[str] = []
     for color_name in _PREGESTATION_OBSERVED_COLOR_TERMS:
         if str(color_name) not in norm_terms:
             continue
@@ -2843,13 +2685,14 @@ def _enrich_pregestation_stack_with_observed_color_masks(
         vmax = float(np.max(score))
         if vmax > 1e-8:
             observed.append(np.clip(score / float(vmax), 0.0, 1.0).astype(np.float32, copy=False))
+            observed_colors.append(str(color_name))
 
     if len(observed) == 0:
-        return elem_stack, _composite_mask_stack(elem_stack)
+        return elem_stack, []
 
     observed_np = np.stack(observed, axis=0)  # [k', H, W]
     extended = np.concatenate([elem_stack, observed_np], axis=0)  # [k + k', H, W]
-    return extended, _composite_mask_stack(extended)
+    return extended, observed_colors
 
 
 def _rotate_active_extra_terms(

@@ -36,7 +36,6 @@ Config search owned here
   * Best-config selection and persistence into ctx.render_config
 """
 from __future__ import annotations
-
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
@@ -501,6 +500,10 @@ class TransformerTrainNode(IRTrainingNode):
         _skip_dir: list = [0]  # 0=none, 1=forward, -1=back
 
         def _stop_or_skip() -> bool:
+            from pipeline.progress import wait_for_resume
+
+            if wait_for_resume(control=ctx, pause_poll_s=0.05):
+                return True
             stop_fn = getattr(ctx, "stop_requested", None)
             if callable(stop_fn):
                 try:

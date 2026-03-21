@@ -396,9 +396,15 @@ def make_training_progress_callback(
         return None
 
     from pipeline.plan_protocol import ExecutionEventPayload
+    from pipeline.progress import raise_if_stop_requested, wait_for_resume
     import uuid as _uuid
 
+    def _wait_for_resume() -> None:
+        if wait_for_resume(control=ctx, pause_poll_s=0.05):
+            raise_if_stop_requested(ctx)
+
     def _callback(info: Dict[str, Any]) -> None:
+        _wait_for_resume()
         step = int(info.get("global_step", 0))
         total = int(info.get("total_steps", 0))
         loss = float(info.get("loss", 0.0))

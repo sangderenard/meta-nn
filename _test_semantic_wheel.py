@@ -11,6 +11,7 @@ import torch
 from PIL import Image
 from torch.utils.data import DataLoader
 
+from pipeline.nodes.classifier_node import _yb_from_terms
 from pipeline.nodes.data_nodes import (
     _expand_semantic_mask_supervision_batch,
     _unpack_masked_semantic_batch,
@@ -58,7 +59,6 @@ def _make_rows(root: Path, n_rows: int = 3) -> tuple[list[SemanticDiskRow], list
         rows.append(
             SemanticDiskRow(
                 image_path=str(img_path),
-                label_vec=y,
                 terms=["berkeley sbd dataset", "object", "signal", "red object"],
                 source="berkeley_sbd_train",
                 mask_path=str(mask_path),
@@ -88,14 +88,12 @@ def test_roundtrip() -> None:
         built = ensure_semantic_wheel_cache(
             rows=rows,
             candidate_indices=[0, 1, 2],
-            class_names=class_names,
             config=cfg,
         )
         ds = SemanticWheelDataset(cache_dir=str(built["cache_dir"]), return_mask_stack=True)
         assert len(ds) == 6, len(ds)
         sample = ds.read_numpy_entry(0)
         assert sample["image_u8"].dtype == np.uint8
-        assert sample["mixed_mask"].dtype == np.float32
         assert sample["mask_stack"].dtype == np.float32
         _ok("wheel dataset round-trips float32 mask payloads")
 
@@ -106,14 +104,23 @@ def test_roundtrip() -> None:
             collate_fn=semantic_mask_stack_collate,
         )
         batch = next(iter(loader))
-        xb, yb, mb, meta = _unpack_masked_semantic_batch(batch, context="semantic-wheel-smoke")
+        xb, mb, meta = _unpack_masked_semantic_batch(batch, context="semantic-wheel-smoke")
         assert xb.dtype == torch.float32
-        assert yb.dtype == torch.float32
         assert mb.dtype == torch.float32
         assert float(torch.amax(mb).item()) <= 1.0
         assert float(torch.amin(mb).item()) >= 0.0
         assert meta["mask_stacks"][0].dtype == torch.uint8
         _ok("dataloader unpack normalizes uint8 masks to float01")
+
+        # Build yb from terms at batch time (canonical path)
+        active_term_to_idx = {str(n): i for i, n in enumerate(class_names)}
+        yb = _yb_from_terms(
+            terms_rows=meta["terms_rows"],
+            active_term_to_idx=active_term_to_idx,
+            n_active_classes=len(class_names),
+            device=xb.device,
+        )
+        assert yb.dtype == torch.float32
 
         x_exp, y_exp, m_exp = _expand_semantic_mask_supervision_batch(
             xb=xb,
@@ -151,7 +158,6 @@ def test_sanity_cap_guard() -> None:
             ensure_semantic_wheel_cache(
                 rows=rows,
                 candidate_indices=[0, 1],
-                class_names=class_names,
                 config=cfg,
             )
         except RuntimeError as exc:
@@ -166,17 +172,14 @@ def test_generic_candidate_deck_rotation() -> None:
     with tempfile.TemporaryDirectory(dir=".") as td:
         root = Path(td)
         label_dim = 5
+        local_vocab = [f"term-{i}" for i in range(5)]
         images: list[np.ndarray] = []
-        targets: list[np.ndarray] = []
         candidates: list[SemanticWheelCandidate] = []
         for i in range(5):
             img = np.zeros((3, 12, 12), dtype=np.float32)
             img[0, :, :] = float(i + 1) / 8.0
             img[1, 2:10, 2:10] = 1.0
-            y = np.zeros((label_dim,), dtype=np.float32)
-            y[i] = 1.0
             images.append(img)
-            targets.append(y)
             candidates.append(
                 SemanticWheelCandidate(
                     cache_key=f"candidate-{i}",
@@ -189,7 +192,6 @@ def test_generic_candidate_deck_rotation() -> None:
             return [
                 build_semantic_cache_entry(
                     image=images[int(base_idx)],
-                    label_vec=targets[int(base_idx)],
                     image_size=16,
                 )
             ]
@@ -213,14 +215,14 @@ def test_generic_candidate_deck_rotation() -> None:
             candidates=candidates,
             candidate_indices=list(range(5)),
             build_entry_group=_entry_group,
-            label_dim=label_dim,
+            local_vocab=local_vocab,
             config=cfg,
         )
         second = ensure_semantic_candidate_cache(
             candidates=candidates,
             candidate_indices=list(range(5)),
             build_entry_group=_entry_group,
-            label_dim=label_dim,
+            local_vocab=local_vocab,
             config=cfg,
         )
         first_rows = [int(x) for x in list(first.get("base_candidate_indices") or [])]
@@ -236,6 +238,7 @@ def test_generic_candidate_cache_expiry_respected() -> None:
     with tempfile.TemporaryDirectory(dir=".") as td:
         root = Path(td)
         label_dim = 3
+        local_vocab = [f"term-{i}" for i in range(4)]
         candidates = [
             SemanticWheelCandidate(cache_key=f"candidate-{i}", terms=[f"term-{i}"], source="synthetic")
             for i in range(4)
@@ -244,9 +247,7 @@ def test_generic_candidate_cache_expiry_respected() -> None:
         def _entry_group(base_idx: int, _base_pos: int) -> list[dict]:
             img = np.zeros((3, 8, 8), dtype=np.float32)
             img[0, :, :] = float(base_idx + 1) / 8.0
-            y = np.zeros((label_dim,), dtype=np.float32)
-            y[int(base_idx) % int(label_dim)] = 1.0
-            return [build_semantic_cache_entry(image=img, label_vec=y, image_size=8)]
+            return [build_semantic_cache_entry(image=img, image_size=8)]
 
         cfg = SemanticWheelConfig(
             purpose="expiry_probe",
@@ -267,21 +268,21 @@ def test_generic_candidate_cache_expiry_respected() -> None:
             candidates=candidates,
             candidate_indices=list(range(4)),
             build_entry_group=_entry_group,
-            label_dim=label_dim,
+            local_vocab=local_vocab,
             config=cfg,
         )
         second = ensure_semantic_candidate_cache(
             candidates=candidates,
             candidate_indices=list(range(4)),
             build_entry_group=_entry_group,
-            label_dim=label_dim,
+            local_vocab=local_vocab,
             config=cfg,
         )
         third = ensure_semantic_candidate_cache(
             candidates=candidates,
             candidate_indices=list(range(4)),
             build_entry_group=_entry_group,
-            label_dim=label_dim,
+            local_vocab=local_vocab,
             config=cfg,
         )
         assert bool(first.get("cache_hit", False)) is False
@@ -296,6 +297,7 @@ def test_generic_candidate_cache_prunes_old_variants_and_tmp_dirs() -> None:
         root = Path(td)
         cache_root = root / "cache"
         label_dim = 2
+        local_vocab = [f"term-{i}" for i in range(3)]
         candidates = [
             SemanticWheelCandidate(cache_key=f"candidate-{i}", terms=[f"term-{i}"], source="synthetic")
             for i in range(3)
@@ -304,9 +306,7 @@ def test_generic_candidate_cache_prunes_old_variants_and_tmp_dirs() -> None:
         def _entry_group(base_idx: int, _base_pos: int) -> list[dict]:
             img = np.zeros((3, 8, 8), dtype=np.float32)
             img[1, :, :] = float(base_idx + 1) / 6.0
-            y = np.zeros((label_dim,), dtype=np.float32)
-            y[int(base_idx) % int(label_dim)] = 1.0
-            return [build_semantic_cache_entry(image=img, label_vec=y, image_size=8)]
+            return [build_semantic_cache_entry(image=img, image_size=8)]
 
         cfg_a = SemanticWheelConfig(
             purpose="prune_probe",
@@ -326,7 +326,7 @@ def test_generic_candidate_cache_prunes_old_variants_and_tmp_dirs() -> None:
             candidates=candidates,
             candidate_indices=list(range(3)),
             build_entry_group=_entry_group,
-            label_dim=label_dim,
+            local_vocab=local_vocab,
             config=cfg_a,
         )
         stale_tmp = cache_root / "prune_probe_deadbeef_tmp"
@@ -351,7 +351,7 @@ def test_generic_candidate_cache_prunes_old_variants_and_tmp_dirs() -> None:
             candidates=candidates,
             candidate_indices=list(range(3)),
             build_entry_group=_entry_group,
-            label_dim=label_dim,
+            local_vocab=local_vocab,
             config=cfg_b,
         )
         remaining = sorted(

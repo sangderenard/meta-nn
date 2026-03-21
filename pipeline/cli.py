@@ -980,27 +980,6 @@ def parse_args():
         help="Required reduction margin for spurious labels (after must be below before-margin).",
     )
     p.add_argument(
-        "--target-label-knockout-prob",
-        type=float,
-        default=0.0,
-        help=(
-            "Per-row probability of randomly dropping a subset of active target labels during training-target assembly "
-            "(0 disables label knockout)."
-        ),
-    )
-    p.add_argument(
-        "--target-label-knockout-max-drop-frac",
-        type=float,
-        default=0.50,
-        help="Maximum fraction of active labels that may be dropped when knockout is applied to a row.",
-    )
-    p.add_argument(
-        "--target-label-knockout-min-keep",
-        type=int,
-        default=1,
-        help="Minimum number of active labels to preserve in a row after knockout.",
-    )
-    p.add_argument(
         "--transformer-accepted-preload-max",
         type=int,
         default=0,

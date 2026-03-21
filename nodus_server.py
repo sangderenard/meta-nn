@@ -3,8 +3,9 @@
 nodus_server.py -- HTTP server that exposes the nodus shared-memory data stores.
 
 Connects to the same cross-process shared memory as the training pipeline and
-serves the data as JSON / PNG over HTTP.  The server is read-only; it never
-writes to the shared memory.
+serves the data as JSON / PNG over HTTP.  Most endpoints are read-only; the
+server only writes lightweight runtime-control flags used to prioritize web
+work over training and to honor cooperative shutdown requests.
 
 Usage:
     python nodus_server.py [--host 127.0.0.1] [--port 7272]
@@ -12,6 +13,7 @@ Usage:
 Endpoints:
     GET /                                   HTML index / API listing
     GET /api/status                         JSON  overall store status
+    GET /api/model/interface/meta          JSON  unified lease/latest model descriptor
     GET /api/loss/channels                  JSON  all loss channels + summary
     GET /api/loss/channel/<key>/records     JSON  records (query: from_step, max)
     GET /api/loss/channel/<key>/latest      JSON  most recent record
@@ -31,11 +33,17 @@ Endpoints:
     GET /api/weight/image/info              JSON  image-cache stats
     GET /api/weight/image/latest.png        PNG   newest rendered weight image
     GET /api/weight/image/<idx>.png         PNG   weight image by index
+    GET /api/runtime/control                JSON  runtime-control flags
+    GET /api/model/latest/classifier/meta   JSON  latest classifier labels + input shape
+    POST /api/model/latest/classifier/infer JSON  latest classifier inference on an uploaded image
+    POST /api/model/interface/prepare       JSON  unified prepare/export for lease/latest models
+    POST /api/model/interface/infer         JSON  unified classifier inference for lease/latest models
 """
 
 from __future__ import annotations
 
 import argparse
+import base64
 import ctypes
 import dataclasses
 import io
@@ -44,7 +52,9 @@ import re
 import struct
 import sys
 import threading
+import time
 import zlib
+from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Optional
 from urllib.parse import parse_qs, urlparse
@@ -99,13 +109,14 @@ def _composite_rgba_on_black(width: int, height: int, rgba: bytes) -> bytes:
 # ---------------------------------------------------------------------------
 
 def _get_stores():
-    """Return (loss_store, scrub_ring, weight_state_store, weight_image_store).
+    """Return (loss_store, scrub_ring, weight_state_store, weight_image_store, runtime_control).
 
     Imported lazily so the module can be imported without the DLL present.
     Stores are the cross-process global singletons.
     """
     from pipeline.nodus_loss_store import (
         NodusLossStore,
+        NodusRuntimeControlStore,
         NodusScrubRing,
         NodusWeightStateStore,
         NodusWeightImageStore,
@@ -114,7 +125,8 @@ def _get_stores():
     scrub  = NodusScrubRing.get_global()
     wstate = NodusWeightStateStore.get_global()
     wimage = NodusWeightImageStore.get_global()
-    return loss, scrub, wstate, wimage
+    control = NodusRuntimeControlStore.get_global()
+    return loss, scrub, wstate, wimage, control
 
 
 # Cached after first successful load.
@@ -136,10 +148,21 @@ _CHECKPOINT_DIR: Optional[str] = None
 # Cache: model_name → (mtime, onnx_bytes)
 _ONNX_CACHE: dict = {}
 _ONNX_CACHE_LOCK = threading.Lock()
+_LATEST_CLASSIFIER_CACHE: dict = {}
+_LATEST_CLASSIFIER_CACHE_LOCK = threading.Lock()
 
 _LATEST_MODEL_ALLOWED = {
     "classifier", "transformer", "generator", "discriminator", "wave_classifier",
 }
+_MODEL_CLASS_TO_NAME = {
+    "TinyConvClassifier": "classifier",
+    "ConditionalBitPlaneGenerator": "generator",
+    "ConditionalBitPlaneDiscriminator": "discriminator",
+    "WavePatchTransformer": "transformer",
+    "DeskewFilterBundle": "wave_classifier",
+}
+_MODEL_NAME_TO_CLASS = {value: key for key, value in _MODEL_CLASS_TO_NAME.items()}
+_ALLOWED_MODEL_CLASSES = set(_MODEL_CLASS_TO_NAME.keys())
 
 
 def _lease_store():
@@ -173,6 +196,61 @@ def _wimage():
     return _stores()[3]
 
 
+def _control():
+    return _stores()[4]
+
+
+def _model_name_for_class(model_class: str) -> str:
+    return _MODEL_CLASS_TO_NAME.get(str(model_class or "").strip(), "")
+
+
+def _model_class_for_name(model_name: str) -> str:
+    return _MODEL_NAME_TO_CLASS.get(str(model_name or "").strip(), "")
+
+
+def _normalise_model_selection(model_name: str = "", model_class: str = "") -> tuple[str, str]:
+    resolved_name = str(model_name or "").strip()
+    resolved_class = str(model_class or "").strip()
+    if resolved_class and resolved_class not in _ALLOWED_MODEL_CLASSES:
+        raise ValueError(f"model_class must be one of {sorted(_ALLOWED_MODEL_CLASSES)}")
+    if resolved_name and resolved_name not in _LATEST_MODEL_ALLOWED:
+        raise ValueError(f"model_name must be one of {sorted(_LATEST_MODEL_ALLOWED)}")
+    if not resolved_name and resolved_class:
+        resolved_name = _model_name_for_class(resolved_class)
+    if not resolved_class and resolved_name:
+        resolved_class = _model_class_for_name(resolved_name)
+    if not resolved_name and not resolved_class:
+        resolved_name = "classifier"
+        resolved_class = _model_class_for_name(resolved_name)
+    if not resolved_name:
+        raise ValueError("could not infer model_name from model_class")
+    if not resolved_class:
+        raise ValueError("could not infer model_class from model_name")
+    return resolved_name, resolved_class
+
+
+def _normalise_input_shape(raw: object, default: object = None) -> list[int]:
+    fallback = list(default) if isinstance(default, (list, tuple)) else [1, 3, 64, 64]
+    if isinstance(raw, str):
+        parts = [p.strip() for p in str(raw).split(",") if p.strip()]
+        values = [int(p) for p in parts] if parts else list(fallback)
+    elif isinstance(raw, (list, tuple)):
+        values = [int(x) for x in list(raw)]
+    else:
+        values = list(fallback)
+    if len(values) != 4:
+        values = list(fallback)
+    if int(values[0]) <= 0:
+        values[0] = 1
+    if int(values[1]) <= 0:
+        values[1] = 3
+    if int(values[2]) <= 0:
+        values[2] = 64
+    if int(values[3]) <= 0:
+        values[3] = 64
+    return [int(x) for x in values]
+
+
 # ---------------------------------------------------------------------------
 # JSON helpers
 # ---------------------------------------------------------------------------
@@ -183,6 +261,613 @@ def _json(obj) -> bytes:
 
 def _dataclass_dict(obj) -> dict:
     return dataclasses.asdict(obj)
+
+
+def _runtime_control_state_dict() -> dict:
+    try:
+        state = _control().get_state()
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+    if state is None:
+        return {"ok": False, "error": "runtime control state unavailable"}
+    return {
+        "ok": True,
+        "active_service_count": int(getattr(state, "active_service_count", 0)),
+        "service_enter_count": int(getattr(state, "service_enter_count", 0)),
+        "service_exit_count": int(getattr(state, "service_exit_count", 0)),
+        "exit_requested": bool(getattr(state, "exit_requested", False)),
+        "last_service_ts": float(getattr(state, "last_service_ts", 0.0)),
+        "exit_ts": float(getattr(state, "exit_ts", 0.0)),
+        "last_source": str(getattr(state, "last_source", "") or ""),
+        "exit_reason": str(getattr(state, "exit_reason", "") or ""),
+    }
+
+
+@contextmanager
+def _service_priority(source: str):
+    control = None
+    try:
+        control = _control()
+    except Exception:
+        control = None
+    token = str(source or "service")
+    if control is not None:
+        try:
+            control.begin_service(token)
+        except Exception:
+            control = None
+    try:
+        yield
+    finally:
+        if control is not None:
+            try:
+                control.end_service(token)
+            except Exception:
+                pass
+
+
+def _extract_checkpoint_state_dict(blob: object, preferred_keys: tuple[str, ...] = ()) -> dict:
+    if isinstance(blob, dict):
+        for key in preferred_keys:
+            candidate = blob.get(key)
+            if isinstance(candidate, dict):
+                blob = candidate
+                break
+        else:
+            blob = blob.get("state_dict", blob)
+    if isinstance(blob, dict) and isinstance(blob.get("model_state_dict"), dict):
+        blob = blob["model_state_dict"]
+    if not isinstance(blob, dict):
+        raise RuntimeError("checkpoint does not contain a state_dict payload")
+    return dict(blob)
+
+
+def _normalise_label_list(raw: object, count: int, prefix: str) -> list[str]:
+    items: list[str]
+    if isinstance(raw, (list, tuple)):
+        items = [str(x) for x in list(raw)]
+    elif isinstance(raw, dict):
+        tmp = ["" for _ in range(max(0, int(count)))]
+        for key, value in raw.items():
+            try:
+                idx = int(key)
+            except Exception:
+                continue
+            if 0 <= idx < len(tmp):
+                tmp[idx] = str(value)
+        items = tmp
+    else:
+        items = []
+    items = [str(x).strip() for x in items]
+    target = max(1, int(count))
+    if len(items) < target:
+        items.extend(f"{prefix}_{i}" for i in range(len(items), target))
+    if len(items) > target:
+        items = items[:target]
+    return items
+
+
+def _infer_tiny_classifier_ctor_kwargs(state_dict: dict, fallback_num_classes: int) -> dict:
+    import torch
+
+    def _shape(key: str) -> tuple[int, ...]:
+        value = state_dict.get(key)
+        if torch.is_tensor(value):
+            return tuple(int(x) for x in value.shape)
+        return ()
+
+    c0 = _shape("features.0.weight")
+    c1 = _shape("features.4.weight")
+    c2 = _shape("features.8.weight")
+    c3 = _shape("features.12.weight")
+    head = _shape("head.2.weight")
+    bank = _shape("label_embed_bank")
+    mask = _shape("mask_head.0.weight")
+
+    context_indices = set()
+    for key in state_dict.keys():
+        m = re.match(r"features\.(\d+)\.conv1\.weight$", str(key))
+        if m:
+            context_indices.add(int(m.group(1)))
+
+    num_classes = int(fallback_num_classes)
+    if len(head) >= 1 and int(head[0]) > 0:
+        num_classes = int(head[0])
+    if len(bank) >= 1 and int(bank[0]) > 0:
+        num_classes = max(int(num_classes), int(bank[0]))
+    num_classes = max(1, int(num_classes))
+
+    base_ch = int(c0[0]) if len(c0) >= 1 else 64
+    max_ch = max(
+        int(base_ch),
+        int(c1[0]) if len(c1) >= 1 else int(base_ch),
+        int(c2[0]) if len(c2) >= 1 else int(base_ch),
+        int(c3[0]) if len(c3) >= 1 else int(base_ch),
+    )
+    return {
+        "num_classes": int(num_classes),
+        "base_ch": int(base_ch),
+        "max_ch": int(max_ch),
+        "context_blocks": int(len(context_indices)),
+        "context_dropout": 0.05,
+        "mask_decoder_channels": int(mask[0]) if len(mask) >= 1 else 0,
+    }
+
+
+def _checkpoint_signature(paths: list[object]) -> tuple:
+    sig = []
+    for path in paths:
+        if path is None:
+            continue
+        try:
+            if path.exists():
+                st = path.stat()
+                sig.append((str(path), int(st.st_mtime_ns), int(st.st_size)))
+        except Exception:
+            continue
+    return tuple(sig)
+
+
+def _load_model_from_checkpoint_blob(checkpoint: object, model_class_name: str):
+    import torch
+    import wav_ml_models as _models
+    from wav_ml_models import prime_tiny_classifier_label_bank_for_state_dict
+
+    if model_class_name not in _ALLOWED_MODEL_CLASSES:
+        raise ValueError(f"model_class must be one of {sorted(_ALLOWED_MODEL_CLASSES)}")
+
+    cls = getattr(_models, model_class_name)
+    ctor_kwargs = {}
+    if isinstance(checkpoint, dict) and isinstance(checkpoint.get("ctor_kwargs"), dict):
+        ctor_kwargs = dict(checkpoint.get("ctor_kwargs") or {})
+    state_dict = _extract_checkpoint_state_dict(checkpoint, preferred_keys=("state_dict",))
+
+    if model_class_name == "TinyConvClassifier" and not ctor_kwargs:
+        fallback_num_classes = int(checkpoint.get("num_classes", 0) or 0) if isinstance(checkpoint, dict) else 0
+        ctor_kwargs = _infer_tiny_classifier_ctor_kwargs(state_dict, fallback_num_classes)
+
+    if ctor_kwargs:
+        model = cls(**ctor_kwargs)
+    else:
+        try:
+            model = cls()
+        except TypeError as exc:
+            raise RuntimeError(
+                f"Cannot auto-instantiate {model_class_name}; include ctor_kwargs in the checkpoint or request"
+            ) from exc
+
+    if model_class_name == "TinyConvClassifier":
+        temperature = float(checkpoint.get("label_embedding_temperature", 10.0) or 10.0) if isinstance(checkpoint, dict) else 10.0
+        prime_tiny_classifier_label_bank_for_state_dict(model, state_dict, temperature=temperature)
+    model.load_state_dict(state_dict, strict=False)
+    model.eval()
+    return model, state_dict, dict(ctor_kwargs)
+
+
+def _build_classifier_bundle(
+    *,
+    cache_key: str,
+    signature: tuple,
+    classifier_blob: object,
+    pipeline_blob: object,
+    checkpoint_dir: str,
+    classifier_path: str,
+    pipeline_checkpoint_path: str = "",
+    source: str = "latest",
+    lease_id: str = "",
+    collection_id: str = "",
+    slot_name: str = "",
+    generation: int = 0,
+) -> dict:
+    import torch
+    from wav_ml_models import TinyConvClassifier, prime_tiny_classifier_label_bank_for_state_dict
+
+    with _LATEST_CLASSIFIER_CACHE_LOCK:
+        cached = _LATEST_CLASSIFIER_CACHE.get(cache_key)
+        if cached is not None and cached.get("signature") == signature:
+            return cached["bundle"]
+
+        if classifier_blob:
+            state_dict = _extract_checkpoint_state_dict(classifier_blob, preferred_keys=("state_dict",))
+        else:
+            state_dict = _extract_checkpoint_state_dict(pipeline_blob, preferred_keys=("classifier_state",))
+
+        meta_blob: dict = {}
+        if isinstance(pipeline_blob, dict):
+            meta_blob.update(pipeline_blob)
+        if isinstance(classifier_blob, dict):
+            meta_blob.update(classifier_blob)
+
+        num_classes = int(meta_blob.get("num_classes", 0) or 0)
+        if num_classes <= 0:
+            ctor_probe = _infer_tiny_classifier_ctor_kwargs(state_dict, 1)
+            num_classes = int(ctor_probe.get("num_classes", 1))
+        ctor_kwargs = meta_blob.get("ctor_kwargs")
+        if not isinstance(ctor_kwargs, dict):
+            ctor_kwargs = _infer_tiny_classifier_ctor_kwargs(state_dict, num_classes)
+        ctor_kwargs = dict(ctor_kwargs)
+        ctor_kwargs["num_classes"] = max(1, int(ctor_kwargs.get("num_classes", num_classes)))
+        num_classes = int(ctor_kwargs["num_classes"])
+
+        model = TinyConvClassifier(**ctor_kwargs)
+        prime_tiny_classifier_label_bank_for_state_dict(
+            model,
+            state_dict,
+            temperature=float(meta_blob.get("label_embedding_temperature", 10.0) or 10.0),
+        )
+        model.load_state_dict(state_dict, strict=False)
+        model.eval()
+
+        class_names = _normalise_label_list(meta_blob.get("class_names"), num_classes, "class")
+        label_texts = _normalise_label_list(meta_blob.get("label_texts", class_names), num_classes, "label")
+        input_shape = _normalise_input_shape(meta_blob.get("input_shape"), [1, 3, 64, 64])
+
+        bundle = {
+            "source": str(source or "latest"),
+            "model_name": "classifier",
+            "model_class": "TinyConvClassifier",
+            "model": model,
+            "class_names": class_names,
+            "label_texts": label_texts,
+            "input_shape": input_shape,
+            "checkpoint_dir": str(checkpoint_dir or ""),
+            "classifier_path": str(classifier_path or ""),
+            "pipeline_checkpoint_path": str(pipeline_checkpoint_path or ""),
+            "mtime": float(max((item[1] for item in signature), default=0) / 1_000_000_000.0),
+            "num_classes": int(num_classes),
+            "ctor_kwargs": dict(ctor_kwargs),
+            "lease_id": str(lease_id or ""),
+            "collection_id": str(collection_id or ""),
+            "slot_name": str(slot_name or ""),
+            "generation": int(generation or 0),
+        }
+        _LATEST_CLASSIFIER_CACHE[cache_key] = {"signature": signature, "bundle": bundle}
+        return bundle
+
+
+def _load_latest_classifier_bundle() -> dict:
+    if not _CHECKPOINT_DIR:
+        raise RuntimeError("checkpoint dir not configured")
+
+    import pathlib
+    import torch
+
+    ckpt_dir = pathlib.Path(_CHECKPOINT_DIR)
+    classifier_path = ckpt_dir / "classifier.pt"
+    pipeline_path = ckpt_dir / "pipeline_checkpoint.pt"
+    if not classifier_path.exists() and not pipeline_path.exists():
+        raise FileNotFoundError("classifier.pt or pipeline_checkpoint.pt not found")
+
+    classifier_blob = (
+        torch.load(str(classifier_path), map_location="cpu", weights_only=False)
+        if classifier_path.exists()
+        else {}
+    )
+    pipeline_blob = (
+        torch.load(str(pipeline_path), map_location="cpu", weights_only=False)
+        if pipeline_path.exists()
+        else {}
+    )
+    signature = _checkpoint_signature([classifier_path, pipeline_path])
+    return _build_classifier_bundle(
+        cache_key="latest",
+        signature=signature,
+        classifier_blob=classifier_blob,
+        pipeline_blob=pipeline_blob,
+        checkpoint_dir=str(ckpt_dir),
+        classifier_path=str(classifier_path if classifier_path.exists() else pipeline_path),
+        pipeline_checkpoint_path=str(pipeline_path) if pipeline_path.exists() else "",
+        source="latest",
+    )
+
+
+def _lease_model_artifacts(lease_id: str) -> dict:
+    import pathlib
+
+    lease_id = str(lease_id or "").strip()
+    if not lease_id:
+        raise ValueError("lease_id required")
+    ls = _lease_store()
+    if ls is None:
+        raise RuntimeError("lease store not configured")
+    lease = ls.get_lease(lease_id)
+    if lease is None:
+        raise FileNotFoundError("lease not found")
+    weights_dir = pathlib.Path(ls._dir) / "active_weights" / lease.collection_id
+    return {
+        "lease_store": ls,
+        "lease": lease,
+        "weights_dir": weights_dir,
+        "weights_path": weights_dir / "weights.pt",
+        "onnx_path": weights_dir / "model.onnx",
+    }
+
+
+def _load_lease_classifier_bundle(lease_id: str) -> dict:
+    import torch
+
+    artifacts = _lease_model_artifacts(lease_id)
+    weights_path = artifacts["weights_path"]
+    if not weights_path.exists():
+        raise FileNotFoundError("weights.pt not found for this lease collection")
+    checkpoint = torch.load(str(weights_path), map_location="cpu", weights_only=False)
+    model_class = str(checkpoint.get("model_class", "TinyConvClassifier") or "TinyConvClassifier").strip()
+    if model_class != "TinyConvClassifier":
+        raise RuntimeError(f"lease model is {model_class}, not TinyConvClassifier")
+    lease = artifacts["lease"]
+    signature = _checkpoint_signature([weights_path])
+    return _build_classifier_bundle(
+        cache_key=f"lease:{lease_id}",
+        signature=signature,
+        classifier_blob=checkpoint,
+        pipeline_blob={},
+        checkpoint_dir=str(artifacts["weights_dir"]),
+        classifier_path=str(weights_path),
+        source="lease",
+        lease_id=str(lease_id),
+        collection_id=str(lease.collection_id),
+        slot_name=str(getattr(lease, "slot_name", "") or ""),
+        generation=int(getattr(lease, "generation", 0) or 0),
+    )
+
+
+def _decode_image_b64_to_rgb(image_b64: str):
+    if not image_b64:
+        raise ValueError("image_b64 required")
+    payload = str(image_b64).strip()
+    if payload.startswith("data:") and "," in payload:
+        payload = payload.split(",", 1)[1]
+    raw_bytes = base64.b64decode(payload)
+    try:
+        from PIL import Image
+    except ImportError as exc:
+        raise RuntimeError("Pillow not installed on server; cannot decode image") from exc
+    img = Image.open(io.BytesIO(raw_bytes))
+    return img.convert("RGB")
+
+
+def _prepare_classifier_input_tensor(image_b64: str, input_shape: list[int]):
+    import numpy as np
+    import torch
+    from PIL import Image
+
+    img = _decode_image_b64_to_rgb(image_b64)
+    width = max(1, int(input_shape[3]))
+    height = max(1, int(input_shape[2]))
+    resized = img.resize((width, height), resample=Image.BILINEAR)
+    arr = np.asarray(resized, dtype=np.float32)
+    if int(arr.ndim) != 3 or int(arr.shape[2]) < 3:
+        raise ValueError("decoded image is not RGB")
+    chw = np.transpose(arr[:, :, :3] / 255.0, (2, 0, 1))[None, ...]
+    tensor = torch.from_numpy(chw)
+    meta = {
+        "original_width": int(img.size[0]),
+        "original_height": int(img.size[1]),
+        "resized_width": int(width),
+        "resized_height": int(height),
+    }
+    return tensor, meta
+
+
+def _classifier_bundle_meta_payload(bundle: dict) -> dict:
+    payload = {
+        "source": str(bundle.get("source", "latest") or "latest"),
+        "model_name": str(bundle.get("model_name", "classifier") or "classifier"),
+        "model_class": str(bundle.get("model_class", "TinyConvClassifier") or "TinyConvClassifier"),
+        "checkpoint_dir": str(bundle.get("checkpoint_dir", "") or ""),
+        "classifier_path": str(bundle.get("classifier_path", "") or ""),
+        "pipeline_checkpoint_path": str(bundle.get("pipeline_checkpoint_path", "") or ""),
+        "modified": float(bundle.get("mtime", 0.0) or 0.0),
+        "input_shape": list(bundle.get("input_shape") or [1, 3, 64, 64]),
+        "num_classes": int(bundle.get("num_classes", 0) or 0),
+        "class_names": list(bundle.get("class_names") or []),
+        "label_texts": list(bundle.get("label_texts") or []),
+        "ctor_kwargs": dict(bundle.get("ctor_kwargs") or {}),
+        "server_infer_supported": True,
+    }
+    lease_id = str(bundle.get("lease_id", "") or "")
+    if lease_id:
+        payload["lease_id"] = lease_id
+    collection_id = str(bundle.get("collection_id", "") or "")
+    if collection_id:
+        payload["collection_id"] = collection_id
+    slot_name = str(bundle.get("slot_name", "") or "")
+    if slot_name:
+        payload["slot_name"] = slot_name
+    generation = int(bundle.get("generation", 0) or 0)
+    if generation:
+        payload["generation"] = generation
+    return payload
+
+
+def _run_classifier_inference(bundle: dict, image_b64: str, topk: int) -> dict:
+    import numpy as np
+    import torch
+
+    input_tensor, image_meta = _prepare_classifier_input_tensor(
+        image_b64=image_b64,
+        input_shape=list(bundle["input_shape"]),
+    )
+    model = bundle["model"]
+    with torch.inference_mode():
+        logits = model(input_tensor.to(dtype=torch.float32))
+        probs = torch.sigmoid(logits).detach().cpu().numpy().reshape(-1)
+        logits_np = logits.detach().cpu().numpy().reshape(-1)
+    class_names = list(bundle["class_names"])
+    label_texts = list(bundle["label_texts"])
+    scores = []
+    for idx, score in enumerate(probs.tolist()):
+        scores.append({
+            "index": int(idx),
+            "label": str(class_names[idx]) if idx < len(class_names) else f"class_{idx}",
+            "label_text": str(label_texts[idx]) if idx < len(label_texts) else (
+                str(class_names[idx]) if idx < len(class_names) else f"class_{idx}"
+            ),
+            "score": float(score),
+            "logit": float(logits_np[idx]) if idx < int(len(logits_np)) else 0.0,
+        })
+    order = np.argsort(-probs)[: max(1, min(int(topk), int(probs.size)))]
+    result = _classifier_bundle_meta_payload(bundle)
+    result.update({
+        "image": image_meta,
+        "top_scores": [scores[int(i)] for i in order.tolist()],
+        "scores": scores,
+    })
+    return result
+
+
+def _export_model_to_onnx_bytes(model, input_shape: list[int], opset: int, service_source: str) -> bytes:
+    import torch
+
+    dummy_input = torch.randn(*_normalise_input_shape(input_shape))
+    buf = io.BytesIO()
+    with _service_priority(service_source):
+        torch.onnx.export(
+            model,
+            dummy_input,
+            buf,
+            opset_version=int(opset),
+            input_names=["input"],
+            output_names=["output"],
+            dynamic_axes={"input": {0: "batch"}, "output": {0: "batch"}},
+        )
+    return buf.getvalue()
+
+
+def _export_collection_onnx(collection_id: str, model_class_name: str, input_shape: object, opset_version: int, *, lease_store=None) -> dict:
+    import torch
+
+    collection_id = str(collection_id or "").strip()
+    model_class_name = str(model_class_name or "").strip()
+    if not collection_id or not model_class_name:
+        raise ValueError("collection_id and model_class are required")
+    if model_class_name not in _ALLOWED_MODEL_CLASSES:
+        raise ValueError(f"model_class must be one of {sorted(_ALLOWED_MODEL_CLASSES)}")
+
+    ls = lease_store if lease_store is not None else _lease_store()
+    if ls is None:
+        raise RuntimeError("lease store not configured")
+    weights_dir = __import__("pathlib").Path(ls._dir) / "active_weights" / collection_id
+    pt_path = weights_dir / "weights.pt"
+    if not pt_path.exists():
+        raise FileNotFoundError("weights.pt not found for this collection")
+
+    checkpoint = torch.load(str(pt_path), map_location="cpu", weights_only=False)
+    model, _state_dict, _ctor_kwargs = _load_model_from_checkpoint_blob(checkpoint, model_class_name)
+    resolved_shape = _normalise_input_shape(
+        input_shape,
+        checkpoint.get("input_shape", [1, 3, 64, 64]) if isinstance(checkpoint, dict) else [1, 3, 64, 64],
+    )
+    onnx_bytes = _export_model_to_onnx_bytes(
+        model,
+        resolved_shape,
+        int(opset_version or 17),
+        f"lease_onnx_export:{collection_id}",
+    )
+    onnx_path = weights_dir / "model.onnx"
+    onnx_path.write_bytes(onnx_bytes)
+    return {
+        "ok": True,
+        "collection_id": collection_id,
+        "model_class": model_class_name,
+        "onnx_path": str(onnx_path),
+        "onnx_size_bytes": len(onnx_bytes),
+        "opset_version": int(opset_version or 17),
+        "input_shape": resolved_shape,
+    }
+
+
+def _build_model_interface_descriptor(
+    *,
+    source: str,
+    lease_id: str = "",
+    model_name: str = "",
+    model_class: str = "",
+    input_shape: object = None,
+    ensure_onnx: bool = False,
+    opset_version: int = 17,
+) -> dict:
+    resolved_source = str(source or "latest").strip().lower()
+    if resolved_source not in {"latest", "lease"}:
+        raise ValueError("source must be 'latest' or 'lease'")
+
+    if resolved_source == "latest":
+        resolved_name, resolved_class = _normalise_model_selection(model_name, model_class)
+        if not _CHECKPOINT_DIR:
+            raise RuntimeError("checkpoint dir not configured")
+        descriptor = {
+            "source": "latest",
+            "model_name": resolved_name,
+            "model_class": resolved_class,
+            "input_shape": _normalise_input_shape(input_shape),
+            "pt_url": f"/api/model/latest/{resolved_name}.pt",
+            "onnx_url": (
+                f"/api/model/latest/{resolved_name}.onnx"
+                f"?model_class={resolved_class}&input_shape={','.join(str(x) for x in _normalise_input_shape(input_shape))}"
+            ),
+            "onnx_ready": True,
+            "server_infer_supported": False,
+            "train_with_lease": False,
+        }
+        if resolved_name == "classifier" and resolved_class == "TinyConvClassifier":
+            bundle = _load_latest_classifier_bundle()
+            descriptor.update(_classifier_bundle_meta_payload(bundle))
+            descriptor["meta_url"] = "/api/model/latest/classifier/meta"
+            descriptor["infer_url"] = "/api/model/interface/infer"
+            descriptor["onnx_url"] = (
+                "/api/model/latest/classifier.onnx"
+                f"?model_class=TinyConvClassifier&input_shape={','.join(str(x) for x in descriptor['input_shape'])}"
+            )
+        return descriptor
+
+    artifacts = _lease_model_artifacts(lease_id)
+    weights_path = artifacts["weights_path"]
+    if not weights_path.exists():
+        raise FileNotFoundError("weights.pt not found for this lease collection")
+
+    import torch
+
+    checkpoint = torch.load(str(weights_path), map_location="cpu", weights_only=False)
+    checkpoint_model_class = str(checkpoint.get("model_class", "") or "").strip() if isinstance(checkpoint, dict) else ""
+    resolved_name, resolved_class = _normalise_model_selection(
+        model_name,
+        model_class or checkpoint_model_class,
+    )
+    if ensure_onnx:
+        _export_collection_onnx(
+            str(artifacts["lease"].collection_id),
+            resolved_class,
+            input_shape,
+            int(opset_version or 17),
+            lease_store=artifacts["lease_store"],
+        )
+
+    resolved_shape = _normalise_input_shape(
+        input_shape,
+        checkpoint.get("input_shape", [1, 3, 64, 64]) if isinstance(checkpoint, dict) else [1, 3, 64, 64],
+    )
+    lease = artifacts["lease"]
+    descriptor = {
+        "source": "lease",
+        "lease_id": str(lease_id),
+        "collection_id": str(lease.collection_id),
+        "slot_name": str(getattr(lease, "slot_name", "") or ""),
+        "generation": int(getattr(lease, "generation", 0) or 0),
+        "model_name": resolved_name,
+        "model_class": resolved_class,
+        "input_shape": resolved_shape,
+        "weights_pt_url": f"/api/web/lease/{lease_id}/weights",
+        "onnx_url": f"/api/web/lease/{lease_id}/weights.onnx",
+        "onnx_ready": bool(artifacts["onnx_path"].exists()),
+        "dataset_url": f"/api/web/lease/{lease_id}/dataset",
+        "server_infer_supported": False,
+        "train_with_lease": True,
+    }
+    if resolved_name == "classifier" and resolved_class == "TinyConvClassifier":
+        bundle = _load_lease_classifier_bundle(lease_id)
+        descriptor.update(_classifier_bundle_meta_payload(bundle))
+        descriptor["infer_url"] = "/api/model/interface/infer"
+    return descriptor
 
 
 # ---------------------------------------------------------------------------
@@ -263,6 +948,9 @@ class NodusHandler(BaseHTTPRequestHandler):
         if path == "/api/model/latest":
             return self._handle_model_latest_list()
 
+        if path == "/api/model/latest/classifier/meta":
+            return self._handle_model_latest_classifier_meta()
+
         m = re.fullmatch(r"/api/model/latest/([^/]+)\.onnx", path)
         if m:
             return self._handle_model_latest_onnx(m.group(1), qs)
@@ -273,6 +961,9 @@ class NodusHandler(BaseHTTPRequestHandler):
 
         if path == "/api/status":
             return self._handle_status()
+
+        if path == "/api/runtime/control":
+            return self._handle_runtime_control_status()
 
         # -- Loss store --
         if path == "/api/loss/channels":
@@ -426,6 +1117,80 @@ class NodusHandler(BaseHTTPRequestHandler):
             return
         self._send(200, "application/octet-stream", pt_path.read_bytes())
 
+    def _handle_model_latest_classifier_meta(self):
+        try:
+            bundle = _load_latest_classifier_bundle()
+        except Exception as exc:
+            self._send(503, "application/json", _json({"error": str(exc)}))
+            return
+        self._send(200, "application/json", _json({
+            "checkpoint_dir": bundle["checkpoint_dir"],
+            "classifier_path": bundle["classifier_path"],
+            "pipeline_checkpoint_path": bundle["pipeline_checkpoint_path"],
+            "modified": bundle["mtime"],
+            "input_shape": list(bundle["input_shape"]),
+            "num_classes": int(bundle["num_classes"]),
+            "class_names": list(bundle["class_names"]),
+            "label_texts": list(bundle["label_texts"]),
+            "ctor_kwargs": dict(bundle["ctor_kwargs"]),
+        }))
+
+    def _handle_model_latest_classifier_infer(self, body: bytes):
+        try:
+            req = json.loads(body or b"{}")
+        except Exception:
+            self._send(400, "application/json", _json({"error": "invalid JSON body"}))
+            return
+        image_b64 = str(req.get("image_b64") or "").strip()
+        topk = max(1, int(req.get("topk", 12) or 12))
+        if not image_b64:
+            self._send(400, "application/json", _json({"error": "image_b64 required"}))
+            return
+
+        with _service_priority("latest_classifier_infer"):
+            try:
+                import numpy as np
+                import torch
+
+                bundle = _load_latest_classifier_bundle()
+                input_tensor, image_meta = _prepare_classifier_input_tensor(
+                    image_b64=image_b64,
+                    input_shape=list(bundle["input_shape"]),
+                )
+                model = bundle["model"]
+                with torch.inference_mode():
+                    logits = model(input_tensor.to(dtype=torch.float32))
+                    probs = torch.sigmoid(logits).detach().cpu().numpy().reshape(-1)
+                    logits_np = logits.detach().cpu().numpy().reshape(-1)
+                class_names = list(bundle["class_names"])
+                label_texts = list(bundle["label_texts"])
+                scores = []
+                for idx, score in enumerate(probs.tolist()):
+                    scores.append({
+                        "index": int(idx),
+                        "label": str(class_names[idx]) if idx < len(class_names) else f"class_{idx}",
+                        "label_text": str(label_texts[idx]) if idx < len(label_texts) else (
+                            str(class_names[idx]) if idx < len(class_names) else f"class_{idx}"
+                        ),
+                        "score": float(score),
+                        "logit": float(logits_np[idx]) if idx < int(len(logits_np)) else 0.0,
+                    })
+                order = np.argsort(-probs)[: max(1, min(int(topk), int(probs.size)))]
+                top_scores = [scores[int(i)] for i in order.tolist()]
+            except Exception as exc:
+                self._send(500, "application/json", _json({"error": f"classifier inference failed: {exc}"}))
+                return
+
+        self._send(200, "application/json", _json({
+            "checkpoint_dir": bundle["checkpoint_dir"],
+            "classifier_path": bundle["classifier_path"],
+            "input_shape": list(bundle["input_shape"]),
+            "num_classes": int(bundle["num_classes"]),
+            "image": image_meta,
+            "top_scores": top_scores,
+            "scores": scores,
+        }))
+
     def _handle_model_latest_onnx(self, name: str, qs: dict):
         """On-demand ONNX conversion of the latest checkpoint.
 
@@ -465,18 +1230,9 @@ class NodusHandler(BaseHTTPRequestHandler):
         try:
             import torch
             import wav_ml_models as _models
+            from wav_ml_models import prime_tiny_classifier_label_bank_for_state_dict
 
             checkpoint = torch.load(str(pt_path), map_location="cpu", weights_only=False)
-
-            ctor_kwargs = {}
-            state_dict = checkpoint
-            if isinstance(checkpoint, dict):
-                ctor_kwargs = checkpoint.get("ctor_kwargs", {})
-                state_dict = checkpoint.get("state_dict", checkpoint)
-                if "model_state_dict" in state_dict:
-                    state_dict = state_dict["model_state_dict"]
-                if not model_class:
-                    model_class = checkpoint.get("model_class", "")
 
             # Infer model class from name if not explicitly given
             _CLASS_HINTS = {
@@ -503,26 +1259,41 @@ class NodusHandler(BaseHTTPRequestHandler):
                            _json({"error": f"model_class must be one of {sorted(_ALLOWED)}"}))
                 return
 
-            cls = getattr(_models, model_class)
-            model = cls(**ctor_kwargs) if ctor_kwargs else cls()
-            if isinstance(state_dict, dict):
-                model.load_state_dict(state_dict, strict=False)
+            if name == "classifier" or model_class == "TinyConvClassifier":
+                with _service_priority("latest_classifier_onnx"):
+                    bundle = _load_latest_classifier_bundle()
+                    model = bundle["model"]
+            else:
+                ctor_kwargs = {}
+                state_dict = checkpoint
+                if isinstance(checkpoint, dict):
+                    ctor_kwargs = checkpoint.get("ctor_kwargs", {})
+                    state_dict = checkpoint.get("state_dict", checkpoint)
+                    if "model_state_dict" in state_dict:
+                        state_dict = state_dict["model_state_dict"]
+                    if not model_class:
+                        model_class = checkpoint.get("model_class", "")
+                cls = getattr(_models, model_class)
+                model = cls(**ctor_kwargs) if ctor_kwargs else cls()
+                if isinstance(state_dict, dict):
+                    model.load_state_dict(state_dict, strict=False)
             model.eval()
 
             if input_shape_str:
                 input_shape = [int(d) for d in input_shape_str.split(",")]
             else:
-                input_shape = [1, 3, 64, 64]
+                input_shape = list(bundle["input_shape"]) if name == "classifier" or model_class == "TinyConvClassifier" else [1, 3, 64, 64]
             dummy_input = torch.randn(*input_shape)
 
             buf = io.BytesIO()
-            torch.onnx.export(
-                model, dummy_input, buf,
-                opset_version=opset,
-                input_names=["input"],
-                output_names=["output"],
-                dynamic_axes={"input": {0: "batch"}, "output": {0: "batch"}},
-            )
+            with _service_priority(f"latest_model_onnx:{name}"):
+                torch.onnx.export(
+                    model, dummy_input, buf,
+                    opset_version=opset,
+                    input_names=["input"],
+                    output_names=["output"],
+                    dynamic_axes={"input": {0: "batch"}, "output": {0: "batch"}},
+                )
             onnx_bytes = buf.getvalue()
 
             with _ONNX_CACHE_LOCK:
@@ -539,16 +1310,21 @@ class NodusHandler(BaseHTTPRequestHandler):
             sr  = _scrub()
             wst = _wstate()
             wim = _wimage()
+            runtime_control = _runtime_control_state_dict()
             body = _json({
                 "ok": True,
                 "loss_channels": ls.channel_count(),
                 "scrub_length": sr.length(),
                 "scrub_capacity": sr.capacity(),
                 "weight_image_count": wim.length(),
+                "runtime_control": runtime_control,
             })
         except Exception as exc:
             body = _json({"ok": False, "error": str(exc)})
         self._send(200, "application/json", body)
+
+    def _handle_runtime_control_status(self):
+        self._send(200, "application/json", _json(_runtime_control_state_dict()))
 
     # ---- Loss store ----
 
@@ -946,15 +1722,16 @@ class NodusHandler(BaseHTTPRequestHandler):
             ctor_kwargs = {}
             if isinstance(checkpoint, dict) and "ctor_kwargs" in checkpoint:
                 ctor_kwargs = checkpoint["ctor_kwargs"]
-            state_dict = checkpoint if isinstance(checkpoint, dict) and "state_dict" not in checkpoint else (
-                checkpoint.get("state_dict", checkpoint)
-            )
-            if isinstance(state_dict, dict) and "model_state_dict" in state_dict:
-                state_dict = state_dict["model_state_dict"]
+            state_dict = _extract_checkpoint_state_dict(checkpoint, preferred_keys=("state_dict",))
 
+            if model_class_name == "TinyConvClassifier":
+                if not isinstance(ctor_kwargs, dict) or not ctor_kwargs:
+                    ctor_kwargs = _infer_tiny_classifier_ctor_kwargs(
+                        state_dict,
+                        int(getattr(checkpoint, "get", lambda *_args, **_kwargs: 0)("num_classes", 0) if hasattr(checkpoint, "get") else 0),
+                    )
             model = cls(**ctor_kwargs) if ctor_kwargs else cls.__new__(cls)
             if not ctor_kwargs:
-                # Attempt basic init for shape inference
                 try:
                     model = cls()
                 except TypeError:
@@ -963,6 +1740,12 @@ class NodusHandler(BaseHTTPRequestHandler):
                                                 f"include ctor_kwargs in checkpoint or request"}))
                     return
             if isinstance(state_dict, dict):
+                if model_class_name == "TinyConvClassifier":
+                    prime_tiny_classifier_label_bank_for_state_dict(
+                        model,
+                        state_dict,
+                        temperature=float(getattr(checkpoint, "get", lambda *_args, **_kwargs: 10.0)("label_embedding_temperature", 10.0) if hasattr(checkpoint, "get") else 10.0),
+                    )
                 model.load_state_dict(state_dict, strict=False)
             model.eval()
 
@@ -972,13 +1755,14 @@ class NodusHandler(BaseHTTPRequestHandler):
             opset = int(req.get("opset_version") or 17)
 
             onnx_path = weights_dir / "model.onnx"
-            torch.onnx.export(
-                model, dummy_input, str(onnx_path),
-                opset_version=opset,
-                input_names=["input"],
-                output_names=["output"],
-                dynamic_axes={"input": {0: "batch"}, "output": {0: "batch"}},
-            )
+            with _service_priority(f"lease_onnx_export:{collection_id}"):
+                torch.onnx.export(
+                    model, dummy_input, str(onnx_path),
+                    opset_version=opset,
+                    input_names=["input"],
+                    output_names=["output"],
+                    dynamic_axes={"input": {0: "batch"}, "output": {0: "batch"}},
+                )
             onnx_size = onnx_path.stat().st_size
             self._send(200, "application/json", _json({
                 "ok": True,
@@ -1018,6 +1802,9 @@ class NodusHandler(BaseHTTPRequestHandler):
 
     def _dispatch_post(self, path: str, body: bytes):
         ls = _lease_store()
+
+        if path == "/api/model/latest/classifier/infer":
+            return self._handle_model_latest_classifier_infer(body)
 
         # ONNX export from a .pt checkpoint
         if path == "/api/onnx/export":
@@ -1255,6 +2042,7 @@ _INDEX_HTML = """\
 <table>
   <tr><th>Endpoint</th><th>Description</th></tr>
   <tr><td><a href="/api/status">/api/status</a></td><td>Overall store status (JSON)</td></tr>
+  <tr><td><a href="/api/runtime/control">/api/runtime/control</a></td><td>Runtime-control service priority + exit flags</td></tr>
 </table>
 
 <h2>Loss Store</h2>
@@ -1319,6 +2107,8 @@ output directory. ONNX conversion is done on-demand and cached until the <code>.
 <table>
   <tr><th>Method</th><th>Endpoint</th><th>Description</th></tr>
   <tr><td>GET</td><td><a href="/api/model/latest">/api/model/latest</a></td><td>List available model checkpoints with timestamps</td></tr>
+  <tr><td>GET</td><td>/api/model/latest/classifier/meta</td><td>Latest classifier labels, texts, and input shape</td></tr>
+  <tr><td>POST</td><td>/api/model/latest/classifier/infer</td><td>Run latest classifier on <code>{"image_b64":"..."}</code> and return the full labeled score vector</td></tr>
   <tr><td>GET</td><td>/api/model/latest/&lt;name&gt;.onnx</td><td>On-demand ONNX &mdash; <code>?model_class=&amp;input_shape=1,3,64,64&amp;opset=17</code></td></tr>
   <tr><td>GET</td><td>/api/model/latest/&lt;name&gt;.pt</td><td>Raw PyTorch checkpoint</td></tr>
 </table>
@@ -1366,12 +2156,13 @@ def main():
     # Eagerly load the shared-memory stores so startup errors surface immediately.
     print(f"[nodus] Loading shared-memory stores ...", flush=True)
     try:
-        loss, scrub, wst, wim = _get_stores()
+        loss, scrub, wst, wim, control = _get_stores()
         global _STORES
-        _STORES = (loss, scrub, wst, wim)
+        _STORES = (loss, scrub, wst, wim, control)
         print(f"[nodus] Connected: {loss.channel_count()} loss channel(s), "
               f"scrub ring {scrub.length()}/{scrub.capacity()}, "
-              f"{wim.length()} weight image(s).", flush=True)
+              f"{wim.length()} weight image(s), "
+              f"service_active={control.active_services()}.", flush=True)
     except Exception as exc:
         print(f"[nodus] WARNING: Could not load stores: {exc}", flush=True)
         print(f"[nodus] Server will still start; store errors will be "
@@ -1409,6 +2200,33 @@ def main():
     server = ThreadingHTTPServer((args.host, args.port), NodusHandler)
     url = f"http://{args.host}:{args.port}/"
     print(f"[nodus] Serving at {url}", flush=True)
+    try:
+        control = _control()
+    except Exception:
+        control = None
+    if control is not None:
+        try:
+            control.clear_exit_requested()
+        except Exception:
+            pass
+        def _shutdown_watch():
+            while True:
+                time.sleep(0.5)
+                try:
+                    state = control.get_state()
+                except Exception:
+                    state = None
+                if state is None:
+                    continue
+                if bool(getattr(state, "exit_requested", False)):
+                    reason = str(getattr(state, "exit_reason", "") or "runtime_exit")
+                    print(f"[nodus] Exit requested via runtime control ({reason}); shutting down.", flush=True)
+                    try:
+                        server.shutdown()
+                    except Exception:
+                        pass
+                    return
+        threading.Thread(target=_shutdown_watch, daemon=True, name="runtime-control-watch").start()
     try:
         server.serve_forever()
     except KeyboardInterrupt:
