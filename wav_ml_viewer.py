@@ -462,7 +462,7 @@ class _TransformerStatusOpenGLViewer:
         self._preview_work_queue_ref: Optional[Any] = None
         # -- Scrub / history ---------------------------------------------------
         # GUI-local copies of rendered weight images for scrub history.
-        self._weight_history_maxlen: int = 512
+        self._weight_history_maxlen: int = 2048
         self._weight_snapshot_deque: deque = deque(maxlen=self._weight_history_maxlen)
         self._loss_count_at_snap_deque: deque = deque(maxlen=self._weight_history_maxlen)
         self._last_step_txt: str = ""
@@ -3281,7 +3281,10 @@ class _TransformerStatusOpenGLViewer:
         start_n = int(oldest_counts.get(ref_sid, 0))
         if total_n <= 0 or start_n <= 0:
             return base
-        return max(base, float(max(0, min(total_n, start_n))) / float(max(1, total_n)))
+        snap_frac = float(max(0, min(total_n, start_n))) / float(max(1, total_n))
+        # Never hide more than 85% of recorded data in recent mode —
+        # ensures at least 15% of all training history is always shown.
+        return max(base, min(snap_frac, 0.85))
 
     def _graph_view_start_frac(self) -> float:
         base = max(0.0, min(0.99, float(self._graph_display_start_frac)))
@@ -3407,7 +3410,11 @@ class _TransformerStatusOpenGLViewer:
                 _i_from_steps: Dict[str, int] = {}
                 for ck in vis_keys:
                     _i_n = self._loss_channel_length(ck)
-                    _i_fs = int(_sf * _i_n)
+                    # Compute the actual step number for position (_sf * _i_n),
+                    # accounting for circular-buffer wrap: oldest_step = cursor - length.
+                    _i_cursor = store.channel_cursor(ck)
+                    _i_oldest_step = _i_cursor - _i_n
+                    _i_fs = _i_oldest_step + int(_sf * _i_n)
                     _i_from_steps[ck] = _i_fs
                     _i_yr = store.channel_y_range(ck, from_step=_i_fs)
                     if _i_yr is not None:
@@ -3476,7 +3483,13 @@ class _TransformerStatusOpenGLViewer:
                         arr = time_arrays.get(ck)
                         if arr is None or arr.size <= 0:
                             continue
-                        from_step = int(np.searchsorted(arr, t_view_min, side="left"))
+                        # searchsorted gives a position index; convert to the actual
+                        # step number so C's step-based filter is correct even when
+                        # the circular buffer has wrapped.
+                        _pos = int(np.searchsorted(arr, t_view_min, side="left"))
+                        _cursor_t = store.channel_cursor(ck)
+                        _oldest_t = _cursor_t - int(arr.size)
+                        from_step = _oldest_t + _pos
                         from_steps[ck] = from_step
                         yr = store.channel_y_range(ck, from_step=from_step)
                         if yr is None:

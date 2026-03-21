@@ -26,6 +26,12 @@ _MODE_TO_C = {
     "architectural_packed": 3,
 }
 
+# Scale-mode flags (packed into the high byte of the mode int passed to C).
+# See NODUS_WEIGHT_FLAG_* in nodus_weight_image.h.
+WEIGHT_SCALE_INTEGER    = 0x000   # largest integer factor ≥ 1 (gate / crisp-pixel mode)
+WEIGHT_SCALE_FRACTIONAL = 0x100   # float NN scale that fills the target exactly
+WEIGHT_SCALE_NONE       = 0x200   # no upscale; centre at 1×1
+
 _WIMG_LIB: ctypes.CDLL | None = None
 
 
@@ -303,6 +309,7 @@ def _render_weight_image_c(
     target_width: int = 256,
     target_height: int = 256,
     mode: str = "architectural_tall",
+    scale_mode: int = WEIGHT_SCALE_FRACTIONAL,
 ) -> Tuple[np.ndarray, Dict[str, Any]]:
     mode_key = str(mode).strip().lower()
     if mode_key not in _MODE_TO_C:
@@ -390,7 +397,7 @@ def _render_weight_image_c(
         ctypes.c_int32(n),
         ref_data_arr,
         ref_numel_arr,
-        ctypes.c_int(_MODE_TO_C[mode_key]),
+        ctypes.c_int(_MODE_TO_C[mode_key] | int(scale_mode)),
         ctypes.c_int32(max(8, int(target_width))),
         ctypes.c_int32(max(8, int(target_height))),
         ctypes.byref(out_rgb),
@@ -549,8 +556,15 @@ def render_weight_image(
     target_height: int = 256,
     mode: str = "architectural_tall",
     resample: str = "lanczos",
+    scale_mode: int = WEIGHT_SCALE_FRACTIONAL,
 ) -> Tuple[np.ndarray, Dict[str, Any]]:
-    """Single entry point for model weight visualisation."""
+    """Single entry point for model weight visualisation.
+
+    scale_mode controls how the raw pixel grid is upscaled to fill the target:
+      WEIGHT_SCALE_FRACTIONAL (default) — float NN scale, fills all available space
+      WEIGHT_SCALE_INTEGER             — largest integer factor ≥ 1 (crisp-pixel gate)
+      WEIGHT_SCALE_NONE                — no upscale, centre at 1×1
+    """
     _ = resample
     render_spec = resolve_weight_render_spec(
         state_dict,
@@ -568,6 +582,7 @@ def render_weight_image(
         target_width=target_width,
         target_height=target_height,
         mode=mode,
+        scale_mode=scale_mode,
     )
     layers = list(render_spec.get("layers", []))
     if str(mode).strip().lower() == "parameter_groups":

@@ -37,6 +37,7 @@ static float clampf(float v, float lo, float hi) {
 }
 
 static float maxf(float a, float b) { return a > b ? a : b; }
+static float minf(float a, float b) { return a < b ? a : b; }
 
 static int maxi(int a, int b) { return a > b ? a : b; }
 static int mini(int a, int b) { return a < b ? a : b; }
@@ -238,6 +239,28 @@ static void nn_upscale(const uint8_t *src, int src_w, int src_h,
                     dst[di + 2] = b;
                 }
             }
+        }
+    }
+}
+
+/* Nearest-neighbour resize to an arbitrary (non-integer) output size.
+ * Maps each dst pixel back to the nearest src pixel using integer arithmetic
+ * (no floating-point per-pixel work, identical output to a float NN filter).
+ * dst must have room for dst_w * dst_h * 3 bytes. */
+static void nn_resize_exact(const uint8_t *src, int src_w, int src_h,
+                             uint8_t *dst, int dst_w, int dst_h)
+{
+    for (int y = 0; y < dst_h; y++) {
+        int sy = (y * src_h) / dst_h;
+        if (sy >= src_h) sy = src_h - 1;
+        for (int x = 0; x < dst_w; x++) {
+            int sx = (x * src_w) / dst_w;
+            if (sx >= src_w) sx = src_w - 1;
+            int si = (sy * src_w + sx) * 3;
+            int di = (y  * dst_w + x)  * 3;
+            dst[di]     = src[si];
+            dst[di + 1] = src[si + 1];
+            dst[di + 2] = src[si + 2];
         }
     }
 }
@@ -546,8 +569,9 @@ static int render_architectural(
         const NodusWeightLayer *layers, int32_t num_layers,
         int32_t target_w, int32_t target_h,
         int transpose,  /* 0 = tall, 1 = wide */
-    int pack_to_mean,
+        int pack_to_mean,
         const int32_t *group_ids,
+        int scale_flags,  /* NODUS_WEIGHT_FLAG_* from high byte of mode */
         uint8_t *out_rgb, int32_t *out_w, int32_t *out_h)
 {
     int use_nonviolator_max = 1;
@@ -796,17 +820,57 @@ static int render_architectural(
     int avail_w = maxi(1, eff_w);
     int avail_h = maxi(1, data_h);
 
-    /* Integer scale: largest factor that fits within target. */
-    int scale = maxi(1, mini(avail_h / ori_h, avail_w / ori_w));
-    int scaled_w = ori_w * scale;
-    int scaled_h = ori_h * scale;
+    /* Compute scale according to the requested mode flag.
+     *
+     * fscale is kept as float for overlay coordinate math; scaled_w/h are
+     * the actual pixel dimensions of the upscaled image.
+     *
+     *  default (0)              : integer gate — largest whole factor ≥ 1
+     *  NODUS_WEIGHT_FLAG_NO_UPSCALE  : never scale; centre at 1×1
+     *  NODUS_WEIGHT_FLAG_FRACTIONAL_NN : float scale that fills available
+     *                                    space exactly, NN interpolation
+     */
+    float fscale;
+    int   scaled_w, scaled_h;
 
-    /* Upscale. */
+    if (scale_flags & NODUS_WEIGHT_FLAG_NO_UPSCALE) {
+        fscale   = 1.0f;
+        scaled_w = ori_w;
+        scaled_h = ori_h;
+    } else if (scale_flags & NODUS_WEIGHT_FLAG_FRACTIONAL_NN) {
+        fscale = minf((float)avail_h / (float)ori_h,
+                      (float)avail_w / (float)ori_w);
+        if (fscale < 1.0f) fscale = 1.0f;
+        scaled_w = (int)(ori_w * fscale);
+        scaled_h = (int)(ori_h * fscale);
+        if (scaled_w < 1) scaled_w = 1;
+        if (scaled_h < 1) scaled_h = 1;
+    } else {
+        /* Integer gate mode (default). */
+        int scale_i = maxi(1, mini(avail_h / ori_h, avail_w / ori_w));
+        fscale   = (float)scale_i;
+        scaled_w = ori_w * scale_i;
+        scaled_h = ori_h * scale_i;
+    }
+
+    /* Upscale / resize. */
     uint8_t *scaled;
-    if (scale > 1) {
+    int is_exact_resize = (scale_flags & NODUS_WEIGHT_FLAG_FRACTIONAL_NN) != 0
+                          && (scaled_w != ori_w || scaled_h != ori_h);
+    int is_int_upscale  = !(scale_flags & (NODUS_WEIGHT_FLAG_FRACTIONAL_NN |
+                                           NODUS_WEIGHT_FLAG_NO_UPSCALE))
+                          && (scaled_w != ori_w || scaled_h != ori_h);
+
+    if (is_exact_resize) {
         scaled = (uint8_t *)malloc((size_t)scaled_w * (size_t)scaled_h * 3);
         if (!scaled) { free(oriented); free(seam_cols); free(data_flat_cols_per_layer); free(image_display_cols_per_layer); free(packed_is_mega); free(ll); return -1; }
-        nn_upscale(oriented, ori_w, ori_h, scaled, scale, scale);
+        nn_resize_exact(oriented, ori_w, ori_h, scaled, scaled_w, scaled_h);
+        free(oriented);
+    } else if (is_int_upscale) {
+        int scale_i = (int)fscale;
+        scaled = (uint8_t *)malloc((size_t)scaled_w * (size_t)scaled_h * 3);
+        if (!scaled) { free(oriented); free(seam_cols); free(data_flat_cols_per_layer); free(image_display_cols_per_layer); free(packed_is_mega); free(ll); return -1; }
+        nn_upscale(oriented, ori_w, ori_h, scaled, scale_i, scale_i);
         free(oriented);
     } else {
         scaled = oriented;
@@ -878,12 +942,12 @@ static int render_architectural(
                 for (int gi = 0; gi < group_count; gi++) {
                     int li0 = group_start[gi];
                     int li1 = group_end[gi];
-                    int gx0 = x0 + ll[li0].x0 * scale;
-                    int gx1 = x0 + ll[li1].x1 * scale;
+                    int gx0 = x0 + (int)(ll[li0].x0 * fscale);
+                    int gx1 = x0 + (int)(ll[li1].x1 * fscale);
                     int y_start = eff_h, y_end = -1;
                     for (int k = li0; k <= li1; k++) {
-                        int ly_top = y0 + ll[k].y_top_raw * scale;
-                        int ly_bot = y0 + (ll[k].y_bot_raw + 1) * scale - 1;
+                        int ly_top = y0 + (int)(ll[k].y_top_raw * fscale);
+                        int ly_bot = y0 + (int)((ll[k].y_bot_raw + 1) * fscale) - 1;
                         if (ly_top < y_start) y_start = ly_top;
                         if (ly_bot > y_end)   y_end   = ly_bot;
                     }
@@ -904,10 +968,10 @@ static int render_architectural(
 
             /* Pass 2: mega tint + dark-grey border ring using inter-layer boundary bands. */
             for (int li = 0; li < num_layers; li++) {
-                int lx0 = x0 + ll[li].x0 * scale;
-                int lx1 = x0 + ll[li].x1 * scale;
-                int y_start = y0 + ll[li].y_top_raw * scale;
-                int y_end   = y0 + (ll[li].y_bot_raw + 1) * scale - 1;
+                int lx0 = x0 + (int)(ll[li].x0 * fscale);
+                int lx1 = x0 + (int)(ll[li].x1 * fscale);
+                int y_start = y0 + (int)(ll[li].y_top_raw * fscale);
+                int y_end   = y0 + (int)((ll[li].y_bot_raw + 1) * fscale) - 1;
                 int left_seam = seam_cols ? seam_cols[li] : 0;
                 int right_seam = seam_cols ? seam_cols[li + 1] : 0;
                 if (!ll[li].is_mega) continue;
@@ -939,12 +1003,12 @@ static int render_architectural(
                 for (int gi = 0; gi < group_count; gi++) {
                     int li0 = group_start[gi];
                     int li1 = group_end[gi];
-                    int gx0 = x0 + ll[li0].x0 * scale;
-                    int gx1 = x0 + ll[li1].x1 * scale;
+                    int gx0 = x0 + (int)(ll[li0].x0 * fscale);
+                    int gx1 = x0 + (int)(ll[li1].x1 * fscale);
                     int y_start = eff_h, y_end = -1;
                     for (int k = li0; k <= li1; k++) {
-                        int ly_top = y0 + ll[k].y_top_raw * scale;
-                        int ly_bot = y0 + (ll[k].y_bot_raw + 1) * scale - 1;
+                        int ly_top = y0 + (int)(ll[k].y_top_raw * fscale);
+                        int ly_bot = y0 + (int)((ll[k].y_bot_raw + 1) * fscale) - 1;
                         if (ly_top < y_start) y_start = ly_top;
                         if (ly_bot > y_end)   y_end   = ly_bot;
                     }
@@ -988,21 +1052,12 @@ static int render_architectural(
     for (int x = 0; x < eff_w; x++) {
         set_pixel(out_rgb, eff_w, eff_h, x, data_h, 52, 58, 68);
     }
-    /* Tick marks at each layer center. */
+    /* Tick marks at each layer center (use fscale for sub-integer alignment). */
     for (int li = 0; li < num_layers; li++) {
-        int lx0, lx1, cx;
-        if (transpose) {
-            /* In wide mode the layers run vertically after transpose,
-               but footer ticks still index by the pre-transpose column
-               range mapped through scale + centering. */
-            lx0 = x0 + ll[li].x0 * scale;
-            lx1 = x0 + ll[li].x1 * scale;
-        } else {
-            lx0 = x0 + ll[li].x0 * scale;
-            lx1 = x0 + ll[li].x1 * scale;
-        }
+        int lx0 = x0 + (int)(ll[li].x0 * fscale);
+        int lx1 = x0 + (int)(ll[li].x1 * fscale);
         if (lx1 <= lx0) lx1 = lx0 + 1;
-        cx = (lx0 + lx1) / 2;
+        int cx = (lx0 + lx1) / 2;
         for (int y = data_h; y < eff_h; y++) {
             set_pixel(out_rgb, eff_w, eff_h, cx, y, 76, 84, 96);
         }
@@ -1039,7 +1094,10 @@ NODUS_API int nodus_weight_image_render(
     target_w = maxi(8, target_w);
     target_h = maxi(8, target_h);
 
-    switch (mode) {
+    int pure_mode   = mode & 0xFF;
+    int scale_flags = mode >> 8;
+
+    switch (pure_mode) {
     case NODUS_WEIGHT_MODE_PARAMETER_GROUPS:
         if (!nodes || num_nodes <= 0) return -1;
         return render_parameter_groups(nodes, num_nodes,
@@ -1050,19 +1108,19 @@ NODUS_API int nodus_weight_image_render(
         if (!layers || num_layers <= 0) return -1;
         return render_architectural(layers, num_layers,
                                     target_w, target_h,
-                                    0, 0, NULL, out_rgb, out_w, out_h);
+                                    0, 0, NULL, scale_flags, out_rgb, out_w, out_h);
 
     case NODUS_WEIGHT_MODE_ARCHITECTURAL_WIDE:
         if (!layers || num_layers <= 0) return -1;
         return render_architectural(layers, num_layers,
                                     target_w, target_h,
-                                    1, 0, NULL, out_rgb, out_w, out_h);
+                                    1, 0, NULL, scale_flags, out_rgb, out_w, out_h);
 
     case NODUS_WEIGHT_MODE_ARCHITECTURAL_PACKED:
         if (!layers || num_layers <= 0) return -1;
         return render_architectural(layers, num_layers,
                                     target_w, target_h,
-                                    0, 1, NULL, out_rgb, out_w, out_h);
+                                    0, 1, NULL, scale_flags, out_rgb, out_w, out_h);
 
     default:
         return -1;
@@ -1082,7 +1140,8 @@ NODUS_API int nodus_weight_image_measure(
 {
     target_w = maxi(8, target_w);
     target_h = maxi(8, target_h);
-    switch (mode) {
+    int pure_mode = mode & 0xFF; /* strip scale flags — measure output size is invariant */
+    switch (pure_mode) {
     case NODUS_WEIGHT_MODE_PARAMETER_GROUPS:
         if (!nodes || num_nodes <= 0) return -1;
         return measure_parameter_groups_dims(num_nodes, target_w, target_h, out_w, out_h);
@@ -1239,34 +1298,37 @@ NODUS_API int nodus_weight_image_measure_from_state_dict(
         }
     }
 
-    if (mode == NODUS_WEIGHT_MODE_PARAMETER_GROUPS) {
-        rc = measure_parameter_groups_dims(num_groups, target_w, target_h, out_w, out_h);
-        free(nodes_acc);
-        return rc;
-    }
-
-    shape0_buf = (int32_t *)malloc((size_t)num_params * sizeof(int32_t));
-    unit_counts = (int32_t *)calloc((size_t)num_groups, sizeof(int32_t));
-    if (!shape0_buf || !unit_counts) goto cleanup;
-
-    for (int g = 0; g < num_groups; g++) {
-        int np = nodes_acc[g].num_params;
-        for (int j = 0; j < np; j++) {
-            shape0_buf[j] = param_shape0[nodes_acc[g].param_indices[j]];
+    {
+        int pure_mode_m = mode & 0xFF;  /* scale flags don't affect measured dimensions */
+        if (pure_mode_m == NODUS_WEIGHT_MODE_PARAMETER_GROUPS) {
+            rc = measure_parameter_groups_dims(num_groups, target_w, target_h, out_w, out_h);
+            free(nodes_acc);
+            return rc;
         }
-        unit_counts[g] = choose_unit_count(shape0_buf, np);
-    }
 
-    rc = measure_architectural_dims(
-        unit_counts,
-        num_groups,
-        target_w,
-        target_h,
-        (mode == NODUS_WEIGHT_MODE_ARCHITECTURAL_WIDE) ? 1 : 0,
-        (mode == NODUS_WEIGHT_MODE_ARCHITECTURAL_PACKED) ? 1 : 0,
-        out_w,
-        out_h
-    );
+        shape0_buf = (int32_t *)malloc((size_t)num_params * sizeof(int32_t));
+        unit_counts = (int32_t *)calloc((size_t)num_groups, sizeof(int32_t));
+        if (!shape0_buf || !unit_counts) goto cleanup;
+
+        for (int g = 0; g < num_groups; g++) {
+            int np = nodes_acc[g].num_params;
+            for (int j = 0; j < np; j++) {
+                shape0_buf[j] = param_shape0[nodes_acc[g].param_indices[j]];
+            }
+            unit_counts[g] = choose_unit_count(shape0_buf, np);
+        }
+
+        rc = measure_architectural_dims(
+            unit_counts,
+            num_groups,
+            target_w,
+            target_h,
+            (pure_mode_m == NODUS_WEIGHT_MODE_ARCHITECTURAL_WIDE) ? 1 : 0,
+            (pure_mode_m == NODUS_WEIGHT_MODE_ARCHITECTURAL_PACKED) ? 1 : 0,
+            out_w,
+            out_h
+        );
+    }
 
 cleanup:
     free(unit_counts);
@@ -1334,8 +1396,11 @@ NODUS_API int nodus_weight_image_from_state_dict(
     }
     free(shape0_buf);
 
+    int pure_mode   = mode & 0xFF;
+    int scale_flags = mode >> 8;
+
     /* ---- PARAMETER_GROUPS mode: aggregate per node group ---- */
-    if (mode == NODUS_WEIGHT_MODE_PARAMETER_GROUPS) {
+    if (pure_mode == NODUS_WEIGHT_MODE_PARAMETER_GROUPS) {
         NodusWeightNodeGroup *ng = (NodusWeightNodeGroup *)calloc(
             (size_t)num_groups, sizeof(NodusWeightNodeGroup));
         if (!ng) { free(nodes_acc); return -1; }
@@ -1503,8 +1568,8 @@ NODUS_API int nodus_weight_image_from_state_dict(
             num_groups,
             target_w,
             target_h,
-            (mode == NODUS_WEIGHT_MODE_ARCHITECTURAL_WIDE) ? 1 : 0,
-            (mode == NODUS_WEIGHT_MODE_ARCHITECTURAL_PACKED) ? 1 : 0,
+            (pure_mode == NODUS_WEIGHT_MODE_ARCHITECTURAL_WIDE) ? 1 : 0,
+            (pure_mode == NODUS_WEIGHT_MODE_ARCHITECTURAL_PACKED) ? 1 : 0,
             &alloc_w,
             &alloc_h) != 0) {
         free(unit_counts_tmp);
@@ -1523,11 +1588,12 @@ NODUS_API int nodus_weight_image_from_state_dict(
         return -1;
     }
 
-    int transpose = (mode == NODUS_WEIGHT_MODE_ARCHITECTURAL_WIDE) ? 1 : 0;
-    int pack_to_mean = (mode == NODUS_WEIGHT_MODE_ARCHITECTURAL_PACKED) ? 1 : 0;
+    int transpose    = (pure_mode == NODUS_WEIGHT_MODE_ARCHITECTURAL_WIDE) ? 1 : 0;
+    int pack_to_mean = (pure_mode == NODUS_WEIGHT_MODE_ARCHITECTURAL_PACKED) ? 1 : 0;
     int rc = render_architectural(layers, num_groups,
                                   target_w, target_h,
-                                  transpose, pack_to_mean, group_ids, rgb, out_w, out_h);
+                                  transpose, pack_to_mean, group_ids,
+                                  scale_flags, rgb, out_w, out_h);
 
     for (int g = 0; g < num_groups; g++) free(layers[g].units);
     free(group_ids);

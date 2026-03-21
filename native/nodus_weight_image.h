@@ -36,11 +36,24 @@ extern "C" {
 /*  Constants                                                         */
 /* ------------------------------------------------------------------ */
 
-/* Render modes. */
+/* Render modes (low byte of the mode parameter). */
 #define NODUS_WEIGHT_MODE_PARAMETER_GROUPS    0
 #define NODUS_WEIGHT_MODE_ARCHITECTURAL_TALL  1
 #define NODUS_WEIGHT_MODE_ARCHITECTURAL_WIDE  2
 #define NODUS_WEIGHT_MODE_ARCHITECTURAL_PACKED 3
+
+/* Scale-mode flags (high byte of the mode parameter, OR'd in).
+ *
+ * Default (0x000): largest integer factor that fits (gate mode — no fractional
+ *                  pixels, image stays on a clean pixel grid).
+ * FRACTIONAL_NN  : float scale factor that fills all available space with
+ *                  nearest-neighbour interpolation (default for GUI display).
+ * NO_UPSCALE     : never scale; just centre the image at 1×1.
+ *
+ * Usage:  mode = NODUS_WEIGHT_MODE_ARCHITECTURAL_PACKED | NODUS_WEIGHT_FLAG_FRACTIONAL_NN
+ */
+#define NODUS_WEIGHT_FLAG_FRACTIONAL_NN  0x0100
+#define NODUS_WEIGHT_FLAG_NO_UPSCALE     0x0200
 
 /* Limits. */
 #define NODUS_WEIGHT_MAX_LAYERS  512
