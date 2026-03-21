@@ -231,7 +231,7 @@ def main():
 
     # Import viewer after arg parse so the window opens as fast as possible
     from wav_ml_viewer import _TransformerStatusOpenGLViewer, ViewerIPCServer
-    from pipeline.nodus_loss_store import NodusLossStore
+    from pipeline.nodus_loss_store import NodusLossStore, NodusRuntimeControlStore
 
     # Create the native loss store — single authoritative source for all loss data.
     loss_store = NodusLossStore.get_global()
@@ -262,6 +262,20 @@ def main():
 
     print("[gui] viewer ready, waiting for training process...", flush=True)
 
+    # Grab the runtime control store once so we can signal the web server to exit.
+    try:
+        runtime_control = NodusRuntimeControlStore.get_global()
+    except Exception:
+        runtime_control = None
+
+    def _signal_web_server_exit(reason: str) -> None:
+        if runtime_control is None:
+            return
+        try:
+            runtime_control.set_exit_requested(True, reason=reason)
+        except Exception:
+            pass
+
     # Main event loop — pumps the viewer and drains IPC messages
     try:
         while True:
@@ -270,12 +284,18 @@ def main():
             backend_quit = getattr(viewer, "backend_quit_requested", lambda: False)
             if backend_quit():
                 viewer._backend_quit_requested = False
+                # QUIT button: stop the backend.  Signal the web server to exit
+                # too — it should not outlive the decision to quit.
+                _signal_web_server_exit("gui_quit_button")
             if viewer.stop_requested():
                 break
             time.sleep(0.002)  # ~500 Hz poll; pump() self-throttles via slew
     except KeyboardInterrupt:
         pass
     finally:
+        # GUI window closed or keyboard interrupt — ensure the web server exits
+        # regardless of whether a training process is still running.
+        _signal_web_server_exit("gui_exit")
         server.stop()
         viewer.close()
         # Clean up port file

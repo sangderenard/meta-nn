@@ -2524,6 +2524,12 @@ def _build_configs_from_args(args) -> dict:
         fake_class_disc_weight=float(_g("generator_fake_feedback_condition_weight", default=1.0)),
         classifier_init_ckpt=str(_g("classifier_init_ckpt", "classifier_init", default="") or ""),
         classifier_init_scope=str(_g("classifier_init_scope", default="all") or "all"),
+        label_dropout_rate=float(_g("target_label_knockout_prob", default=0.0)),
+        label_dropout_max_drop_frac=float(_g("target_label_knockout_max_drop_frac", default=1.0)),
+        label_dropout_min_keep=int(_g("target_label_knockout_min_keep", default=1)),
+        label_dropout_network_rate=float(_g("target_label_knockout_network_dropout", default=0.0)),
+        label_dropout_dataset_threshold=int(_g("target_label_knockout_dataset_threshold", default=-1)),
+        label_dropout_min_keep_dataset=int(_g("target_label_knockout_min_keep_dataset", default=1)),
     )
 
     transformer = TransformerConfig(

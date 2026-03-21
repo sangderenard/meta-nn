@@ -428,7 +428,21 @@ class LabelMaskDropoutConfig:
     negative.  Values in (0, 1) are soft dampers.  1.0 is a no-op."""
 
     min_keep_labels: int = 0
-    """Minimum positive labels guaranteed to survive per sample."""
+    """Minimum positive labels guaranteed to survive per sample (applies to
+    all labels unless ``dataset_label_index_threshold`` splits the floor)."""
+
+    dataset_label_index_threshold: int = -1
+    """When >= 0, labels with index > this value are treated as dataset-specific
+    language and protected by ``min_keep_dataset_labels``.  Labels at or below
+    this threshold are base/primitive vocab and may be fully dropped (floor = 0)."""
+
+    min_keep_dataset_labels: int = 1
+    """Minimum dataset-specific labels (index > threshold) that must survive.
+    Only active when ``dataset_label_index_threshold >= 0``."""
+
+    max_drop_frac: float = 1.0
+    """Maximum fraction of active labels that may be dropped per sample.
+    1.0 = no cap (only min_keep_labels applies); 0.5 = drop at most half."""
 
     network_dropout: Optional[float] = None
     """If set, all nn.Dropout / nn.Dropout2d modules on the target model are
@@ -3746,25 +3760,53 @@ def _apply_label_mask_dropout(
     yb_out = yb.to(dtype=torch.float32).clone()
     out_stacks: List[Any] = list(stack_list)
     out_indices: List[Any] = list(index_list)
-    keep_min = max(0, int(cfg.min_keep_labels))
+    abs_keep_min = max(0, int(cfg.min_keep_labels))
+    max_drop_frac = float(max(0.0, min(1.0, cfg.max_drop_frac)))
     fn_target = float(max(0.0, min(1.0, cfg.false_neg_target)))
+    split_threshold = int(cfg.dataset_label_index_threshold)
+    use_split = split_threshold >= 0
+    min_keep_dataset = max(0, int(cfg.min_keep_dataset_labels)) if use_split else 0
 
     for bi in range(int(yb_out.shape[0])):
         row = yb_out[bi]
         active = torch.nonzero(row >= 0.5, as_tuple=False).reshape(-1)
         n_active = int(active.numel())
 
+        # Compute the overall floor from max_drop_frac
+        frac_keep_min = int(math.ceil(n_active * (1.0 - max_drop_frac)))
+
+        if use_split:
+            # Split active labels into base-vocab (index <= threshold) and
+            # dataset-specific (index > threshold).  Base vocab may be fully
+            # dropped (floor = 0); dataset language is protected.
+            active_list = active.tolist()
+            dataset_active = [li for li in active_list if int(li) > split_threshold]
+            # Must keep at least min_keep_dataset of the dataset-specific labels
+            dataset_floor = min(min_keep_dataset, len(dataset_active))
+            # Overall keep_min is driven by dataset floor and the frac cap,
+            # but base vocab contributes 0 to the absolute floor.
+            keep_min = max(dataset_floor, frac_keep_min)
+        else:
+            keep_min = max(abs_keep_min, frac_keep_min)
+
         dropped_labels: set = set()
         if n_active > keep_min:
             remaining = int(n_active)
+            remaining_dataset = len(dataset_active) if use_split else 0
             for li_t in active.tolist():
                 li = int(li_t)
                 if remaining <= keep_min:
                     break
+                # Protect dataset-specific labels once their floor is reached
+                if use_split and int(li) > split_threshold:
+                    if remaining_dataset <= dataset_floor:
+                        continue
                 if float(rng.random()) < p:
                     row[li] = fn_target
                     dropped_labels.add(li)
                     remaining -= 1
+                    if use_split and int(li) > split_threshold:
+                        remaining_dataset -= 1
 
         if dropped_labels and bi < len(out_stacks) and out_stacks[bi] is not None:
             raw_st = out_stacks[bi]

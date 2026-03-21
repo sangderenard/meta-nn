@@ -153,9 +153,12 @@ set "TRANS_LOSS_WAVE_W=1.00"
 set "TRANS_LOSS_LO_W=0.08"
 set "TRANS_LOSS_SCORE_TARGET_W=2.00"
 set "TRANS_SCORE_MARGIN=0.02"
-set "TARGET_LABEL_KNOCKOUT_PROB=0.00"
+set "TARGET_LABEL_KNOCKOUT_PROB=0.75"
 set "TARGET_LABEL_KNOCKOUT_MAX_DROP_FRAC=0.50"
 set "TARGET_LABEL_KNOCKOUT_MIN_KEEP=1"
+set "TARGET_LABEL_KNOCKOUT_NETWORK_DROPOUT=0.10"
+set "TARGET_LABEL_KNOCKOUT_DATASET_THRESHOLD=101"
+set "TARGET_LABEL_KNOCKOUT_MIN_KEEP_DATASET=1"
 set "LR_SINE_CYCLES=0"
 set "LR_SINE_FREQUENCY=0.0"
 set "LR_SINE_TAIL_FRACTION=0.0"
@@ -786,6 +789,9 @@ set "RUN_EXTRA_ARG=%~2"
   --target-label-knockout-prob %TARGET_LABEL_KNOCKOUT_PROB% ^
   --target-label-knockout-max-drop-frac %TARGET_LABEL_KNOCKOUT_MAX_DROP_FRAC% ^
   --target-label-knockout-min-keep %TARGET_LABEL_KNOCKOUT_MIN_KEEP% ^
+  --target-label-knockout-network-dropout %TARGET_LABEL_KNOCKOUT_NETWORK_DROPOUT% ^
+  --target-label-knockout-dataset-threshold %TARGET_LABEL_KNOCKOUT_DATASET_THRESHOLD% ^
+  --target-label-knockout-min-keep-dataset %TARGET_LABEL_KNOCKOUT_MIN_KEEP_DATASET% ^
   --latent-berkeley-imprint-mix-targets ^
   --latent-berkeley-imprint-steps %LATENT_IMPRINT_STEPS% ^
   --latent-berkeley-imprint-lr %LATENT_IMPRINT_LR% ^

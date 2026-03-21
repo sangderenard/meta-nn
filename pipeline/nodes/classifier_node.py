@@ -185,6 +185,24 @@ class ClassifierConfig:
     fake_class_batch_size: int = 16
     fake_class_disc_weight: float = 1.0   # discriminator-confidence weighting
 
+    # ---- Label + mask dropout (applies to all training stages) -------------
+    label_dropout_rate: float = 0.0
+    """Per-label probability of dropping a (label, mask) pair during training.
+    0.0 = disabled."""
+    label_dropout_max_drop_frac: float = 1.0
+    """Cap: drop at most this fraction of active labels per sample. 1.0 = no cap."""
+    label_dropout_min_keep: int = 1
+    """Minimum active labels guaranteed to survive per sample."""
+    label_dropout_network_rate: float = 0.0
+    """If > 0, all nn.Dropout modules in the classifier are set to this rate
+    during each training step. 0.0 = leave model's own dropout unchanged."""
+    label_dropout_dataset_threshold: int = -1
+    """Labels with index > this value are treated as dataset-specific language
+    and protected by label_dropout_min_keep_dataset. -1 = disabled (all labels
+    share the same min_keep floor)."""
+    label_dropout_min_keep_dataset: int = 1
+    """Minimum dataset-specific labels (index > threshold) to keep per sample."""
+
     # ---- Progress logging (applies to all _run_classifier_refresh_epochs calls) --
     # 0 = silent; N = print one progress line every N steps
     log_every: int = 50
@@ -195,6 +213,20 @@ class ClassifierConfig:
     # ---- Checkpoint init -----------------------------------------------
     classifier_init_ckpt: str = ""
     classifier_init_scope: str = "all"
+
+
+def _make_label_dropout_cfg(cfg: "ClassifierConfig") -> "Optional[LabelMaskDropoutConfig]":
+    """Build a LabelMaskDropoutConfig from ClassifierConfig, or None if disabled."""
+    if float(cfg.label_dropout_rate) <= 0.0 and float(cfg.label_dropout_network_rate) <= 0.0:
+        return None
+    return LabelMaskDropoutConfig(
+        drop_rate=float(cfg.label_dropout_rate),
+        max_drop_frac=float(cfg.label_dropout_max_drop_frac),
+        min_keep_labels=int(cfg.label_dropout_min_keep),
+        dataset_label_index_threshold=int(cfg.label_dropout_dataset_threshold),
+        min_keep_dataset_labels=int(cfg.label_dropout_min_keep_dataset),
+        network_dropout=float(cfg.label_dropout_network_rate) if float(cfg.label_dropout_network_rate) > 0.0 else None,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -423,6 +455,7 @@ class PregestationTrainNode(IRTrainingNode):
             weight_update_callback=weight_update_callback,
             active_term_to_idx=dict(ctx.semantic_term_to_idx),
             n_active_classes=len(ctx.class_names),
+            label_mask_dropout_cfg=_make_label_dropout_cfg(self.cfg),
             args=ctx.args,
         )
 
@@ -547,6 +580,7 @@ class GestationTrainNode(IRTrainingNode):
             weight_update_callback=weight_update_callback,
             active_term_to_idx=dict(ctx.semantic_term_to_idx),
             n_active_classes=len(ctx.class_names),
+            label_mask_dropout_cfg=_make_label_dropout_cfg(self.cfg),
             args=ctx.args,
         )
 
@@ -668,6 +702,7 @@ class BerkeleyRefreshTrainNode(IRTrainingNode):
             args=ctx.args,
             active_term_to_idx=dict(ctx.semantic_term_to_idx),
             n_active_classes=len(ctx.class_names),
+            label_mask_dropout_cfg=_make_label_dropout_cfg(self.cfg),
         )
 
         loss = float(result.get("loss", float("inf")))
@@ -832,6 +867,7 @@ class LoRARoundNode(IRTrainingNode):
                 args=ctx.args,
                 active_term_to_idx=dict(ctx.semantic_term_to_idx),
                 n_active_classes=len(ctx.class_names),
+                label_mask_dropout_cfg=_make_label_dropout_cfg(self.cfg),
                 stop_requested=ctx.stop_requested,
                 pause_requested=ctx.paused,
                 ipc_pump=getattr(ctx.viewer_proxy, "pump", None),

@@ -1058,6 +1058,10 @@ class NodusHandler(BaseHTTPRequestHandler):
         if m:
             return self._handle_lease_detail(m.group(1))
 
+        # -- Unified model interface (lease or latest) --
+        if path == "/api/model/interface/meta":
+            return self._handle_model_interface_meta(qs)
+
         self._send(404, "application/json", _json({"error": "not found", "path": path}))
 
     # ------------------------------------------------------------------ #
@@ -1146,50 +1150,14 @@ class NodusHandler(BaseHTTPRequestHandler):
         if not image_b64:
             self._send(400, "application/json", _json({"error": "image_b64 required"}))
             return
-
         with _service_priority("latest_classifier_infer"):
             try:
-                import numpy as np
-                import torch
-
                 bundle = _load_latest_classifier_bundle()
-                input_tensor, image_meta = _prepare_classifier_input_tensor(
-                    image_b64=image_b64,
-                    input_shape=list(bundle["input_shape"]),
-                )
-                model = bundle["model"]
-                with torch.inference_mode():
-                    logits = model(input_tensor.to(dtype=torch.float32))
-                    probs = torch.sigmoid(logits).detach().cpu().numpy().reshape(-1)
-                    logits_np = logits.detach().cpu().numpy().reshape(-1)
-                class_names = list(bundle["class_names"])
-                label_texts = list(bundle["label_texts"])
-                scores = []
-                for idx, score in enumerate(probs.tolist()):
-                    scores.append({
-                        "index": int(idx),
-                        "label": str(class_names[idx]) if idx < len(class_names) else f"class_{idx}",
-                        "label_text": str(label_texts[idx]) if idx < len(label_texts) else (
-                            str(class_names[idx]) if idx < len(class_names) else f"class_{idx}"
-                        ),
-                        "score": float(score),
-                        "logit": float(logits_np[idx]) if idx < int(len(logits_np)) else 0.0,
-                    })
-                order = np.argsort(-probs)[: max(1, min(int(topk), int(probs.size)))]
-                top_scores = [scores[int(i)] for i in order.tolist()]
+                result = _run_classifier_inference(bundle, image_b64, topk)
             except Exception as exc:
                 self._send(500, "application/json", _json({"error": f"classifier inference failed: {exc}"}))
                 return
-
-        self._send(200, "application/json", _json({
-            "checkpoint_dir": bundle["checkpoint_dir"],
-            "classifier_path": bundle["classifier_path"],
-            "input_shape": list(bundle["input_shape"]),
-            "num_classes": int(bundle["num_classes"]),
-            "image": image_meta,
-            "top_scores": top_scores,
-            "scores": scores,
-        }))
+        self._send(200, "application/json", _json(result))
 
     def _handle_model_latest_onnx(self, name: str, qs: dict):
         """On-demand ONNX conversion of the latest checkpoint.
@@ -1325,6 +1293,137 @@ class NodusHandler(BaseHTTPRequestHandler):
 
     def _handle_runtime_control_status(self):
         self._send(200, "application/json", _json(_runtime_control_state_dict()))
+
+    # ---- Unified model interface (interrupt-pause-resume) ----
+
+    def _handle_model_interface_meta(self, qs: dict):
+        """GET /api/model/interface/meta
+
+        Returns the descriptor for either the latest checkpoint or a lease model.
+        The descriptor includes input_shape, class labels, and infer_url so the
+        client knows where to send inference requests.
+
+        Query params:
+            source       "latest" (default) or "lease"
+            lease_id     required when source=lease
+            model_name   optional (default "classifier")
+            model_class  optional (default inferred from name)
+            input_shape  optional comma-separated e.g. "1,3,64,64"
+        """
+        source = (qs.get("source") or ["latest"])[0].strip().lower() or "latest"
+        lease_id = (qs.get("lease_id") or [""])[0].strip()
+        model_name = (qs.get("model_name") or [""])[0].strip()
+        model_class = (qs.get("model_class") or [""])[0].strip()
+        input_shape_str = (qs.get("input_shape") or [""])[0].strip()
+        input_shape = [int(x) for x in input_shape_str.split(",") if x.strip()] if input_shape_str else None
+        try:
+            descriptor = _build_model_interface_descriptor(
+                source=source,
+                lease_id=lease_id,
+                model_name=model_name,
+                model_class=model_class,
+                input_shape=input_shape,
+            )
+        except (FileNotFoundError, RuntimeError, ValueError) as exc:
+            self._send(404 if isinstance(exc, FileNotFoundError) else 400,
+                       "application/json", _json({"error": str(exc)}))
+            return
+        except Exception as exc:
+            self._send(500, "application/json", _json({"error": str(exc)}))
+            return
+        self._send(200, "application/json", _json(descriptor))
+
+    def _handle_model_interface_prepare(self, body: bytes):
+        """POST /api/model/interface/prepare
+
+        Ensures the model is ready for client use (ONNX export if requested) and
+        returns the full descriptor.  Does NOT run inference or pause training.
+
+        Body JSON:
+            source        "latest" or "lease"
+            lease_id      required when source=lease
+            model_name    optional
+            model_class   optional
+            input_shape   optional list e.g. [1,3,64,64]
+            ensure_onnx   bool (default false) — trigger ONNX export now
+            opset_version int (default 17)
+        """
+        try:
+            req = json.loads(body or b"{}")
+        except Exception:
+            self._send(400, "application/json", _json({"error": "invalid JSON body"}))
+            return
+        source = str(req.get("source") or "latest").strip().lower() or "latest"
+        lease_id = str(req.get("lease_id") or "").strip()
+        model_name = str(req.get("model_name") or "").strip()
+        model_class = str(req.get("model_class") or "").strip()
+        input_shape = req.get("input_shape") or None
+        ensure_onnx = bool(req.get("ensure_onnx", False))
+        opset_version = int(req.get("opset_version") or 17)
+        try:
+            with _service_priority("model_interface_prepare"):
+                descriptor = _build_model_interface_descriptor(
+                    source=source,
+                    lease_id=lease_id,
+                    model_name=model_name,
+                    model_class=model_class,
+                    input_shape=input_shape,
+                    ensure_onnx=ensure_onnx,
+                    opset_version=opset_version,
+                )
+        except (FileNotFoundError, RuntimeError, ValueError) as exc:
+            self._send(404 if isinstance(exc, FileNotFoundError) else 400,
+                       "application/json", _json({"error": str(exc)}))
+            return
+        except Exception as exc:
+            self._send(500, "application/json", _json({"error": str(exc)}))
+            return
+        self._send(200, "application/json", _json(descriptor))
+
+    def _handle_model_interface_infer(self, body: bytes):
+        """POST /api/model/interface/infer
+
+        Interrupts training (via service priority), runs classifier inference on
+        the supplied image, then allows training to resume.
+
+        Body JSON:
+            source       "latest" (default) or "lease"
+            lease_id     required when source=lease
+            model_name   optional
+            model_class  optional
+            image_b64    base64 PNG/JPEG (required)
+            topk         int (default 12)
+        """
+        try:
+            req = json.loads(body or b"{}")
+        except Exception:
+            self._send(400, "application/json", _json({"error": "invalid JSON body"}))
+            return
+        source = str(req.get("source") or "latest").strip().lower() or "latest"
+        lease_id = str(req.get("lease_id") or "").strip()
+        model_name = str(req.get("model_name") or "").strip()
+        model_class = str(req.get("model_class") or "").strip()
+        image_b64 = str(req.get("image_b64") or "").strip()
+        topk = max(1, int(req.get("topk") or 12))
+        if not image_b64:
+            self._send(400, "application/json", _json({"error": "image_b64 required"}))
+            return
+        service_tag = f"model_interface_infer:{source}"
+        with _service_priority(service_tag):
+            try:
+                if source == "lease":
+                    bundle = _load_lease_classifier_bundle(lease_id)
+                else:
+                    bundle = _load_latest_classifier_bundle()
+                result = _run_classifier_inference(bundle, image_b64, topk)
+            except (FileNotFoundError, RuntimeError, ValueError) as exc:
+                self._send(404 if isinstance(exc, FileNotFoundError) else 400,
+                           "application/json", _json({"error": str(exc)}))
+                return
+            except Exception as exc:
+                self._send(500, "application/json", _json({"error": f"inference failed: {exc}"}))
+                return
+        self._send(200, "application/json", _json(result))
 
     # ---- Loss store ----
 
@@ -1833,6 +1932,13 @@ class NodusHandler(BaseHTTPRequestHandler):
         m = re.fullmatch(r"/api/lease/collection/([^/]+)/apply", path)
         if m:
             return self._handle_lease_mark_applied(ls, m.group(1))
+
+        # -- Unified model interface (lease or latest) --
+        if path == "/api/model/interface/prepare":
+            return self._handle_model_interface_prepare(body)
+
+        if path == "/api/model/interface/infer":
+            return self._handle_model_interface_infer(body)
 
         self._send(404, "application/json", _json({"error": "not found", "path": path}))
 

@@ -227,6 +227,18 @@ def parse_args():
     p.add_argument("--classifier-max-ch", type=int, default=384, help="Max channel cap for image classifiers.")
     p.add_argument("--classifier-context-blocks", type=int, default=8, help="Residual context blocks in image classifiers.")
     p.add_argument("--classifier-context-dropout", type=float, default=0.05, help="Dropout in classifier context blocks.")
+    p.add_argument("--target-label-knockout-prob", type=float, default=0.0, dest="target_label_knockout_prob",
+                   help="Per-label probability of dropping a (label+mask) pair during classifier training. 0.0 = disabled.")
+    p.add_argument("--target-label-knockout-max-drop-frac", type=float, default=1.0, dest="target_label_knockout_max_drop_frac",
+                   help="Maximum fraction of active labels that may be dropped per sample (1.0 = no cap).")
+    p.add_argument("--target-label-knockout-min-keep", type=int, default=1, dest="target_label_knockout_min_keep",
+                   help="Minimum active labels guaranteed to survive per sample after dropout.")
+    p.add_argument("--target-label-knockout-network-dropout", type=float, default=0.0, dest="target_label_knockout_network_dropout",
+                   help="If > 0, override all nn.Dropout rates in the classifier to this value during training steps.")
+    p.add_argument("--target-label-knockout-dataset-threshold", type=int, default=-1, dest="target_label_knockout_dataset_threshold",
+                   help="Labels with index > this value are treated as dataset-specific language with their own keep floor. -1 = disabled.")
+    p.add_argument("--target-label-knockout-min-keep-dataset", type=int, default=1, dest="target_label_knockout_min_keep_dataset",
+                   help="Minimum dataset-specific labels (index > threshold) guaranteed to survive per sample.")
     p.add_argument(
         "--lr-sine-cycles",
         type=float,
