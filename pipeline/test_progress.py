@@ -3,9 +3,11 @@ from __future__ import annotations
 import unittest
 from types import SimpleNamespace
 
+import torch
+
 from pipeline.graph import PipelineGraph, PipelineNode
 from pipeline.nodes.interrupts import StageStopRequested
-from pipeline.progress import interruptible_tqdm
+from pipeline.progress import interruptible_tqdm, register_progress_control
 
 
 class _Control:
@@ -47,6 +49,28 @@ class _ProgressStopNode(PipelineNode):
             pass
 
 
+class _RegisteredControlNode(PipelineNode):
+    @property
+    def node_id(self) -> str:
+        return "registered"
+
+    def execute(self, ctx) -> None:
+        for _ in interruptible_tqdm(range(2), disable=True):
+            pass
+
+
+class _DataLoaderStopNode(PipelineNode):
+    @property
+    def node_id(self) -> str:
+        return "loader_stop"
+
+    def execute(self, ctx) -> None:
+        ds = torch.utils.data.TensorDataset(torch.arange(3))
+        loader = torch.utils.data.DataLoader(ds, batch_size=1, num_workers=0)
+        for _batch in loader:
+            pass
+
+
 class ProgressTests(unittest.TestCase):
     def test_interruptible_tqdm_raises_stop_requested(self) -> None:
         control = _Control(stop=True, save=False)
@@ -57,6 +81,12 @@ class ProgressTests(unittest.TestCase):
     def test_interruptible_tqdm_pause_pumps_until_resume(self) -> None:
         control = _PauseThenResumeControl()
         self.assertEqual(list(interruptible_tqdm(range(1), control=control, disable=True, pause_poll_s=0.01)), [0])
+        self.assertGreaterEqual(control.pump_calls, 1)
+
+    def test_interruptible_tqdm_uses_registered_control_when_omitted(self) -> None:
+        control = _PauseThenResumeControl()
+        with register_progress_control(control):
+            self.assertEqual(list(interruptible_tqdm(range(1), disable=True, pause_poll_s=0.01)), [0])
         self.assertGreaterEqual(control.pump_calls, 1)
 
     def test_graph_marks_stop_save_interrupt_before_reraising(self) -> None:
@@ -74,6 +104,34 @@ class ProgressTests(unittest.TestCase):
         self.assertTrue(excinfo.exception.save_requested)
         self.assertEqual(ctx.last_node_statuses["stopper"], "interrupted:stop_save")
         self.assertEqual(ctx.last_execution_trace[-1]["status"], "interrupted:stop_save")
+
+    def test_graph_registers_control_for_nodes_without_explicit_progress_control(self) -> None:
+        graph = PipelineGraph(name="registered-control")
+        graph.add_node(_RegisteredControlNode())
+        ctx = SimpleNamespace(
+            stop_requested=lambda: False,
+            shutdown_save=lambda: False,
+            paused=lambda: False,
+            viewer_proxy=None,
+            raise_on_node_failure=True,
+        )
+        statuses = graph.execute_sequence(ctx)
+        self.assertEqual(statuses["registered"], "ran")
+
+    def test_graph_registers_control_for_plain_dataloader_iteration(self) -> None:
+        graph = PipelineGraph(name="dataloader-stop")
+        graph.add_node(_DataLoaderStopNode())
+        ctx = SimpleNamespace(
+            stop_requested=lambda: True,
+            shutdown_save=lambda: True,
+            paused=lambda: False,
+            viewer_proxy=None,
+            raise_on_node_failure=True,
+        )
+        with self.assertRaises(StageStopRequested) as excinfo:
+            graph.execute_sequence(ctx)
+        self.assertTrue(excinfo.exception.save_requested)
+        self.assertEqual(ctx.last_node_statuses["loader_stop"], "interrupted:stop_save")
 
 
 if __name__ == "__main__":
