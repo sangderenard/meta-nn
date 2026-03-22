@@ -739,7 +739,7 @@ class GeneratorTrainNode(IRTrainingNode):
                 pin_memory=True,
                 prefetch_factor=2,
                 persistent_workers=True,
-                shuffle_train=True,
+                shuffle_train=False,
             )
 
             trained_g, trained_d, metrics_list = train_conditional_generator_discriminator(
