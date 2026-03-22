@@ -1,3 +1,0 @@
-C:/dev/Powershell/meta-nn/native/build/CMakeFiles/nodus_loss_store.dir
-C:/dev/Powershell/meta-nn/native/build/CMakeFiles/ALL_BUILD.dir
-C:/dev/Powershell/meta-nn/native/build/CMakeFiles/ZERO_CHECK.dir
