@@ -1430,15 +1430,16 @@ class NodusHandler(BaseHTTPRequestHandler):
     def _handle_loss_channels(self):
         ls = _loss()
         channels = []
-        for key in ls.channel_keys():
-            lat = ls.latest(key)
-            channels.append({
-                "key": key,
-                "length": ls.channel_length(key),
-                "cursor": ls.channel_cursor(key),
-                "latest_loss": lat.loss if lat else None,
-                "latest_step": lat.step if lat else None,
-            })
+        with ls.locked():
+            for key in ls.channel_keys():
+                lat = ls.latest(key)
+                channels.append({
+                    "key": key,
+                    "length": ls.channel_length(key),
+                    "cursor": ls.channel_cursor(key),
+                    "latest_loss": lat.loss if lat else None,
+                    "latest_step": lat.step if lat else None,
+                })
         self._send(200, "application/json", _json({"channels": channels}))
 
     def _handle_loss_records(self, key: str, qs: dict):
@@ -1468,17 +1469,16 @@ class NodusHandler(BaseHTTPRequestHandler):
         start = float(qs.get("start", ["0.0"])[0])
         bg_str = qs.get("bg", ["0,0,0"])[0]
 
-        keys = ls.channel_keys()
-        if not keys:
-            # Return a blank black PNG.
-            blank = b"\x00" * (w * h * 3)
-            self._send(200, "image/png", _encode_png_rgb(w, h, blank))
-            return
+        with ls.locked():
+            keys = ls.channel_keys()
+            if not keys:
+                blank = b"\x00" * (w * h * 3)
+                self._send(200, "image/png", _encode_png_rgb(w, h, blank))
+                return
 
-        # Extend palette cyclically.
-        colors = [_GRAPH_COLORS[i % len(_GRAPH_COLORS)] for i in range(len(keys))]
-        result = ls.render_all_lines(keys, colors, w, h,
-                                     display_start_frac=max(0.0, min(1.0, start)))
+            colors = [_GRAPH_COLORS[i % len(_GRAPH_COLORS)] for i in range(len(keys))]
+            result = ls.render_all_lines(keys, colors, w, h,
+                                         display_start_frac=max(0.0, min(1.0, start)))
         if result is None:
             blank = b"\x00" * (w * h * 3)
             self._send(200, "image/png", _encode_png_rgb(w, h, blank))
@@ -1515,20 +1515,22 @@ class NodusHandler(BaseHTTPRequestHandler):
 
     def _handle_scrub_info(self):
         sr = _scrub()
-        body = _json({
-            "length": sr.length(),
-            "capacity": sr.capacity(),
-            "write_cursor": sr.write_cursor(),
-        })
+        with sr.locked():
+            body = _json({
+                "length": sr.length(),
+                "capacity": sr.capacity(),
+                "write_cursor": sr.write_cursor(),
+            })
         self._send(200, "application/json", body)
 
     def _handle_scrub_meta(self, index):
         sr = _scrub()
-        idx = self._resolve_scrub_index(sr, index)
-        if idx is None:
-            self._send(404, "application/json", _json({"error": "empty ring"}))
-            return
-        meta = sr.get_meta(idx)
+        with sr.locked():
+            idx = self._resolve_scrub_index(sr, index)
+            if idx is None:
+                self._send(404, "application/json", _json({"error": "empty ring"}))
+                return
+            meta = sr.get_meta(idx)
         if meta is None:
             self._send(404, "application/json", _json({"error": "index out of range"}))
             return
@@ -1538,38 +1540,37 @@ class NodusHandler(BaseHTTPRequestHandler):
 
     def _handle_scrub_image(self, index, kind: str):
         sr = _scrub()
-        idx = self._resolve_scrub_index(sr, index)
-        if idx is None:
-            self._send(404, "application/json", _json({"error": "empty ring"}))
-            return
-        meta = sr.get_meta(idx)
-        if meta is None:
-            self._send(404, "application/json", _json({"error": "index out of range"}))
-            return
+        with sr.locked():
+            idx = self._resolve_scrub_index(sr, index)
+            if idx is None:
+                self._send(404, "application/json", _json({"error": "empty ring"}))
+                return
+            meta = sr.get_meta(idx)
+            if meta is None:
+                self._send(404, "application/json", _json({"error": "index out of range"}))
+                return
 
-        if kind == "training":
-            raw = sr.copy_training_image(idx)
-            w, h = meta.image_w, meta.image_h
-            channels = 4
-        elif kind == "output":
-            raw = sr.copy_output_image(idx)
-            w, h = meta.output_w, meta.output_h
-            channels = 4
-        elif kind == "target":
-            raw = sr.copy_target(idx)
-            # Target is stored as RGBA same dimensions as training image.
-            w, h = meta.image_w, meta.image_h
-            channels = 4
-        else:
-            self._send(400, "application/json", _json({"error": "unknown image kind"}))
-            return
+            if kind == "training":
+                raw = sr.copy_training_image(idx)
+                w, h = meta.image_w, meta.image_h
+                channels = 4
+            elif kind == "output":
+                raw = sr.copy_output_image(idx)
+                w, h = meta.output_w, meta.output_h
+                channels = 4
+            elif kind == "target":
+                raw = sr.copy_target(idx)
+                w, h = meta.image_w, meta.image_h
+                channels = 4
+            else:
+                self._send(400, "application/json", _json({"error": "unknown image kind"}))
+                return
 
         if raw is None or len(raw) == 0:
             self._send(404, "application/json", _json({"error": "image not present"}))
             return
 
         if w == 0 or h == 0:
-            # Fall back to known scrub image size.
             from pipeline.nodus_loss_store import SCRUB_IMAGE_W, SCRUB_IMAGE_H
             w, h = SCRUB_IMAGE_W, SCRUB_IMAGE_H
 
@@ -1601,12 +1602,13 @@ class NodusHandler(BaseHTTPRequestHandler):
 
     def _handle_weight_meta_all(self):
         wst = _wstate()
-        count = wst.count()
-        entries = []
-        for i in range(count):
-            meta = wst.get_meta_at(i)
-            if meta is not None:
-                entries.append(_dataclass_dict(meta))
+        with wst.locked():
+            count = wst.count()
+            entries = []
+            for i in range(count):
+                meta = wst.get_meta_at(i)
+                if meta is not None:
+                    entries.append(_dataclass_dict(meta))
         self._send(200, "application/json", _json({"count": count, "entries": entries}))
 
     def _handle_weight_image_info(self):
@@ -1619,25 +1621,27 @@ class NodusHandler(BaseHTTPRequestHandler):
 
     def _handle_weight_image(self, index):
         wim = _wimage()
-        count = wim.length()
-        if count == 0:
-            self._send(404, "application/json", _json({"error": "no weight images cached"}))
-            return
-
-        if index == "latest":
-            idx = count - 1
-        else:
-            idx = int(index)
-            if idx < 0 or idx >= count:
-                self._send(404, "application/json", _json({"error": "index out of range"}))
+        with wim.locked():
+            count = wim.length()
+            if count == 0:
+                self._send(404, "application/json", _json({"error": "no weight images cached"}))
                 return
 
-        meta = wim.get_meta(idx)
-        if meta is None:
-            self._send(404, "application/json", _json({"error": "metadata unavailable"}))
-            return
+            if index == "latest":
+                idx = count - 1
+            else:
+                idx = int(index)
+                if idx < 0 or idx >= count:
+                    self._send(404, "application/json", _json({"error": "index out of range"}))
+                    return
 
-        raw = wim.copy_image(idx)
+            meta = wim.get_meta(idx)
+            if meta is None:
+                self._send(404, "application/json", _json({"error": "metadata unavailable"}))
+                return
+
+            raw = wim.copy_image(idx)
+
         if raw is None or len(raw) == 0:
             self._send(404, "application/json", _json({"error": "image data unavailable"}))
             return

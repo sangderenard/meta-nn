@@ -656,6 +656,22 @@ def _setup_signatures(lib: ctypes.CDLL) -> None:
     ]
     lib.nodus_runtime_control_store_get_state.restype = ctypes.c_int
 
+    # -- exported lock/unlock for multi-step atomic access --
+    lib.nodus_weight_state_store_lock.argtypes = [c_weight_state_p]
+    lib.nodus_weight_state_store_lock.restype = None
+    lib.nodus_weight_state_store_unlock.argtypes = [c_weight_state_p]
+    lib.nodus_weight_state_store_unlock.restype = None
+
+    lib.nodus_weight_image_store_lock.argtypes = [c_weight_image_p]
+    lib.nodus_weight_image_store_lock.restype = None
+    lib.nodus_weight_image_store_unlock.argtypes = [c_weight_image_p]
+    lib.nodus_weight_image_store_unlock.restype = None
+
+    lib.nodus_runtime_control_store_lock.argtypes = [c_runtime_control_p]
+    lib.nodus_runtime_control_store_lock.restype = None
+    lib.nodus_runtime_control_store_unlock.argtypes = [c_runtime_control_p]
+    lib.nodus_runtime_control_store_unlock.restype = None
+
 
 # -- Python dataclass for query results --
 
@@ -1142,7 +1158,7 @@ class NodusLossStore:
 class _StoreLockCtx:
     __slots__ = ("_store",)
 
-    def __init__(self, store: NodusLossStore):
+    def __init__(self, store):
         self._store = store
 
     def __enter__(self):
@@ -2043,6 +2059,15 @@ class NodusWeightStateStore:
             if meta is not None
         ]
 
+    def lock(self) -> None:
+        self._lib.nodus_weight_state_store_lock(self._handle)
+
+    def unlock(self) -> None:
+        self._lib.nodus_weight_state_store_unlock(self._handle)
+
+    def locked(self):
+        return _StoreLockCtx(self)
+
 
 class NodusWeightImageStore:
     """Cross-process cache of GUI-rendered weight images."""
@@ -2385,6 +2410,15 @@ class NodusWeightImageStore:
         )
         return int(rc) == 0
 
+    def lock(self) -> None:
+        self._lib.nodus_weight_image_store_lock(self._handle)
+
+    def unlock(self) -> None:
+        self._lib.nodus_weight_image_store_unlock(self._handle)
+
+    def locked(self):
+        return _StoreLockCtx(self)
+
 
 class NodusRuntimeControlStore:
     """Cross-process runtime control block for service priority and shutdown."""
@@ -2469,3 +2503,12 @@ class NodusRuntimeControlStore:
             last_source=last_source.value.decode("utf-8", errors="replace"),
             exit_reason=exit_reason.value.decode("utf-8", errors="replace"),
         )
+
+    def lock(self) -> None:
+        self._lib.nodus_runtime_control_store_lock(self._handle)
+
+    def unlock(self) -> None:
+        self._lib.nodus_runtime_control_store_unlock(self._handle)
+
+    def locked(self):
+        return _StoreLockCtx(self)

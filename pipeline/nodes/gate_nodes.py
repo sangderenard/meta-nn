@@ -64,28 +64,32 @@ CLASSIFIER_SEMANTIC_COSINE_WEIGHT = 0.35
 
 
 def _gate_eval_model(ctx: PipelineContext, *, channels_last: bool = False) -> tuple[nn.Module, torch.device, str]:
-    model = getattr(ctx, "classifier", None)
-    gate_device = resolve_non_training_device(ctx)
-    if model is not None:
-        try:
-            from pipeline.nodes.classifier_node import _sync_gate_classifier_replica
+    """Build a temporary frozen replica of the classifier for gate evaluation.
 
-            ctx.gate_classifier, _info = _sync_gate_classifier_replica(
-                source_classifier=model,
-                gate_classifier=ctx.gate_classifier,
-                gate_device=gate_device,
-                channels_last=bool(channels_last),
-            )
-        except Exception:
-            pass
-    gate_model = getattr(ctx, "gate_classifier", None) or model
-    if gate_model is None:
-        raise RuntimeError("Gate evaluation requires classifier or gate_classifier")
+    The replica is created fresh each time and NOT stored on ctx so that no
+    duplicate model weights linger in RAM between evaluations.
+    """
+    model = getattr(ctx, "classifier", None)
+    if model is None:
+        raise RuntimeError("Gate evaluation requires a classifier")
+    gate_device = resolve_non_training_device(ctx)
+    gate_model = model  # fallback: use training classifier directly
+    try:
+        from pipeline.nodes.classifier_node import _sync_gate_classifier_replica
+
+        gate_model, _info = _sync_gate_classifier_replica(
+            source_classifier=model,
+            gate_classifier=None,
+            gate_device=gate_device,
+            channels_last=bool(channels_last),
+        )
+    except Exception:
+        pass
     try:
         gate_device = next(gate_model.parameters()).device
     except StopIteration:
         gate_device = torch.device("cpu")
-    gate_name = "gate_classifier" if getattr(ctx, "gate_classifier", None) is gate_model else "classifier"
+    gate_name = "gate_classifier" if gate_model is not model else "classifier"
     return gate_model, gate_device, gate_name
 
 
@@ -126,7 +130,7 @@ class PregestationEvalNode(PipelineNode):
         self.cfg = cfg
 
     def should_run(self, ctx: PipelineContext) -> bool:
-        return ctx.pregestation_eval_loader is not None and (ctx.classifier is not None or ctx.gate_classifier is not None)
+        return ctx.pregestation_eval_loader is not None and ctx.classifier is not None
 
     def execute(self, ctx: PipelineContext) -> None:
         max_steps = int(getattr(ctx.args, "gate_pregestation_eval_max_steps", 10) or 10)
@@ -167,9 +171,9 @@ class GestationEvalNode(GatedNode):
         self.cfg = cfg
 
     def should_run(self, ctx: PipelineContext) -> bool:
-        # Bypass gate_pregestation dependency — even a single gestation image
-        # produces a valid loss signal that justifies a gate check.
-        return ctx.gestation_eval_loader is not None and (ctx.classifier is not None or ctx.gate_classifier is not None)
+        if ctx.is_gate_bypassed("gate_gestation"):
+            return False
+        return ctx.gestation_eval_loader is not None and ctx.classifier is not None
 
     def execute(self, ctx: PipelineContext) -> None:
         max_steps = int(getattr(ctx.args, "gate_gestation_eval_max_steps", 10) or 10)
@@ -245,7 +249,7 @@ class BerkeleyGateNode(GatedNode):
             return False
         return (
             ctx.payload_validation_loader is not None
-            and (ctx.classifier is not None or ctx.gate_classifier is not None)
+            and ctx.classifier is not None
         )
 
     def execute(self, ctx: PipelineContext) -> None:

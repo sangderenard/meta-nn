@@ -716,6 +716,9 @@ class GeneratorTrainNode(IRTrainingNode):
             f"feat={feat_score:.4f} gate={'PASS' if ctx.gate_generator.passed else 'hold'}"
         )
 
+        from pipeline.nodes.vocab_node import deactivate_vocab_lora_slot
+        deactivate_vocab_lora_slot(ctx)
+
 
 # ---------------------------------------------------------------------------
 # Private helpers

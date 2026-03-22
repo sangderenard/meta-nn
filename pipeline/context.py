@@ -230,7 +230,8 @@ class PipelineContext:
     classifier_lr_controller: Optional[Any] = None
     classifier_grad_scaler: Optional[Any] = None
 
-    # Frozen CPU replica used for gate evaluation without disrupting gradients
+    # Gate evaluation builds a temporary replica on demand; this field exists
+    # for condition-expression compatibility but is always None at rest.
     gate_classifier: Optional[nn.Module] = None
 
     # Patch-based wav→image transformer (WavePatchTransformer)
@@ -329,7 +330,6 @@ class PipelineContext:
     latent_wav_pool_dir: Optional[Path] = None
 
     # ---- LoRA adapter state (classifier) --------------------------------
-    lora_slot_snapshots: Dict[str, Any] = field(default_factory=dict)
     lora_active_slot: str = ""
     vocab_lora_library: Dict[str, Any] = field(default_factory=dict)
     vocab_lora_plan_cache: Dict[str, Any] = field(default_factory=dict)
@@ -368,8 +368,6 @@ class PipelineContext:
     vocab_lora_plan_registered_cycle: int = -1  # orchestrator cycle when plan_signature was last set
     vocab_lora_plan_registered_round: int = -1   # round_id when plan_signature was last set
     vocab_churn_activation_pending: bool = False  # set by activating sources; consumed+cleared by VocabChurnNode
-    vocab_churn_demand_registry: Dict[str, List[str]] = field(default_factory=dict)    # source → normalized terms
-    vocab_churn_demand_term_rows: Dict[str, List[List[str]]] = field(default_factory=dict)  # source → term rows
     last_node_statuses: Dict[str, str] = field(default_factory=dict)
     last_execution_trace: List[Dict[str, Any]] = field(default_factory=list)
     last_program_trace: List[Dict[str, Any]] = field(default_factory=list)
@@ -754,6 +752,12 @@ class PipelineContext:
         self.metrics_history.append(
             {"cycle": self.cycle, "round": self.round_id, "stage": stage, "key": key, "value": value_f}
         )
+        # Authoritative metric history lives in loss_store (C++ native) and
+        # loss_logger (binary file).  This Python list is only consumed for
+        # checkpoint round-trip and a tail-50 summary, so cap it.
+        _MAX_METRICS_HISTORY = 5000
+        if len(self.metrics_history) > _MAX_METRICS_HISTORY:
+            self.metrics_history = self.metrics_history[-_MAX_METRICS_HISTORY:]
         ck = _channel_key_for_metric(stage, key)
         if ck is not None:
             self.publish_loss(ck, value_f)

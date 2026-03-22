@@ -2137,16 +2137,17 @@ class _TransformerStatusOpenGLViewer:
                 )
                 if not ok:
                     continue
-                index = _self._find_weight_image_store_index_for_state(
-                    _state_meta,
-                    mode=int(mode),
-                    target_width=int(target_width),
-                    target_height=int(target_height),
-                )
-                if index is None:
-                    continue
-                image_meta = _image_store.get_meta(int(index))
-                rgb = _image_store.copy_image(int(index))
+                with _image_store.locked():
+                    index = _self._find_weight_image_store_index_for_state(
+                        _state_meta,
+                        mode=int(mode),
+                        target_width=int(target_width),
+                        target_height=int(target_height),
+                    )
+                    if index is None:
+                        continue
+                    image_meta = _image_store.get_meta(int(index))
+                    rgb = _image_store.copy_image(int(index))
                 if image_meta is None or rgb is None:
                     continue
                 subtitle = f"r{int(image_meta.round_id)} c{int(image_meta.cycle)} s{int(image_meta.step)}"

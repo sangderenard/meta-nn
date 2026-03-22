@@ -44,11 +44,18 @@ static NodusLossStore *g_global;
 #  include <unistd.h>
    typedef pthread_mutex_t nodus_mutex_t;
 
-   static void mutex_init(nodus_mutex_t *m)    { pthread_mutex_init(m, NULL); }
+   static void mutex_init(nodus_mutex_t *m) {
+       pthread_mutexattr_t attr;
+       pthread_mutexattr_init(&attr);
+       pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
+       pthread_mutex_init(m, &attr);
+       pthread_mutexattr_destroy(&attr);
+   }
    static void mutex_init_shared(nodus_mutex_t *m) {
        pthread_mutexattr_t attr;
        pthread_mutexattr_init(&attr);
        pthread_mutexattr_setpshared(&attr, PTHREAD_PROCESS_SHARED);
+       pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
        pthread_mutex_init(m, &attr);
        pthread_mutexattr_destroy(&attr);
    }
@@ -385,18 +392,31 @@ NODUS_API int nodus_loss_store_clear_channel(
 /* ------------------------------------------------------------------ */
 
 NODUS_API int nodus_loss_store_channel_count(const NodusLossStore *store) {
-    return store ? store->channel_count : 0;
+    int count;
+    NodusLossStore *st = (NodusLossStore*)store;
+    if (!st) return 0;
+    store_lock(st);
+    count = st->channel_count;
+    store_unlock(st);
+    return count;
 }
 
 NODUS_API int nodus_loss_store_channel_name(
         const NodusLossStore *store, int index, char *buf, int buf_len)
 {
-    if (!store || !buf || buf_len <= 0) return -1;
-    if (index < 0 || index >= store->channel_count) return -1;
-    int len = (int)strlen(store->channels[index].name);
-    int copy = (len < buf_len - 1) ? len : (buf_len - 1);
-    memcpy(buf, store->channels[index].name, (size_t)copy);
+    NodusLossStore *st = (NodusLossStore*)store;
+    int len, copy;
+    if (!st || !buf || buf_len <= 0) return -1;
+    store_lock(st);
+    if (index < 0 || index >= st->channel_count) {
+        store_unlock(st);
+        return -1;
+    }
+    len = (int)strlen(st->channels[index].name);
+    copy = (len < buf_len - 1) ? len : (buf_len - 1);
+    memcpy(buf, st->channels[index].name, (size_t)copy);
     buf[copy] = '\0';
+    store_unlock(st);
     return len;
 }
 
@@ -407,18 +427,29 @@ NODUS_API int nodus_loss_store_channel_name(
 NODUS_API int32_t nodus_loss_store_channel_length(
         const NodusLossStore *store, const char *channel_key)
 {
-    if (!store || !channel_key) return 0;
-    /* Cast away const for find_channel -- it only reads. */
-    int idx = find_channel(store, channel_key);
-    return (idx >= 0) ? store->channels[idx].length : 0;
+    NodusLossStore *st = (NodusLossStore*)store;
+    int idx;
+    int32_t length;
+    if (!st || !channel_key) return 0;
+    store_lock(st);
+    idx = find_channel(st, channel_key);
+    length = (idx >= 0) ? st->channels[idx].length : 0;
+    store_unlock(st);
+    return length;
 }
 
 NODUS_API int32_t nodus_loss_store_channel_cursor(
         const NodusLossStore *store, const char *channel_key)
 {
-    if (!store || !channel_key) return 0;
-    int idx = find_channel(store, channel_key);
-    return (idx >= 0) ? store->channels[idx].step_cursor : 0;
+    NodusLossStore *st = (NodusLossStore*)store;
+    int idx;
+    int32_t cursor;
+    if (!st || !channel_key) return 0;
+    store_lock(st);
+    idx = find_channel(st, channel_key);
+    cursor = (idx >= 0) ? st->channels[idx].step_cursor : 0;
+    store_unlock(st);
+    return cursor;
 }
 
 NODUS_API int32_t nodus_loss_store_query_since(
@@ -428,20 +459,29 @@ NODUS_API int32_t nodus_loss_store_query_since(
         NodusLossRecord      *out_buf,
         int32_t               max_out)
 {
-    if (!store || !channel_key || !out_buf || max_out <= 0) return -1;
-
-    int idx = find_channel(store, channel_key);
-    if (idx < 0) return -1;
-
-    const NodusChannel *ch = &store->channels[idx];
+    NodusLossStore *st = (NodusLossStore*)store;
+    int idx;
+    const NodusChannel *ch;
     int32_t copied = 0;
+    int32_t i;
+    if (!st || !channel_key || !out_buf || max_out <= 0) return -1;
 
-    for (int32_t i = 0; i < ch->length && copied < max_out; i++) {
+    store_lock(st);
+    idx = find_channel(st, channel_key);
+    if (idx < 0) {
+        store_unlock(st);
+        return -1;
+    }
+
+    ch = &st->channels[idx];
+
+    for (i = 0; i < ch->length && copied < max_out; i++) {
         int bi = buf_index(ch, i);
         if (ch->records[bi].step >= from_step) {
             out_buf[copied++] = ch->records[bi];
         }
     }
+    store_unlock(st);
     return copied;
 }
 
@@ -450,17 +490,28 @@ NODUS_API int nodus_loss_store_latest(
         const char           *channel_key,
         NodusLossRecord      *out)
 {
-    if (!store || !channel_key || !out) return -1;
+    NodusLossStore *st = (NodusLossStore*)store;
+    int idx, bi;
+    const NodusChannel *ch;
+    if (!st || !channel_key || !out) return -1;
 
-    int idx = find_channel(store, channel_key);
-    if (idx < 0) return -1;
+    store_lock(st);
+    idx = find_channel(st, channel_key);
+    if (idx < 0) {
+        store_unlock(st);
+        return -1;
+    }
 
-    const NodusChannel *ch = &store->channels[idx];
-    if (ch->length == 0) return -1;
+    ch = &st->channels[idx];
+    if (ch->length == 0) {
+        store_unlock(st);
+        return -1;
+    }
 
     /* Latest is at logical position length-1. */
-    int bi = buf_index(ch, ch->length - 1);
+    bi = buf_index(ch, ch->length - 1);
     *out = ch->records[bi];
+    store_unlock(st);
     return 0;
 }
 
@@ -470,14 +521,26 @@ NODUS_API int nodus_loss_store_channel_data_ptr(
         const NodusLossRecord **out_ptr,
         int32_t               *out_length)
 {
-    if (!store || !channel_key || !out_ptr || !out_length) return -1;
+    NodusLossStore *st = (NodusLossStore*)store;
+    int idx;
+    const NodusChannel *ch;
+    if (!st || !channel_key || !out_ptr || !out_length) return -1;
 
-    int idx = find_channel(store, channel_key);
-    if (idx < 0) return -1;
+    /* NOTE: Caller MUST hold the external lock to use the returned pointer
+       safely.  This function acquires the lock only to resolve the channel
+       and copy the pointer/length; the data behind the pointer can change
+       as soon as the lock is released. */
+    store_lock(st);
+    idx = find_channel(st, channel_key);
+    if (idx < 0) {
+        store_unlock(st);
+        return -1;
+    }
 
-    const NodusChannel *ch = &store->channels[idx];
+    ch = &st->channels[idx];
     *out_ptr   = ch->records;
     *out_length = ch->length;
+    store_unlock(st);
     return 0;
 }
 
@@ -504,16 +567,21 @@ NODUS_API int32_t nodus_loss_store_get_loss_array(
         float                *out_buf,
         int32_t               max_out)
 {
-    if (!store || !channel_key || !out_buf || max_out <= 0) return -1;
-    int idx = find_channel(store, channel_key);
-    if (idx < 0) return -1;
-    const NodusChannel *ch = &store->channels[idx];
+    NodusLossStore *st = (NodusLossStore*)store;
+    int idx;
+    const NodusChannel *ch;
     int32_t copied = 0;
+    if (!st || !channel_key || !out_buf || max_out <= 0) return -1;
+    store_lock(st);
+    idx = find_channel(st, channel_key);
+    if (idx < 0) { store_unlock(st); return -1; }
+    ch = &st->channels[idx];
     for (int32_t i = 0; i < ch->length && copied < max_out; i++) {
         int bi = buf_index(ch, i);
         if (ch->records[bi].step >= from_step)
             out_buf[copied++] = ch->records[bi].loss;
     }
+    store_unlock(st);
     return copied;
 }
 
@@ -524,16 +592,21 @@ NODUS_API int32_t nodus_loss_store_get_ts_array(
         double               *out_buf,
         int32_t               max_out)
 {
-    if (!store || !channel_key || !out_buf || max_out <= 0) return -1;
-    int idx = find_channel(store, channel_key);
-    if (idx < 0) return -1;
-    const NodusChannel *ch = &store->channels[idx];
+    NodusLossStore *st = (NodusLossStore*)store;
+    int idx;
+    const NodusChannel *ch;
     int32_t copied = 0;
+    if (!st || !channel_key || !out_buf || max_out <= 0) return -1;
+    store_lock(st);
+    idx = find_channel(st, channel_key);
+    if (idx < 0) { store_unlock(st); return -1; }
+    ch = &st->channels[idx];
     for (int32_t i = 0; i < ch->length && copied < max_out; i++) {
         int bi = buf_index(ch, i);
         if (ch->records[bi].step >= from_step)
             out_buf[copied++] = ch->records[bi].ts;
     }
+    store_unlock(st);
     return copied;
 }
 
@@ -544,16 +617,21 @@ NODUS_API int32_t nodus_loss_store_get_step_array(
         int32_t              *out_buf,
         int32_t               max_out)
 {
-    if (!store || !channel_key || !out_buf || max_out <= 0) return -1;
-    int idx = find_channel(store, channel_key);
-    if (idx < 0) return -1;
-    const NodusChannel *ch = &store->channels[idx];
+    NodusLossStore *st = (NodusLossStore*)store;
+    int idx;
+    const NodusChannel *ch;
     int32_t copied = 0;
+    if (!st || !channel_key || !out_buf || max_out <= 0) return -1;
+    store_lock(st);
+    idx = find_channel(st, channel_key);
+    if (idx < 0) { store_unlock(st); return -1; }
+    ch = &st->channels[idx];
     for (int32_t i = 0; i < ch->length && copied < max_out; i++) {
         int bi = buf_index(ch, i);
         if (ch->records[bi].step >= from_step)
             out_buf[copied++] = ch->records[bi].step;
     }
+    store_unlock(st);
     return copied;
 }
 
@@ -568,13 +646,18 @@ NODUS_API int nodus_loss_store_channel_y_range(
         float                *out_min,
         float                *out_max)
 {
-    if (!store || !channel_key || !out_min || !out_max) return -1;
-    int idx = find_channel(store, channel_key);
-    if (idx < 0) return -1;
-    const NodusChannel *ch = &store->channels[idx];
-    float lo =  1e30f;
-    float hi = -1e30f;
-    int count = 0;
+    NodusLossStore *st = (NodusLossStore*)store;
+    int idx, count = 0;
+    const NodusChannel *ch;
+    float lo, hi, span;
+    if (!st || !channel_key || !out_min || !out_max) return -1;
+
+    store_lock(st);
+    idx = find_channel(st, channel_key);
+    if (idx < 0) { store_unlock(st); return -1; }
+    ch = &st->channels[idx];
+    lo =  1e30f;
+    hi = -1e30f;
     for (int32_t i = 0; i < ch->length; i++) {
         int bi = buf_index(ch, i);
         const NodusLossRecord *r = &ch->records[bi];
@@ -584,8 +667,9 @@ NODUS_API int nodus_loss_store_channel_y_range(
         if (r->loss > hi) hi = r->loss;
         count++;
     }
+    store_unlock(st);
     if (count < 1) return -1;
-    float span = hi - lo;
+    span = hi - lo;
     *out_min = (lo - span * 0.05f > 0.0f) ? lo - span * 0.05f : 0.0f;
     *out_max = hi + span * 0.05f;
     if (*out_max <= *out_min + 1e-9f) *out_max = *out_min + 1.0f;
@@ -597,11 +681,15 @@ NODUS_API int nodus_loss_store_global_time_range(
         double               *out_t_min,
         double               *out_t_max)
 {
-    if (!store || !out_t_min || !out_t_max) return -1;
-    double lo = 1e30, hi = -1e30;
+    NodusLossStore *st = (NodusLossStore*)store;
+    double lo, hi;
     int found = 0;
-    for (int c = 0; c < store->channel_count; c++) {
-        const NodusChannel *ch = &store->channels[c];
+    if (!st || !out_t_min || !out_t_max) return -1;
+
+    store_lock(st);
+    lo = 1e30; hi = -1e30;
+    for (int c = 0; c < st->channel_count; c++) {
+        const NodusChannel *ch = &st->channels[c];
         for (int32_t i = 0; i < ch->length; i++) {
             int bi = buf_index(ch, i);
             double t = ch->records[bi].ts;
@@ -612,6 +700,7 @@ NODUS_API int nodus_loss_store_global_time_range(
             }
         }
     }
+    store_unlock(st);
     if (!found) return -1;
     *out_t_min = lo;
     *out_t_max = hi;
@@ -656,49 +745,55 @@ NODUS_API int32_t nodus_loss_store_render_graph_line(
         const NodusGraphLineConfig *cfg,
         uint8_t                    *out_rgba)
 {
-    if (!store || !channel_key || !cfg || !out_rgba) return -1;
-    int idx = find_channel(store, channel_key);
-    if (idx < 0) return -1;
+    NodusLossStore *st = (NodusLossStore*)store;
+    int idx;
+    const NodusChannel *ch;
+    int32_t pw, ph, from_step, n_visible, vi, plotted;
+    float ymin, ymax;
+    double tmin, tmax, t_span;
+    int use_time, use_heap;
+    int *px_buf = NULL;
+    int stack_buf[8192 * 2];
 
-    const NodusChannel *ch = &store->channels[idx];
-    int32_t pw = cfg->plot_w;
-    int32_t ph = cfg->plot_h;
-    float ymin = cfg->y_min;
-    float ymax = cfg->y_max;
-    double tmin = cfg->t_min;
-    double tmax = cfg->t_max;
-    int use_time = cfg->use_time_axis;
-    int32_t from_step = cfg->from_step;
+    if (!st || !channel_key || !cfg || !out_rgba) return -1;
 
-    if (pw <= 0 || ph <= 0) return -1;
-    if (ymax <= ymin + 1e-9f) return -1;
+    store_lock(st);
+    idx = find_channel(st, channel_key);
+    if (idx < 0) { store_unlock(st); return -1; }
+
+    ch = &st->channels[idx];
+    pw = cfg->plot_w;
+    ph = cfg->plot_h;
+    ymin = cfg->y_min;
+    ymax = cfg->y_max;
+    tmin = cfg->t_min;
+    tmax = cfg->t_max;
+    use_time = cfg->use_time_axis;
+    from_step = cfg->from_step;
+
+    if (pw <= 0 || ph <= 0) { store_unlock(st); return -1; }
+    if (ymax <= ymin + 1e-9f) { store_unlock(st); return -1; }
 
     /* Collect visible records. */
-    int32_t n_visible = 0;
+    n_visible = 0;
     for (int32_t i = 0; i < ch->length; i++) {
         int bi = buf_index(ch, i);
         if (ch->records[bi].step >= from_step) n_visible++;
     }
-    if (n_visible < 2) return 0;
+    if (n_visible < 2) { store_unlock(st); return 0; }
 
-    /* We need to iterate twice -- first to count for downsampling, then to draw.
-       For efficiency, compute x,y pixel pairs in a local stack if small,
-       else heap. */
-    int use_heap = (n_visible > 8192);
-    int *px_buf = NULL;
-    int stack_buf[8192 * 2];
+    use_heap = (n_visible > 8192);
     if (use_heap) {
         px_buf = (int*)malloc(sizeof(int) * (size_t)n_visible * 2);
-        if (!px_buf) return -1;
+        if (!px_buf) { store_unlock(st); return -1; }
     } else {
         px_buf = stack_buf;
     }
 
     /* Compute time span for step-index mode. */
-    double t_span = (tmax > tmin + 1e-9) ? (tmax - tmin) : 1.0;
-    /* For step-index mode, count visible for uniform spacing. */
-    int32_t vi = 0;
-    int32_t plotted = 0;
+    t_span = (tmax > tmin + 1e-9) ? (tmax - tmin) : 1.0;
+    vi = 0;
+    plotted = 0;
     for (int32_t i = 0; i < ch->length; i++) {
         int bi = buf_index(ch, i);
         const NodusLossRecord *r = &ch->records[bi];
@@ -715,7 +810,6 @@ NODUS_API int32_t nodus_loss_store_render_graph_line(
         float yfrac = (r->loss - ymin) / (ymax - ymin);
         yp = (int)((double)(ph - 1) * (1.0 - (double)yfrac));
 
-        /* Clamp to plot area. */
         if (xp < 0) xp = 0; if (xp >= pw) xp = pw - 1;
         if (yp < 0) yp = 0; if (yp >= ph) yp = ph - 1;
 
@@ -724,8 +818,9 @@ NODUS_API int32_t nodus_loss_store_render_graph_line(
         plotted++;
         vi++;
     }
+    store_unlock(st);
 
-    /* Draw line segments. */
+    /* Draw line segments (operates on local px_buf, no lock needed). */
     for (int32_t j = 1; j < plotted; j++) {
         draw_line_rgba(out_rgba, pw, ph,
                        px_buf[(j-1)*2], px_buf[(j-1)*2+1],
@@ -1221,15 +1316,33 @@ NODUS_API void nodus_scrub_ring_clear(NodusScrubRing *ring)
 /* ------------------------------------------------------------------ */
 
 NODUS_API int32_t nodus_scrub_ring_length(const NodusScrubRing *ring) {
-    return ring ? ring->length : 0;
+    NodusScrubRing *r = (NodusScrubRing*)ring;
+    int32_t len;
+    if (!r) return 0;
+    ring_lock(r);
+    len = r->length;
+    ring_unlock(r);
+    return len;
 }
 
 NODUS_API int32_t nodus_scrub_ring_capacity(const NodusScrubRing *ring) {
-    return ring ? ring->capacity : 0;
+    NodusScrubRing *r = (NodusScrubRing*)ring;
+    int32_t cap;
+    if (!r) return 0;
+    ring_lock(r);
+    cap = r->capacity;
+    ring_unlock(r);
+    return cap;
 }
 
 NODUS_API int32_t nodus_scrub_ring_write_cursor(const NodusScrubRing *ring) {
-    return ring ? ring->write_cursor : 0;
+    NodusScrubRing *r = (NodusScrubRing*)ring;
+    int32_t cur;
+    if (!r) return 0;
+    ring_lock(r);
+    cur = r->write_cursor;
+    ring_unlock(r);
+    return cur;
 }
 
 NODUS_API int nodus_scrub_ring_get_meta(
@@ -1241,10 +1354,19 @@ NODUS_API int nodus_scrub_ring_get_meta(
         uint32_t *out_target_len,
         uint32_t *out_output_w, uint32_t *out_output_h)
 {
-    if (!ring || index < 0 || index >= ring->length) return -1;
+    NodusScrubRing *r = (NodusScrubRing*)ring;
+    int bi;
+    const NodusScrubEntry *e;
+    if (!r) return -1;
 
-    int bi = scrub_buf_index(ring, index);
-    const NodusScrubEntry *e = &ring->entries[bi];
+    ring_lock(r);
+    if (index < 0 || index >= r->length) {
+        ring_unlock(r);
+        return -1;
+    }
+
+    bi = scrub_buf_index(r, index);
+    e = &r->entries[bi];
 
     if (out_step)      *out_step      = e->step;
     if (out_round_id)  *out_round_id  = e->round_id;
@@ -1261,6 +1383,7 @@ NODUS_API int nodus_scrub_ring_get_meta(
         strncpy(out_channel_key, e->channel_key, channel_key_buflen - 1);
         out_channel_key[channel_key_buflen - 1] = '\0';
     }
+    ring_unlock(r);
 
     return 0;
 }
@@ -1269,14 +1392,22 @@ NODUS_API int32_t nodus_scrub_ring_copy_output_image(
         const NodusScrubRing *ring, int32_t index,
         uint8_t *out_buf, uint32_t buf_size)
 {
-    if (!ring || !out_buf || index < 0 || index >= ring->length) return -1;
-    int bi = scrub_buf_index(ring, index);
-    const NodusScrubEntry *e = &ring->entries[bi];
-    if (!(e->flags & NODUS_SCRUB_FLAG_HAS_OUTPUT)) return 0;
-    uint32_t img_bytes = e->output_w * e->output_h * NODUS_SCRUB_IMAGE_C;
+    NodusScrubRing *r = (NodusScrubRing*)ring;
+    int bi;
+    const NodusScrubEntry *e;
+    uint32_t img_bytes, n;
+    if (!r || !out_buf) return -1;
+
+    ring_lock(r);
+    if (index < 0 || index >= r->length) { ring_unlock(r); return -1; }
+    bi = scrub_buf_index(r, index);
+    e = &r->entries[bi];
+    if (!(e->flags & NODUS_SCRUB_FLAG_HAS_OUTPUT)) { ring_unlock(r); return 0; }
+    img_bytes = e->output_w * e->output_h * NODUS_SCRUB_IMAGE_C;
     if (img_bytes > NODUS_SCRUB_IMAGE_BYTES) img_bytes = NODUS_SCRUB_IMAGE_BYTES;
-    uint32_t n = (img_bytes < buf_size) ? img_bytes : buf_size;
+    n = (img_bytes < buf_size) ? img_bytes : buf_size;
     memcpy(out_buf, e->output_image, n);
+    ring_unlock(r);
     return (int32_t)n;
 }
 
@@ -1284,14 +1415,22 @@ NODUS_API int32_t nodus_scrub_ring_copy_training_image(
         const NodusScrubRing *ring, int32_t index,
         uint8_t *out_buf, uint32_t buf_size)
 {
-    if (!ring || !out_buf || index < 0 || index >= ring->length) return -1;
-    int bi = scrub_buf_index(ring, index);
-    const NodusScrubEntry *e = &ring->entries[bi];
-    if (!(e->flags & NODUS_SCRUB_FLAG_HAS_IMAGE)) return 0;
-    uint32_t img_bytes = e->image_w * e->image_h * NODUS_SCRUB_IMAGE_C;
+    NodusScrubRing *r = (NodusScrubRing*)ring;
+    int bi;
+    const NodusScrubEntry *e;
+    uint32_t img_bytes, n;
+    if (!r || !out_buf) return -1;
+
+    ring_lock(r);
+    if (index < 0 || index >= r->length) { ring_unlock(r); return -1; }
+    bi = scrub_buf_index(r, index);
+    e = &r->entries[bi];
+    if (!(e->flags & NODUS_SCRUB_FLAG_HAS_IMAGE)) { ring_unlock(r); return 0; }
+    img_bytes = e->image_w * e->image_h * NODUS_SCRUB_IMAGE_C;
     if (img_bytes > NODUS_SCRUB_IMAGE_BYTES) img_bytes = NODUS_SCRUB_IMAGE_BYTES;
-    uint32_t n = (img_bytes < buf_size) ? img_bytes : buf_size;
+    n = (img_bytes < buf_size) ? img_bytes : buf_size;
     memcpy(out_buf, e->training_image, n);
+    ring_unlock(r);
     return (int32_t)n;
 }
 
@@ -1299,12 +1438,20 @@ NODUS_API int32_t nodus_scrub_ring_copy_target(
         const NodusScrubRing *ring, int32_t index,
         uint8_t *out_buf, uint32_t buf_size)
 {
-    if (!ring || !out_buf || index < 0 || index >= ring->length) return -1;
-    int bi = scrub_buf_index(ring, index);
-    const NodusScrubEntry *e = &ring->entries[bi];
-    if (!(e->flags & NODUS_SCRUB_FLAG_HAS_TARGET)) return 0;
-    uint32_t n = (e->target_len < buf_size) ? e->target_len : buf_size;
+    NodusScrubRing *r = (NodusScrubRing*)ring;
+    int bi;
+    const NodusScrubEntry *e;
+    uint32_t n;
+    if (!r || !out_buf) return -1;
+
+    ring_lock(r);
+    if (index < 0 || index >= r->length) { ring_unlock(r); return -1; }
+    bi = scrub_buf_index(r, index);
+    e = &r->entries[bi];
+    if (!(e->flags & NODUS_SCRUB_FLAG_HAS_TARGET)) { ring_unlock(r); return 0; }
+    n = (e->target_len < buf_size) ? e->target_len : buf_size;
     memcpy(out_buf, e->target_data, n);
+    ring_unlock(r);
     return (int32_t)n;
 }
 
@@ -1312,14 +1459,22 @@ NODUS_API int32_t nodus_scrub_ring_copy_thumbnail(
         const NodusScrubRing *ring, int32_t index, int thumb_idx,
         uint8_t *out_buf, uint32_t buf_size)
 {
-    if (!ring || !out_buf || index < 0 || index >= ring->length) return -1;
+    NodusScrubRing *r = (NodusScrubRing*)ring;
+    int bi;
+    const NodusScrubEntry *e;
+    uint32_t n;
+    if (!r || !out_buf) return -1;
     if (thumb_idx < 0 || thumb_idx >= NODUS_SCRUB_NUM_THUMBS) return -1;
-    int bi = scrub_buf_index(ring, index);
-    const NodusScrubEntry *e = &ring->entries[bi];
-    if (!(e->flags & NODUS_SCRUB_FLAG_HAS_THUMBS)) return 0;
-    uint32_t n = (NODUS_SCRUB_THUMB_BYTES < buf_size)
+
+    ring_lock(r);
+    if (index < 0 || index >= r->length) { ring_unlock(r); return -1; }
+    bi = scrub_buf_index(r, index);
+    e = &r->entries[bi];
+    if (!(e->flags & NODUS_SCRUB_FLAG_HAS_THUMBS)) { ring_unlock(r); return 0; }
+    n = (NODUS_SCRUB_THUMB_BYTES < buf_size)
                ? NODUS_SCRUB_THUMB_BYTES : buf_size;
     memcpy(out_buf, e->thumbnails[thumb_idx], n);
+    ring_unlock(r);
     return (int32_t)n;
 }
 
@@ -1570,15 +1725,26 @@ NODUS_API int nodus_composite_build_frame(
         uint32_t panel_w, uint32_t panel_h,
         NodusCompositeFrame *out_frame)
 {
-    if (!ring || !out_frame || index < 0 || index >= ring->length) return -1;
+    NodusScrubRing *r = (NodusScrubRing*)ring;
+    int bi;
+    const NodusScrubEntry *e;
+    uint32_t src_w, src_h, out_w, out_h;
+
+    if (!r || !out_frame) return -1;
     if (panel_w == 0 || panel_h == 0) return -1;
     if (panel_w > NODUS_COMPOSITE_PANEL_MAX_W) panel_w = NODUS_COMPOSITE_PANEL_MAX_W;
     if (panel_h > NODUS_COMPOSITE_PANEL_MAX_H) panel_h = NODUS_COMPOSITE_PANEL_MAX_H;
 
-    int bi = scrub_buf_index(ring, index);
-    const NodusScrubEntry *e = &ring->entries[bi];
+    ring_lock(r);
+    if (index < 0 || index >= r->length) {
+        ring_unlock(r);
+        return -1;
+    }
 
-    out_frame->source_ring_cursor = ring->write_cursor;
+    bi = scrub_buf_index(r, index);
+    e = &r->entries[bi];
+
+    out_frame->source_ring_cursor = r->write_cursor;
     out_frame->step      = e->step;
     out_frame->round_id  = e->round_id;
     out_frame->ts        = e->ts;
@@ -1587,10 +1753,10 @@ NODUS_API int nodus_composite_build_frame(
     out_frame->panel_h   = panel_h;
     out_frame->flags     = e->flags;
 
-    uint32_t src_w = e->image_w;
-    uint32_t src_h = e->image_h;
-    uint32_t out_w = e->output_w;
-    uint32_t out_h = e->output_h;
+    src_w = e->image_w;
+    src_h = e->image_h;
+    out_w = e->output_w;
+    out_h = e->output_h;
 
     /* Target → target_panel (RGBA source in target_data). */
     if ((e->flags & NODUS_SCRUB_FLAG_HAS_TARGET) && src_w > 0 && src_h > 0) {
@@ -3032,11 +3198,23 @@ cleanup:
 }
 
 NODUS_API int32_t nodus_weight_image_store_length(const NodusWeightImageStore *store) {
-    return store ? store->entry_count : 0;
+    NodusWeightImageStore *st = (NodusWeightImageStore*)store;
+    int32_t count;
+    if (!st) return 0;
+    weight_image_store_lock(st);
+    count = st->entry_count;
+    weight_image_store_unlock(st);
+    return count;
 }
 
 NODUS_API int32_t nodus_weight_image_store_capacity(const NodusWeightImageStore *store) {
-    return store ? store->max_entries : 0;
+    NodusWeightImageStore *st = (NodusWeightImageStore*)store;
+    int32_t cap;
+    if (!st) return 0;
+    weight_image_store_lock(st);
+    cap = st->max_entries;
+    weight_image_store_unlock(st);
+    return cap;
 }
 
 NODUS_API int nodus_weight_image_store_set_limits(
@@ -3593,4 +3771,27 @@ NODUS_API int nodus_runtime_control_store_get_state(
     copy_out_string(st->exit_reason, out_exit_reason, out_exit_reason_buflen);
     runtime_control_store_unlock(st);
     return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Exported lock/unlock for stores that lacked public lock APIs      */
+/* ------------------------------------------------------------------ */
+
+NODUS_API void nodus_weight_state_store_lock(NodusWeightStateStore *store) {
+    if (store) weight_state_store_lock(store);
+}
+NODUS_API void nodus_weight_state_store_unlock(NodusWeightStateStore *store) {
+    if (store) weight_state_store_unlock(store);
+}
+NODUS_API void nodus_weight_image_store_lock(NodusWeightImageStore *store) {
+    if (store) weight_image_store_lock(store);
+}
+NODUS_API void nodus_weight_image_store_unlock(NodusWeightImageStore *store) {
+    if (store) weight_image_store_unlock(store);
+}
+NODUS_API void nodus_runtime_control_store_lock(NodusRuntimeControlStore *store) {
+    if (store) runtime_control_store_lock(store);
+}
+NODUS_API void nodus_runtime_control_store_unlock(NodusRuntimeControlStore *store) {
+    if (store) runtime_control_store_unlock(store);
 }

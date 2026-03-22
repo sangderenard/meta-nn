@@ -619,6 +619,13 @@ NODUS_API int nodus_weight_state_store_get_meta_for(
         int                          out_blob_name_buflen);
 
 /* ------------------------------------------------------------------ */
+/*  Weight state store locking                                        */
+/* ------------------------------------------------------------------ */
+
+NODUS_API void nodus_weight_state_store_lock(NodusWeightStateStore *store);
+NODUS_API void nodus_weight_state_store_unlock(NodusWeightStateStore *store);
+
+/* ------------------------------------------------------------------ */
 /*  Weight image cache                                                */
 /* ------------------------------------------------------------------ */
 
@@ -761,6 +768,13 @@ NODUS_API int nodus_weight_image_store_mark_checkpoint(
         int32_t                round_id,
         int32_t                cycle);
 
+/* ------------------------------------------------------------------ */
+/*  Weight image store locking                                        */
+/* ------------------------------------------------------------------ */
+
+NODUS_API void nodus_weight_image_store_lock(NodusWeightImageStore *store);
+NODUS_API void nodus_weight_image_store_unlock(NodusWeightImageStore *store);
+
 /* ================================================================== */
 /*  Runtime Control Store                                             */
 /* ================================================================== */
@@ -816,6 +830,13 @@ NODUS_API int nodus_runtime_control_store_get_state(
         int                             out_last_source_buflen,
         char                           *out_exit_reason,
         int                             out_exit_reason_buflen);
+
+/* ------------------------------------------------------------------ */
+/*  Runtime control store locking                                     */
+/* ------------------------------------------------------------------ */
+
+NODUS_API void nodus_runtime_control_store_lock(NodusRuntimeControlStore *store);
+NODUS_API void nodus_runtime_control_store_unlock(NodusRuntimeControlStore *store);
 
 #ifdef __cplusplus
 }

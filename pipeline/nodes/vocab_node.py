@@ -189,6 +189,11 @@ class VocabChurnNode(PipelineNode):
         return (ctx.vocab_rotation_cycle % max(1, self.cfg.churn_every_n_cycles)) == 0
 
     def execute(self, ctx: PipelineContext) -> None:
+        # Safety net: deactivate any lingering LoRA from the previous round.
+        # Under normal flow each stage deactivates its own LoRA, but this
+        # catches edge cases like a stage that errored out before cleanup.
+        deactivate_vocab_lora_slot(ctx)
+
         # Activate a slot only when an activating source (berkeley, payload, etc.)
         # explicitly raised the pending flag this round.
         pending = bool(getattr(ctx, "vocab_churn_activation_pending", False))
@@ -207,6 +212,7 @@ class VocabChurnNode(PipelineNode):
         else:
             ctx.vocab_churn_activation_pending = False  # clear
             selected_slot = None
+
         if isinstance(selected_slot, dict) and selected_slot:
             info = activate_vocab_lora_slot(ctx, selected_slot)
             ctx.vocab_rotation_cycle += 1
@@ -904,34 +910,17 @@ def register_churn_requirement(
     stage_label: str = "",
     max_terms_per_slot: int = 0,
 ) -> Dict[str, Any]:
-    # ---- Accumulate this source's demands into the cumulative registry ----
+    # Plan exclusively from THIS caller's terms — no cross-source accumulation.
     _src_terms = _normalize_vocab_terms(required_terms)
     _src_rows = _normalize_term_rows(term_rows)
-    if _src_terms:
-        ctx.vocab_churn_demand_registry[str(source)] = list(_src_terms)
-    if _src_rows:
-        ctx.vocab_churn_demand_term_rows[str(source)] = list(_src_rows)
 
-    # ---- Build unified plan from the UNION of all accumulated demands ----
-    _all_terms: List[str] = []
-    _seen_keys: set = set()
-    for _src_term_list in ctx.vocab_churn_demand_registry.values():
-        for _t in _src_term_list:
-            _k = _vocab_term_key(_t)
-            if _k and _k not in _seen_keys:
-                _seen_keys.add(_k)
-                _all_terms.append(_t)
-    _all_rows: List[List[str]] = []
-    for _src_row_list in ctx.vocab_churn_demand_term_rows.values():
-        _all_rows.extend(_src_row_list)
-
-    if not _all_terms:
+    if not _src_terms:
         return {"required_extra_term_count": 0, "current_vocab_fit": True, "slot_count": 0}
 
     plan = plan_vocab_lora_requirements(
         ctx=ctx,
-        required_terms=_all_terms,
-        term_rows=_all_rows if _all_rows else None,
+        required_terms=list(_src_terms),
+        term_rows=list(_src_rows) if _src_rows else None,
         source=str(source),
         stage_label=str(stage_label),
         max_terms_per_slot=int(max_terms_per_slot),
@@ -965,7 +954,6 @@ def register_churn_requirement(
                 "plan_signature": str(plan_signature),
                 "latest_source": str(source),
                 "latest_stage": str(stage_label),
-                "snapshot_present": bool(str(signature) in getattr(ctx, "lora_slot_snapshots", {})),
                 "activation_count": int(library_entry.get("activation_count", 0)),
                 "trained_rounds": int(library_entry.get("trained_rounds", 0)),
             }
@@ -990,6 +978,9 @@ def register_churn_requirement(
             "current_vocab_fit": bool(plan.get("current_vocab_fit", False)),
         }
     )
+    _MAX_REQ_HISTORY = 200
+    if len(ctx.vocab_lora_requirement_history) > _MAX_REQ_HISTORY:
+        ctx.vocab_lora_requirement_history = ctx.vocab_lora_requirement_history[-_MAX_REQ_HISTORY:]
     return plan
 
 
@@ -1109,6 +1100,35 @@ def activate_vocab_lora_slot(ctx: PipelineContext, slot: Dict[str, Any]) -> Dict
         "class_count": int(len(ctx.class_names)),
         "extra_count": int(len(ctx.active_extra_terms)),
     }
+
+
+def deactivate_vocab_lora_slot(ctx: PipelineContext) -> Dict[str, Any]:
+    """Save the active LoRA slot to the library and disable its contribution.
+
+    After this call the LoRA modules remain installed on the classifier but
+    contribute nothing to the forward pass (active_slot set to the empty
+    string).  The saved weights are available for later reactivation.
+    """
+    from wav_ml_models import save_lora_slot_to_file, set_tiny_classifier_lora_state
+
+    outgoing_slot = str(getattr(ctx, "lora_active_slot", "") or "").strip()
+    if not outgoing_slot or ctx.classifier is None:
+        ctx.lora_active_slot = ""
+        return {"deactivated": False, "reason": "no_active_slot"}
+
+    lib_dir = _lora_library_dir(ctx)
+    saved = False
+    if lib_dir is not None:
+        slot_path = lib_dir / f"{outgoing_slot}.pt"
+        saved = save_lora_slot_to_file(ctx.classifier, outgoing_slot, slot_path)
+        if saved:
+            _log(f"[lora-library] saved & deactivating slot: {outgoing_slot}")
+
+    set_tiny_classifier_lora_state(ctx.classifier, slot_name="", lora_only=False)
+    ctx.lora_active_slot = ""
+
+    _log(f"[vocab-churn] deactivated LoRA slot: {outgoing_slot}")
+    return {"deactivated": True, "slot_name": outgoing_slot, "saved": saved}
 
 
 def _resolve_supervised_class_names(ctx: PipelineContext) -> List[str]:

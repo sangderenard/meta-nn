@@ -1745,10 +1745,8 @@ def build_pipeline_graph(
                on_traverse=_data_node.provide_gestation)
     g.add_edge("data_node", "stage_1_gestation", label="per_round")
     g.add_edge("data_node", "gate_1_gestation_eval",
-               condition=_gest_rebuild_cond, label="provides:gestation_eval_loader",
-               condition_id=_CONDITION_ID_GEST_REBUILD,
+               label="provides:gestation_eval_loader",
                on_traverse=_data_node.provide_gestation_eval)
-    g.add_edge("data_node", "gate_1_gestation_eval", label="per_round")
 
     # Berkeley refresh: predicate graph governs activate vs on_traverse so
     # stage 2 still trains on cached loaders between refresh intervals.

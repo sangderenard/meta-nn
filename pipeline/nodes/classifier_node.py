@@ -82,6 +82,7 @@ from pipeline.nodes.data_nodes import (
     _unpack_masked_semantic_batch,
 )
 from pipeline.preview import make_classifier_step_preview_callback
+from pipeline.nodes.vocab_node import deactivate_vocab_lora_slot
 from pipeline.utils import (
     _classifier_supervision_loss,
     _cuda_mem_diag,
@@ -331,9 +332,6 @@ class BuildClassifierNode(PipelineNode):
         if str(ckpt_path).strip():
             _load_classifier_checkpoint(model, str(ckpt_path), scope=str(ckpt_scope))
 
-        # Build frozen gate replica on CPU
-        ctx.gate_classifier = _build_gate_replica(model, ctx)
-
         _log(f"[classifier] built: n_classes={n_classes} "
              f"base_ch={self.cfg.base_ch} max_ch={self.cfg.max_ch} "
              f"context_blocks={self.cfg.context_blocks} "
@@ -463,6 +461,8 @@ class PregestationTrainNode(IRTrainingNode):
         ctx.log_metric("stage0", "loss", loss)
         _log(f"[stage0] loss={loss:.4f}")
 
+        deactivate_vocab_lora_slot(ctx)
+
 
 # ---------------------------------------------------------------------------
 # Stage 1 — Gestation training node
@@ -588,6 +588,8 @@ class GestationTrainNode(IRTrainingNode):
         ctx.log_metric("stage1", "loss", loss)
         _log(f"[stage1] loss={loss:.4f}")
 
+        deactivate_vocab_lora_slot(ctx)
+
 
 # ---------------------------------------------------------------------------
 # Stage 2 — Berkeley SBD refresh training node
@@ -709,6 +711,8 @@ class BerkeleyRefreshTrainNode(IRTrainingNode):
         ctx.log_metric("stage2", "loss", loss)
         _log(f"[stage2] loss={loss:.4f}")
 
+        deactivate_vocab_lora_slot(ctx)
+
 
 # ---------------------------------------------------------------------------
 # Stage C — LoRA slot training node
@@ -801,8 +805,6 @@ class LoRARoundNode(IRTrainingNode):
         from wav_ml_models import (
             ensure_tiny_classifier_lora_slot,
             install_tiny_classifier_lora,
-            tiny_classifier_lora_snapshot,
-            restore_tiny_classifier_lora_snapshot,
             set_tiny_classifier_lora_state,
         )
         from pipeline.nodes.vocab_node import activate_vocab_lora_slot, get_all_planned_lora_slots
@@ -835,14 +837,8 @@ class LoRARoundNode(IRTrainingNode):
             # Activate this slot's vocabulary in the pipeline context
             activate_vocab_lora_slot(ctx, slot_def)
 
-            # Prepare LoRA slot
+            # Prepare LoRA slot (disk library was loaded by activate_vocab_lora_slot)
             ensure_tiny_classifier_lora_slot(ctx.classifier, slot_name=slot_name)
-            existing_snapshot = (
-                getattr(ctx, "lora_slot_snapshots", {}).get(str(slot_signature))
-                or getattr(ctx, "lora_slot_snapshots", {}).get(str(slot_name))
-            )
-            if isinstance(existing_snapshot, dict):
-                restore_tiny_classifier_lora_snapshot(ctx.classifier, existing_snapshot)
 
             # Backbone + LoRA train together
             set_tiny_classifier_lora_state(ctx.classifier, slot_name=slot_name, lora_only=False)
@@ -873,10 +869,12 @@ class LoRARoundNode(IRTrainingNode):
                 ipc_pump=getattr(ctx.viewer_proxy, "pump", None),
             )
 
-            # Snapshot trained slot
-            slot_snapshot = tiny_classifier_lora_snapshot(ctx.classifier, slot_name=slot_name)
-            ctx.lora_slot_snapshots[str(slot_signature)] = dict(slot_snapshot)
-            ctx.lora_slot_snapshots[str(slot_name)] = dict(slot_snapshot)
+            # Save trained slot to disk library (no in-memory snapshot copy)
+            from pipeline.nodes.vocab_node import _lora_library_dir
+            from wav_ml_models import save_lora_slot_to_file
+            _lib = _lora_library_dir(ctx)
+            if _lib is not None:
+                save_lora_slot_to_file(ctx.classifier, slot_name, _lib / f"{slot_name}.pt")
 
             library_entry = dict(getattr(ctx, "vocab_lora_library", {}).get(str(slot_signature), {}) or {})
             library_entry.update(
@@ -884,7 +882,6 @@ class LoRARoundNode(IRTrainingNode):
                     "signature": str(slot_signature),
                     "slot_name": str(slot_name),
                     "terms": list(slot_terms),
-                    "snapshot_present": True,
                     "trained_rounds": int(library_entry.get("trained_rounds", 0)) + 1,
                     "last_trained_round": int(getattr(ctx, "round_id", 0) or 0),
                 }
@@ -897,14 +894,10 @@ class LoRARoundNode(IRTrainingNode):
                 f"name={slot_name} terms={len(slot_terms)} signature={slot_signature[:12]}"
             )
 
-        # After sweeping all slots, leave the last trained slot active.
-        # The 50 open vocab slots must never be used without a LoRA in place.
-        # If no slots were trained, re-ensure the current vocab LoRA is active.
-        if slots_trained == 0:
-            ensure_vocab_lora_active(ctx, self.cfg)
+        deactivate_vocab_lora_slot(ctx)
         _log(
             f"[stageC] LoRA sweep complete: {slots_trained} slot(s) trained, "
-            f"active_slot={ctx.lora_active_slot}"
+            f"deactivated after sweep"
         )
 
 
@@ -1070,7 +1063,13 @@ class FakeClassFeedbackNode(IRTrainingNode):
 # ---------------------------------------------------------------------------
 
 class SyncGateReplicaNode(PipelineNode):
-    """Keep the frozen gate_classifier in sync with the training classifier."""
+    """Historically kept a frozen gate_classifier in sync.
+
+    Gate evaluation now builds a temporary replica on demand and discards it
+    after each eval so no duplicate model weights persist in RAM.  This node
+    is retained as a graph placeholder (edges still reference it) but performs
+    no work.
+    """
 
     node_id = "sync_gate_replica"
     description = "Sync frozen gate_classifier from main classifier"
@@ -1082,18 +1081,10 @@ class SyncGateReplicaNode(PipelineNode):
         self.cfg = cfg
 
     def should_run(self, ctx: PipelineContext) -> bool:
-        return ctx.classifier is not None
+        return False
 
     def execute(self, ctx: PipelineContext) -> None:
-
-        ctx.gate_classifier, info = _sync_gate_classifier_replica(
-            source_classifier=ctx.classifier,
-            gate_classifier=ctx.gate_classifier,
-            gate_device=resolve_non_training_device(ctx),
-            channels_last=self.cfg.channels_last,
-        )
-        if info.get("created"):
-            _log(f"[gate-replica] created fresh replica on {info.get('device', 'cpu')}")
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -1104,17 +1095,6 @@ def _term_to_slot_name(term: str) -> str:
     import re
     slug = re.sub(r"[^a-z0-9]+", "_", term.strip().lower()).strip("_")
     return slug or "slot"
-
-
-def _build_gate_replica(model: nn.Module, ctx: PipelineContext) -> nn.Module:
-    base = unwrap_compiled(model)
-    target = resolve_non_training_device(ctx)
-    if target.type == "cuda" and getattr(ctx, "gpu_residence", None) is not None:
-        target = torch.device("cpu")
-    replica = copy.deepcopy(base).to(device=target, dtype=torch.float32)
-    replica.eval()
-    freeze(replica)
-    return replica
 
 
 def _load_classifier_checkpoint(model: nn.Module, path: str, scope: str = "all") -> None:

@@ -17,7 +17,6 @@ from pipeline.nodes.vocab_node import (
     VocabChurnNode,
     VocabConfig,
 )
-from pipeline.vocabulary_defaults import DEFAULT_VOCABULARY
 from pipeline.semantic_wheel_cache import (
     SemanticWheelCandidate,
     SemanticWheelConfig,
@@ -149,24 +148,24 @@ def test_collect_semantic_disk_rows_remaps_voc_bits_by_name() -> None:
         _ok("Berkeley multilabel rows remap VOC cache bits by class name instead of raw position")
 
 
-def test_voc20_terms_enter_only_via_churn() -> None:
-    print("\n--- test_voc20_terms_enter_only_via_churn ---")
+def test_churn_node_does_not_inject_terms_on_its_own() -> None:
+    print("\n--- test_churn_node_does_not_inject_terms_on_its_own ---")
     fixed_supervised = [f"fixed-{i}" for i in range(151)]
     ctx = PipelineContext()
     ctx.supervised_class_names = list(fixed_supervised)
     ctx.active_extra_terms = ["object", "signal", "semantic slot 3", "semantic slot 4"]
     ctx.class_names = list(ctx.supervised_class_names) + list(ctx.active_extra_terms)
+    original_extra = list(ctx.active_extra_terms)
     node = VocabChurnNode(VocabConfig(churn_n=2, churn_every_n_cycles=1, seed=0))
 
-    assert "aeroplane" not in set(DEFAULT_VOCABULARY)
-
+    # Without any data provider calling register_churn_requirement, the churn
+    # node must NOT alter the extra terms — terms enter only via data providers.
     node.execute(ctx)
 
     assert ctx.supervised_class_names == fixed_supervised
     assert ctx.class_names[: len(fixed_supervised)] == fixed_supervised
-    assert ctx.active_extra_terms[0:2] == ["object", "signal"]
-    assert "aeroplane" in ctx.active_extra_terms
-    _ok("VOC20 names are injected only at churn time and do not edit the fixed supervised slice")
+    assert ctx.active_extra_terms == original_extra
+    _ok("VocabChurnNode does not inject terms on its own — terms enter only via data providers")
 
 
 def test_semantic_candidate_cache_batch_build_preserves_order() -> None:
@@ -293,7 +292,7 @@ if __name__ == "__main__":
     test_gate_replica_sync_realigns_label_bank()
     test_checkpoint_prime_realigns_label_bank_before_load()
     test_collect_semantic_disk_rows_remaps_voc_bits_by_name()
-    test_voc20_terms_enter_only_via_churn()
+    test_churn_node_does_not_inject_terms_on_its_own()
     test_semantic_candidate_cache_batch_build_preserves_order()
     test_semantic_support_masks_torch_path_matches_default()
     test_term_mask_stacks_torch_path_matches_default()

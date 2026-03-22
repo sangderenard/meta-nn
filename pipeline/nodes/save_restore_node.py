@@ -765,8 +765,6 @@ class SaveRestoreNode(PipelineNode):
         # Replay callbacks: channel_key → callable that accepts a batch dict
         # and performs one training step.  Registered by the orchestrator.
         self._replay_callbacks: Dict[str, Callable[[Dict[str, Any]], None]] = {}
-        # Snapshot of the classifier lora helper (injected)
-        self._snapshot_lora_fn: Optional[Callable] = None
         self._last_weight_state_meta: Optional[WeightStateMeta] = None
         self._last_weight_image_config: Optional[WeightImageConfig] = None
         self._weight_model_generations: Dict[Tuple[str, str], Tuple[int, int]] = {}
@@ -1226,10 +1224,8 @@ class SaveRestoreNode(PipelineNode):
         # vocab_lora_latest_plan_signature and vocab_lora_plan_slot_cursor are not restored;
         # they start empty each run so churn only activates once this round's data nodes
         # (Berkeley, payload) have re-registered their requirements.
-        # lora_slot_snapshots and lora_active_slot are not restored from the checkpoint;
         # LoRA weights live in the lora_library/ directory and are loaded on demand
         # by activate_vocab_lora_slot / ensure_vocab_lora_active when stages need them.
-        ctx.lora_slot_snapshots = {}
         ctx.lora_active_slot = ""
         try:
             ctx.total_rounds_completed = max(
@@ -1355,14 +1351,6 @@ class SaveRestoreNode(PipelineNode):
 
         _log(f"[restore] replay complete, control returned to orchestrator")
 
-    def _get_lora_snapshot(self, ctx: PipelineContext) -> Optional[Any]:
-        if self._snapshot_lora_fn is not None and ctx.classifier is not None:
-            try:
-                return self._snapshot_lora_fn(ctx.classifier)
-            except Exception:
-                pass
-        return None
-
     @staticmethod
     def _strip_lora_from_state_dict(model: Any, state_dict: Dict[str, Any]) -> Dict[str, Any]:
         """Return a copy of state_dict with LoRA slot keys removed and .base. keys remapped.
@@ -1438,9 +1426,6 @@ class SaveRestoreNode(PipelineNode):
         if self.seed_bank is not None:
             return self.seed_bank.capture(round_id, cycle)
         return None
-
-    def set_lora_snapshot_fn(self, fn: Callable) -> None:
-        self._snapshot_lora_fn = fn
 
     def latest_weight_state_meta(self) -> Optional[WeightStateMeta]:
         meta = self.weight_state_store.get_meta()
