@@ -3892,6 +3892,14 @@ def _expand_semantic_mask_supervision_batch(
                 stack_t = stack_t.to(device=xb.device, dtype=torch.float32)
                 if int(stack_t.ndim) == 2:
                     stack_t = stack_t.unsqueeze(0)
+                if int(stack_t.ndim) == 3 and (
+                    int(stack_t.shape[-2]) != int(h) or int(stack_t.shape[-1]) != int(w)
+                ):
+                    stack_t = F.interpolate(
+                        stack_t.unsqueeze(1),
+                        size=(int(h), int(w)),
+                        mode="nearest",
+                    ).squeeze(1)
                 if int(stack_t.shape[0]) > 0:
                     composite = stack_t.sum(dim=0)
                     vmax = torch.amax(composite)
@@ -3937,6 +3945,14 @@ def _expand_semantic_mask_supervision_batch(
             idx_t = idx_t.to(device=xb.device, dtype=torch.long).reshape(-1)
             if int(stack_t.ndim) == 2:
                 stack_t = stack_t.unsqueeze(0)
+            if int(stack_t.ndim) == 3 and (
+                int(stack_t.shape[-2]) != int(mb.shape[-2]) or int(stack_t.shape[-1]) != int(mb.shape[-1])
+            ):
+                stack_t = F.interpolate(
+                    stack_t.unsqueeze(1),
+                    size=(int(mb.shape[-2]), int(mb.shape[-1])),
+                    mode="nearest",
+                ).squeeze(1)
             n_pairs = min(int(stack_t.shape[0]), int(idx_t.numel()))
             for si in range(int(n_pairs)):
                 cls_idx = int(idx_t[si].item())

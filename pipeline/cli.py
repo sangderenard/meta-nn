@@ -1052,7 +1052,7 @@ def parse_args():
     p.add_argument("--generator-loss-cls-weight", type=float, default=1.50)
     p.add_argument("--generator-loss-mask-weight", type=float, default=1.00)
     p.add_argument("--generator-loss-disc-mask-weight", type=float, default=0.50)
-    p.add_argument("--generator-loss-outside-mask-weight", type=float, default=0.25)
+    p.add_argument("--generator-loss-outside-mask-weight", type=float, default=0.0)
     p.add_argument(
         "--generator-loss-wave-weight",
         type=float,

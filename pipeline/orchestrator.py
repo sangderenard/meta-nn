@@ -1802,6 +1802,10 @@ def build_pipeline_graph(
 
     # == Stage R — Transformer =====================================
 
+    g.add_edge("data_node", "stage_r_transformer",
+               condition=_early_gates_passed, label="provides:payload_for_transformer",
+               condition_id=_CONDITION_ID_EARLY_GATES,
+               on_traverse=_data_node.provide_payload)
     g.add_edge("gate_berkeley", "stage_r_transformer",
                condition=_early_gates_passed, label="after_gate1", condition_id=_CONDITION_ID_EARLY_GATES)
     g.add_edge("stage_r_transformer", "gate_transformer",
@@ -2591,7 +2595,10 @@ def _build_configs_from_args(args) -> dict:
         d_steps_per_g_step=int(_g("discriminator_steps_per_generator_step", default=1)),
         adv_weight=float(_g("generator_loss_adv_weight", "adv_weight", default=1.0)),
         feature_score_weight=float(_g("generator_loss_cls_weight", "gan_feature_weight", default=0.5)),
-        wave_recon_weight=float(_g("generator_loss_wave_weight", default=0.1)),
+        mask_weight=float(_g("generator_loss_mask_weight", default=1.0)),
+        disc_mask_weight=float(_g("generator_loss_disc_mask_weight", default=0.5)),
+        outside_mask_weight=float(_g("generator_loss_outside_mask_weight", default=0.0)),
+        wave_recon_weight=float(_g("generator_loss_wave_weight", default=0.0)),
         r1_weight=float(_g("r1_weight", default=10.0)),
         gate_feature_score_target=float(_g("generator_gate_min_target_prob", "generator_gate_target", default=0.50)),
         gate_required_consecutive=int(_g("generator_gate_maintain_rounds", "generator_gate_consecutive", default=2)),

@@ -159,9 +159,9 @@ class GeneratorConfig:
     # Generator losses
     adv_weight: float = 1.0         # adversarial (non-saturating)
     feature_score_weight: float = 0.5  # classifier feature score guidance
-    wave_recon_weight: float = 0.1  # bit-plane reconstruction fidelity
+    wave_recon_weight: float = 0.0  # optional real-image/wave feedback (off by default)
     mask_weight: float = 1.0        # mask BCE supervision
-    outside_mask_weight: float = 0.5  # L1 reconstruction outside mask
+    outside_mask_weight: float = 0.0  # optional real-image feedback (off by default)
     disc_mask_weight: float = 0.0   # discriminator mask head adversarial
 
     # Anti-collapse losses
@@ -540,103 +540,207 @@ class GeneratorTrainNode(IRTrainingNode):
             label_dropout_min_keep_dataset=int(getattr(ctx.args, "target_label_knockout_min_keep_dataset", 1) or 1),
         ))
 
-        steps_per_slot = max(1, self.cfg.steps_per_round // max(1, len(planned_slots)))
-
         image_hw = (self.cfg.image_size, self.cfg.image_size)
         _payload_bank = ctx.payload_bank
         _payload_bank_obj = getattr(_payload_bank, "bank", None)  # SemanticWheelPayloadBank
 
+        if _payload_bank_obj is None:
+            _log("[stageG] WARNING: no payload bank — cannot train")
+            return
+
+        from torch.utils.data import ConcatDataset, Subset, SequentialSampler
+        from pipeline.nodes.data_nodes import build_stage_loaders
+
+        _ds = SemanticWheelPayloadDataset(
+            bank=_payload_bank_obj,
+            image_hw=image_hw,
+        )
+
+        # ----------------------------------------------------------------
+        # Sort ALL rows by slot affinity — no rows are ever discarded.
+        # Each row is assigned to exactly one slot (best-overlap).  Rows
+        # with no extra terms (neutral) are spread across slots for variety.
+        # The resulting sorted index list is walked contiguously; the LoRA
+        # is switched at each slot boundary.
+        # ----------------------------------------------------------------
+        _supervised_keys = {str(n).strip().lower() for n in list(getattr(ctx, "supervised_class_names", []))}
+        _all_pt = ctx.payload_terms or []
+        _n_rows = min(len(_all_pt), len(_ds))
+
+        # --- DIAGNOSTIC: what does the payload bank actually contain? ---
+        _diag_extra_term_counts: Dict[str, int] = {}
+        _diag_no_extra = 0
+        for _dri in range(min(_n_rows, 200)):
+            _drow = {str(t).strip().lower() for t in _all_pt[_dri]}
+            _dextra = _drow - _supervised_keys
+            if not _dextra:
+                _diag_no_extra += 1
+            for _dt in _dextra:
+                _diag_extra_term_counts[_dt] = _diag_extra_term_counts.get(_dt, 0) + 1
+        _diag_top = sorted(_diag_extra_term_counts.items(), key=lambda x: -x[1])[:30]
+        _log(
+            f"[stageG DIAG] {_n_rows} total rows, {len(_all_pt)} payload_terms, {len(_ds)} ds rows\n"
+            f"  supervised_keys ({len(_supervised_keys)}): {sorted(list(_supervised_keys))[:20]}...\n"
+            f"  rows with NO extra terms (first 200): {_diag_no_extra}\n"
+            f"  top extra terms (first 200 rows): {_diag_top}\n"
+            f"  sample row 0 terms: {list(_all_pt[0]) if _all_pt else '(empty)'}\n"
+            f"  sample row 5 terms: {list(_all_pt[5]) if len(_all_pt) > 5 else '(n/a)'}"
+        )
+
+        # Build a lookup: slot_index → set of lowered extra term keys
+        _slot_key_sets: List[set] = []
+        for _sd in planned_slots:
+            _slot_key_sets.append({str(t).strip().lower() for t in (_sd.get("terms") or [])})
+
+        # --- DIAGNOSTIC: what do the planned slots look like? ---
+        _log(
+            f"[stageG DIAG] {len(planned_slots)} planned slots:\n" +
+            "\n".join(
+                f"  slot {_si}: sig={str(_sd.get('signature',''))[:12]} "
+                f"terms={sorted(_slot_key_sets[_si])}"
+                for _si, _sd in enumerate(planned_slots)
+            )
+        )
+
+        # Assign every row to a slot (or neutral bucket)
+        _slot_buckets: List[List[int]] = [[] for _ in range(len(planned_slots))]
+        _neutral_indices: List[int] = []
+        for _ri in range(_n_rows):
+            _row_extra = {str(t).strip().lower() for t in _all_pt[_ri]} - _supervised_keys
+            if not _row_extra:
+                _neutral_indices.append(_ri)
+                continue
+            # Assign to slot with best overlap
+            _best_slot = -1
+            _best_overlap = 0
+            for _si, _skeys in enumerate(_slot_key_sets):
+                _overlap = len(_row_extra & _skeys)
+                if _overlap > _best_overlap:
+                    _best_overlap = _overlap
+                    _best_slot = _si
+            if _best_slot >= 0:
+                _slot_buckets[_best_slot].append(_ri)
+            else:
+                # Extra terms matched no slot — treat as neutral
+                _neutral_indices.append(_ri)
+
+        # Distribute neutral rows across slots round-robin for variety
+        if _neutral_indices:
+            _rng_neutral = np.random.default_rng(42)
+            _rng_neutral.shuffle(_neutral_indices)
+            for _ni, _idx in enumerate(_neutral_indices):
+                _target_slot = _ni % max(1, len(planned_slots))
+                _slot_buckets[_target_slot].append(_idx)
+
+        # Merge flashcard rows into their matching slots
+        _fc_terms = list(getattr(ctx, "flashcard_row_terms", []) or [])
+        _fc_rows = list(getattr(ctx, "flashcard_rows", []) or [])
+        _fc_ds = None
+        _fc_slot_buckets: List[List[int]] = [[] for _ in range(len(planned_slots))]
+        if _fc_terms and _fc_rows:
+            _fc_imgs = [img for img, _cond in _fc_rows]
+            _fc_ds = _FlashcardDataset(
+                images=_fc_imgs,
+                terms_rows=_fc_terms,
+                image_hw=image_hw,
+            )
+            _fc_base_offset = len(_ds)  # flashcard indices offset in ConcatDataset
+            for _fi, _ft in enumerate(_fc_terms):
+                _fc_extra = {str(t).strip().lower() for t in _ft} - _supervised_keys
+                _best_fc_slot = -1
+                _best_fc_overlap = 0
+                for _si, _skeys in enumerate(_slot_key_sets):
+                    _overlap = len(_fc_extra & _skeys)
+                    if _overlap > _best_fc_overlap:
+                        _best_fc_overlap = _overlap
+                        _best_fc_slot = _si
+                if _best_fc_slot >= 0:
+                    _fc_slot_buckets[_best_fc_slot].append(_fc_base_offset + _fi)
+                else:
+                    # No slot match — assign round-robin
+                    _fc_slot_buckets[_fi % max(1, len(planned_slots))].append(_fc_base_offset + _fi)
+
+        # Build the full dataset (wheel + flashcards if any)
+        if _fc_ds is not None:
+            _full_ds = ConcatDataset([_ds, _fc_ds])
+            _full_ds.use_semantic_mask_stack_collate = True
+        else:
+            _full_ds = _ds
+
+        # Build the contiguous sorted index list and slot boundaries
+        _sorted_indices: List[int] = []
+        _slot_boundaries: List[tuple] = []  # (start_in_sorted, end_in_sorted, slot_index)
+        for _si in range(len(planned_slots)):
+            _bucket = list(_slot_buckets[_si])
+            if _fc_ds is not None:
+                _bucket.extend(_fc_slot_buckets[_si])
+            if not _bucket:
+                continue
+            _start = len(_sorted_indices)
+            _sorted_indices.extend(_bucket)
+            _end = len(_sorted_indices)
+            _slot_boundaries.append((_start, _end, _si))
+
+        if not _sorted_indices:
+            _log("[stageG] WARNING: no rows assigned to any slot — cannot train")
+            return
+
+        _log(
+            f"[stageG] sorted {len(_sorted_indices)} rows into "
+            f"{len(_slot_boundaries)} slot groups "
+            f"({', '.join(str(e - s) for s, e, _ in _slot_boundaries)} rows each)"
+        )
+
+        # Walk through each contiguous slot group, switching LoRA at boundaries
+        steps_per_slot = max(1, self.cfg.steps_per_round // max(1, len(_slot_boundaries)))
         all_metrics: List[Dict[str, Any]] = []
         slots_trained = 0
 
-        for slot_def in planned_slots:
+        for _start, _end, _si in _slot_boundaries:
+            slot_def = planned_slots[_si]
             slot_signature = str(slot_def.get("signature", "")).strip()
             slot_name = str(slot_def.get("slot_name", f"vocab_{slot_signature}"))
-            slot_terms = list(slot_def.get("terms") or [])
-            if not slot_signature or not slot_terms:
-                continue
 
-            # Activate this slot's vocabulary and install its LoRA on the classifier.
+            # Switch LoRA at this boundary
             activate_vocab_lora_slot(ctx, slot_def)
-
-            # class_names and n_classes are read AFTER activation so they reflect
-            # the slot's vocabulary (slot terms are added to ctx.class_names here).
             current_class_names = list(ctx.class_names or [])
             current_n_classes = max(1, len(current_class_names))
             current_term_to_idx = dict(ctx.semantic_term_to_idx)
 
+            _group_indices = _sorted_indices[_start:_end]
+            _group_ds = Subset(_full_ds, _group_indices)
+            _group_ds.use_semantic_mask_stack_collate = True
+
             _log(
-                f"[stageG] slot {slot_name} ({len(slot_terms)} terms): "
-                f"{len(ctx.payload_bank or [])} rows, {steps_per_slot} steps"
+                f"[stageG] slot {slot_name}: {len(_group_indices)} rows, "
+                f"{steps_per_slot} steps"
             )
 
-            if _payload_bank_obj is not None:
-                from torch.utils.data import ConcatDataset, RandomSampler, Subset
-                from pipeline.nodes.data_nodes import build_stage_loaders
-                _ds = SemanticWheelPayloadDataset(
-                    bank=_payload_bank_obj,
-                    image_hw=image_hw,
-                )
-                # ---- Slot-affinity filtering (CNC tool-changer) ----
-                # Select payload rows whose extra terms match the active slot.
-                # Rows with no extra terms (supervised-only) are included in
-                # every slot so the model keeps seeing diverse imagery.
-                _slot_extra_keys = {str(t).strip().lower() for t in slot_terms}
-                _supervised_keys = {str(n).strip().lower() for n in list(getattr(ctx, "supervised_class_names", []))}
-                _all_pt = ctx.payload_terms or []
-                _affine_idx: list = []
-                _neutral_idx: list = []
-                for _ri, _row_t in enumerate(_all_pt):
-                    if _ri >= len(_ds):
-                        break
-                    _row_extra = {str(t).strip().lower() for t in _row_t} - _supervised_keys
-                    if not _row_extra:
-                        _neutral_idx.append(_ri)
-                    elif _row_extra & _slot_extra_keys:
-                        _affine_idx.append(_ri)
-                    # rows with extra terms NOT in this slot → skip for this slot
-                _slot_idx = _affine_idx + _neutral_idx
-                if _slot_idx and len(_slot_idx) < len(_ds):
-                    _ds = Subset(_ds, _slot_idx)
-                    _log(
-                        f"[stageG] slot affinity: {len(_affine_idx)} matching + "
-                        f"{len(_neutral_idx)} neutral of {len(_all_pt)} rows"
-                    )
-                # Merge flashcard rows only when this slot covers flashcard terms.
-                _fc_terms = list(getattr(ctx, "flashcard_row_terms", []) or [])
-                _fc_rows  = list(getattr(ctx, "flashcard_rows", []) or [])
-                if _fc_terms and _fc_rows:
-                    _fc_has_affinity = any(
-                        any(str(t).strip().lower() in _slot_extra_keys for t in row_t)
-                        for row_t in _fc_terms
-                    )
-                    if _fc_has_affinity:
-                        _fc_imgs = [img for img, _cond in _fc_rows]
-                        _fc_ds = _FlashcardDataset(
-                            images=_fc_imgs,
-                            terms_rows=_fc_terms,
-                            image_hw=image_hw,
-                        )
-                        _ds = ConcatDataset([_ds, _fc_ds])
-                        _ds.use_semantic_mask_stack_collate = True
-                        _log(
-                            f"[stageG] merged {len(_fc_ds)} flashcard rows into slot "
-                            f"{slot_name} dataset (total {len(_ds)} rows)"
-                        )
-                _slot_loader, _ = build_stage_loaders(
-                    dataset=_ds,
-                    name=f"generator_slot_{slot_name}",
-                    batch_size=self.cfg.batch_size,
-                    num_workers=1,
-                    device_type=str(ctx.device.type),
-                    pin_memory=True,
-                    prefetch_factor=2,
-                    persistent_workers=True,
-                    shuffle_train=True,
-                    train_sampler=RandomSampler(_ds, replacement=True),
-                )
-            else:
-                _slot_loader = None
+            # --- DIAGNOSTIC: what vocabulary is active for this slot? ---
+            _slot_extra_only = sorted(set(str(t).lower() for t in current_class_names) - _supervised_keys)
+            _sample_gi = _group_indices[0] if _group_indices else -1
+            _sample_terms = list(_all_pt[_sample_gi]) if 0 <= _sample_gi < len(_all_pt) else []
+            _sample_matched = [t for t in _sample_terms if str(t).strip().lower() in current_term_to_idx]
+            _sample_unmatched = [t for t in _sample_terms if str(t).strip().lower() not in current_term_to_idx]
+            _log(
+                f"[stageG DIAG] slot {slot_name} active vocab: "
+                f"{current_n_classes} classes, extras={_slot_extra_only}\n"
+                f"  sample row {_sample_gi} terms: {_sample_terms}\n"
+                f"  -> matched in active vocab: {_sample_matched}\n"
+                f"  -> NOT in active vocab (lost!): {_sample_unmatched}"
+            )
+
+            _slot_loader, _ = build_stage_loaders(
+                dataset=_group_ds,
+                name=f"generator_slot_{slot_name}",
+                batch_size=self.cfg.batch_size,
+                num_workers=1,
+                device_type=str(ctx.device.type),
+                pin_memory=True,
+                prefetch_factor=2,
+                persistent_workers=True,
+                shuffle_train=True,
+            )
 
             trained_g, trained_d, metrics_list = train_conditional_generator_discriminator(
                 generator=ctx.generator,
@@ -688,7 +792,7 @@ class GeneratorTrainNode(IRTrainingNode):
             slots_trained += 1
 
         if slots_trained == 0:
-            _log("[stageG] WARNING: no slots trained — all payload rows skipped")
+            _log("[stageG] WARNING: no slots trained")
             return
 
         last_m = (all_metrics or [{}])[-1]

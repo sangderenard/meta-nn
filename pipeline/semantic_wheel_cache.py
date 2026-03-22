@@ -820,7 +820,33 @@ def _chunk_payload(entries: Sequence[Dict[str, Any]], image_size: int) -> Tuple[
     if int(n) <= 0:
         raise RuntimeError("semantic wheel chunk payload requires at least one entry")
     size = max(8, int(image_size))
-    images = np.stack([np.asarray(entry["image_u8"], dtype=np.uint8) for entry in entries], axis=0).astype(np.uint8, copy=False)
+    def _normalize_entry(entry: Dict[str, Any]) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        img_u8 = _fit_image_array_u8(image=entry.get("image_u8"), image_size=size)
+        stack_f = np.asarray(entry.get("mask_stack"), dtype=np.float32)
+        stack_idx = np.asarray(entry.get("mask_indices"), dtype=np.int32).reshape(-1)
+        if int(stack_f.ndim) == 2:
+            stack_f = stack_f[None, ...]
+        if int(stack_f.ndim) != 3:
+            stack_f = np.zeros((0, size, size), dtype=np.float32)
+        if int(stack_f.shape[0]) > 0:
+            stack_f = np.stack(
+                [
+                    _fit_mask_letterbox(np.asarray(stack_f[int(i)], dtype=np.float32), image_size=size)
+                    for i in range(int(stack_f.shape[0]))
+                ],
+                axis=0,
+            ).astype(np.float32, copy=False)
+        else:
+            stack_f = np.zeros((0, size, size), dtype=np.float32)
+        pair_count = min(int(stack_f.shape[0]), int(stack_idx.size))
+        return (
+            np.asarray(img_u8, dtype=np.uint8),
+            np.asarray(stack_f[: int(pair_count)], dtype=np.float32),
+            np.asarray(stack_idx[: int(pair_count)], dtype=np.int32).reshape(-1),
+        )
+
+    norm_entries = [_normalize_entry(entry) for entry in entries]
+    images = np.stack([row[0] for row in norm_entries], axis=0).astype(np.uint8, copy=False)
     terms_bank_rows: List[str] = []
     terms_bank_lut: Dict[str, int] = {}
     terms_refs: List[int] = []
@@ -829,7 +855,7 @@ def _chunk_payload(entries: Sequence[Dict[str, Any]], image_size: int) -> Tuple[
     assoc_offsets: List[int] = [0]
     assoc_mask_ids: List[int] = []
     assoc_label_indices: List[int] = []
-    for entry in entries:
+    for entry, (_img_u8, stack_f, stack_idx) in zip(entries, norm_entries):
         terms_json = json.dumps(
             list(normalize_vocab_terms([str(x) for x in list(entry.get("terms") or [])])),
             ensure_ascii=True,
@@ -842,12 +868,6 @@ def _chunk_payload(entries: Sequence[Dict[str, Any]], image_size: int) -> Tuple[
             terms_bank_rows.append(str(terms_json))
         terms_refs.append(int(term_id))
 
-        stack_f = np.asarray(entry["mask_stack"], dtype=np.float32)
-        stack_idx = np.asarray(entry["mask_indices"], dtype=np.int32).reshape(-1)
-        if int(stack_f.ndim) == 2:
-            stack_f = stack_f[None, ...]
-        if int(stack_f.ndim) != 3:
-            stack_f = np.zeros((0, size, size), dtype=np.float32)
         pair_count = min(int(stack_f.shape[0]), int(stack_idx.size))
         for pos in range(int(pair_count)):
             mask_f16 = np.asarray(stack_f[int(pos)], dtype=np.float16)
@@ -1009,6 +1029,17 @@ class SemanticWheelDataset(Dataset):
             if int(mask_ids.size) > 0 and int(mask_bank.shape[0]) > 0
             else np.zeros((0, int(self.image_size), int(self.image_size)), dtype=np.float32)
         )
+        if int(stack_f32.ndim) == 3 and int(stack_f32.shape[0]) > 0 and (
+            int(stack_f32.shape[1]) != int(self.image_size)
+            or int(stack_f32.shape[2]) != int(self.image_size)
+        ):
+            stack_f32 = np.stack(
+                [
+                    _fit_mask_letterbox(np.asarray(stack_f32[int(i)], dtype=np.float32), image_size=int(self.image_size))
+                    for i in range(int(stack_f32.shape[0]))
+                ],
+                axis=0,
+            ).astype(np.float32, copy=False)
         return {
             "image_u8": np.asarray(images[int(row_offset)], dtype=np.uint8),
             "mask_stack": np.asarray(stack_f32, dtype=np.float32),
@@ -1224,6 +1255,8 @@ def ensure_semantic_candidate_cache(
         and str(manifest.get("candidate_signature", "")) == str(candidate_sig)
         and list(manifest.get("local_vocab", [])) == [str(t) for t in local_vocab]
         and int(manifest.get("image_size", 0)) == int(config.image_size)
+        and str(manifest.get("image_fit_mode", "")) == "letterbox_fill0"
+        and str(manifest.get("mask_fit_mode", "")) == "letterbox_fill0"
         and not bool(expired_by_use)
     )
     if bool(manifest_ok):
@@ -1491,6 +1524,8 @@ def ensure_semantic_candidate_cache(
         "purpose": str(config.purpose),
         "candidate_signature": str(candidate_sig),
         "image_size": int(config.image_size),
+        "image_fit_mode": "letterbox_fill0",
+        "mask_fit_mode": "letterbox_fill0",
         "local_vocab": [str(t) for t in local_vocab],
         "batch_size": int(config.batch_size),
         "lookahead_batches": int(config.lookahead_batches),

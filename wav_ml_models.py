@@ -1547,41 +1547,6 @@ def _payload_condition_mask_batch(
     )
 
 
-def _payload_loader_batch_to_tensors(
-    batch: Any,
-    *,
-    device: torch.device,
-    context: str,
-    active_term_to_idx: Optional[Dict[str, int]],
-    n_active_classes: int,
-    dropout_cfg: Optional[Any] = None,
-    dropout_rng: Optional[np.random.Generator] = None,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    from pipeline.nodes.classifier_node import _yb_from_terms
-    from pipeline.nodes.data_nodes import (
-        _expand_semantic_mask_supervision_batch,
-        _unpack_masked_semantic_batch,
-    )
-    xb, mb, batch_meta = _unpack_masked_semantic_batch(batch, context=context)
-    xb = xb.to(device=device, non_blocking=True)
-    mb = mb.to(device=device, non_blocking=True, dtype=torch.float32)
-    _tti = active_term_to_idx or {}
-    _nac = int(n_active_classes) if int(n_active_classes) > 0 else len(_tti)
-    _terms = list(batch_meta.get("terms_rows") or [[] for _ in range(int(xb.shape[0]))])
-    cond = _yb_from_terms(_terms, _tti, _nac, xb.device)
-    xb, cond, mb = _expand_semantic_mask_supervision_batch(
-        xb=xb,
-        yb=cond,
-        mb=mb,
-        batch_meta=batch_meta,
-        mode="multihot_mix",
-        context=context,
-        dropout_cfg=dropout_cfg,
-        dropout_rng=dropout_rng,
-    )
-    return xb, cond, mb
-
-
 def _align_probs_with_condition(probs: torch.Tensor, cond: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     if probs.ndim != 2:
         raise ValueError(f"Expected probs [B,C], got shape={tuple(probs.shape)}")
@@ -1643,6 +1608,9 @@ def evaluate_conditional_generator(
             "mask_iou": 0.0,
             "mask_dice": 0.0,
         }
+    from pipeline.nodes.classifier_node import _yb_from_terms
+    from pipeline.nodes.data_nodes import _unpack_masked_semantic_batch
+
     rng = np.random.default_rng(seed)
     use_amp = _should_use_amp(device=device, amp=amp)
     amp_dtype_t = _resolve_amp_dtype(amp_dtype) if use_amp else torch.float16
@@ -1670,13 +1638,12 @@ def evaluate_conditional_generator(
             except StopIteration:
                 _loader_iter = iter(payload_loader)
                 _batch = next(_loader_iter)
-            _, cond, mask_target = _payload_loader_batch_to_tensors(
-                _batch,
-                device=device,
-                context="generator payload evaluation",
-                active_term_to_idx=active_term_to_idx,
-                n_active_classes=int(num_classes),
-            )
+            _, mask_target, batch_meta = _unpack_masked_semantic_batch(_batch, context="generator payload evaluation")
+            mask_target = mask_target.to(device=device, non_blocking=True, dtype=torch.float32)
+            _tti = active_term_to_idx or {}
+            _nac = int(num_classes) if int(num_classes) > 0 else len(_tti)
+            _terms = list(batch_meta.get("terms_rows") or [[] for _ in range(int(mask_target.shape[0]))])
+            cond = _yb_from_terms(_terms, _tti, _nac, device)
         else:
             idx = rng.integers(0, int(n_payload), size=max(1, int(batch_size)))
             cond_cpu, mask_cpu = _payload_condition_mask_batch(
@@ -1814,7 +1781,12 @@ def train_conditional_generator_discriminator(
     label_mask_dropout_cfg: Optional[Any] = None,
     active_term_to_idx: Optional[Dict[str, int]] = None,
 ) -> Tuple[nn.Module, nn.Module, List[Dict[str, float]]]:
-    from pipeline.nodes.data_nodes import _apply_network_dropout_rate
+    from pipeline.nodes.classifier_node import _yb_from_terms
+    from pipeline.nodes.data_nodes import (
+        _apply_network_dropout_rate,
+        _expand_semantic_mask_supervision_batch,
+        _unpack_masked_semantic_batch,
+    )
 
     if len(payload_images) <= 0 or len(payload_conditions) <= 0 or len(payload_masks) <= 0:
         raise RuntimeError("Generator/discriminator training requires non-empty payload bank.")
@@ -1994,14 +1966,17 @@ def train_conditional_generator_discriminator(
                 except StopIteration:
                     _loader_iter = iter(payload_loader)
                     _batch = next(_loader_iter)
-                real, cond, real_mask = _payload_loader_batch_to_tensors(
-                    _batch,
-                    device=device,
-                    context="generator payload training",
-                    active_term_to_idx=active_term_to_idx,
-                    n_active_classes=int(num_classes),
-                    dropout_cfg=label_mask_dropout_cfg,
-                    dropout_rng=dropout_rng,
+                real, real_mask, batch_meta = _unpack_masked_semantic_batch(_batch, context="generator payload training")
+                real = real.to(device=device, non_blocking=True)
+                real_mask = real_mask.to(device=device, non_blocking=True, dtype=torch.float32)
+                _tti = active_term_to_idx or {}
+                _nac = int(num_classes) if int(num_classes) > 0 else len(_tti)
+                _terms = list(batch_meta.get("terms_rows") or [[] for _ in range(int(real.shape[0]))])
+                cond = _yb_from_terms(_terms, _tti, _nac, real.device)
+                real, cond, real_mask = _expand_semantic_mask_supervision_batch(
+                    xb=real, yb=cond, mb=real_mask, batch_meta=batch_meta,
+                    mode="multihot_mix", context="generator payload training",
+                    dropout_cfg=label_mask_dropout_cfg, dropout_rng=dropout_rng,
                 )
             else:
                 idx = rng.integers(0, int(n_payload), size=max(1, int(batch_size)))
@@ -2020,14 +1995,17 @@ def train_conditional_generator_discriminator(
                         except StopIteration:
                             _loader_iter = iter(payload_loader)
                             _batch = next(_loader_iter)
-                        real, cond, real_mask = _payload_loader_batch_to_tensors(
-                            _batch,
-                            device=device,
-                            context="generator payload training",
-                            active_term_to_idx=active_term_to_idx,
-                            n_active_classes=int(num_classes),
-                            dropout_cfg=label_mask_dropout_cfg,
-                            dropout_rng=dropout_rng,
+                        real, real_mask, batch_meta = _unpack_masked_semantic_batch(_batch, context="generator payload training")
+                        real = real.to(device=device, non_blocking=True)
+                        real_mask = real_mask.to(device=device, non_blocking=True, dtype=torch.float32)
+                        _tti = active_term_to_idx or {}
+                        _nac = int(num_classes) if int(num_classes) > 0 else len(_tti)
+                        _terms = list(batch_meta.get("terms_rows") or [[] for _ in range(int(real.shape[0]))])
+                        cond = _yb_from_terms(_terms, _tti, _nac, real.device)
+                        real, cond, real_mask = _expand_semantic_mask_supervision_batch(
+                            xb=real, yb=cond, mb=real_mask, batch_meta=batch_meta,
+                            mode="multihot_mix", context="generator payload training",
+                            dropout_cfg=label_mask_dropout_cfg, dropout_rng=dropout_rng,
                         )
                     else:
                         _didx = rng.integers(0, int(n_payload), size=max(1, int(batch_size)))
@@ -4298,10 +4276,12 @@ def train_transformer_feature_metric(
                 probs_after_all = torch.sigmoid(logits_after_v).to(torch.float32)
                 score_target = ((probs_before_all * target_vec).sum(dim=1) / target_count).mean()
                 score_after = ((probs_after_all * target_vec).sum(dim=1) / target_count).mean()
-                score_gap = (
-                    (F.relu((probs_before_all + score_target_margin) - probs_after_all) * target_vec).sum(dim=1)
-                    / target_count
-                ).mean()
+                # Enforce per-target improvement: penalize both average active-target
+                # regression and worst active-target regression versus the per-target baseline.
+                target_gap_matrix = F.relu((probs_before_all + score_target_margin) - probs_after_all) * target_vec
+                score_gap_mean = (target_gap_matrix.sum(dim=1) / target_count).mean()
+                score_gap_worst = target_gap_matrix.max(dim=1).values.mean()
+                score_gap = 0.5 * (score_gap_mean + score_gap_worst)
                 non_target_vec = torch.clamp(1.0 - target_vec, 0.0, 1.0)
                 non_target_count = non_target_vec.sum(dim=1)
                 has_non_target = non_target_count > 0.0

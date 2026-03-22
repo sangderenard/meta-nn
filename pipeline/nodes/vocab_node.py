@@ -595,7 +595,8 @@ def _build_reference_flashcard_payload_rows(
             vec_clip = np.clip(np.asarray(vec[: int(sup_take)], dtype=np.float32), 0.0, 1.0)
             missing = (sup_clip >= 0.5) & (vec_clip < 0.5)
             if bool(np.any(missing)):
-                raise RuntimeError(f"Berkeley/object flashcard row dropped original supervised labels during conditioning. term={str(term)!r}")
+                # Preserve original supervised positives even if conditioning omitted them.
+                vec[: int(sup_take)] = np.maximum(vec_clip, sup_clip).astype(np.float32, copy=False)
             if int(berkeley_idx) < 0:
                 raise RuntimeError("Berkeley/object flashcard row cannot be emitted because 'berkeley sbd dataset' is missing from semantic class names.")
             if int(vec.size) <= int(berkeley_idx) or float(vec[int(berkeley_idx)]) < 0.5:

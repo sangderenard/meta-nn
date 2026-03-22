@@ -532,12 +532,13 @@ class TransformerTrainNode(IRTrainingNode):
         # train_transformer_feature_metric creates its own optimizer internally and
         # returns (trained_module, list_of_epoch_metric_dicts).  ctx.transformer_optimizer
         # is not consumed here — the function manages its own LR schedule per-call.
+        stream_target_labels = _build_transformer_stream_target_labels(ctx)
         trained_transformer, metrics_list = train_transformer_feature_metric(
             transformer=ctx.transformer,
             classifier=ctx.classifier,
             train_streams=ctx.float_streams,
             val_streams=ctx.float_streams,
-            train_target_labels=None,
+            train_target_labels=stream_target_labels,
             cfg=ctx.render_config,
             sample_bits=self.cfg.sample_bits,
             image_hw=(self.cfg.image_size, self.cfg.image_size),
@@ -615,6 +616,78 @@ def _degrade_prob(
         return float(start)
     t = min(1.0, float(step) / float(max(1, total_rounds - 1)))
     return float(start) + t * (float(end) - float(start))
+
+
+def _build_transformer_stream_target_labels(ctx: PipelineContext) -> List[Any]:
+    """Build per-stream semantic targets so each transformer epoch sees varied conditions.
+
+    Prefers payload_conditions (Berkeley) if available; otherwise synthesizes conditions
+    from class_names to ensure transformer always has target supervision without
+    depending on optional Berkeley data being loaded.
+    """
+    import numpy as np
+
+    streams = list(getattr(ctx, "float_streams", []) or [])
+    n_streams = int(len(streams))
+    if n_streams <= 0:
+        raise RuntimeError(
+            "Transformer Stage R target-label path requires float_streams, but none are available. "
+            "Run wave pool/data preparation before Stage R."
+        )
+
+    width = max(1, int(len(getattr(ctx, "class_names", []) or [])))
+    if int(width) <= 0:
+        raise RuntimeError(
+            "Transformer Stage R target-label path requires class_names to be initialized before training."
+        )
+
+    # Prefer Berkeley payload conditions if available.
+    rows_in = list(getattr(ctx, "payload_conditions", []) or [])
+    if len(rows_in) > 0:
+        # Use payload conditions path.
+        unique_rows: List[np.ndarray] = []
+        seen: set = set()
+        for row in rows_in:
+            arr = np.asarray(row, dtype=np.float32).reshape(-1)
+            if int(arr.size) <= 0:
+                continue
+            if int(arr.size) < int(width):
+                arr = np.concatenate(
+                    [arr, np.zeros((int(width) - int(arr.size),), dtype=np.float32)],
+                    axis=0,
+                )
+            elif int(arr.size) > int(width):
+                arr = arr[: int(width)]
+            arr = np.clip(arr, 0.0, 1.0).astype(np.float32, copy=False)
+            if float(np.sum(arr)) <= 0.0:
+                continue
+            key = tuple(np.round(arr, 5).tolist())
+            if key in seen:
+                continue
+            seen.add(key)
+            unique_rows.append(arr)
+    else:
+        # Fallback: synthesize one-hot vectors from class_names for target variety.
+        # This ensures transformer always has supervision without depending on Berkeley data.
+        unique_rows = [
+            np.eye(1, int(width), int(i), dtype=np.float32).reshape(-1)
+            for i in range(int(width))
+        ]
+
+    if len(unique_rows) <= 0:
+        raise RuntimeError(
+            "Transformer Stage R could not derive any valid semantic target vectors "
+            "from payload_conditions or class_names fallback."
+        )
+
+    round_id = int(getattr(ctx, "round_id", 0) or 0)
+    cycle_id = int(getattr(ctx, "cycle_id", 0) or 0)
+    offset = int((max(0, round_id) + (17 * max(0, cycle_id))) % max(1, len(unique_rows)))
+    out: List[Any] = []
+    for i in range(n_streams):
+        src = unique_rows[int((offset + i) % len(unique_rows))]
+        out.append(np.asarray(src, dtype=np.float32).copy())
+    return out
 
 
 def _resolve_transformer_chunk_samples(ctx: PipelineContext, cfg: TransformerConfig) -> int:
