@@ -1637,6 +1637,17 @@ def _orphan_free_split(
         if idx not in val_set:
             train_set.add(idx)
 
+    # Fallback: orphan constraint may have prevented collecting enough val items.
+    # An empty eval loader causes gate-1 eval to permanently skip (should_run returns
+    # False when gestation_eval_loader is None), stalling the whole pipeline.
+    # Forcing a minimal split is far better than having no validation rows at all.
+    if len(val_set) < min_val and n > 1:
+        rng2 = np.random.default_rng(max(0, seed + 1))
+        forced_count = min(min_val, n - 1)  # keep at least 1 training row
+        perm2 = rng2.permutation(n).tolist()
+        val_set = set(perm2[:forced_count])
+        train_set = set(range(n)) - val_set
+
     return sorted(train_set), sorted(val_set)
 
 

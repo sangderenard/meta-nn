@@ -94,6 +94,7 @@ set "GATE_BERKELEY_BATCH_SIZE=32"
 set "GATE_TRANS_AFTER_MIN=0.265"
 set "GATE_TRANS_GAIN_MIN=0.0005"
 set "GATE_TRANS_MAINTAIN=2"
+set "GATE_TRANS_MAX_TRAINER_ENTROPY_EXCESS=0.20"
 
 REM Training schedule defaults
 set "ORCH_MODE=staged_cgrw"
@@ -766,6 +767,7 @@ set "RUN_EXTRA_ARG=%~2"
   --gate-total-token-schedule-threshold %GATE_TOTAL_TOKEN_SCHEDULE_THRESHOLD% ^
   --gate-transformer-min-score-after %GATE_TRANS_AFTER_MIN% ^
   --gate-transformer-min-gain %GATE_TRANS_GAIN_MIN% ^
+  --gate-transformer-max-trainer-entropy-excess %GATE_TRANS_MAX_TRAINER_ENTROPY_EXCESS% ^
   --gate-transformer-maintain-rounds %GATE_TRANS_MAINTAIN% ^
   --max-delta 0.80 ^
   --transformer-degrade-inputs ^

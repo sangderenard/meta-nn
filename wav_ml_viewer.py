@@ -1403,24 +1403,25 @@ class _TransformerStatusOpenGLViewer:
         if store is None:
             return None
         model_key = self._normalise_weight_model_name(model_name)
-        for index in range(max(0, int(store.length())) - 1, -1, -1):
-            meta = store.get_meta(index)
-            if meta is None:
-                continue
-            if (int(meta.flags) & int(WEIGHT_IMAGE_FLAG_CHECKPOINT)) == 0:
-                continue
-            if int(meta.round_id) != int(round_id) or int(meta.cycle) != int(cycle):
-                continue
-            if self._normalise_weight_model_name(getattr(meta, "model_name", "")) != model_key:
-                continue
-            if int(generation) > 0 and int(getattr(meta, "generation", 0) or 0) != int(generation):
-                continue
-            if (
-                int(architecture_version) > 0
-                and int(getattr(meta, "architecture_version", 0) or 0) != int(architecture_version)
-            ):
-                continue
-            return int(index)
+        with store.locked():
+            for index in range(max(0, int(store.length())) - 1, -1, -1):
+                meta = store.get_meta(index)
+                if meta is None:
+                    continue
+                if (int(meta.flags) & int(WEIGHT_IMAGE_FLAG_CHECKPOINT)) == 0:
+                    continue
+                if int(meta.round_id) != int(round_id) or int(meta.cycle) != int(cycle):
+                    continue
+                if self._normalise_weight_model_name(getattr(meta, "model_name", "")) != model_key:
+                    continue
+                if int(generation) > 0 and int(getattr(meta, "generation", 0) or 0) != int(generation):
+                    continue
+                if (
+                    int(architecture_version) > 0
+                    and int(getattr(meta, "architecture_version", 0) or 0) != int(architecture_version)
+                ):
+                    continue
+                return int(index)
         return None
 
     def _checkpoint_thumbnail_cache_key(
@@ -1695,25 +1696,26 @@ class _TransformerStatusOpenGLViewer:
         target_model = self._normalise_weight_model_name(getattr(state_meta, "model_name", ""))
         target_node = str(getattr(state_meta, "node_id", "") or "")
         target_publish_seq = int(getattr(state_meta, "publish_seq", 0) or 0)
-        for index in range(max(0, int(store.length())) - 1, -1, -1):
-            image_meta = store.get_meta(index)
-            if image_meta is None:
-                continue
-            if int(getattr(image_meta, "state_publish_seq", 0) or 0) != target_publish_seq:
-                continue
-            if self._normalise_weight_model_name(getattr(image_meta, "model_name", "")) != target_model:
-                continue
-            if str(getattr(image_meta, "node_id", "") or "") != target_node:
-                continue
-            if checkpoint_only and (int(getattr(image_meta, "flags", 0) or 0) & int(WEIGHT_IMAGE_FLAG_CHECKPOINT)) == 0:
-                continue
-            if mode is not None and int(getattr(image_meta, "mode", 0) or 0) != int(mode):
-                continue
-            if target_width is not None and int(getattr(image_meta, "target_width", 0) or 0) != int(target_width):
-                continue
-            if target_height is not None and int(getattr(image_meta, "target_height", 0) or 0) != int(target_height):
-                continue
-            return int(index)
+        with store.locked():
+            for index in range(max(0, int(store.length())) - 1, -1, -1):
+                image_meta = store.get_meta(index)
+                if image_meta is None:
+                    continue
+                if int(getattr(image_meta, "state_publish_seq", 0) or 0) != target_publish_seq:
+                    continue
+                if self._normalise_weight_model_name(getattr(image_meta, "model_name", "")) != target_model:
+                    continue
+                if str(getattr(image_meta, "node_id", "") or "") != target_node:
+                    continue
+                if checkpoint_only and (int(getattr(image_meta, "flags", 0) or 0) & int(WEIGHT_IMAGE_FLAG_CHECKPOINT)) == 0:
+                    continue
+                if mode is not None and int(getattr(image_meta, "mode", 0) or 0) != int(mode):
+                    continue
+                if target_width is not None and int(getattr(image_meta, "target_width", 0) or 0) != int(target_width):
+                    continue
+                if target_height is not None and int(getattr(image_meta, "target_height", 0) or 0) != int(target_height):
+                    continue
+                return int(index)
         return None
 
     def _weight_image_present_for_state(
@@ -1946,12 +1948,13 @@ class _TransformerStatusOpenGLViewer:
         root = self._checkpoint_thumbnail_root_path()
         if store is None or root is None:
             return None
-        meta = store.get_meta(int(index))
-        if meta is None:
-            return None
-        if (int(meta.flags) & int(WEIGHT_IMAGE_FLAG_CHECKPOINT)) == 0:
-            return None
-        rgb = store.copy_image(int(index))
+        with store.locked():
+            meta = store.get_meta(int(index))
+            if meta is None:
+                return None
+            if (int(meta.flags) & int(WEIGHT_IMAGE_FLAG_CHECKPOINT)) == 0:
+                return None
+            rgb = store.copy_image(int(index))
         if rgb is None:
             return None
         cropped = crop_weight_image_rgb(
@@ -2017,7 +2020,8 @@ class _TransformerStatusOpenGLViewer:
         image_bytes = row_bytes * max(1, int(cfg.render_height))
         max_entries = max(1, int(self._weight_history_maxlen))
         max_total_bytes = max(1, image_bytes) * max_entries
-        entries = [store.get_meta(i) for i in range(max(0, int(store.length())))]
+        with store.locked():
+            entries = [store.get_meta(i) for i in range(max(0, int(store.length())))]
         evict_indices = plan_weight_image_evictions(
             [entry for entry in entries if entry is not None],
             max_entries=int(max_entries),
@@ -2040,7 +2044,8 @@ class _TransformerStatusOpenGLViewer:
         if row_bytes <= 0:
             row_bytes = int(cfg.render_width) * max(1, int(cfg.render_channels))
         incoming_bytes = row_bytes * max(1, int(cfg.render_height))
-        entries = [store.get_meta(i) for i in range(max(0, int(store.length())))]
+        with store.locked():
+            entries = [store.get_meta(i) for i in range(max(0, int(store.length())))]
         evict_indices = plan_weight_image_evictions(
             [entry for entry in entries if entry is not None],
             max_entries=max(1, int(stats.max_entries)),
@@ -3026,19 +3031,20 @@ class _TransformerStatusOpenGLViewer:
         store = self._loss_store
         if store is None:
             return
-        keys = self._loss_channel_keys()
-        if not keys:
-            self.notify_pipeline_checkpoint_saved()
-            return
-        snapshot: Dict[str, int] = {}
-        for ck in keys:
-            ts_tensor = store.get_ts_array(ck)
-            if ts_tensor.numel() == 0:
-                continue
-            ts_list = ts_tensor.tolist()
-            idx = bisect.bisect_left(ts_list, float(wall_ts))
-            idx = max(0, min(len(ts_list) - 1, idx))
-            snapshot[ck] = idx + 1  # 1-based count mirrors length convention
+        with store.locked():
+            keys = self._loss_channel_keys()
+            if not keys:
+                self.notify_pipeline_checkpoint_saved()
+                return
+            snapshot: Dict[str, int] = {}
+            for ck in keys:
+                ts_tensor = store.get_ts_array(ck)
+                if ts_tensor.numel() == 0:
+                    continue
+                ts_list = ts_tensor.tolist()
+                idx = bisect.bisect_left(ts_list, float(wall_ts))
+                idx = max(0, min(len(ts_list) - 1, idx))
+                snapshot[ck] = idx + 1  # 1-based count mirrors length convention
         if snapshot:
             self._disk_save_loss_counts.append(snapshot)
             self._checkpoint_marker_records.append(
@@ -3145,7 +3151,8 @@ class _TransformerStatusOpenGLViewer:
         store = self._loss_store
         if store is None:
             return {}
-        return {ck: store.channel_length(ck) for ck in store.channel_keys()}
+        with store.locked():
+            return {ck: store.channel_length(ck) for ck in store.channel_keys()}
 
     # -- Pull-model handlers (SaveRestoreNode IPC integration) ----------
 
@@ -3832,23 +3839,24 @@ class _TransformerStatusOpenGLViewer:
             output_rgb = np.asarray(images[2], dtype=np.uint8)
             h, w = target_rgb.shape[0], target_rgb.shape[1]
             flags = SCRUB_FLAG_HAS_IMAGE | SCRUB_FLAG_HAS_TARGET | SCRUB_FLAG_HAS_OUTPUT
-            ring_cursor = self._scrub_ring.push(
-                step=0, round_id=0, ts=time.time(), loss=0.0,
-                channel_key="preview", flags=flags,
-                image_w=w, image_h=h,
-                training_image=input_rgb,
-                output_image=output_rgb,
-                target_data=target_rgb,
-                thumb0=None,
-                thumb1=None,
-                thumb2=None,
-            )
-            self._scrub_ring.write_text(
-                ring_cursor,
-                caption=str(frame_dict.get("caption", "")),
-                titles=frame_dict.get("titles", self._panel_titles),
-                rows=frame_dict.get("rows", self._panel_rows),
-            )
+            with self._scrub_ring.locked():
+                ring_cursor = self._scrub_ring.push(
+                    step=0, round_id=0, ts=time.time(), loss=0.0,
+                    channel_key="preview", flags=flags,
+                    image_w=w, image_h=h,
+                    training_image=input_rgb,
+                    output_image=output_rgb,
+                    target_data=target_rgb,
+                    thumb0=None,
+                    thumb1=None,
+                    thumb2=None,
+                )
+                self._scrub_ring.write_text(
+                    ring_cursor,
+                    caption=str(frame_dict.get("caption", "")),
+                    titles=frame_dict.get("titles", self._panel_titles),
+                    rows=frame_dict.get("rows", self._panel_rows),
+                )
         self._stage_frame_text(ring_cursor)
 
     def update(

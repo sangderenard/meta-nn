@@ -583,22 +583,21 @@ class TransformerTrainNode(IRTrainingNode):
 
         ctx.transformer = trained_transformer
         last_m = (metrics_list or [{}])[-1]
-        score = float(last_m.get("feature_score", 0.0))
-        entropy = float(last_m.get("entropy", 0.0))
-        combined = (score + entropy) / 2.0
-
-        ctx.gate_transformer.required_consecutive = self.cfg.gate_required_consecutive
-        ctx.gate_transformer.record(
-            round_id=ctx.round_id,
-            metric=combined,
-            threshold=self.cfg.gate_score_target,
-            above=True,
+        feature_score = float(
+            last_m.get("val_score_after", last_m.get("score_after", 0.0))
         )
-        ctx.log_metric("stageR", "feature_score", score)
-        ctx.log_metric("stageR", "entropy", entropy)
+        trainer_entropy_excess = float(
+            last_m.get("train_entropy_excess", last_m.get("entropy_excess", 0.0))
+        )
 
-        _log(f"[stageR] score={score:.4f} entropy={entropy:.4f} "
-             f"gate={'PASS' if ctx.gate_transformer.passed else 'hold'}")
+        # Stage R publishes trainer metrics; Gate R consumes them and owns gate state.
+        ctx.log_metric("stageR", "feature_score", feature_score)
+        ctx.log_metric("stageR", "trainer_entropy_excess", trainer_entropy_excess)
+
+        _log(
+            f"[stageR] feature_score={feature_score:.4f} "
+            f"trainer_entropy_excess={trainer_entropy_excess:.4f}"
+        )
 
 
 # ---------------------------------------------------------------------------

@@ -247,12 +247,20 @@ class BerkeleyGateNode(GatedNode):
     def should_run(self, ctx: PipelineContext) -> bool:
         if not super().should_run(ctx):
             return False
-        return (
-            ctx.payload_validation_loader is not None
-            and ctx.classifier is not None
-        )
+        return ctx.classifier is not None
 
     def execute(self, ctx: PipelineContext) -> None:
+        if ctx.payload_validation_loader is None:
+            data_node = getattr(ctx, "data", None)
+            provide_gate_data = getattr(data_node, "provide_gate_data", None)
+            if callable(provide_gate_data):
+                try:
+                    provide_gate_data(ctx)
+                except Exception as exc:
+                    _log(f"[gate2] loader request failed: {exc}")
+        if ctx.payload_validation_loader is None:
+            _log("[gate2] hold (missing payload_validation_loader)")
+            return
         gate_model, gate_device, gate_name = _gate_eval_model(ctx, channels_last=False)
         with gpu_resident(ctx, [(gate_model, gate_name)], device=gate_device) if gate_device.type == "cuda" else nullcontext():
             result = _evaluate_berkeley_classifier_gate(
@@ -318,12 +326,13 @@ class BerkeleyGateNode(GatedNode):
 class TransformerGateConfig:
     """Thresholds for the transformer feature-score gate."""
 
-    # Minimum combined (feature_score + entropy) / 2 metric
+    # Minimum feature score required to pass gate R.
     score_target: float = 0.60
 
-    # Individual minimums (both must be met)
+    # Feature score threshold (higher is better)
     feature_score_min: float = 0.50
-    entropy_min: float = 0.40
+    # Training entropy-excess threshold (lower is better). Negative disables it.
+    max_trainer_entropy_excess: float = -1.0
 
     required_consecutive: int = 3
 
@@ -336,14 +345,14 @@ class TransformerGateConfig:
 
 
 class TransformerGateNode(GatedNode):
-    """Gate R: Evaluate transformer output quality via classifier feature score.
+    """Gate R: Evaluate transformer output quality via feature score and trainer entropy excess.
 
     Requires Gate 0 + Gate 1.  Scores the transformer's current renderings
     and checks both the combined metric and the individual component thresholds.
     """
 
     node_id = "gate_transformer"
-    description = "Gate R Eval: transformer feature score + entropy"
+    description = "Gate R Eval: transformer feature score + trainer entropy excess"
     runtime_object_type = "evaluator"
     runtime_faculty = "gate"
     required_gates = ["gate_pregestation", "gate_gestation"]
@@ -360,6 +369,19 @@ class TransformerGateNode(GatedNode):
     def execute(self, ctx: PipelineContext) -> None:
         from wav_ml_models import evaluate_feature_score_before_after
         from pipeline.utils import _resolve_synced_chunk_samples
+
+        def _latest_stage_r_trainer_entropy_excess() -> float:
+            rows = list(getattr(ctx, "metrics_history", []) or [])
+            for row in reversed(rows):
+                if str(row.get("stage", "")) != "stageR":
+                    continue
+                if str(row.get("key", "")) != "trainer_entropy_excess":
+                    continue
+                try:
+                    return float(row.get("value", float("nan")))
+                except Exception:
+                    return float("nan")
+            return float("nan")
 
         image_size = int(self.cfg.image_size)
         requested_chunks = int(self.cfg.chunk_samples or getattr(ctx.args, "chunk_samples", 0) or 1)
@@ -389,30 +411,36 @@ class TransformerGateNode(GatedNode):
         )
 
         feature_score = float(result.get("score_after", 0.0))
-        entropy = float(result.get("hard_coverage_after", 0.0))
-        combined = (feature_score + entropy) / 2.0
+        trainer_entropy_excess = _latest_stage_r_trainer_entropy_excess()
+        combined = float(feature_score)
 
+        required_feature = max(float(self.cfg.score_target), float(self.cfg.feature_score_min))
+        entropy_gate_enabled = float(self.cfg.max_trainer_entropy_excess) >= 0.0
+        entropy_ok = (not entropy_gate_enabled) or (
+            trainer_entropy_excess <= float(self.cfg.max_trainer_entropy_excess)
+        )
         passes = (
-            combined >= self.cfg.score_target
-            and feature_score >= self.cfg.feature_score_min
-            and entropy >= self.cfg.entropy_min
+            feature_score >= required_feature
+            and entropy_ok
         )
 
         ctx.gate_transformer.required_consecutive = self.cfg.required_consecutive
-        threshold_metric = combined if passes else 0.0
+        threshold_metric = feature_score if passes else 0.0
         ctx.gate_transformer.record(
             round_id=ctx.round_id,
             metric=threshold_metric,
-            threshold=self.cfg.score_target * 0.99,
+            threshold=required_feature * 0.99,
             above=True,
         )
 
         ctx.log_metric("gateR", "feature_score", feature_score)
-        ctx.log_metric("gateR", "entropy", entropy)
+        if trainer_entropy_excess == trainer_entropy_excess:
+            ctx.log_metric("gateR", "trainer_entropy_excess", trainer_entropy_excess)
 
         _log(
-            f"[gateR] score={feature_score:.3f} entropy={entropy:.3f} "
-            f"combined={combined:.3f}/{self.cfg.score_target:.2f} "
+            f"[gateR] score={feature_score:.3f} trainer_entropy_excess={trainer_entropy_excess:.4f} "
+            f"combined={combined:.3f} req_score={required_feature:.3f} "
+            f"max_trainer_entropy_excess={self.cfg.max_trainer_entropy_excess:.4f} "
             f"consecutive={ctx.gate_transformer.consecutive_passes}/"
             f"{self.cfg.required_consecutive} "
             f"{'PASS' if ctx.gate_transformer.passed else 'hold'}"

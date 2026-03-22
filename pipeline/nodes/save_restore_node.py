@@ -808,10 +808,11 @@ class SaveRestoreNode(PipelineNode):
         process loads history first via wav_ml_gui_main._load_history).
         """
         if self.loss_store.channel_count() > 0:
-            total = sum(
-                self.loss_store.channel_length(ck)
-                for ck in self.loss_store.channel_keys()
-            )
+            with self.loss_store.locked():
+                total = sum(
+                    self.loss_store.channel_length(ck)
+                    for ck in self.loss_store.channel_keys()
+                )
             _log(f"[save-restore] C store already has {total} records; skipping binary log replay")
             return
         try:
@@ -1499,14 +1500,15 @@ class SaveRestoreNode(PipelineNode):
         if state_meta is None:
             return None
         try:
-            cfg = self.weight_image_store.measure_for(
-                self.weight_state_store,
-                model_name=str(state_meta.model_name),
-                node_id=str(state_meta.node_id or ""),
-                mode=int(mode),
-                target_width=int(target_width),
-                target_height=int(target_height),
-            )
+            with self.weight_state_store.locked():
+                cfg = self.weight_image_store.measure_for(
+                    self.weight_state_store,
+                    model_name=str(state_meta.model_name),
+                    node_id=str(state_meta.node_id or ""),
+                    mode=int(mode),
+                    target_width=int(target_width),
+                    target_height=int(target_height),
+                )
         except Exception:
             return None
         if cfg is not None:
@@ -1621,26 +1623,27 @@ class SaveRestoreNode(PipelineNode):
         return None
 
     def _resp_channel_list(self) -> Dict[str, Any]:
-        loss_keys = self.loss_store.channel_keys()
-        result_keys = self.result_store.channel_keys()
-        tm_keys = self.training_cache.channel_keys() if self.training_cache else []
-        all_keys = sorted(set(loss_keys) | set(result_keys) | set(tm_keys))
-        return {
-            "type": RESP_CHANNEL_LIST,
-            "channels": [
-                {
-                    "key": ck,
-                    "has_loss": ck in loss_keys,
-                    "loss_length": self.loss_store.channel_length(ck),
-                    "has_result": ck in result_keys,
-                    "result_depth": self.result_store.channel_depth(ck),
-                    "has_tm": ck in tm_keys,
-                    "tm_entries": (self.training_cache.channel_entry_count(ck)
-                                   if self.training_cache else 0),
-                }
-                for ck in all_keys
-            ],
-        }
+        with self.loss_store.locked():
+            loss_keys = self.loss_store.channel_keys()
+            result_keys = self.result_store.channel_keys()
+            tm_keys = self.training_cache.channel_keys() if self.training_cache else []
+            all_keys = sorted(set(loss_keys) | set(result_keys) | set(tm_keys))
+            return {
+                "type": RESP_CHANNEL_LIST,
+                "channels": [
+                    {
+                        "key": ck,
+                        "has_loss": ck in loss_keys,
+                        "loss_length": self.loss_store.channel_length(ck),
+                        "has_result": ck in result_keys,
+                        "result_depth": self.result_store.channel_depth(ck),
+                        "has_tm": ck in tm_keys,
+                        "tm_entries": (self.training_cache.channel_entry_count(ck)
+                                       if self.training_cache else 0),
+                    }
+                    for ck in all_keys
+                ],
+            }
 
     def _resp_loss_history(self, query: Dict[str, Any]) -> Dict[str, Any]:
         ck = str(query.get("channel_key", ""))

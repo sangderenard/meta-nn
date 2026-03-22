@@ -223,8 +223,6 @@ class VocabChurnNode(PipelineNode):
                 f"terms={int(len(slot_terms))} "
                 f"signature={str(info.get('signature', ''))[:12]}"
             )
-            for _t in slot_terms:
-                _log(f"[vocab-churn]   term: {str(_t)}")
             return
 
         # No activating source raised a request this round — nothing to rotate.

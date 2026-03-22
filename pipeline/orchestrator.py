@@ -2741,7 +2741,7 @@ def _build_configs_from_args(args) -> dict:
     transformer_gate = TransformerGateConfig(
         score_target=float(_g("gate_transformer_min_score_after", "transformer_gate_target", default=0.60)),
         feature_score_min=float(_g("gate_transformer_min_score_after", "transformer_score_min", default=0.50)),
-        entropy_min=float(_g("transformer_entropy_min", default=0.40)),
+        max_trainer_entropy_excess=float(_g("gate_transformer_max_trainer_entropy_excess", default=-1.0)),
         required_consecutive=int(_g("gate_transformer_maintain_rounds", "transformer_gate_consecutive", default=3)),
     )
 

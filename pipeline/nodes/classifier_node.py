@@ -666,6 +666,16 @@ class BerkeleyRefreshTrainNode(IRTrainingNode):
         }
 
     def execute(self, ctx: PipelineContext) -> None:
+        # Self-heal: when edge traversal callbacks are skipped or out-of-order,
+        # stage-2 must still request its required loader instead of crashing/skipping.
+        if ctx.berkeley_refresh_loader is None:
+            data_node = getattr(ctx, "data", None)
+            provide = getattr(data_node, "provide_berkeley_data", None)
+            if callable(provide):
+                try:
+                    provide(ctx)
+                except Exception as exc:
+                    _log(f"[stage2_berkeley] loader request failed: {exc}")
         ensure_vocab_lora_active(ctx, self.cfg)
         from pipeline.nodes.base import make_training_progress_callback
         preview_callback = make_classifier_step_preview_callback(ctx, self.node_id)
@@ -1144,12 +1154,16 @@ def ensure_vocab_lora_active(ctx: PipelineContext, cfg: ClassifierConfig) -> Dic
         _log("[lora-guard] installed LoRA adapters (extra vocab active)")
 
     # Step 2: determine which slot should be active.
-    # Always recompute the expected signature from the current extra_terms so
-    # that a vocab change between stages (e.g. gestation → berkeley) is caught
-    # immediately rather than silently reusing the stale gestation slot.
+    # Compute the expected signature from the REAL extra terms only.
+    # active_extra_terms is padded with "semantic slot N" fillers by _normalize_extra_terms;
+    # including those fillers in the hash causes a permanent mismatch against the slot
+    # signature (which was computed from the unpadded terms), making the guard fire every
+    # round and switch back to the wrong slot.
+    _PADDING_SLOT_RE = re.compile(r"^semantic slot \d+$", re.IGNORECASE)
+    _real_extra = [t for t in extra_terms if not _PADDING_SLOT_RE.match(str(t).strip())]
     expected_signature = hashlib.sha1(
-        "|".join(str(t) for t in sorted(extra_terms)).encode("utf-8", errors="ignore")
-    ).hexdigest()[:16]
+        "|".join(str(t) for t in sorted(_real_extra)).encode("utf-8", errors="ignore")
+    ).hexdigest()[:16] if _real_extra else (str(getattr(ctx, "vocab_lora_active_signature", "") or "").strip() or "")
     stored_signature = str(getattr(ctx, "vocab_lora_active_signature", "") or "").strip()
     if stored_signature and stored_signature != expected_signature:
         _log(
@@ -1399,6 +1413,37 @@ def _run_classifier_refresh_epochs(
         and mode_key in ("", "multihot_mix", "multihot", "mixed")
         and bool(_refresh_cache_is_staging_safe(cache_x=cache_x, cache_y=cache_y, cache_m=cache_m, model_device=device))
     )
+    if not use_cache:
+        if loader is None:
+            _log(f"[{stage_label}] skip: missing loader")
+            return {
+                "ran": False,
+                "loss": 0.0,
+                "samples": 0,
+                "steps_per_epoch": 0,
+                "truncated_by_time": False,
+                "stopped_early": False,
+                "elapsed_sec": 0.0,
+                "source": "loader",
+                "reason": "missing_loader",
+            }
+        try:
+            loader_len = int(len(loader))
+        except Exception:
+            loader_len = -1
+        if loader_len <= 0:
+            _log(f"[{stage_label}] skip: empty loader")
+            return {
+                "ran": False,
+                "loss": 0.0,
+                "samples": 0,
+                "steps_per_epoch": 0,
+                "truncated_by_time": False,
+                "stopped_early": False,
+                "elapsed_sec": 0.0,
+                "source": "loader",
+                "reason": "empty_loader",
+            }
     cache_batch_size = max(1, int(cache_batch_size)) if use_cache else 0
     refresh_source = "cache" if use_cache else "loader"
     if bool(use_cache) and cache_x is not None and str(cache_x.device) != str(device):
@@ -1417,7 +1462,7 @@ def _run_classifier_refresh_epochs(
         steps_per_epoch = int(full_steps if int(max_steps) <= 0 else max(1, int(max_steps)))
         steps_per_epoch = max(int(steps_per_epoch), int(min_steps))
     else:
-        full_steps = max(1, int(len(loader)))
+        full_steps = max(1, int(loader_len))
         steps_per_epoch = int(full_steps if int(max_steps) <= 0 else max(1, int(max_steps)))
         steps_per_epoch = max(int(steps_per_epoch), int(min_steps))
     updates_per_epoch = int(math.ceil(float(steps_per_epoch) / float(grad_accum_steps)))

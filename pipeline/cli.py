@@ -1501,6 +1501,12 @@ def parse_args():
         help="Required consecutive transformer gate passes before wave-classifier stage.",
     )
     p.add_argument(
+        "--gate-transformer-max-trainer-entropy-excess",
+        type=float,
+        default=-1.0,
+        help="Optional max Stage-R trainer entropy excess for Gate R (<0 disables entropy-excess gate).",
+    )
+    p.add_argument(
         "--gate-wave-feedback-min-acc",
         type=float,
         default=0.25,

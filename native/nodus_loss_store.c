@@ -1782,6 +1782,7 @@ NODUS_API int nodus_composite_build_frame(
         memset(out_frame->output_panel, 14, panel_w * panel_h * 3);
     }
 
+    ring_unlock(r);
     return 0;
 }
 
