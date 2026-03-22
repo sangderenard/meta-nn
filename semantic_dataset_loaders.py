@@ -35,6 +35,10 @@ _IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".bmp", ".webp", ".tif", ".tiff"}
 _SEMANTIC_DISK_ROWS_CACHE_LOCK = threading.Lock()
 _SEMANTIC_DISK_ROWS_CACHE: Dict[str, Tuple[List["SemanticDiskRow"], Dict[str, Any]]] = {}
 _SEMANTIC_COLOR_TERMS: Tuple[str, ...] = (
+    "bright",
+    "dark",
+    "warm",
+    "cool",
     "red",
     "orange",
     "green",
@@ -46,6 +50,7 @@ _SEMANTIC_COLOR_TERMS: Tuple[str, ...] = (
     "black",
     "white",
     "gray",
+    "neutral",
     "edge",
 )
 _INGESTED_ITEM_MASK_TERMS = frozenset(("signal", "object"))
@@ -186,6 +191,25 @@ def targets_from_terms(
                 y[idx] = 1.0
         out.append(y)
     return out
+
+
+def merge_terms_with_mask_indices(
+    terms: Sequence[str],
+    mask_indices: Any,
+    idx_to_term: Optional[Dict[int, str]] = None,
+) -> List[str]:
+    merged = list(normalize_vocab_terms([str(x) for x in list(terms or [])]))
+    if not isinstance(idx_to_term, dict) or not idx_to_term:
+        return merged
+    extra_terms: List[str] = []
+    idx_arr = np.asarray(mask_indices, dtype=np.int64).reshape(-1)
+    for cls_idx in idx_arr.tolist():
+        term = idx_to_term.get(int(cls_idx))
+        if str(term or "").strip():
+            extra_terms.append(str(term))
+    if len(extra_terms) <= 0:
+        return merged
+    return list(normalize_vocab_terms(list(merged) + extra_terms))
 
 
 def convert_sbd_mat_to_npz(root, progress_control: Any = None) -> None:
@@ -658,12 +682,11 @@ def term_mask_map_to_label_stack(
             for idx, term in idx_to_term.items()
             if str(term).strip()
         }
-    positive_set = set(_positive_label_indices(label_vec).tolist())
     raw_masks: List[np.ndarray] = []
     indices: List[int] = []
     for raw_term, raw_mask in term_mask_map.items():
         ci = int(lut.get(_norm_txt(str(raw_term)), -1))
-        if ci < 0 or ci not in positive_set:
+        if ci < 0:
             continue
         arr = np.asarray(raw_mask, dtype=np.float32)
         if int(arr.ndim) != 2 or int(arr.size) <= 0:
@@ -774,13 +797,11 @@ def elem_stacks_to_label_stacks(
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Convert per-element spatial masks into per-label mask stacks.
 
-    Each element mask is replicated for every positive label index that
-    appears in that element's term list.  The result is a ``[K, H, W]``
+    Each element mask is replicated for every known label index that
+    appears in that element's term list. The result is a ``[K, H, W]``
     stack paired with a ``[K]`` int64 index array suitable for direct
     lookup by ``_expand_semantic_mask_supervision_batch``.
     """
-    y = np.asarray(label_vec, dtype=np.float32).reshape(-1)
-    positive_set = set(np.where(y >= 0.5)[0].tolist())
     stack = np.asarray(elem_stack, dtype=np.float32)
     if int(stack.ndim) == 2:
         stack = stack[None, ...]
@@ -798,7 +819,7 @@ def elem_stacks_to_label_stacks(
             for term in elem_term_lists[int(ei)]:
                 tk = _norm_txt(str(term))  # cached
                 ci = int(term_to_idx.get(tk, -1))
-                if ci < 0 or ci not in positive_set:
+                if ci < 0:
                     continue
                 out_masks.append(mask_e)
                 out_idx.append(ci)
@@ -920,23 +941,6 @@ def build_term_mask_stack_from_image(
     return stacks[0], indices[0]
 
 
-def augment_label_vec_with_detected_color_terms(
-    *,
-    image: Any,
-    label_vec: Any,
-    term_to_idx: Optional[Dict[str, int]] = None,
-) -> np.ndarray:
-    y = np.asarray(label_vec, dtype=np.float32).reshape(-1).copy()
-    if int(y.size) <= 0 or not isinstance(term_to_idx, dict) or not term_to_idx:
-        return y
-    detected_terms = detect_semantic_color_terms(image=image)
-    for term in normalize_vocab_terms([str(x) for x in list(detected_terms)]):
-        ti = int(term_to_idx.get(_norm_txt(term), -1))
-        if 0 <= int(ti) < int(y.size):
-            y[int(ti)] = 1.0
-    return y
-
-
 def _single_label_whole_image_mask(label_vec: Any, *, height: int, width: int) -> Optional[np.ndarray]:
     positive_idx = _positive_label_indices(label_vec)
     if int(positive_idx.size) != 1 or int(height) <= 0 or int(width) <= 0:
@@ -977,11 +981,6 @@ def assemble_semantic_mask_layers(
         if int(deformation_stack.shape[0]) > 0 and int(deformation_idx.size) > 0:
             parts.append((deformation_stack, deformation_idx))
 
-    y = augment_label_vec_with_detected_color_terms(
-        image=chw,
-        label_vec=y,
-        term_to_idx=term_to_idx,
-    )
     detected_stack, detected_idx = build_term_mask_stack_from_image(
         image=chw,
         label_vec=y,
@@ -1098,197 +1097,91 @@ def _image_batch_to_bchw01(images: Any) -> np.ndarray:
         bchw = (bchw + 1.0) * 0.5
     return np.clip(bchw, 0.0, 1.0).astype(np.float32, copy=False)
 
-
-def _resolve_processing_device(processing_device: Optional[Any]) -> Optional[torch.device]:
-    if processing_device is None:
-        return None
-    if isinstance(processing_device, torch.device):
-        return processing_device
-    text = str(processing_device).strip().lower()
-    if not text or text == "none":
-        return None
-    if text == "auto":
-        return torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-    try:
-        return torch.device(str(processing_device))
-    except Exception:
-        return None
-
-
-
-def _semantic_color_score_maps_batch_torch(
-    chw_batch: Any,
-    *,
-    device: Optional[Any] = None,
-) -> Dict[str, torch.Tensor]:
-    resolved = _resolve_processing_device(device) or torch.device("cpu")
-    arr = torch.as_tensor(_image_batch_to_bchw01(chw_batch), dtype=torch.float32, device=resolved)
+def build_observed_color_stack_from_terms(
+    image: Any,
+    term_row: Sequence[str] = (),
+    processing_device: Optional[Any] = None,
+) -> Tuple[np.ndarray, List[str]]:
+    bchw = _image_batch_to_bchw01(np.asarray(image, dtype=np.float32))
+    h = int(bchw.shape[2]) if int(bchw.ndim) == 4 else 0
+    w = int(bchw.shape[3]) if int(bchw.ndim) == 4 else 0
+    resolved = torch.device("cpu")
+    if processing_device is not None:
+        try:
+            resolved = processing_device if isinstance(processing_device, torch.device) else torch.device(str(processing_device))
+            if resolved.type == "cuda" and not torch.cuda.is_available():
+                resolved = torch.device("cpu")
+        except Exception:
+            resolved = torch.device("cpu")
+    arr = torch.as_tensor(bchw, dtype=torch.float32, device=resolved)
     arr = torch.clamp(arr, 0.0, 1.0)
     if int(arr.ndim) != 4 or int(arr.shape[1]) < 3:
-        return {}
+        return np.zeros((0, h, w), dtype=np.float32), []
+
     r = arr[:, 0]
     g = arr[:, 1]
     b = arr[:, 2]
     vmax = torch.maximum(torch.maximum(r, g), b)
     vmin = torch.minimum(torch.minimum(r, g), b)
     sat = torch.clamp(vmax - vmin, 0.0, 1.0)
+    luma = torch.mean(arr[:, :3], dim=1)
 
     def _norm01_batch(x: torch.Tensor) -> torch.Tensor:
         hi = torch.amax(x, dim=(1, 2), keepdim=True)
         valid = hi > 1e-8
-        return torch.where(valid, torch.clamp(x / torch.where(valid, hi, torch.ones_like(hi)), 0.0, 1.0), torch.zeros_like(x))
+        safe_hi = torch.where(valid, hi, torch.ones_like(hi))
+        return torch.where(valid, torch.clamp(x / safe_hi, 0.0, 1.0), torch.zeros_like(x))
 
-    red = _norm01_batch(torch.clamp(r - torch.maximum(g, b), 0.0, 1.0) * torch.clamp(sat - 0.05, 0.0, 1.0))
-    green = _norm01_batch(torch.clamp(g - torch.maximum(r, b), 0.0, 1.0) * torch.clamp(sat - 0.05, 0.0, 1.0))
-    blue = _norm01_batch(torch.clamp(b - torch.maximum(r, g), 0.0, 1.0) * torch.clamp(sat - 0.05, 0.0, 1.0))
-    yellow = _norm01_batch(torch.clamp(torch.minimum(r, g) - b, 0.0, 1.0) * torch.clamp(sat - 0.05, 0.0, 1.0))
-    cyan = _norm01_batch(torch.clamp(torch.minimum(g, b) - r, 0.0, 1.0) * torch.clamp(sat - 0.05, 0.0, 1.0))
-    magenta = _norm01_batch(torch.clamp(torch.minimum(r, b) - g, 0.0, 1.0) * torch.clamp(sat - 0.05, 0.0, 1.0))
-    brown = _norm01_batch(
-        torch.clamp(r - g, 0.0, 1.0)
-        * torch.clamp(g - b, 0.0, 1.0)
-        * torch.clamp(vmax, 0.15, 0.75)
-        * torch.clamp(0.85 - vmax, 0.0, 1.0)
-    )
-    orange = _norm01_batch(
-        torch.clamp(r - b - 0.05, 0.0, 1.0)
-        * torch.clamp(r - g - 0.08, 0.0, 1.0)
-        * torch.clamp(g - b - 0.02, 0.0, 1.0)
-        * torch.clamp(sat - 0.10, 0.0, 1.0)
-    )
-    black = _norm01_batch(torch.clamp(0.22 - vmax, 0.0, 1.0))
-    white = _norm01_batch(torch.clamp(vmin - 0.78, 0.0, 1.0) * torch.clamp(0.20 - sat, 0.0, 1.0))
-    gray = _norm01_batch(torch.clamp(0.18 - sat, 0.0, 1.0) * torch.clamp(1.0 - torch.abs(vmax - 0.5) * 2.2, 0.0, 1.0))
-    luma = torch.mean(arr[:, :3], dim=1)
+    color_maps: Dict[str, torch.Tensor] = {
+        "bright": _norm01_batch(torch.clamp(luma, 0.0, 1.0)),
+        "dark": _norm01_batch(torch.clamp(1.0 - luma, 0.0, 1.0)),
+        "warm": _norm01_batch(torch.clamp((r + 0.5 * g) - b, 0.0, 1.0) * torch.clamp(sat, 0.0, 1.0)),
+        "cool": _norm01_batch(torch.clamp((b + 0.5 * g) - r, 0.0, 1.0) * torch.clamp(sat, 0.0, 1.0)),
+        "red": _norm01_batch(torch.clamp(r - torch.maximum(g, b), 0.0, 1.0) * torch.clamp(sat - 0.05, 0.0, 1.0)),
+        "orange": _norm01_batch(
+            torch.clamp(r - b - 0.05, 0.0, 1.0)
+            * torch.clamp(r - g - 0.08, 0.0, 1.0)
+            * torch.clamp(g - b - 0.02, 0.0, 1.0)
+            * torch.clamp(sat - 0.10, 0.0, 1.0)
+        ),
+        "green": _norm01_batch(torch.clamp(g - torch.maximum(r, b), 0.0, 1.0) * torch.clamp(sat - 0.05, 0.0, 1.0)),
+        "blue": _norm01_batch(torch.clamp(b - torch.maximum(r, g), 0.0, 1.0) * torch.clamp(sat - 0.05, 0.0, 1.0)),
+        "yellow": _norm01_batch(torch.clamp(torch.minimum(r, g) - b, 0.0, 1.0) * torch.clamp(sat - 0.05, 0.0, 1.0)),
+        "cyan": _norm01_batch(torch.clamp(torch.minimum(g, b) - r, 0.0, 1.0) * torch.clamp(sat - 0.05, 0.0, 1.0)),
+        "magenta": _norm01_batch(torch.clamp(torch.minimum(r, b) - g, 0.0, 1.0) * torch.clamp(sat - 0.05, 0.0, 1.0)),
+        "brown": _norm01_batch(
+            torch.clamp(r - g, 0.0, 1.0)
+            * torch.clamp(g - b, 0.0, 1.0)
+            * torch.clamp(vmax, 0.15, 0.75)
+            * torch.clamp(0.85 - vmax, 0.0, 1.0)
+        ),
+        "black": _norm01_batch(torch.clamp(0.22 - vmax, 0.0, 1.0)),
+        "white": _norm01_batch(torch.clamp(vmin - 0.78, 0.0, 1.0) * torch.clamp(0.20 - sat, 0.0, 1.0)),
+        "gray": _norm01_batch(torch.clamp(0.18 - sat, 0.0, 1.0) * torch.clamp(1.0 - torch.abs(vmax - 0.5) * 2.2, 0.0, 1.0)),
+        "neutral": _norm01_batch(torch.clamp(0.25 - sat, 0.0, 1.0) * torch.clamp(vmax - 0.05, 0.0, 1.0)),
+    }
     gx = torch.zeros_like(luma)
     gy = torch.zeros_like(luma)
     gx[:, :, 1:-1] = luma[:, :, 2:] - luma[:, :, :-2]
     gy[:, 1:-1, :] = luma[:, 2:, :] - luma[:, :-2, :]
-    edge = _norm01_batch(torch.sqrt((gx * gx) + (gy * gy)))
-    return {
-        "red": red,
-        "orange": orange,
-        "green": green,
-        "blue": blue,
-        "yellow": yellow,
-        "cyan": cyan,
-        "magenta": magenta,
-        "brown": brown,
-        "black": black,
-        "white": white,
-        "gray": gray,
-        "edge": edge,
-    }
+    color_maps["edge"] = _norm01_batch(torch.sqrt((gx * gx) + (gy * gy)))
 
-
-def _semantic_color_mask_from_score_batch_torch(
-    scores: Any,
-    *,
-    device: Optional[Any] = None,
-) -> torch.Tensor:
-    resolved = _resolve_processing_device(device) or torch.device("cpu")
-    arr = scores if torch.is_tensor(scores) else torch.as_tensor(scores, dtype=torch.float32, device=resolved)
-    arr = arr.to(device=resolved, dtype=torch.float32)
-    squeeze = False
-    if int(arr.ndim) == 2:
-        arr = arr.unsqueeze(0)
-        squeeze = True
-    n = int(arr.shape[0])
-    if int(n) <= 0 or int(arr.numel()) <= 0:
-        return arr[0] if bool(squeeze) else arr
-    vmax = torch.amax(arr.view(int(n), -1), dim=1, keepdim=True).unsqueeze(-1)
-    out = torch.where(vmax > 1e-8, arr / torch.where(vmax > 1e-8, vmax, torch.ones_like(vmax)), torch.zeros_like(arr))
-    return out[0] if bool(squeeze) else out
-
-
-
-def _semantic_color_score_maps(chw: np.ndarray) -> Dict[str, np.ndarray]:
-    maps = _semantic_color_score_maps_batch(np.asarray(chw, dtype=np.float32)[None, ...])
-    return {str(k): np.asarray(v[0], dtype=np.float32) for k, v in maps.items()}
-
-
-def _semantic_color_score_maps_batch(chw_batch: Any) -> Dict[str, np.ndarray]:
-    arr = np.clip(_image_batch_to_bchw01(chw_batch), 0.0, 1.0).astype(np.float32, copy=False)
-    if int(arr.ndim) != 4 or int(arr.shape[1]) < 3:
-        return {}
-    r = np.asarray(arr[:, 0], dtype=np.float32)
-    g = np.asarray(arr[:, 1], dtype=np.float32)
-    b = np.asarray(arr[:, 2], dtype=np.float32)
-    vmax = np.maximum.reduce([r, g, b]).astype(np.float32, copy=False)
-    vmin = np.minimum.reduce([r, g, b]).astype(np.float32, copy=False)
-    sat = np.clip(vmax - vmin, 0.0, 1.0).astype(np.float32, copy=False)
-
-    def _norm01_batch(x: np.ndarray) -> np.ndarray:
-        xx = np.asarray(x, dtype=np.float32)
-        hi = np.max(xx, axis=(1, 2), keepdims=True) if int(xx.size) > 0 else np.zeros((int(xx.shape[0]), 1, 1), dtype=np.float32)
-        valid = hi > 1e-8
-        return np.where(valid, np.clip(xx / np.where(valid, hi, 1.0), 0.0, 1.0), 0.0).astype(np.float32, copy=False)
-
-    red = _norm01_batch(np.clip(r - np.maximum(g, b), 0.0, 1.0) * np.clip(sat - 0.05, 0.0, 1.0))
-    green = _norm01_batch(np.clip(g - np.maximum(r, b), 0.0, 1.0) * np.clip(sat - 0.05, 0.0, 1.0))
-    blue = _norm01_batch(np.clip(b - np.maximum(r, g), 0.0, 1.0) * np.clip(sat - 0.05, 0.0, 1.0))
-    yellow = _norm01_batch(np.clip(np.minimum(r, g) - b, 0.0, 1.0) * np.clip(sat - 0.05, 0.0, 1.0))
-    cyan = _norm01_batch(np.clip(np.minimum(g, b) - r, 0.0, 1.0) * np.clip(sat - 0.05, 0.0, 1.0))
-    magenta = _norm01_batch(np.clip(np.minimum(r, b) - g, 0.0, 1.0) * np.clip(sat - 0.05, 0.0, 1.0))
-    brown = _norm01_batch(
-        np.clip(r - g, 0.0, 1.0)
-        * np.clip(g - b, 0.0, 1.0)
-        * np.clip(vmax, 0.15, 0.75)
-        * np.clip(0.85 - vmax, 0.0, 1.0)
-    )
-    orange = _norm01_batch(
-        np.clip(r - b - 0.05, 0.0, 1.0)
-        * np.clip(r - g - 0.08, 0.0, 1.0)
-        * np.clip(g - b - 0.02, 0.0, 1.0)
-        * np.clip(sat - 0.10, 0.0, 1.0)
-    )
-    black = _norm01_batch(np.clip(0.22 - vmax, 0.0, 1.0))
-    white = _norm01_batch(np.clip(vmin - 0.78, 0.0, 1.0) * np.clip(0.20 - sat, 0.0, 1.0))
-    gray = _norm01_batch(np.clip(0.18 - sat, 0.0, 1.0) * np.clip(1.0 - np.abs(vmax - 0.5) * 2.2, 0.0, 1.0))
-    # neutral: desaturated but not black — achromatic mid-tones
-    neutral = _norm01_batch(np.clip(0.25 - sat, 0.0, 1.0) * np.clip(vmax - 0.05, 0.0, 1.0))
-    # Fast Sobel-like edge detector across batch
-    luma = np.mean(arr[:, :3], axis=1)  # (B, H, W)
-    gx = np.zeros_like(luma)
-    gy = np.zeros_like(luma)
-    gx[:, :, 1:-1] = luma[:, :, 2:] - luma[:, :, :-2]
-    gy[:, 1:-1, :] = luma[:, 2:, :] - luma[:, :-2, :]
-    edge = _norm01_batch(np.sqrt(gx * gx + gy * gy).astype(np.float32, copy=False))
-    return {
-        "red": red,
-        "orange": orange,
-        "green": green,
-        "blue": blue,
-        "yellow": yellow,
-        "cyan": cyan,
-        "magenta": magenta,
-        "brown": brown,
-        "black": black,
-        "white": white,
-        "gray": gray,
-        "neutral": neutral,
-        "edge": edge,
-    }
-
-
-def detect_semantic_color_terms(
-    image: Any,
-) -> List[str]:
-    try:
-        chw = _image_to_chw01(image)
-    except Exception:
-        return []
-    maps = _semantic_color_score_maps(chw)
-    if len(maps) <= 0:
-        return []
-    out: List[str] = []
-    for term in ["red", "orange", "green", "blue", "yellow", "cyan", "magenta", "brown", "black", "white", "gray", "neutral", "edge"]:
-        score = np.asarray(maps.get(term), dtype=np.float32)
-        if int(score.size) <= 0:
+    observed_masks: List[np.ndarray] = []
+    observed_terms: List[str] = []
+    for color_name in _SEMANTIC_COLOR_TERMS:
+        score_t = color_maps.get(str(color_name))
+        if score_t is None or int(score_t.ndim) != 3 or int(score_t.shape[0]) <= 0:
             continue
-        if float(np.max(score)) > 1e-8:
-            out.append(str(term))
-    return normalize_vocab_terms(out)
+        score = np.asarray(score_t[0].detach().cpu().numpy(), dtype=np.float32)
+        vmax = float(np.max(score))
+        if vmax <= 1e-8:
+            continue
+        observed_masks.append(np.clip(score / vmax, 0.0, 1.0).astype(np.float32, copy=False))
+        observed_terms.append(str(color_name))
+
+    if len(observed_masks) <= 0:
+        return np.zeros((0, h, w), dtype=np.float32), []
+    return np.stack(observed_masks, axis=0).astype(np.float32, copy=False), list(observed_terms)
 
 
 def _normalize_semantic_terms_batch(
@@ -1303,34 +1196,6 @@ def _normalize_semantic_terms_batch(
     elif int(len(term_rows)) > int(batch_size):
         term_rows = term_rows[: int(batch_size)]
     return term_rows
-
-
-def _semantic_color_mask_from_score(color_score: Any) -> np.ndarray:
-    score = np.asarray(color_score, dtype=np.float32)
-    if int(score.ndim) != 2 or int(score.size) <= 0:
-        return np.zeros((0, 0), dtype=np.float32)
-    vmax = float(np.max(score))
-    return (score / vmax).astype(np.float32) if vmax > 1e-8 else np.zeros_like(score, dtype=np.float32)
-
-
-def _semantic_color_mask_from_score_batch(scores: Any) -> np.ndarray:
-    """Batch version of _semantic_color_mask_from_score for [N, H, W] arrays.
-
-    Computes the 82nd-percentile threshold per image simultaneously using
-    np.percentile over the spatial axes, then thresholds and normalises all
-    images in one pass — no Python loop over N.
-    """
-    arr = np.asarray(scores, dtype=np.float32)
-    squeeze = False
-    if arr.ndim == 2:
-        arr = arr[None]
-        squeeze = True
-    n = int(arr.shape[0])
-    if n == 0 or int(arr.size) == 0:
-        return arr[0] if squeeze else arr
-    vmax = np.max(arr.reshape(n, -1), axis=1, keepdims=True).reshape(n, 1, 1)
-    out = np.where(vmax > 1e-8, arr / np.where(vmax > 1e-8, vmax, 1.0), 0.0).astype(np.float32)
-    return np.asarray(out[0], dtype=np.float32) if squeeze else out
 
 
 def build_term_mask_stacks_from_images(
@@ -1350,92 +1215,60 @@ def build_term_mask_stacks_from_images(
     if int(bsz) <= 0 or int(y.shape[0]) != int(bsz):
         return [np.zeros((0, int(h), int(w)), dtype=np.float32) for _ in range(int(max(0, bsz)))], [np.zeros((0,), dtype=np.int64) for _ in range(int(max(0, bsz)))]
 
-    resolved = _resolve_processing_device(processing_device)
-    color_maps_t = _semantic_color_score_maps_batch_torch(bchw, device=resolved) if resolved is not None else {}
-    color_maps = _semantic_color_score_maps_batch(bchw) if resolved is None else {}
     override_rows = list(term_mask_overrides_batch) if term_mask_overrides_batch is not None else [None for _ in range(int(bsz))]
     if int(len(override_rows)) < int(bsz):
         override_rows.extend([None for _ in range(int(bsz) - int(len(override_rows)))])
 
-    masks_per_image: List[List[np.ndarray]] = [[] for _ in range(int(bsz))]
-    idx_per_image: List[List[int]] = [[] for _ in range(int(bsz))]
-
-    # Pre-build cls→term_key map once (avoids re-sub inside every loop iteration)
-    cls_to_term_key: Dict[int, str] = {}
-    if isinstance(idx_to_term, dict):
-        for ci, tname in idx_to_term.items():
-            cls_to_term_key[int(ci)] = _norm_txt(str(tname))
-
-    # active[n, c] = True when image n has class c positive — computed for the whole batch at once
-    active = y >= 0.5  # [N, C]
-    n_classes = int(y.shape[1]) if int(y.ndim) >= 2 else 0
-
-    # ---- Color-map path: loop over terms (~12), not over images (N can be large) ----
-    for term_key, term_scores in (color_maps_t.items() if resolved is not None else color_maps.items()):
-        # Which class indices map to this color term?
-        cls_for_term = [ci for ci, tk in cls_to_term_key.items() if tk == term_key and int(ci) < int(n_classes)]
-        if not cls_for_term:
-            continue
-        term_scores_arr = term_scores if resolved is not None else np.asarray(term_scores, dtype=np.float32)  # [N, H, W]
-        for cls_idx in cls_for_term:
-            # Which images have this class active? — vectorised boolean index
-            active_imgs = np.where(active[:, int(cls_idx)])[0]  # [K]
-            if len(active_imgs) == 0:
-                continue
-            # Compute masks for ALL active images in one batch call, no Python loop
-            if resolved is not None:
-                active_imgs_t = torch.as_tensor(active_imgs.tolist(), dtype=torch.long, device=resolved)
-                batch_masks_t = _semantic_color_mask_from_score_batch_torch(term_scores_arr[active_imgs_t], device=resolved)  # [K, H, W]
-                vmax_t = torch.amax(batch_masks_t.view(len(active_imgs), -1), dim=1)
-                keep = torch.nonzero(vmax_t > 1e-8, as_tuple=False).view(-1).detach().cpu().numpy().tolist()
-                for li in keep:
-                    gi = int(active_imgs[int(li)])
-                    masks_per_image[gi].append(np.asarray(batch_masks_t[int(li)].detach().cpu().numpy(), dtype=np.float32))
-                    idx_per_image[gi].append(int(cls_idx))
-            else:
-                batch_masks = _semantic_color_mask_from_score_batch(term_scores_arr[active_imgs])  # [K, H, W]
-                vmax = np.max(batch_masks.reshape(len(active_imgs), -1), axis=1)  # [K]
-                for li in np.where(vmax > 1e-8)[0]:
-                    gi = int(active_imgs[li])
-                    masks_per_image[gi].append(batch_masks[int(li)])
-                    idx_per_image[gi].append(int(cls_idx))
-
-    # ---- Override path: rare per-image user-supplied masks, stays per-image ----
-    has_overrides = any(isinstance(r, dict) and r for r in override_rows)
-    if has_overrides:
-        for row_idx in range(int(bsz)):
-            if not isinstance(override_rows[int(row_idx)], dict) or not override_rows[int(row_idx)]:
-                continue
-            override_lut = {
-                _norm_txt(str(k)): np.asarray(v, dtype=np.float32)
-                for k, v in override_rows[int(row_idx)].items()
-                if str(k).strip() and v is not None
-            }
-            positive_idx = np.where(active[int(row_idx)])[0]
-            for cls_idx in positive_idx.tolist():
-                term_key = cls_to_term_key.get(int(cls_idx), "")
-                if term_key not in override_lut:
-                    continue
-                # skip if already contributed by color_map path above
-                if any(int(ei) == int(cls_idx) for ei in idx_per_image[int(row_idx)]):
-                    continue
-                mask_arr = np.maximum(np.asarray(override_lut[term_key], dtype=np.float32), 0.0)
-                _vm = float(np.max(mask_arr))
-                mask = (mask_arr / _vm).astype(np.float32) if _vm > 1e-8 else np.zeros_like(mask_arr, dtype=np.float32)
-                if float(np.max(mask)) <= 1e-8:
-                    continue
-                masks_per_image[int(row_idx)].append(np.asarray(mask, dtype=np.float32))
-                idx_per_image[int(row_idx)].append(int(cls_idx))
-
     out_stack: List[np.ndarray] = []
     out_idx: List[np.ndarray] = []
+    term_to_idx = {str(v).strip().lower(): int(k) for k, v in (idx_to_term or {}).items()} if isinstance(idx_to_term, dict) else {}
     for row_idx in range(int(bsz)):
-        if len(masks_per_image[int(row_idx)]) <= 0:
+        observed_stack, observed_terms = build_observed_color_stack_from_terms(
+            image=bchw[int(row_idx)],
+            processing_device=processing_device,
+        ) if term_to_idx else (
+            np.zeros((0, int(h), int(w)), dtype=np.float32),
+            [],
+        )
+
+        row_masks: List[np.ndarray] = []
+        row_indices: List[int] = []
+        seen_idx: set[int] = set()
+
+        observed_count = min(int(observed_stack.shape[0]), int(len(observed_terms)))
+        for pos in range(int(observed_count)):
+            cls_idx = int(term_to_idx.get(_norm_txt(str(observed_terms[int(pos)])), -1))
+            if cls_idx < 0:
+                continue
+            row_masks.append(np.asarray(observed_stack[int(pos)], dtype=np.float32))
+            row_indices.append(int(cls_idx))
+            seen_idx.add(int(cls_idx))
+
+        override_row = override_rows[int(row_idx)]
+        if isinstance(override_row, dict) and override_row:
+            override_stack, override_idx = term_mask_map_to_label_stack(
+                override_row,
+                y[int(row_idx)],
+                term_to_idx=term_to_idx,
+                height=int(h),
+                width=int(w),
+                processing_device=processing_device,
+            )
+            override_count = min(int(override_stack.shape[0]), int(override_idx.size))
+            for pos in range(int(override_count)):
+                cls_idx = int(override_idx[int(pos)])
+                if int(cls_idx) in seen_idx:
+                    continue
+                row_masks.append(np.asarray(override_stack[int(pos)], dtype=np.float32))
+                row_indices.append(int(cls_idx))
+                seen_idx.add(int(cls_idx))
+
+        if len(row_masks) <= 0:
             out_stack.append(np.zeros((0, int(h), int(w)), dtype=np.float32))
             out_idx.append(np.zeros((0,), dtype=np.int64))
             continue
-        out_stack.append(np.stack(masks_per_image[int(row_idx)], axis=0).astype(np.float32, copy=False))
-        out_idx.append(np.asarray(idx_per_image[int(row_idx)], dtype=np.int64))
+        out_stack.append(np.stack(row_masks, axis=0).astype(np.float32, copy=False))
+        out_idx.append(np.asarray(row_indices, dtype=np.int64))
     return out_stack, out_idx
 
 
@@ -2118,7 +1951,7 @@ def _mask_cache_file_path(cache_root: Path, image_path: Path, terms: Sequence[st
             "mask_mtime": (int(Path(str(mask_path)).stat().st_mtime) if str(mask_path).strip() and Path(str(mask_path)).exists() else 0),
             "terms": list(normalize_vocab_terms([str(x) for x in terms])),
             "layout": layout if isinstance(layout, dict) else None,
-            "cache_version": 4,
+            "cache_version": 6,
         },
         sort_keys=True,
         ensure_ascii=True,
@@ -2513,28 +2346,6 @@ def collect_semantic_disk_rows(
     except Exception:
         voc20_names = []
 
-    def _augment_row_with_auto_color_terms(image_path: Path, terms_in: Sequence[str], mask_path: str = "") -> List[str]:
-        out_terms = normalize_vocab_terms([str(x) for x in list(terms_in)])
-        try:
-            with Image.open(str(image_path)) as im:
-                rgb = np.asarray(im.convert("RGB"), dtype=np.float32)
-            mask_arr = None
-            if str(mask_path).strip():
-                try:
-                    mp = Path(str(mask_path))
-                    if mp.exists() and str(mp.suffix).strip().lower() != ".mat":
-                        with Image.open(str(mp)) as mm:
-                            mask_arr = np.asarray(mm.convert("L"), dtype=np.float32)
-                            mask_arr = np.clip(mask_arr / 255.0, 0.0, 1.0).astype(np.float32, copy=False)
-                except Exception:
-                    mask_arr = None
-            color_terms = detect_semantic_color_terms(image=rgb, mask=mask_arr)
-        except Exception:
-            color_terms = []
-        if len(color_terms) <= 0:
-            return out_terms
-        return normalize_vocab_terms(list(out_terms) + list(color_terms))
-
     convert_sbd_mat_to_npz(root, progress_control=progress_control)
     split_specs = [("train", "berkeley_sbd_train"), ("val", "berkeley_sbd_val")]
     for split_name, source_key in split_specs:
@@ -2599,11 +2410,7 @@ def collect_semantic_disk_rows(
         def _build_berkeley_row(spec: Tuple[Path, np.ndarray, str, str, str, List[str]]) -> SemanticDiskRow:
             ip, yv_base, mask_path_local, source_key_local, _, voc_terms = spec
             base_terms = ["berkeley sbd dataset", "object", "signal"] + [str(t) for t in voc_terms]
-            terms = list(normalize_vocab_terms(_augment_row_with_auto_color_terms(
-                image_path=ip,
-                terms_in=base_terms,
-                mask_path=str(mask_path_local),
-            )))
+            terms = list(normalize_vocab_terms(base_terms))
             return SemanticDiskRow(
                 image_path=str(ip),
                 terms=terms,
@@ -2664,11 +2471,7 @@ def collect_semantic_disk_rows(
                         specific_hits += 1
             if int(specific_hits) <= 0:
                 return None, 1
-            terms = list(normalize_vocab_terms(_augment_row_with_auto_color_terms(
-                image_path=fp,
-                terms_in=mapped_terms,
-                mask_path=_sidecar_mask_path(fp),
-            )))
+            terms = list(normalize_vocab_terms(mapped_terms))
             return SemanticDiskRow(
                 image_path=str(fp),
                 terms=terms,

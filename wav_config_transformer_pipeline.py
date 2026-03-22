@@ -71,10 +71,8 @@ from semantic_dataset_loaders import (
         DiskSemanticRowsDataset,
         OverrideTargetSubsetDataset,
         StageDatasetManifest,
-        _semantic_color_score_maps,
         build_loader_from_manifest,
         collect_semantic_disk_rows,
-        detect_semantic_color_terms,
         maybe_wrap_loader_with_threaded_prefetch,
         semantic_mask_stack_collate,
     )
@@ -112,7 +110,7 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
 
     try:
-        run(args=args, output_dir=output_dir)
+        stop_requested = run(args=args, output_dir=output_dir)
     except KeyboardInterrupt:
         _log("[main] interrupted by user")
         return GUI_STOP_EXIT_CODE
@@ -121,6 +119,9 @@ def main():
         _log(f"[main] FATAL: {exc}")
         traceback.print_exc()
         return 1
+    if stop_requested:
+        _log("[main] GUI stop requested — exiting with code 42")
+        return GUI_STOP_EXIT_CODE
     return 0
 
 
@@ -190,7 +191,6 @@ _EXTRACTED_SYMBOLS = {
     "_build_pregestation_logic_rows": "pipeline.nodes.vocab_node",
 
     "_build_synthetic_semantic_symbol_pool": "pipeline.nodes.vocab_node",
-    "_enrich_pregestation_stack_with_observed_color_masks": "pipeline.nodes.vocab_node",
     "_image_any_to_rgb_chw01": "pipeline.nodes.vocab_node",
     "_load_vocab_terms_json": "pipeline.nodes.vocab_node",
     "_merge_symbol_term_pools": "pipeline.nodes.vocab_node",
@@ -207,8 +207,6 @@ _EXTRACTED_SYMBOLS = {
     "_semantic_noise_terms_from_spectrum_sample": "pipeline.nodes.vocab_node",
 
     "_semantic_term_index_map": "pipeline.nodes.vocab_node",
-    "_semantic_terms_with_tonal_tags": "pipeline.nodes.vocab_node",
-    "_semantic_tonal_tags_from_image": "pipeline.nodes.vocab_node",
     "_build_labels": "pipeline.nodes.wave_classifier_node",
     "_build_wave_classifier_dataset_from_transformer": "pipeline.nodes.wave_classifier_node",
     "_evaluate_zero_shot_queries_on_images": "pipeline.nodes.wave_classifier_node",

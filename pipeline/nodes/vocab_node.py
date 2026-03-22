@@ -45,10 +45,6 @@ from pipeline.context import PipelineContext
 from pipeline.graph import PipelineNode
 from pipeline.nodes.base import OneTimeNode
 from pipeline.progress import interruptible_tqdm
-from semantic_dataset_loaders import (
-    _semantic_color_score_maps,
-    detect_semantic_color_terms,
-)
 
 
 # ---------------------------------------------------------------------------
@@ -571,11 +567,7 @@ def _build_reference_flashcard_payload_rows(
         if not key:
             return
         img_rgb = _image_any_to_rgb_chw01(img, image_size=int(size))
-        terms = _semantic_terms_with_tonal_tags(
-            terms=(list(extra_terms) + [key]),
-            image=img_rgb,
-            image_size=int(size),
-        )
+        terms = _normalize_vocab_terms(list(extra_terms) + [key])
         vec = np.asarray(condition_vector_builder(terms, base_supervised), dtype=np.float32).reshape(-1)
         if int(vec.size) != int(c):
             raise RuntimeError(f"flashcard condition builder width mismatch: got={int(vec.size)} expected={int(c)}")
@@ -1397,120 +1389,6 @@ def _image_any_to_rgb_chw01(img: Any, image_size: int) -> np.ndarray:
         return np.asarray(rgb, dtype=np.float32)
 
     raise RuntimeError(f"Unsupported symbol image shape for conversion: {tuple(arr.shape)}")
-
-
-def _semantic_tonal_tags_from_image(
-    image: Any,
-    image_size: int = 128,
-    low_threshold: float = 0.15,
-    high_threshold: float = 0.85,
-    coverage_threshold: float = 0.25,
-    gray_mean_tolerance: float = 0.12,
-    gray_std_threshold: float = 0.12,
-) -> List[str]:
-    try:
-        rgb = _image_any_to_rgb_chw01(image, image_size=max(8, int(image_size)))
-    except Exception:
-        return []
-    arr = np.asarray(rgb, dtype=np.float32)
-    if int(arr.ndim) != 3 or int(arr.shape[0]) <= 0:
-        return []
-    gray = np.clip(np.mean(arr[:3, :, :], axis=0), 0.0, 1.0).astype(np.float32, copy=False)
-    flat = gray.reshape(-1)
-    if int(flat.size) <= 0:
-        return []
-    lo_t = float(low_threshold)
-    hi_t = float(high_threshold)
-    tags: List[str] = []
-    mean_v = float(np.mean(flat))
-    std_v = float(np.std(flat))
-    tags.extend(["black", "dark"])
-    tags.extend(["white", "bright"])
-    if (abs(mean_v - 0.5) <= float(gray_mean_tolerance)) and (std_v <= float(gray_std_threshold)):
-        tags.append("gray")
-    # fast edge detection: Sobel gradient magnitude
-    if int(arr.shape[0]) >= 1:
-        _eg = np.clip(np.mean(arr[:3, :, :], axis=0), 0.0, 1.0).astype(np.float32, copy=False)
-        _gx = np.zeros_like(_eg)
-        _gy = np.zeros_like(_eg)
-        _gx[:, 1:-1] = _eg[:, 2:] - _eg[:, :-2]
-        _gy[1:-1, :] = _eg[2:, :] - _eg[:-2, :]
-        _emag = np.sqrt(_gx * _gx + _gy * _gy)
-        if float(np.mean(_emag)) >= 0.06:
-            tags.append("edge")
-    # warm/cool color temperature: compare mean R vs mean B channel balance
-    if int(arr.shape[0]) >= 3:
-        tags.append("warm")
-        tags.append("cool")
-    tags.extend(detect_semantic_color_terms(rgb))
-    return _normalize_vocab_terms(tags)
-
-
-def _semantic_terms_with_tonal_tags(
-    terms: Sequence[str],
-    image: Any,
-    image_size: int = 128,
-) -> List[str]:
-    base = _normalize_vocab_terms([str(x) for x in list(terms)])
-    tones = _semantic_tonal_tags_from_image(image=image, image_size=int(image_size))
-    return _normalize_vocab_terms(list(base) + list(tones))
-
-
-def _semantic_tonal_masks_from_image(
-    image: Any,
-    image_size: int = 128,
-    low_threshold: float = 0.15,
-    high_threshold: float = 0.85,
-) -> Dict[str, np.ndarray]:
-    """Return per-term spatial float32 masks in [0,1] for all tonal qualities
-    detectable from *image*.  Covers every term ``_semantic_tonal_tags_from_image``
-    can emit: color-hue terms via ``_semantic_color_score_maps``, plus luma-
-    derived terms (dark, bright) and temperature terms (warm, cool)."""
-    try:
-        rgb = _image_any_to_rgb_chw01(image, image_size=max(8, int(image_size)))
-    except Exception:
-        return {}
-    arr = np.asarray(rgb, dtype=np.float32)
-    if int(arr.ndim) != 3 or int(arr.shape[0]) < 3:
-        return {}
-    color_maps = _semantic_color_score_maps(arr)
-    masks: Dict[str, np.ndarray] = {str(k): np.asarray(v, dtype=np.float32) for k, v in color_maps.items()}
-    gray_luma = np.clip(np.mean(arr[:3], axis=0), 0.0, 1.0).astype(np.float32, copy=False)
-    lo_t = float(max(1e-6, low_threshold))
-    hi_range = float(max(1e-6, 1.0 - high_threshold))
-    masks["dark"] = np.clip((float(low_threshold) - gray_luma) / lo_t, 0.0, 1.0).astype(np.float32, copy=False)
-    masks["bright"] = np.clip((gray_luma - float(high_threshold)) / hi_range, 0.0, 1.0).astype(np.float32, copy=False)
-    masks["warm"] = np.clip(arr[0] - arr[2], 0.0, 1.0).astype(np.float32, copy=False)
-    masks["cool"] = np.clip(arr[2] - arr[0], 0.0, 1.0).astype(np.float32, copy=False)
-    return masks
-
-
-def _semantic_terms_with_tonal_masks(
-    terms: Sequence[str],
-    image: Any,
-    image_size: int = 128,
-) -> Tuple[List[str], Dict[str, np.ndarray]]:
-    """Like ``_semantic_terms_with_tonal_tags`` but also returns spatial masks.
-
-    Returns ``(enriched_terms, tonal_masks)`` where *tonal_masks* maps each
-    tonal term that was *added* by enrichment (not already in *terms*) to its
-    spatial [0,1] float32 mask.  Terms already covered by element geometry do
-    not appear in *tonal_masks* — only genuinely new observations do, so the
-    caller can inject them as an additional mask-stack part without double-
-    counting element geometry masks.
-    """
-    enriched = _semantic_terms_with_tonal_tags(terms=terms, image=image, image_size=int(image_size))
-    base_set = {re.sub(r"\s+", " ", str(x)).strip().lower() for x in terms}
-    new_terms = [t for t in enriched if str(t).strip().lower() not in base_set]
-    if not new_terms:
-        return enriched, {}
-    all_tonal_masks = _semantic_tonal_masks_from_image(image=image, image_size=int(image_size))
-    tonal_masks: Dict[str, np.ndarray] = {}
-    for term in new_terms:
-        t = str(term).strip().lower()
-        if t in all_tonal_masks:
-            tonal_masks[t] = all_tonal_masks[t]
-    return enriched, tonal_masks
 
 
 def _semantic_enrich_generated_terms_with_noise_spectrum(
@@ -2640,60 +2518,6 @@ def _build_pregestation_logic_rows(
         "reason": f"formal_logic_{mode}",
     }
     return out_images, out_masks, out_mask_stacks, out_elem_term_lists, out_terms, info
-
-
-# Recognized color term names whose score maps can be extracted by
-# _semantic_color_score_maps.  "edge" replaces "grey" (british spelling
-# removed); edge masks are produced by a fast Sobel detector.
-_PREGESTATION_OBSERVED_COLOR_TERMS: Tuple[str, ...] = (
-    "red", "orange", "green", "blue", "yellow", "cyan",
-    "magenta", "brown", "black", "white", "gray", "edge",
-)
-
-
-
-def _enrich_pregestation_stack_with_observed_color_masks(
-    image_chw01: np.ndarray,
-    elem_stack: np.ndarray,
-    term_row: Sequence[str],
-) -> Tuple[np.ndarray, List[str]]:
-    """Extend a geometric mask stack with pixel-observed color masks.
-
-    For each color term present in *term_row* that belongs to the known
-    colorimetric vocabulary, extract the corresponding per-pixel color score
-    map from *image_chw01* and append it to *elem_stack* as an additional
-    mask slot.  The output ``extended_stack`` has shape ``[k + k', H, W]``
-    where ``k'`` is the number of matched color terms.
-
-    Returns ``(extended_stack, observed_colors)``.
-    ``observed_colors`` lists the color names whose score maps were actually
-    appended (only those with non-trivial spatial signal).
-    """
-    chw = np.asarray(image_chw01, dtype=np.float32)
-    color_maps = _semantic_color_score_maps(chw)
-    norm_terms = {re.sub(r"\s+", " ", str(t)).strip().lower() for t in term_row}
-
-    observed: List[np.ndarray] = []
-    observed_colors: List[str] = []
-    for color_name in _PREGESTATION_OBSERVED_COLOR_TERMS:
-        if str(color_name) not in norm_terms:
-            continue
-        cmap = color_maps.get(str(color_name))
-        if cmap is None:
-            continue
-        score = np.asarray(cmap, dtype=np.float32)
-        vmax = float(np.max(score))
-        if vmax > 1e-8:
-            observed.append(np.clip(score / float(vmax), 0.0, 1.0).astype(np.float32, copy=False))
-            observed_colors.append(str(color_name))
-
-    if len(observed) == 0:
-        return elem_stack, []
-
-    observed_np = np.stack(observed, axis=0)  # [k', H, W]
-    extended = np.concatenate([elem_stack, observed_np], axis=0)  # [k + k', H, W]
-    return extended, observed_colors
-
 
 def _rotate_active_extra_terms(
     active_terms: Sequence[str],

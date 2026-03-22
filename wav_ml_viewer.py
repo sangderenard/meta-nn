@@ -462,7 +462,7 @@ class _TransformerStatusOpenGLViewer:
         self._preview_work_queue_ref: Optional[Any] = None
         # -- Scrub / history ---------------------------------------------------
         # GUI-local copies of rendered weight images for scrub history.
-        self._weight_history_maxlen: int = 2048
+        self._weight_history_maxlen: int = 512
         self._weight_snapshot_deque: deque = deque(maxlen=self._weight_history_maxlen)
         self._loss_count_at_snap_deque: deque = deque(maxlen=self._weight_history_maxlen)
         self._last_step_txt: str = ""
@@ -1893,7 +1893,7 @@ class _TransformerStatusOpenGLViewer:
     def weight_image_spec(self) -> Dict[str, int]:
         target_h, target_w = self._weight_map_target_hw()
         return {
-            "mode": int(self._weight_image_mode),
+            "mode": int(self._weight_image_mode) | 0x100,
             "panel_crop_w": int(target_w),
             "panel_crop_h": int(target_h),
         }
@@ -4308,6 +4308,8 @@ class ViewerIPCProxy:
         self._recv_lock = threading.Lock()  # protects concurrent reads (bg pump vs stop_requested)
         self._connected_once = False
         self._connection_lost = False
+        self._reconnect_failures = 0
+        self._reconnect_give_up = 10  # stop training after N consecutive failures
         self._port_file = str(port_file) if port_file else ""
         self._static_port = max(0, int(port))
         self._connect_timeout_s = max(0.0, float(timeout))
@@ -4412,6 +4414,7 @@ class ViewerIPCProxy:
                     pass
             self._connected_once = True
             self._connection_lost = False
+            self._reconnect_failures = 0
             self._stop_flag = False
             self._shutdown_save = None
             self._preview_enabled = True
@@ -4430,7 +4433,18 @@ class ViewerIPCProxy:
         if now < self._next_reconnect_t:
             return
         self._next_reconnect_t = now + self._reconnect_interval_s
-        self._connect(reconnect=True, quiet=True)
+        if self._connect(reconnect=True, quiet=True):
+            self._reconnect_failures = 0
+        else:
+            self._reconnect_failures += 1
+            if self._reconnect_failures >= self._reconnect_give_up:
+                print(
+                    f"[viewer-ipc] GUI unreachable after {self._reconnect_failures} "
+                    f"reconnect attempts; requesting stop",
+                    flush=True,
+                )
+                self._stop_flag = True
+                self._shutdown_save = False
 
     def _mark_connection_lost(self, reason: str = "") -> None:
         if self._connection_lost:
@@ -4878,7 +4892,7 @@ class ViewerIPCProxy:
 
     def weight_image_spec(self) -> Dict[str, int]:
         return {
-            "mode": int(self._weight_image_mode),
+            "mode": int(self._weight_image_mode) | 0x100,
             "panel_crop_w": int(self._weight_panel_crop_w),
             "panel_crop_h": int(self._weight_panel_crop_h),
         }

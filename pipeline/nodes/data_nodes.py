@@ -72,6 +72,7 @@ from semantic_dataset_loaders import (
     build_term_mask_stack_from_image,
     build_term_mask_stacks_from_images,
     collect_semantic_disk_rows,
+    merge_terms_with_mask_indices,
     StageDatasetManifest,
     targets_from_terms,
 )
@@ -762,7 +763,6 @@ class DataNode(PipelineNode):
 
         from pipeline.nodes.vocab_node import (
             _build_pregestation_logic_rows,
-            _enrich_pregestation_stack_with_observed_color_masks,
             _normalize_vocab_terms as _preg_normalize_vocab_terms,
         )
 
@@ -778,7 +778,7 @@ class DataNode(PipelineNode):
             "samples_per_combo": self.preg_cfg.samples_per_combo,
             "mode_sequence": sorted(_mode_seq),
             "image_size": self.preg_cfg.image_size,
-            "mask_semantics_version": 6,
+            "mask_semantics_version": 9,
         })
         _raw_cached = _load_raw_stage_cache(_raw_cache_dir, _raw_cache_key)
         if _raw_cached is not None:
@@ -796,7 +796,6 @@ class DataNode(PipelineNode):
             all_mask_stacks: list = []
             all_elem_term_lists: list = []
             all_term_rows: list = []
-            all_tonal_masks: list = []  # List[Dict[str, np.ndarray]] — tonal masks per row
             for mode in interruptible_tqdm(
                 _mode_seq,
                 desc="[pregestation] generating modes",
@@ -817,23 +816,11 @@ class DataNode(PipelineNode):
                 for img_np, comp_mask, elem_stk, elem_tl, term_row in zip(
                     imgs, masks, mask_stacks, elem_term_lists, term_rows
                 ):
-                    # Enrich the geometric elem_stack with pixel-observed color masks.
-                    # This is the correct heuristic: the color observation maps provide
-                    # spatial evidence directly from rendered pixels, covering color terms
-                    # (red, black, gray, etc.) that appear in elem_term_lists but whose
-                    # geometric masks (disk/bg) are only approximate.
-                    enr_stk, _observed_colors = _enrich_pregestation_stack_with_observed_color_masks(
-                        image_chw01=img_np,
-                        elem_stack=elem_stk,
-                        term_row=term_row,
-                    )
-                    enr_tl = list(elem_tl) + [[str(c)] for c in _observed_colors]
                     all_images.append(img_np)
-                    all_masks.append(np.zeros((int(enr_stk.shape[1]), int(enr_stk.shape[2])), dtype=np.float32))
-                    all_mask_stacks.append(enr_stk)
-                    all_elem_term_lists.append(enr_tl)
+                    all_masks.append(np.zeros((int(elem_stk.shape[1]), int(elem_stk.shape[2])), dtype=np.float32))
+                    all_mask_stacks.append(elem_stk)
+                    all_elem_term_lists.append(list(elem_tl))
                     all_term_rows.append(_preg_normalize_vocab_terms(list(term_row)))
-                    all_tonal_masks.append({})  # color coverage handled by enrichment above
 
             if not all_images:
                 _log("[data-node] WARNING: no pregestation images built")
@@ -845,37 +832,53 @@ class DataNode(PipelineNode):
             _n_local = len(_local_vocab)
             all_targets = targets_from_terms(all_term_rows, _local_term_to_idx, _n_local)
 
-            # ---- Precompute per-label mask stacks from element stacks ----
+            # ---- Precompute per-label mask stacks from shared observed-color builder ----
             idx_to_term = {int(i): str(name) for i, name in enumerate(_local_vocab)}
             all_label_stacks: list = []
             all_label_indices: list = []
-            for i in interruptible_tqdm(
-                range(len(all_images)),
-                desc="[pregestation] building mask stacks",
-                unit="img",
-                leave=False,
-                dynamic_ncols=True,
-                control=ctx,
-            ):
-                img_np = np.asarray(all_images[i], dtype=np.float32)
-                if i < len(all_masks):
-                    base_mask_np = np.asarray(all_masks[i], dtype=np.float32)
-                else:
-                    base_mask_np = np.ones((int(img_np.shape[1]), int(img_np.shape[2])), dtype=np.float32)
-                merged_stack, merged_idx = build_combined_mask_stacks(
-                    label_vec=all_targets[i],
+            _images_np = np.stack([np.asarray(im, dtype=np.float32) for im in all_images], axis=0)
+            _targets_np = np.stack([np.asarray(t, dtype=np.float32).reshape(-1) for t in all_targets], axis=0)
+            with semantic_processing_device(ctx, enabled=bool(self.preg_cfg.gpu_preprocess)) as _processing_device:
+                _heuristic_stacks, _heuristic_indices = build_term_mask_stacks_from_images(
+                    images=_images_np,
+                    label_vecs=_targets_np,
                     idx_to_term=idx_to_term,
-                    height=int(base_mask_np.shape[0]),
-                    width=int(base_mask_np.shape[1]),
-                    elem_stack=all_mask_stacks[i] if i < len(all_mask_stacks) else None,
-                    elem_term_lists=all_elem_term_lists[i] if i < len(all_elem_term_lists) else None,
-                    term_to_idx=_local_term_to_idx,
-                    tonal_masks=all_tonal_masks[i] if i < len(all_tonal_masks) else None,
+                    processing_device=_processing_device,
                 )
-                if i < len(all_masks):
-                    all_masks[i] = np.zeros((int(base_mask_np.shape[0]), int(base_mask_np.shape[1])), dtype=np.float32)
-                all_label_stacks.append(np.asarray(merged_stack, dtype=np.float32))
-                all_label_indices.append(np.asarray(merged_idx, dtype=np.int64))
+                for i in interruptible_tqdm(
+                    range(len(all_images)),
+                    desc="[pregestation] building mask stacks",
+                    unit="img",
+                    leave=False,
+                    dynamic_ncols=True,
+                    control=ctx,
+                ):
+                    img_np = np.asarray(all_images[i], dtype=np.float32)
+                    if i < len(all_masks):
+                        base_mask_np = np.asarray(all_masks[i], dtype=np.float32)
+                    else:
+                        base_mask_np = np.ones((int(img_np.shape[1]), int(img_np.shape[2])), dtype=np.float32)
+                    merged_stack, merged_idx = build_combined_mask_stacks(
+                        label_vec=all_targets[i],
+                        idx_to_term=idx_to_term,
+                        height=int(base_mask_np.shape[0]),
+                        width=int(base_mask_np.shape[1]),
+                        elem_stack=all_mask_stacks[i] if i < len(all_mask_stacks) else None,
+                        elem_term_lists=all_elem_term_lists[i] if i < len(all_elem_term_lists) else None,
+                        term_to_idx=_local_term_to_idx,
+                        heuristic_stack=np.asarray(_heuristic_stacks[i], dtype=np.float32),
+                        heuristic_idx=np.asarray(_heuristic_indices[i], dtype=np.int64),
+                        processing_device=_processing_device,
+                    )
+                    if i < len(all_masks):
+                        all_masks[i] = np.zeros((int(base_mask_np.shape[0]), int(base_mask_np.shape[1])), dtype=np.float32)
+                    all_term_rows[i] = merge_terms_with_mask_indices(
+                        all_term_rows[i],
+                        merged_idx,
+                        idx_to_term=idx_to_term,
+                    )
+                    all_label_stacks.append(np.asarray(merged_stack, dtype=np.float32))
+                    all_label_indices.append(np.asarray(merged_idx, dtype=np.int64))
 
             # ---- Persist to disk cache ----
             _log(f"[data-node] pregestation saving raw cache ({_raw_cache_key[:8]}…)")
@@ -1011,7 +1014,6 @@ class DataNode(PipelineNode):
         ctx.gestation_dataset = None
         ctx.gestation_eval_dataset = None
 
-        from pipeline.nodes.vocab_node import _semantic_terms_with_tonal_tags
         symbol_pool = ctx.symbol_pool or {}
 
         # ADD THIS: Tell the churn system what the symbol pool ACTUALLY contains
@@ -1043,7 +1045,7 @@ class DataNode(PipelineNode):
             "samples_per_term": self.gest_cfg.samples_per_term,
             "image_size": self.gest_cfg.image_size,
             "pool_sig": _pool_sig,
-            "mask_semantics_version": 4,
+            "mask_semantics_version": 7,
         })
         _raw_cached = _load_raw_stage_cache(_raw_cache_dir, _raw_cache_key)
         if _raw_cached is not None:
@@ -1055,14 +1057,9 @@ class DataNode(PipelineNode):
         else:
             _log(f"[data-node] gestation raw cache MISS ({_raw_cache_key[:8]}…) — running inference")
 
-            # --- Step 1: terms per image (sequential — lightweight string ops only) ---
-            _gest_image_size = int(self.gest_cfg.image_size)
+            # --- Step 1: terms per image (exact row terms only; no image-level tag enrichment) ---
             _all_terms = [
-                list(_semantic_terms_with_tonal_tags(
-                    terms=initial_terms[i],
-                    image=images[i],
-                    image_size=_gest_image_size,
-                ))
+                list(_normalize_vocab_terms(initial_terms[i]))
                 for i in interruptible_tqdm(
                     range(_n_gest),
                     desc="[gestation] building terms",
@@ -1116,7 +1113,11 @@ class DataNode(PipelineNode):
                         heuristic_idx=h_idx,
                         processing_device=_processing_device,
                     )
-                    terms_rows.append(_all_terms[i])
+                    terms_rows.append(merge_terms_with_mask_indices(
+                        _all_terms[i],
+                        merged_idx,
+                        idx_to_term=_local_i2t_gest,
+                    ))
                     masks.append(np.zeros((_h, _w), dtype=np.float32))
                     mask_stacks.append(np.asarray(merged_stack, dtype=np.float32))
                     mask_indices.append(np.asarray(merged_idx, dtype=np.int64))

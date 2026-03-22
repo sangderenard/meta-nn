@@ -9,11 +9,11 @@ from pipeline.nodes.data_nodes import build_stage_loaders
 from pipeline.semantic_wheel_cache import StatefulSequentialDeckSampler
 from pipeline.nodes.vocab_node import (
     _build_pregestation_logic_rows,
-    _semantic_terms_with_tonal_masks,
 )
 from semantic_dataset_loaders import (
     StageDatasetManifest,
     assemble_semantic_mask_layers,
+    build_observed_color_stack_from_terms,
     build_loader_from_manifest,
     combine_label_mask_stacks,
     elem_stacks_to_label_stacks,
@@ -49,16 +49,12 @@ def test_pregestation_targets_include_observed_terms() -> None:
     )
     chosen = next((i for i, row in enumerate(term_rows) if "white" in row), -1)
     assert chosen >= 0, "expected a white pregestation row"
-    # _semantic_terms_with_tonal_masks returns BOTH enriched terms AND spatial masks
-    # for the newly-added tonal observations — no masks are stripped from the pipeline.
-    enriched_terms, tonal_masks = _semantic_terms_with_tonal_masks(
-        terms=term_rows[int(chosen)],
+    observed_stack, observed_terms = build_observed_color_stack_from_terms(
         image=images[int(chosen)],
-        image_size=32,
+        term_row=term_rows[int(chosen)],
     )
-    added_terms = list(tonal_masks.keys())
-    assert len(added_terms) > 0, (term_rows[int(chosen)], enriched_terms)
-    _ok("pregestation target rows include image-observed tonal terms")
+    assert len(observed_terms) > 0, term_rows[int(chosen)]
+    _ok("pregestation target rows include shared observed-color masks")
 
     class_names = [
         "up",
@@ -79,7 +75,7 @@ def test_pregestation_targets_include_observed_terms() -> None:
     idx_to_term = {int(i): str(name) for i, name in enumerate(class_names)}
     term_to_idx = {str(name).strip().lower(): int(i) for i, name in enumerate(class_names)}
     y = np.zeros((len(class_names),), dtype=np.float32)
-    for term in enriched_terms:
+    for term in term_rows[int(chosen)]:
         idx = int(term_to_idx.get(str(term).strip().lower(), -1))
         if idx >= 0:
             y[int(idx)] = 1.0
@@ -90,32 +86,22 @@ def test_pregestation_targets_include_observed_terms() -> None:
         label_vec=y,
         term_to_idx=term_to_idx,
     )
-    # Tonal additions each come with their spatial mask — build the tonal stack.
-    _tonal_slices, _tonal_idxs = [], []
-    for _tterm, _tmask in tonal_masks.items():
-        _tidx = int(term_to_idx.get(str(_tterm).strip().lower(), -1))
-        if _tidx >= 0:
-            _tonal_slices.append(np.asarray(_tmask, dtype=np.float32))
-            _tonal_idxs.append(_tidx)
-    if _tonal_slices:
-        tonal_stack = np.stack(_tonal_slices, axis=0)
-        tonal_idx = np.asarray(_tonal_idxs, dtype=np.int64)
-    else:
-        h_, w_ = int(masks[int(chosen)].shape[0]), int(masks[int(chosen)].shape[1])
-        tonal_stack = np.zeros((0, h_, w_), dtype=np.float32)
-        tonal_idx = np.zeros((0,), dtype=np.int64)
+    observed_idx = np.asarray(
+        [int(term_to_idx[str(t).strip().lower()]) for t in observed_terms if str(t).strip().lower() in term_to_idx],
+        dtype=np.int64,
+    )
     h_, w_ = int(masks[int(chosen)].shape[0]), int(masks[int(chosen)].shape[1])
     merged_stack, merged_idx = combine_label_mask_stacks(
         y,
         (explicit_stack, explicit_idx),
-        (tonal_stack, tonal_idx),
+        (observed_stack, observed_idx),
         height=h_,
         width=w_,
         fallback_creation_mask=None,
     )
     merged_idx_set = set(np.asarray(merged_idx, dtype=np.int64).tolist())
     assert int(term_to_idx["signal"]) in merged_idx_set or int(term_to_idx["object"]) in merged_idx_set or len(merged_idx_set) > 0
-    _ok("pregestation elem+tonal stacks combine without creation-mask stamping")
+    _ok("pregestation element and shared observed-color stacks combine without creation-mask stamping")
 
 
 def test_stage_manifest_shuffle_with_ordered_subset() -> None:

@@ -457,6 +457,28 @@ class GeneratorGateNode(GatedNode):
         g_cfg = self.generator_cfg
         image_size = int(getattr(g_cfg, "image_size", None) or getattr(ctx.args, "image_size", 128))
         z_dim = int(getattr(g_cfg, "z_dim", None) or getattr(ctx.args, "generator_z_dim", 128))
+        active_term_to_idx = dict(ctx.semantic_term_to_idx)
+        payload_loader = None
+        _payload_bank = getattr(ctx, "payload_bank", None)
+        _payload_bank_obj = getattr(_payload_bank, "bank", None)
+        if _payload_bank_obj is not None and ctx.payload_conditions:
+            from pipeline.nodes.data_nodes import build_stage_loaders
+            from pipeline.semantic_wheel_cache import SemanticWheelPayloadDataset
+            eval_ds = SemanticWheelPayloadDataset(
+                bank=_payload_bank_obj,
+                image_hw=(image_size, image_size),
+            )
+            payload_loader, _ = build_stage_loaders(
+                dataset=eval_ds,
+                name="generator_gate_eval",
+                batch_size=32,
+                num_workers=0,
+                seed=int(getattr(ctx.args, "seed", 42) or 42),
+                device_type=str(ctx.device.type),
+                pin_memory=(ctx.device.type == "cuda"),
+                prefetch_factor=2,
+                shuffle_train=True,
+            )
 
         result = evaluate_conditional_generator(
             generator=ctx.generator,
@@ -469,6 +491,8 @@ class GeneratorGateNode(GatedNode):
             device=ctx.device,
             steps=1,
             batch_size=32,
+            payload_loader=payload_loader,
+            active_term_to_idx=active_term_to_idx,
         )
 
         feat_score = float(result.get("feature_score", result.get("target_prob", 0.0)))

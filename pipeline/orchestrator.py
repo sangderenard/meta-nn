@@ -2219,7 +2219,7 @@ def run(args, output_dir: Path, initial_plan=None) -> None:
     )
     if interrupted or statuses is None:
         _signal_runtime_exit(getattr(ctx, "runtime_control_store", None), "training_initialization_interrupted")
-        return
+        return True
     _log_statuses("init", statuses)
     _save_runtime_snapshot(
         ctx,

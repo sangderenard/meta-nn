@@ -46,6 +46,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from types import SimpleNamespace
 
 import torch
 
@@ -81,21 +82,15 @@ class _FlashcardDataset(Dataset):
     def __init__(
         self,
         images: list,
-        conditions: list,
-        num_classes: int,
+        terms_rows: list,
         image_hw: tuple,
     ) -> None:
+        self.use_semantic_mask_stack_collate = True
         self._h = int(image_hw[0])
         self._w = int(image_hw[1])
-        n = min(len(images), len(conditions))
-        c = max(1, int(num_classes))
-        cond_arr = np.zeros((n, c), dtype=np.float32)
-        for i in range(n):
-            vec = np.asarray(conditions[i], dtype=np.float32).reshape(-1)
-            end = min(int(vec.size), c)
-            cond_arr[i, :end] = vec[:end]
-        self._conds = torch.from_numpy(cond_arr)
+        n = min(len(images), len(terms_rows))
         self._imgs = [np.asarray(img, dtype=np.float32) for img in images[:n]]
+        self._terms_rows = [list(row) if isinstance(row, (list, tuple)) else [] for row in terms_rows[:n]]
         self._n = n
 
     def __len__(self) -> int:
@@ -110,11 +105,12 @@ class _FlashcardDataset(Dataset):
             img = F.interpolate(
                 img.unsqueeze(0), size=(self._h, self._w), mode="nearest"
             ).squeeze(0)
-        zero_mask = torch.zeros((1, self._h, self._w), dtype=torch.float32)
         return (
             img.clamp(0.0, 1.0).contiguous(),
-            self._conds[int(idx)],
-            zero_mask,
+            torch.zeros((1, self._h, self._w), dtype=torch.float32),
+            torch.zeros((0, self._h, self._w), dtype=torch.float32),
+            torch.zeros((0,), dtype=torch.long),
+            list(self._terms_rows[int(idx)]),
         )
 
 
@@ -534,6 +530,15 @@ class GeneratorTrainNode(IRTrainingNode):
         )
 
         planned_slots = get_all_planned_lora_slots(ctx)
+        from pipeline.nodes.classifier_node import _make_label_dropout_cfg
+        _label_mask_dropout_cfg = _make_label_dropout_cfg(SimpleNamespace(
+            label_dropout_rate=float(getattr(ctx.args, "target_label_knockout_prob", 0.0) or 0.0),
+            label_dropout_max_drop_frac=float(getattr(ctx.args, "target_label_knockout_max_drop_frac", 1.0) or 1.0),
+            label_dropout_min_keep=int(getattr(ctx.args, "target_label_knockout_min_keep", 1) or 1),
+            label_dropout_network_rate=float(getattr(ctx.args, "target_label_knockout_network_dropout", 0.0) or 0.0),
+            label_dropout_dataset_threshold=int(getattr(ctx.args, "target_label_knockout_dataset_threshold", -1) or -1),
+            label_dropout_min_keep_dataset=int(getattr(ctx.args, "target_label_knockout_min_keep_dataset", 1) or 1),
+        ))
 
         steps_per_slot = max(1, self.cfg.steps_per_round // max(1, len(planned_slots)))
 
@@ -558,6 +563,7 @@ class GeneratorTrainNode(IRTrainingNode):
             # the slot's vocabulary (slot terms are added to ctx.class_names here).
             current_class_names = list(ctx.class_names or [])
             current_n_classes = max(1, len(current_class_names))
+            current_term_to_idx = dict(ctx.semantic_term_to_idx)
 
             _log(
                 f"[stageG] slot {slot_name} ({len(slot_terms)} terms): "
@@ -566,15 +572,9 @@ class GeneratorTrainNode(IRTrainingNode):
 
             if _payload_bank_obj is not None:
                 from torch.utils.data import ConcatDataset, RandomSampler, Subset
-                from pipeline.nodes.data_nodes import rebuild_conditions_from_terms, build_stage_loaders
-                _slot_conditions = rebuild_conditions_from_terms(
-                    payload_terms=ctx.payload_terms or [],
-                    class_names=current_class_names,
-                ) if ctx.payload_terms else ctx.payload_conditions
+                from pipeline.nodes.data_nodes import build_stage_loaders
                 _ds = SemanticWheelPayloadDataset(
                     bank=_payload_bank_obj,
-                    conditions=_slot_conditions,
-                    num_classes=current_n_classes,
                     image_hw=image_hw,
                 )
                 # ---- Slot-affinity filtering (CNC tool-changer) ----
@@ -611,18 +611,14 @@ class GeneratorTrainNode(IRTrainingNode):
                         for row_t in _fc_terms
                     )
                     if _fc_has_affinity:
-                        _fc_conds = rebuild_conditions_from_terms(
-                            payload_terms=_fc_terms,
-                            class_names=current_class_names,
-                        )
                         _fc_imgs = [img for img, _cond in _fc_rows]
                         _fc_ds = _FlashcardDataset(
                             images=_fc_imgs,
-                            conditions=_fc_conds,
-                            num_classes=current_n_classes,
+                            terms_rows=_fc_terms,
                             image_hw=image_hw,
                         )
                         _ds = ConcatDataset([_ds, _fc_ds])
+                        _ds.use_semantic_mask_stack_collate = True
                         _log(
                             f"[stageG] merged {len(_fc_ds)} flashcard rows into slot "
                             f"{slot_name} dataset (total {len(_ds)} rows)"
@@ -682,6 +678,8 @@ class GeneratorTrainNode(IRTrainingNode):
                 ipc_pump=getattr(ctx.viewer_proxy, "pump", None),
                 generator_step_callback=generator_step_callback,
                 discriminator_step_callback=discriminator_step_callback,
+                label_mask_dropout_cfg=_label_mask_dropout_cfg,
+                active_term_to_idx=current_term_to_idx,
             )
 
             ctx.generator = trained_g

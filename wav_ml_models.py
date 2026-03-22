@@ -1547,6 +1547,41 @@ def _payload_condition_mask_batch(
     )
 
 
+def _payload_loader_batch_to_tensors(
+    batch: Any,
+    *,
+    device: torch.device,
+    context: str,
+    active_term_to_idx: Optional[Dict[str, int]],
+    n_active_classes: int,
+    dropout_cfg: Optional[Any] = None,
+    dropout_rng: Optional[np.random.Generator] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    from pipeline.nodes.classifier_node import _yb_from_terms
+    from pipeline.nodes.data_nodes import (
+        _expand_semantic_mask_supervision_batch,
+        _unpack_masked_semantic_batch,
+    )
+    xb, mb, batch_meta = _unpack_masked_semantic_batch(batch, context=context)
+    xb = xb.to(device=device, non_blocking=True)
+    mb = mb.to(device=device, non_blocking=True, dtype=torch.float32)
+    _tti = active_term_to_idx or {}
+    _nac = int(n_active_classes) if int(n_active_classes) > 0 else len(_tti)
+    _terms = list(batch_meta.get("terms_rows") or [[] for _ in range(int(xb.shape[0]))])
+    cond = _yb_from_terms(_terms, _tti, _nac, xb.device)
+    xb, cond, mb = _expand_semantic_mask_supervision_batch(
+        xb=xb,
+        yb=cond,
+        mb=mb,
+        batch_meta=batch_meta,
+        mode="multihot_mix",
+        context=context,
+        dropout_cfg=dropout_cfg,
+        dropout_rng=dropout_rng,
+    )
+    return xb, cond, mb
+
+
 def _align_probs_with_condition(probs: torch.Tensor, cond: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     if probs.ndim != 2:
         raise ValueError(f"Expected probs [B,C], got shape={tuple(probs.shape)}")
@@ -1582,8 +1617,10 @@ def evaluate_conditional_generator(
     discriminator: Optional[nn.Module] = None,
     mask_threshold: float = 0.5,
     seed: int = 0,
+    payload_loader: Optional[Any] = None,
+    active_term_to_idx: Optional[Dict[str, int]] = None,
 ) -> Dict[str, float]:
-    if len(payload_conditions) <= 0 or len(payload_masks) <= 0:
+    if payload_loader is None and (len(payload_conditions) <= 0 or len(payload_masks) <= 0):
         return {
             "target_prob": 0.0,
             "mean_prob": 0.0,
@@ -1594,8 +1631,8 @@ def evaluate_conditional_generator(
             "mask_iou": 0.0,
             "mask_dice": 0.0,
         }
-    n_payload = min(int(len(payload_conditions)), int(len(payload_masks)))
-    if int(n_payload) <= 0:
+    n_payload = min(int(len(payload_conditions)), int(len(payload_masks))) if payload_loader is None else 0
+    if payload_loader is None and int(n_payload) <= 0:
         return {
             "target_prob": 0.0,
             "mean_prob": 0.0,
@@ -1625,17 +1662,32 @@ def evaluate_conditional_generator(
     sum_mask_iou = torch.zeros((), device=device, dtype=torch.float32)
     sum_mask_dice = torch.zeros((), device=device, dtype=torch.float32)
     n = 0
+    _loader_iter = iter(payload_loader) if payload_loader is not None else None
     for _ in range(max(1, int(steps))):
-        idx = rng.integers(0, int(n_payload), size=max(1, int(batch_size)))
-        cond_cpu, mask_cpu = _payload_condition_mask_batch(
-            payload_conditions=payload_conditions,
-            payload_masks=payload_masks,
-            indices=idx.tolist(),
-            num_classes=int(num_classes),
-            image_hw=image_hw,
-        )
-        cond = cond_cpu.to(device=device, dtype=torch.float32)
-        mask_target = mask_cpu.to(device=device, dtype=torch.float32)
+        if payload_loader is not None:
+            try:
+                _batch = next(_loader_iter)
+            except StopIteration:
+                _loader_iter = iter(payload_loader)
+                _batch = next(_loader_iter)
+            _, cond, mask_target = _payload_loader_batch_to_tensors(
+                _batch,
+                device=device,
+                context="generator payload evaluation",
+                active_term_to_idx=active_term_to_idx,
+                n_active_classes=int(num_classes),
+            )
+        else:
+            idx = rng.integers(0, int(n_payload), size=max(1, int(batch_size)))
+            cond_cpu, mask_cpu = _payload_condition_mask_batch(
+                payload_conditions=payload_conditions,
+                payload_masks=payload_masks,
+                indices=idx.tolist(),
+                num_classes=int(num_classes),
+                image_hw=image_hw,
+            )
+            cond = cond_cpu.to(device=device, dtype=torch.float32)
+            mask_target = mask_cpu.to(device=device, dtype=torch.float32)
         z = torch.randn((int(cond.shape[0]), int(z_dim)), device=device)
         with _autocast_context(device=device, use_amp=use_amp, amp_dtype_t=amp_dtype_t):
             gen_out = generator.forward_with_aux(z, cond) if hasattr(generator, "forward_with_aux") else {"image": generator(z, cond)}
@@ -1759,7 +1811,11 @@ def train_conditional_generator_discriminator(
     diversity_target_std: float = 0.15,
     d_instance_noise_std: float = 0.0,
     r1_weight: float = 0.0,
+    label_mask_dropout_cfg: Optional[Any] = None,
+    active_term_to_idx: Optional[Dict[str, int]] = None,
 ) -> Tuple[nn.Module, nn.Module, List[Dict[str, float]]]:
+    from pipeline.nodes.data_nodes import _apply_network_dropout_rate
+
     if len(payload_images) <= 0 or len(payload_conditions) <= 0 or len(payload_masks) <= 0:
         raise RuntimeError("Generator/discriminator training requires non-empty payload bank.")
     if len(payload_images) != len(payload_conditions):
@@ -1832,6 +1888,7 @@ def train_conditional_generator_discriminator(
     if d_opt is None:
         d_opt = torch.optim.AdamW(discriminator.parameters(), lr=float(lr_d), betas=(0.5, 0.999), weight_decay=1e-4)
     rng = np.random.default_rng(seed)
+    dropout_rng = np.random.default_rng(int(seed) + 17041) if label_mask_dropout_cfg is not None else None
     disc_steps_per_gen_step = max(1, int(disc_steps_per_gen_step))
     grad_accum_steps = max(1, int(grad_accum_steps))
     classifier_forward_batch_cap = max(0, int(classifier_forward_batch_cap))
@@ -1927,15 +1984,25 @@ def train_conditional_generator_discriminator(
                     pass
                 if stop_now:
                     break
+            if label_mask_dropout_cfg is not None and label_mask_dropout_cfg.network_dropout is not None:
+                _ndrop = float(label_mask_dropout_cfg.network_dropout)
+                _apply_network_dropout_rate(generator, _ndrop)
+                _apply_network_dropout_rate(discriminator, _ndrop)
             if _use_loader:
                 try:
                     _batch = next(_loader_iter)
                 except StopIteration:
                     _loader_iter = iter(payload_loader)
                     _batch = next(_loader_iter)
-                real      = _batch[0].to(device=device, non_blocking=True)
-                cond      = _batch[1].to(device=device, non_blocking=True, dtype=torch.float32)
-                real_mask = _batch[2].to(device=device, non_blocking=True, dtype=torch.float32)
+                real, cond, real_mask = _payload_loader_batch_to_tensors(
+                    _batch,
+                    device=device,
+                    context="generator payload training",
+                    active_term_to_idx=active_term_to_idx,
+                    n_active_classes=int(num_classes),
+                    dropout_cfg=label_mask_dropout_cfg,
+                    dropout_rng=dropout_rng,
+                )
             else:
                 idx = rng.integers(0, int(n_payload), size=max(1, int(batch_size)))
                 real      = _bank_images[idx].to(device=device, non_blocking=True)
@@ -1953,9 +2020,15 @@ def train_conditional_generator_discriminator(
                         except StopIteration:
                             _loader_iter = iter(payload_loader)
                             _batch = next(_loader_iter)
-                        real = _batch[0].to(device=device, non_blocking=True)
-                        cond = _batch[1].to(device=device, non_blocking=True, dtype=torch.float32)
-                        real_mask = _batch[2].to(device=device, non_blocking=True, dtype=torch.float32)
+                        real, cond, real_mask = _payload_loader_batch_to_tensors(
+                            _batch,
+                            device=device,
+                            context="generator payload training",
+                            active_term_to_idx=active_term_to_idx,
+                            n_active_classes=int(num_classes),
+                            dropout_cfg=label_mask_dropout_cfg,
+                            dropout_rng=dropout_rng,
+                        )
                     else:
                         _didx = rng.integers(0, int(n_payload), size=max(1, int(batch_size)))
                         real = _bank_images[_didx].to(device=device, non_blocking=True)

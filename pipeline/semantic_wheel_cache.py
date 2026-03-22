@@ -27,12 +27,12 @@ from semantic_dataset_loaders import (
     SemanticDiskRow,
     _apply_degrade as _canonical_apply_degrade,
     _norm_txt,
-    _resolve_processing_device,
     build_combined_mask_stacks,
     build_layout_mask,
     build_term_mask_stack_from_image,
     build_term_mask_stacks_from_images,
 
+    merge_terms_with_mask_indices,
     normalize_vocab_terms,
     targets_from_terms,
     term_mask_map_to_label_stack,
@@ -293,6 +293,96 @@ def _row_creation_mask(row: SemanticDiskRow, image_size: int) -> Optional[np.nda
     return None
 
 
+def _load_seg_class_masks(
+    mask_path: str,
+    image_size: int,
+    term_to_idx: Dict[str, int],
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Decompose a Berkeley SBD segmentation map into per-class binary masks.
+
+    The segmentation values are categorical class IDs (0 = background, 1-20 =
+    VOC classes).  Each unique non-zero class ID is mapped to a VOC class name
+    and then to the local vocabulary index via *term_to_idx*.  Returns
+    ``(mask_stack [K, H, W], mask_indices [K])`` using **only** local vocab
+    numbering — no Berkeley indices survive.
+    """
+    size = max(8, int(image_size))
+    mp = Path(str(mask_path))
+    if not mp.exists():
+        return np.zeros((0, size, size), dtype=np.float32), np.zeros((0,), dtype=np.int64)
+
+    seg = None
+    if str(mp.suffix).strip().lower() in (".mat", ".npz"):
+        npz_path = mp.with_suffix(".npz")
+        mat_path = mp.with_suffix(".mat")
+        try:
+            if npz_path.exists():
+                with np.load(str(npz_path), allow_pickle=False) as z:
+                    seg = np.asarray(z["segmentation"], dtype=np.int32)
+            elif mat_path.exists():
+                from scipy.io import loadmat
+                blob = loadmat(str(mat_path), squeeze_me=False, struct_as_record=False)
+                gtcls = blob.get("GTcls", None)
+                try:
+                    seg = np.asarray(gtcls[0, 0].Segmentation, dtype=np.int32)
+                except Exception:
+                    try:
+                        seg = np.asarray(gtcls.Segmentation[0, 0], dtype=np.int32)
+                    except Exception:
+                        seg = None
+        except Exception:
+            seg = None
+
+    if seg is None:
+        return np.zeros((0, size, size), dtype=np.float32), np.zeros((0,), dtype=np.int64)
+
+    try:
+        from berkeley_sbd_pretrain import VOC20_CLASSES
+    except ImportError:
+        return np.zeros((0, size, size), dtype=np.float32), np.zeros((0,), dtype=np.int64)
+
+    masks: List[np.ndarray] = []
+    indices: List[int] = []
+    present_ids = set(int(v) for v in np.unique(seg) if int(v) > 0)
+    for seg_id in sorted(present_ids):
+        voc_idx = int(seg_id) - 1  # seg IDs are 1-based; VOC20_CLASSES is 0-based
+        if voc_idx < 0 or voc_idx >= len(VOC20_CLASSES):
+            continue
+        term_name = str(VOC20_CLASSES[voc_idx]).strip().lower()
+        local_idx = term_to_idx.get(term_name, -1)
+        if local_idx < 0:
+            continue
+        binary = (seg == int(seg_id)).astype(np.float32, copy=False)
+        fitted = _fit_mask_letterbox(binary, image_size=size)
+        masks.append(fitted)
+        indices.append(int(local_idx))
+
+    if not masks:
+        return np.zeros((0, size, size), dtype=np.float32), np.zeros((0,), dtype=np.int64)
+
+    # "object" = union of all per-class segmentation masks.
+    obj_idx = term_to_idx.get("object", -1)
+    if obj_idx >= 0:
+        foreground = np.clip(
+            np.sum(np.stack(masks, axis=0), axis=0), 0.0, 1.0
+        ).astype(np.float32, copy=False)
+        masks.append(foreground)
+        indices.append(int(obj_idx))
+
+    # "signal" and "berkeley sbd dataset" = whole image.
+    whole = np.ones((size, size), dtype=np.float32)
+    for umbrella in ("signal", "berkeley sbd dataset"):
+        u_idx = term_to_idx.get(umbrella, -1)
+        if u_idx >= 0:
+            masks.append(whole)
+            indices.append(int(u_idx))
+
+    return (
+        np.stack(masks, axis=0).astype(np.float32, copy=False),
+        np.asarray(indices, dtype=np.int64),
+    )
+
+
 def _sobel_edge_map(gray: np.ndarray) -> np.ndarray:
     """Fast Sobel gradient magnitude edge map, normalised to [0, 1]."""
     g = np.asarray(gray, dtype=np.float32)
@@ -445,32 +535,13 @@ def _build_clean_entries_batch(
     )
     image_batch = np.clip(np.asarray(image_u8_batch, dtype=np.float32) / 255.0, 0.0, 1.0).astype(np.float32, copy=False)
 
-    # Enrich each row with tonal/color terms using the same function pregestation uses,
-    # then build local-vocab label_batch so build_term_mask_stacks_from_images generates
-    # spatial masks for those terms.
-    _tonal_enrich = None
-    try:
-        from pipeline.nodes.vocab_node import _semantic_terms_with_tonal_masks as _tonal_enrich
-    except Exception:
-        pass
     term_to_idx: Dict[str, int] = {str(v).strip().lower(): int(k) for k, v in idx_to_term.items()}
     n_local = len(idx_to_term)
     tonal_masks_per_row: List[Dict[str, np.ndarray]] = [{} for _ in rows]
     enriched_terms_per_row: List[List[str]] = [list(row.terms) for row in rows]
-    if _tonal_enrich is not None:
-        for _ri, _row in enumerate(rows):
-            try:
-                _enriched, _tmasks = _tonal_enrich(
-                    terms=list(_row.terms),
-                    image=image_u8_batch[int(_ri)],
-                    image_size=size,
-                )
-                enriched_terms_per_row[int(_ri)] = list(_enriched)
-                tonal_masks_per_row[int(_ri)] = dict(_tmasks)
-            except Exception:
-                pass
 
-    # Build label_batch from enriched terms using LOCAL vocab — transient, not stored.
+    # Build label_batch directly from the row terms. No image-level tonal/color
+    # enrichment is allowed here.
     label_batch = np.stack(
         targets_from_terms(enriched_terms_per_row, term_to_idx, n_local),
         axis=0,
@@ -500,6 +571,14 @@ def _build_clean_entries_batch(
             if creation_mask_u8 is not None
             else np.zeros((size, size), dtype=np.float32)
         )
+        seg_stack, seg_idx = _load_seg_class_masks(
+            mask_path=str(row.mask_path or ""),
+            image_size=size,
+            term_to_idx=term_to_idx,
+        )
+        extra_parts: List[Tuple[Any, Any]] = []
+        if int(seg_stack.shape[0]) > 0:
+            extra_parts.append((seg_stack, seg_idx))
         mask_stack, mask_indices = build_combined_mask_stacks(
             label_vec=label_vec,
             idx_to_term=idx_to_term,
@@ -508,15 +587,21 @@ def _build_clean_entries_batch(
             heuristic_stack=np.asarray(heuristic_stacks[int(row_idx)], dtype=np.float32),
             heuristic_idx=np.asarray(heuristic_indices[int(row_idx)], dtype=np.int64),
             tonal_masks=tonal_masks_per_row[int(row_idx)],
+            extra_parts=extra_parts if extra_parts else None,
             term_to_idx=term_to_idx,
             processing_device=processing_device,
+        )
+        cached_terms = merge_terms_with_mask_indices(
+            enriched_terms_per_row[int(row_idx)],
+            mask_indices,
+            idx_to_term=idx_to_term,
         )
         out.append(
             {
                 "image_u8": np.asarray(image_u8_batch[int(row_idx)], dtype=np.uint8),
                 "mask_stack": np.asarray(mask_stack, dtype=np.float32),
                 "mask_indices": np.asarray(mask_indices, dtype=np.int32).reshape(-1),
-                "terms": list(normalize_vocab_terms(enriched_terms_per_row[int(row_idx)])),
+                "terms": list(cached_terms),
             }
         )
     return out
@@ -1017,22 +1102,13 @@ class SemanticWheelPayloadDataset(Dataset):
     def __init__(
         self,
         bank: "SemanticWheelPayloadBank",
-        conditions: Sequence,
-        num_classes: int,
         image_hw: Tuple[int, int],
     ) -> None:
         self._bank = bank
+        self.use_semantic_mask_stack_collate = True
         self._h = int(image_hw[0])
         self._w = int(image_hw[1])
-        n = min(int(len(bank)), int(len(conditions)))
-        c = max(1, int(num_classes))
-        cond_arr = np.zeros((n, c), dtype=np.float32)
-        for i in range(n):
-            vec = np.asarray(conditions[i], dtype=np.float32).reshape(-1)
-            end = min(int(vec.size), c)
-            cond_arr[i, :end] = vec[:end]
-        self._conds: torch.Tensor = torch.from_numpy(cond_arr)
-        self._n = n
+        self._n = int(len(bank))
 
     def __len__(self) -> int:
         return self._n
@@ -1040,8 +1116,8 @@ class SemanticWheelPayloadDataset(Dataset):
     def __getitem__(self, idx: int):
         h, w = self._h, self._w
 
-        img_np = self._bank.get_image(int(idx))
-        img = torch.from_numpy(np.asarray(img_np, dtype=np.float32))
+        item = self._bank.dataset.read_numpy_entry(int(idx))
+        img = torch.from_numpy(np.asarray(item["image_u8"], dtype=np.float32) / 255.0)
         if img.ndim == 2:
             img = img.unsqueeze(0).expand(3, -1, -1).contiguous()
         elif img.ndim == 3 and img.shape[-1] == 3:
@@ -1050,18 +1126,15 @@ class SemanticWheelPayloadDataset(Dataset):
             img = img.expand(3, -1, -1).contiguous()
         if tuple(img.shape[-2:]) != (h, w):
             img = F.interpolate(img.unsqueeze(0), size=(h, w), mode="nearest").squeeze(0)
-
-        msk_np = self._bank.get_mask(int(idx))
-        msk = torch.from_numpy(np.asarray(msk_np, dtype=np.float32))
-        if msk.ndim == 2:
-            msk = msk.unsqueeze(0)
-        if tuple(msk.shape[-2:]) != (h, w):
-            msk = F.interpolate(msk.unsqueeze(0), size=(h, w), mode="nearest").squeeze(0)
-
+        mask_t = torch.zeros((1, h, w), dtype=torch.float32)
+        stack_t = torch.from_numpy(np.asarray(item.get("mask_stack"), dtype=np.float32))
+        idx_t = torch.from_numpy(np.asarray(item.get("mask_indices"), dtype=np.int64))
         return (
             img.clamp(0.0, 1.0).contiguous(),
-            self._conds[int(idx)],
-            msk.clamp(0.0, 1.0).contiguous(),
+            mask_t,
+            stack_t,
+            idx_t,
+            list(item.get("terms") or []),
         )
 
 
@@ -1117,7 +1190,7 @@ def ensure_semantic_candidate_cache(
         raise
     purpose_key = _sanitize_component(config.purpose)
     build_config = {
-        "format_version": 2,
+        "format_version": 5,
         "purpose": str(config.purpose),
         "image_size": int(config.image_size),
         "batch_size": int(config.batch_size),
