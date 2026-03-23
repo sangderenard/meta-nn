@@ -337,6 +337,9 @@ class PipelineContext:
     vocab_lora_pending_terms: List[str] = field(default_factory=list)
     vocab_lora_active_signature: str = ""
     vocab_lora_active_terms: List[str] = field(default_factory=list)
+    vocab_lora_baseline_extra_terms: List[str] = field(default_factory=list)
+    vocab_lora_baseline_class_names: List[str] = field(default_factory=list)
+    vocab_lora_baseline_term_to_idx: Dict[str, int] = field(default_factory=dict)
     vocab_lora_max_terms: int = 0
     vocab_lora_latest_plan_signature: str = ""
     vocab_lora_plan_slot_cursor: int = 0

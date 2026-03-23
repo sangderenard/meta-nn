@@ -1354,6 +1354,12 @@ class DataNode(PipelineNode):
         ctx.payload_conditions = []
         ctx.payload_terms = []
         ctx.payload_bank_ready = False
+        try:
+            from pipeline.nodes.vocab_node import clear_flashcard_stage_state
+            clear_flashcard_stage_state(ctx)
+        except Exception:
+            ctx.flashcard_rows = []
+            ctx.flashcard_row_terms = []
 
         # One-time conversion of .mat masks → .npz so scipy is not needed thereafter
         from semantic_dataset_loaders import convert_sbd_mat_to_npz

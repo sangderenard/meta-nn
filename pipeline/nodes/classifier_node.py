@@ -75,6 +75,7 @@ from pipeline.nodes.data_nodes import (
     _apply_label_mask_dropout,
     _apply_network_dropout_rate,
     _auto_berkeley_refresh_batch_size,
+    _dataset_terms_rows,
     _expand_semantic_mask_supervision_batch,
     _forward_classifier_outputs_require_mask,
     _payload_condition_bank_tensor,
@@ -82,7 +83,7 @@ from pipeline.nodes.data_nodes import (
     _unpack_masked_semantic_batch,
 )
 from pipeline.preview import make_classifier_step_preview_callback
-from pipeline.nodes.vocab_node import deactivate_vocab_lora_slot
+from pipeline.nodes.vocab_node import deactivate_vocab_lora_slot, reset_vocab_stage_state
 from pipeline.utils import (
     _classifier_supervision_loss,
     _cuda_mem_diag,
@@ -817,9 +818,16 @@ class LoRARoundNode(IRTrainingNode):
             install_tiny_classifier_lora,
             set_tiny_classifier_lora_state,
         )
-        from pipeline.nodes.vocab_node import activate_vocab_lora_slot, get_all_planned_lora_slots
+        from pipeline.nodes.vocab_node import activate_vocab_lora_slot, build_stage_vocab_lora_execution_plan
 
-        planned_slots = get_all_planned_lora_slots(ctx)
+        refresh_term_rows = _dataset_terms_rows(getattr(ctx.berkeley_refresh_loader, "dataset", None), progress_control=ctx)
+        execution_plan = build_stage_vocab_lora_execution_plan(
+            ctx=ctx,
+            term_rows=refresh_term_rows,
+            source="stage_c_lora",
+            stage_label=self.node_id,
+        )
+        planned_slots = list(execution_plan.get("slots") or [])
 
         # -- Install LoRA adapters once ------------------------------------
         install_tiny_classifier_lora(
@@ -904,10 +912,10 @@ class LoRARoundNode(IRTrainingNode):
                 f"name={slot_name} terms={len(slot_terms)} signature={slot_signature[:12]}"
             )
 
-        deactivate_vocab_lora_slot(ctx)
+        reset_vocab_stage_state(ctx)
         _log(
             f"[stageC] LoRA sweep complete: {slots_trained} slot(s) trained, "
-            f"deactivated after sweep"
+            f"reset to baseline after sweep"
         )
 
 
@@ -957,6 +965,8 @@ class FakeClassFeedbackNode(IRTrainingNode):
     def ir_state_inputs(self) -> List[IRStateSpec]:
         return [
             IRStateSpec("payload_conditions", "Semantic condition bank", role="conditioning_bank", detail="semantic condition vectors used to sample fake images"),
+            IRStateSpec("payload_masks", "Semantic mask bank", role="mask_bank", detail="mask rows aligned with the fake-feedback condition bank"),
+            IRStateSpec("payload_terms", "Payload row terms", role="row_metadata", detail="per-row term lists used to keep fake-feedback samples attached to their source rows"),
         ]
 
     def declare_training_mechanics(self) -> Dict[str, Any]:
@@ -969,6 +979,8 @@ class FakeClassFeedbackNode(IRTrainingNode):
                 {"id": "gan_generator_model", "label": "GAN generator", "kind": "model", "detail": "produces conditioned fake images"},
                 {"id": "gan_discriminator_model", "label": "GAN discriminator", "kind": "model", "detail": "weights fake-sample hardness by confidence"},
                 {"id": "semantic_condition_bank", "label": "Semantic condition bank", "kind": "state", "detail": "class-conditioned prompts for fake sampling"},
+                {"id": "semantic_mask_bank", "label": "Semantic mask bank", "kind": "state", "detail": "per-row masks kept aligned with fake-feedback conditioning rows"},
+                {"id": "payload_row_terms", "label": "Payload row terms", "kind": "state", "detail": "row-level provenance kept attached to fake-feedback samples"},
             ],
             "losses": [
                 {"id": "loss_fake_class", "label": "Fake sentinel BCE", "kind": "loss", "detail": "classifier fake-image detection objective"},
@@ -980,10 +992,14 @@ class FakeClassFeedbackNode(IRTrainingNode):
                 {"source": "gan_generator_model", "target": "self", "label": "conditioned fake samples", "kind": "consume"},
                 {"source": "gan_discriminator_model", "target": "self", "label": "confidence curriculum", "kind": "condition"},
                 {"source": "semantic_condition_bank", "target": "self", "label": "conditioning vectors", "kind": "condition"},
+                {"source": "semantic_mask_bank", "target": "self", "label": "aligned masks", "kind": "condition"},
+                {"source": "payload_row_terms", "target": "self", "label": "row provenance", "kind": "condition"},
                 {"source": "classifier_model", "target": "self", "label": "trainable weights", "kind": "consume"},
                 {"source": "self", "target": "loss_fake_class", "label": "fake logits", "kind": "predict"},
                 {"source": "gan_discriminator_model", "target": "loss_fake_class", "label": "hardness weights", "kind": "supervise"},
                 {"source": "semantic_condition_bank", "target": "loss_fake_class", "label": "sentinel targets", "kind": "supervise"},
+                {"source": "semantic_mask_bank", "target": "loss_fake_class", "label": "mask context", "kind": "supervise"},
+                {"source": "payload_row_terms", "target": "loss_fake_class", "label": "row details", "kind": "supervise"},
                 {"source": "loss_fake_class", "target": "classifier_model", "label": "AdamW update", "kind": "optimize"},
             ],
         }
@@ -1016,6 +1032,8 @@ class FakeClassFeedbackNode(IRTrainingNode):
             generator=ctx.generator,
             discriminator=ctx.discriminator,
             payload_conditions=list(getattr(ctx, "payload_conditions", []) or []),
+            payload_masks=list(getattr(ctx, "payload_masks", []) or []),
+            payload_terms=list(getattr(ctx, "payload_terms", []) or []),
             condition_num_classes=_infer_condition_vector_width(
                 payload_conditions=list(getattr(ctx, "payload_conditions", []) or []),
                 class_names=list(getattr(ctx, "class_names", []) or []),
@@ -1780,6 +1798,8 @@ def _run_fake_class_refresh_epochs(
     generator: nn.Module,
     discriminator: Optional[nn.Module],
     payload_conditions: Sequence[Any],
+    payload_masks: Sequence[Any],
+    payload_terms: Sequence[Any],
     condition_num_classes: int,
     fake_label_vector: Optional[torch.Tensor],
     z_dim: int,
@@ -1815,11 +1835,25 @@ def _run_fake_class_refresh_epochs(
         return {"ran": False, "loss": 0.0, "samples": 0, "source": "fake_vector"}
     if generator is None or len(payload_conditions) <= 0:
         return {"ran": False, "loss": 0.0, "samples": 0, "source": "fake_vector"}
+    if len(payload_masks) <= 0:
+        raise RuntimeError("Fake feedback requires payload_masks; mask bundle was dropped before stage_fake_feedback.")
+    if int(len(payload_masks)) != int(len(payload_conditions)):
+        raise RuntimeError(
+            "Fake feedback payload bundle mismatch: "
+            f"conditions={int(len(payload_conditions))} masks={int(len(payload_masks))}"
+        )
+    if len(payload_terms) <= 0:
+        raise RuntimeError("Fake feedback requires payload_terms; row provenance was dropped before stage_fake_feedback.")
+    if int(len(payload_terms)) != int(len(payload_conditions)):
+        raise RuntimeError(
+            "Fake feedback payload provenance mismatch: "
+            f"conditions={int(len(payload_conditions))} terms={int(len(payload_terms))}"
+        )
     if int(condition_num_classes) <= 0:
         return {"ran": False, "loss": 0.0, "samples": 0, "source": "fake_vector"}
     if fake_label_vector is None:
         return {"ran": False, "loss": 0.0, "samples": 0, "source": "fake_vector", "reason": "missing_fake_vector"}
-    from wav_ml_models import TinyConvClassifier
+    from wav_ml_models import TinyConvClassifier, _payload_mask_bank
     if not isinstance(classifier, TinyConvClassifier):
         return {
             "ran": False,
@@ -1918,34 +1952,38 @@ def _run_fake_class_refresh_epochs(
                     pass
 
             idx = rng.integers(0, int(cond_bank.shape[0]), size=max(1, int(batch_size)))
-            idx_t = torch.as_tensor(idx, device=device, dtype=torch.long)
+            picked_rows = [int(i) for i in idx.tolist()]
+            picked_terms = [list(payload_terms[int(i)] or []) for i in picked_rows]
+            idx_t = torch.as_tensor(picked_rows, device=device, dtype=torch.long)
             cond = cond_bank.index_select(0, idx_t).to(device=device, dtype=torch.float32)
             z = torch.randn((int(cond.shape[0]), max(8, int(z_dim))), device=device)
             with torch.no_grad():
                 with autocast_context(device=device, enabled=amp_enabled, amp_dtype=amp_dtype_t):
                     xb = generator(z, cond).to(torch.float32)
-                disc_logits = None
-                if discriminator is not None:
-                    with autocast_context(device=device, enabled=amp_enabled, amp_dtype=amp_dtype_t):
-                        disc_logits = discriminator(xb, cond).to(torch.float32)
+            intended_mask = _payload_mask_bank(
+                payload_masks=[payload_masks[int(i)] for i in picked_rows],
+                image_hw=(int(xb.shape[-2]), int(xb.shape[-1])),
+            ).to(device=device, dtype=torch.float32)
             if channels_last:
                 xb = xb.contiguous(memory_format=torch.channels_last)
             with autocast_context(device=device, enabled=amp_enabled, amp_dtype=amp_dtype_t):
-                feat = classifier.extract_features(xb)
+                out = classifier.forward_with_aux(xb)
+                feat = out["pooled_features"]
                 z_norm = classifier.encode_semantic_from_features(feat)
                 fake_cos = torch.sum(z_norm * fake_vec.unsqueeze(0).to(device=z_norm.device, dtype=z_norm.dtype), dim=1)
                 fake_loss_per = 1.0 - fake_cos
 
-                if bool(int(classifier.label_embed_enabled.item())) and int(classifier.label_embed_bank.shape[0]) > 0:
-                    logits = classifier.semantic_logits_from_features(feat=feat)
-                else:
-                    logits = classifier.head[-1](feat)
+                logits = out["logits"]
 
                 if int(logits.shape[1]) != int(cond.shape[1]):
                     raise RuntimeError(
                         "Condition/logit width mismatch in fake feedback: "
                         f"logits={tuple(logits.shape)} cond={tuple(cond.shape)}"
                     )
+                detected_mask = None
+                mask_logits = out.get("mask_logits")
+                if isinstance(mask_logits, torch.Tensor):
+                    detected_mask = torch.sigmoid(mask_logits.detach().to(torch.float32))
                 if bool(include_condition_targets):
                     cond_prob = torch.sigmoid(logits.to(dtype=torch.float32))
                     cond_target = cond.to(dtype=torch.float32)
@@ -1961,29 +1999,36 @@ def _run_fake_class_refresh_epochs(
                     (float(max(0.0, fake_vector_weight)) * fake_loss_per)
                     + (float(max(0.0, condition_target_weight)) * cond_loss_per)
                 )
-                if disc_logits is not None:
-                    disc_det = disc_logits.detach().to(torch.float32)
-                    pass_mask = disc_det >= 0.0
-                    fail_mask = ~pass_mask
-                    conf_temp = max(1e-4, float(disc_conf_temperature))
-                    conf_floor = max(0.0, min(1.0, float(disc_conf_floor)))
-                    disc_conf = torch.sigmoid(torch.abs(disc_det) / conf_temp)
-                    conf_w = conf_floor + ((1.0 - conf_floor) * disc_conf)
-                    if bool(balance_disc_groups):
-                        pass_count = torch.clamp(pass_mask.to(torch.float32).sum(), min=1.0)
-                        fail_count = torch.clamp(fail_mask.to(torch.float32).sum(), min=1.0)
-                        w_pass = 0.5 / pass_count
-                        w_fail = 0.5 / fail_count
-                        group_w = torch.where(pass_mask, w_pass, w_fail).to(torch.float32)
-                    else:
-                        group_w = torch.ones_like(conf_w, dtype=torch.float32)
-                    sample_w = group_w * conf_w
-                    sample_w = sample_w / torch.clamp(sample_w.mean(), min=1e-6)
-                    loss = (loss_per_sample.to(torch.float32) * sample_w.to(torch.float32)).mean().to(loss_per_sample.dtype)
+                pass_mask = None
+                disc_conf = None
+                loss = loss_per_sample.mean()
+            disc_logits = None
+            if discriminator is not None:
+                disc_mask = detected_mask if detected_mask is not None else intended_mask
+                with torch.no_grad():
+                    with autocast_context(device=device, enabled=amp_enabled, amp_dtype=amp_dtype_t):
+                        disc_logits = discriminator(
+                            xb,
+                            cond,
+                            disc_mask.to(device=device, dtype=torch.float32),
+                        ).to(torch.float32)
+                pass_mask = disc_logits.detach().to(torch.float32) >= 0.0
+                fail_mask = ~pass_mask
+                conf_temp = max(1e-4, float(disc_conf_temperature))
+                conf_floor = max(0.0, min(1.0, float(disc_conf_floor)))
+                disc_conf = torch.sigmoid(torch.abs(disc_logits.detach().to(torch.float32)) / conf_temp)
+                conf_w = conf_floor + ((1.0 - conf_floor) * disc_conf)
+                if bool(balance_disc_groups):
+                    pass_count = torch.clamp(pass_mask.to(torch.float32).sum(), min=1.0)
+                    fail_count = torch.clamp(fail_mask.to(torch.float32).sum(), min=1.0)
+                    w_pass = 0.5 / pass_count
+                    w_fail = 0.5 / fail_count
+                    group_w = torch.where(pass_mask, w_pass, w_fail).to(torch.float32)
                 else:
-                    pass_mask = None
-                    disc_conf = None
-                    loss = loss_per_sample.mean()
+                    group_w = torch.ones_like(conf_w, dtype=torch.float32)
+                sample_w = group_w * conf_w
+                sample_w = sample_w / torch.clamp(sample_w.mean(), min=1e-6)
+                loss = (loss_per_sample.to(torch.float32) * sample_w.to(torch.float32)).mean().to(loss_per_sample.dtype)
             loss = loss * float(CLASSIFIER_LOSS_SCALE)
             loss_to_backprop = loss / float(grad_accum_steps)
             if use_scaler:
@@ -2082,7 +2127,16 @@ def _run_fake_class_refresh_epochs(
                                 "total_steps": int(total_target_steps),
                                 "img": xb[_i].detach().to(torch.float32).cpu(),
                                 "probs": torch.sigmoid(logits[_i].detach()).to(torch.float32).cpu(),
+                                "payload_row_idx": int(picked_rows[_i]),
+                                "payload_terms": list(picked_terms[_i]),
                                 "target_vec": cond[_i].detach().to(torch.float32).cpu(),
+                                "target_mask": intended_mask[_i].detach().to(device="cpu", dtype=torch.float32),
+                                "detected_mask": (
+                                    detected_mask[_i].detach().to(device="cpu", dtype=torch.float32)
+                                    if detected_mask is not None
+                                    else None
+                                ),
+                                "mask_source": ("classifier_detected" if detected_mask is not None else "payload_intended"),
                                 "loss": _avg_loss,
                                 "batch_loss": _batch_loss,
                                 "fake_cos": float(fake_cos_f[_i].detach().item()),

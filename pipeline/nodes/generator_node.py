@@ -73,31 +73,30 @@ from torch.utils.data import Dataset
 # ---------------------------------------------------------------------------
 
 class _FlashcardDataset(Dataset):
-    """Wraps pre-built CHW float32 flashcard images with per-slot rebuilt conditions.
-
-    Returns ``(img [3,H,W] float32, cond [C] float32, mask [1,H,W] float32)``
-    where mask is all-zeros (flashcard rows carry no spatial annotation).
-    """
+    """Wrap pre-built flashcard semantic rows with slot-local full-frame masks."""
 
     def __init__(
         self,
-        images: list,
-        terms_rows: list,
+        samples: list,
         image_hw: tuple,
+        active_term_to_idx: Optional[Dict[str, int]] = None,
     ) -> None:
         self.use_semantic_mask_stack_collate = True
         self._h = int(image_hw[0])
         self._w = int(image_hw[1])
-        n = min(len(images), len(terms_rows))
-        self._imgs = [np.asarray(img, dtype=np.float32) for img in images[:n]]
-        self._terms_rows = [list(row) if isinstance(row, (list, tuple)) else [] for row in terms_rows[:n]]
-        self._n = n
+        self._samples = [dict(row) for row in list(samples or []) if isinstance(row, dict)]
+        self._active_term_to_idx = dict(active_term_to_idx or {})
+        self._n = int(len(self._samples))
 
     def __len__(self) -> int:
         return self._n
 
+    def set_active_term_to_idx(self, term_to_idx: Dict[str, int]) -> None:
+        self._active_term_to_idx = dict(term_to_idx or {})
+
     def __getitem__(self, idx: int):
-        img = torch.from_numpy(self._imgs[int(idx)])
+        sample = dict(self._samples[int(idx)] or {})
+        img = torch.from_numpy(np.asarray(sample.get("image"), dtype=np.float32))
         # Accept both CHW (3,H,W) and HWC (H,W,3)
         if img.ndim == 3 and img.shape[-1] == 3:
             img = img.permute(2, 0, 1).contiguous()
@@ -105,12 +104,50 @@ class _FlashcardDataset(Dataset):
             img = F.interpolate(
                 img.unsqueeze(0), size=(self._h, self._w), mode="nearest"
             ).squeeze(0)
+
+        mask = sample.get("mask", None)
+        if mask is None:
+            mask_t = torch.ones((1, self._h, self._w), dtype=torch.float32)
+        else:
+            mask_t = (mask if torch.is_tensor(mask) else torch.as_tensor(mask, dtype=torch.float32))
+            if int(mask_t.ndim) == 2:
+                mask_t = mask_t.unsqueeze(0)
+            if tuple(mask_t.shape[-2:]) != (self._h, self._w):
+                mask_t = F.interpolate(
+                    mask_t.unsqueeze(0), size=(self._h, self._w), mode="nearest"
+                ).squeeze(0)
+            if int(mask_t.ndim) != 3 or int(mask_t.shape[0]) <= 0:
+                mask_t = torch.ones((1, self._h, self._w), dtype=torch.float32)
+            else:
+                mask_t = mask_t[:1].to(dtype=torch.float32)
+
+        current_term_to_idx = dict(self._active_term_to_idx or {})
+        active_indices: List[int] = []
+        seen_indices = set()
+        terms_row = list(sample.get("terms") or [])
+        for term in terms_row:
+            key = str(term).strip().lower()
+            term_idx = int(current_term_to_idx.get(key, -1))
+            if int(term_idx) < 0 or int(term_idx) in seen_indices:
+                continue
+            seen_indices.add(int(term_idx))
+            active_indices.append(int(term_idx))
+
+        if active_indices:
+            stack_t = mask_t.repeat(int(len(active_indices)), 1, 1)
+            idx_t = torch.as_tensor(active_indices, dtype=torch.long)
+            composite_t = mask_t
+        else:
+            stack_t = torch.zeros((0, self._h, self._w), dtype=torch.float32)
+            idx_t = torch.zeros((0,), dtype=torch.long)
+            composite_t = torch.zeros((1, self._h, self._w), dtype=torch.float32)
+
         return (
             img.clamp(0.0, 1.0).contiguous(),
-            torch.zeros((1, self._h, self._w), dtype=torch.float32),
-            torch.zeros((0, self._h, self._w), dtype=torch.float32),
-            torch.zeros((0,), dtype=torch.long),
-            list(self._terms_rows[int(idx)]),
+            composite_t.contiguous(),
+            stack_t.contiguous(),
+            idx_t,
+            list(terms_row),
         )
 
 
@@ -505,10 +542,20 @@ class GeneratorTrainNode(IRTrainingNode):
         from pipeline.semantic_wheel_cache import SemanticWheelPayloadDataset
         from pipeline.preview import make_generator_step_preview_callback
         from pipeline.nodes.base import make_training_progress_callback
-        from pipeline.nodes.vocab_node import activate_vocab_lora_slot, get_all_planned_lora_slots
+        from pipeline.nodes.vocab_node import (
+            activate_vocab_lora_slot,
+            build_stage_vocab_lora_execution_plan,
+            clear_flashcard_stage_state,
+            reset_vocab_stage_state,
+        )
+
+        def _cleanup_stage_state() -> None:
+            clear_flashcard_stage_state(ctx)
+            reset_vocab_stage_state(ctx)
 
         if not ctx.payload_masks:
             _log("[stageG] WARNING: payload_masks is empty — generator cannot train without spatial masks")
+            _cleanup_stage_state()
             return
 
         generator_step_callback = make_runtime_weight_publish_callback(
@@ -529,7 +576,6 @@ class GeneratorTrainNode(IRTrainingNode):
             publish_loss=(_step_preview_cb is None),
         )
 
-        planned_slots = get_all_planned_lora_slots(ctx)
         from pipeline.nodes.classifier_node import _make_label_dropout_cfg
         _label_mask_dropout_cfg = _make_label_dropout_cfg(SimpleNamespace(
             label_dropout_rate=float(getattr(ctx.args, "target_label_knockout_prob", 0.0) or 0.0),
@@ -546,9 +592,10 @@ class GeneratorTrainNode(IRTrainingNode):
 
         if _payload_bank_obj is None:
             _log("[stageG] WARNING: no payload bank — cannot train")
+            _cleanup_stage_state()
             return
 
-        from torch.utils.data import ConcatDataset, Subset, SequentialSampler
+        from torch.utils.data import ConcatDataset, Subset
         from pipeline.nodes.data_nodes import build_stage_loaders
 
         _ds = SemanticWheelPayloadDataset(
@@ -566,6 +613,18 @@ class GeneratorTrainNode(IRTrainingNode):
         _supervised_keys = {str(n).strip().lower() for n in list(getattr(ctx, "supervised_class_names", []))}
         _all_pt = ctx.payload_terms or []
         _n_rows = min(len(_all_pt), len(_ds))
+        _fc_terms = list(getattr(ctx, "flashcard_row_terms", []) or [])
+        _fc_rows = list(getattr(ctx, "flashcard_rows", []) or [])
+        _combined_term_rows = list(_all_pt[:_n_rows]) + list(_fc_terms)
+        _execution_plan = build_stage_vocab_lora_execution_plan(
+            ctx=ctx,
+            term_rows=_combined_term_rows,
+            source="payload_stage_g_generator",
+            stage_label=self.node_id,
+        ) if _combined_term_rows else {"slots": [], "slot_groups": [], "ordered_row_indices": []}
+        planned_slots = list(_execution_plan.get("slots") or [])
+        _slot_boundaries = list(_execution_plan.get("slot_groups") or [])
+        _sorted_indices = list(_execution_plan.get("ordered_row_indices") or [])
 
         # --- DIAGNOSTIC: what does the payload bank actually contain? ---
         _diag_extra_term_counts: Dict[str, int] = {}
@@ -601,64 +660,13 @@ class GeneratorTrainNode(IRTrainingNode):
                 for _si, _sd in enumerate(planned_slots)
             )
         )
-
-        # Assign every row to a slot (or neutral bucket)
-        _slot_buckets: List[List[int]] = [[] for _ in range(len(planned_slots))]
-        _neutral_indices: List[int] = []
-        for _ri in range(_n_rows):
-            _row_extra = {str(t).strip().lower() for t in _all_pt[_ri]} - _supervised_keys
-            if not _row_extra:
-                _neutral_indices.append(_ri)
-                continue
-            # Assign to slot with best overlap
-            _best_slot = -1
-            _best_overlap = 0
-            for _si, _skeys in enumerate(_slot_key_sets):
-                _overlap = len(_row_extra & _skeys)
-                if _overlap > _best_overlap:
-                    _best_overlap = _overlap
-                    _best_slot = _si
-            if _best_slot >= 0:
-                _slot_buckets[_best_slot].append(_ri)
-            else:
-                # Extra terms matched no slot — treat as neutral
-                _neutral_indices.append(_ri)
-
-        # Distribute neutral rows across slots round-robin for variety
-        if _neutral_indices:
-            _rng_neutral = np.random.default_rng(42)
-            _rng_neutral.shuffle(_neutral_indices)
-            for _ni, _idx in enumerate(_neutral_indices):
-                _target_slot = _ni % max(1, len(planned_slots))
-                _slot_buckets[_target_slot].append(_idx)
-
-        # Merge flashcard rows into their matching slots
-        _fc_terms = list(getattr(ctx, "flashcard_row_terms", []) or [])
-        _fc_rows = list(getattr(ctx, "flashcard_rows", []) or [])
         _fc_ds = None
-        _fc_slot_buckets: List[List[int]] = [[] for _ in range(len(planned_slots))]
         if _fc_terms and _fc_rows:
-            _fc_imgs = [img for img, _cond in _fc_rows]
             _fc_ds = _FlashcardDataset(
-                images=_fc_imgs,
-                terms_rows=_fc_terms,
+                samples=_fc_rows,
                 image_hw=image_hw,
+                active_term_to_idx=dict(getattr(ctx, "semantic_term_to_idx", {}) or {}),
             )
-            _fc_base_offset = len(_ds)  # flashcard indices offset in ConcatDataset
-            for _fi, _ft in enumerate(_fc_terms):
-                _fc_extra = {str(t).strip().lower() for t in _ft} - _supervised_keys
-                _best_fc_slot = -1
-                _best_fc_overlap = 0
-                for _si, _skeys in enumerate(_slot_key_sets):
-                    _overlap = len(_fc_extra & _skeys)
-                    if _overlap > _best_fc_overlap:
-                        _best_fc_overlap = _overlap
-                        _best_fc_slot = _si
-                if _best_fc_slot >= 0:
-                    _fc_slot_buckets[_best_fc_slot].append(_fc_base_offset + _fi)
-                else:
-                    # No slot match — assign round-robin
-                    _fc_slot_buckets[_fi % max(1, len(planned_slots))].append(_fc_base_offset + _fi)
 
         # Build the full dataset (wheel + flashcards if any)
         if _fc_ds is not None:
@@ -667,28 +675,21 @@ class GeneratorTrainNode(IRTrainingNode):
         else:
             _full_ds = _ds
 
-        # Build the contiguous sorted index list and slot boundaries
-        _sorted_indices: List[int] = []
-        _slot_boundaries: List[tuple] = []  # (start_in_sorted, end_in_sorted, slot_index)
-        for _si in range(len(planned_slots)):
-            _bucket = list(_slot_buckets[_si])
-            if _fc_ds is not None:
-                _bucket.extend(_fc_slot_buckets[_si])
-            if not _bucket:
-                continue
-            _start = len(_sorted_indices)
-            _sorted_indices.extend(_bucket)
-            _end = len(_sorted_indices)
-            _slot_boundaries.append((_start, _end, _si))
+        def _combined_row_to_dataset_index(row_idx: int) -> int:
+            row_idx_i = int(row_idx)
+            if int(row_idx_i) < int(_n_rows):
+                return int(row_idx_i)
+            return int(len(_ds) + (row_idx_i - _n_rows))
 
         if not _sorted_indices:
             _log("[stageG] WARNING: no rows assigned to any slot — cannot train")
+            _cleanup_stage_state()
             return
 
         _log(
             f"[stageG] sorted {len(_sorted_indices)} rows into "
             f"{len(_slot_boundaries)} slot groups "
-            f"({', '.join(str(e - s) for s, e, _ in _slot_boundaries)} rows each)"
+            f"({', '.join(str(int(group.get('row_count', 0))) for group in _slot_boundaries)} rows each)"
         )
 
         # Walk through each contiguous slot group, switching LoRA at boundaries
@@ -696,7 +697,10 @@ class GeneratorTrainNode(IRTrainingNode):
         all_metrics: List[Dict[str, Any]] = []
         slots_trained = 0
 
-        for _start, _end, _si in _slot_boundaries:
+        for _group in _slot_boundaries:
+            _si = int(_group.get("slot_index", -1))
+            if not (0 <= _si < len(planned_slots)):
+                continue
             slot_def = planned_slots[_si]
             slot_signature = str(slot_def.get("signature", "")).strip()
             slot_name = str(slot_def.get("slot_name", f"vocab_{slot_signature}"))
@@ -706,9 +710,12 @@ class GeneratorTrainNode(IRTrainingNode):
             current_class_names = list(ctx.class_names or [])
             current_n_classes = max(1, len(current_class_names))
             current_term_to_idx = dict(ctx.semantic_term_to_idx)
+            if _fc_ds is not None:
+                _fc_ds.set_active_term_to_idx(current_term_to_idx)
 
-            _group_indices = _sorted_indices[_start:_end]
-            _group_ds = Subset(_full_ds, _group_indices)
+            _group_indices = list(_group.get("row_indices") or [])
+            _group_dataset_indices = [_combined_row_to_dataset_index(_gi) for _gi in _group_indices]
+            _group_ds = Subset(_full_ds, _group_dataset_indices)
             _group_ds.use_semantic_mask_stack_collate = True
 
             _log(
@@ -719,7 +726,7 @@ class GeneratorTrainNode(IRTrainingNode):
             # --- DIAGNOSTIC: what vocabulary is active for this slot? ---
             _slot_extra_only = sorted(set(str(t).lower() for t in current_class_names) - _supervised_keys)
             _sample_gi = _group_indices[0] if _group_indices else -1
-            _sample_terms = list(_all_pt[_sample_gi]) if 0 <= _sample_gi < len(_all_pt) else []
+            _sample_terms = list(_combined_term_rows[_sample_gi]) if 0 <= _sample_gi < len(_combined_term_rows) else []
             _sample_matched = [t for t in _sample_terms if str(t).strip().lower() in current_term_to_idx]
             _sample_unmatched = [t for t in _sample_terms if str(t).strip().lower() not in current_term_to_idx]
             _log(
@@ -793,6 +800,7 @@ class GeneratorTrainNode(IRTrainingNode):
 
         if slots_trained == 0:
             _log("[stageG] WARNING: no slots trained")
+            _cleanup_stage_state()
             return
 
         last_m = (all_metrics or [{}])[-1]
@@ -820,8 +828,7 @@ class GeneratorTrainNode(IRTrainingNode):
             f"feat={feat_score:.4f} gate={'PASS' if ctx.gate_generator.passed else 'hold'}"
         )
 
-        from pipeline.nodes.vocab_node import deactivate_vocab_lora_slot
-        deactivate_vocab_lora_slot(ctx)
+        _cleanup_stage_state()
 
 
 # ---------------------------------------------------------------------------

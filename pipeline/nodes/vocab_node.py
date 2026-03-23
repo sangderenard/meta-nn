@@ -147,6 +147,7 @@ class InitVocabNode(OneTimeNode):
         ctx.class_names = list(supervised) + list(active_extra)
         ctx.semantic_term_to_idx = _semantic_term_index_map(ctx.class_names)
         ctx.vocab_lora_max_terms = max(1, int(getattr(ctx.args, "stage_c_lora_max_terms", len(active_extra)) or len(active_extra)))
+        capture_vocab_baseline_state(ctx)
 
         _log(
             f"[vocab-init] classes={len(ctx.class_names)} "
@@ -192,7 +193,7 @@ class VocabChurnNode(PipelineNode):
         # Safety net: deactivate any lingering LoRA from the previous round.
         # Under normal flow each stage deactivates its own LoRA, but this
         # catches edge cases like a stage that errored out before cleanup.
-        deactivate_vocab_lora_slot(ctx)
+        reset_vocab_stage_state(ctx)
 
         # Activate a slot only when an activating source (berkeley, payload, etc.)
         # explicitly raised the pending flag this round.
@@ -306,10 +307,18 @@ class BuildFlashcardRowsNode(PipelineNode):
         self.cfg = cfg
 
     def should_run(self, ctx: PipelineContext) -> bool:
-        return self.cfg.flashcard_enabled and ctx.payload_bank is not None
+        return (
+            ctx.payload_bank is not None
+            or bool(getattr(ctx, "flashcard_rows", []))
+            or bool(getattr(ctx, "flashcard_row_terms", []))
+        )
 
     def execute(self, ctx: PipelineContext) -> None:
         import numpy as np
+
+        clear_flashcard_stage_state(ctx)
+        if not self.cfg.flashcard_enabled or ctx.payload_bank is None:
+            return
 
         # Register the raw symbol pool terms with churn BEFORE filtering,
         # so the LoRA system sees demand for terms not yet in the vocab.
@@ -358,7 +367,22 @@ class BuildFlashcardRowsNode(PipelineNode):
             progress_control=ctx,
         )
 
-        ctx.flashcard_rows = list(zip(flashcard_images, flashcard_conditions))
+        flashcard_rows: List[Dict[str, Any]] = []
+        for img, cond, terms in zip(flashcard_images, flashcard_conditions, flashcard_row_terms):
+            img_np = _image_any_to_rgb_chw01(img, image_size=self.cfg.image_size)
+            h = int(img_np.shape[1]) if int(img_np.ndim) >= 3 else int(self.cfg.image_size)
+            w = int(img_np.shape[2]) if int(img_np.ndim) >= 3 else int(self.cfg.image_size)
+            flashcard_rows.append(
+                {
+                    "image": img_np,
+                    "condition": np.asarray(cond, dtype=np.float32).reshape(-1),
+                    "mask": np.ones((1, h, w), dtype=np.float32),
+                    "terms": list(_normalize_vocab_terms(list(terms))),
+                    "mask_mode": "full_frame_per_label",
+                }
+            )
+
+        ctx.flashcard_rows = list(flashcard_rows)
         ctx.flashcard_row_terms = list(flashcard_row_terms)
         _log(f"[flashcard] built {len(ctx.flashcard_rows)} rows "
              f"(info: {info.get('rows_added', 0)} added)")
@@ -1024,6 +1048,132 @@ def get_all_planned_lora_slots(ctx: PipelineContext) -> List[Dict[str, Any]]:
     return [{"signature": active_sig, "slot_name": f"vocab_{active_sig}", "terms": fallback_terms}]
 
 
+def build_stage_vocab_lora_execution_plan(
+    ctx: PipelineContext,
+    *,
+    term_rows: Sequence[Sequence[str]],
+    source: str,
+    stage_label: str,
+    max_terms_per_slot: int = 0,
+) -> Dict[str, Any]:
+    normalized_rows = _normalize_term_rows(term_rows)
+    if int(len(normalized_rows)) <= 0:
+        return {
+            "signature": "",
+            "source": str(source),
+            "stage_label": str(stage_label),
+            "slots": [],
+            "slot_groups": [],
+            "ordered_row_indices": [],
+            "row_count": 0,
+        }
+
+    plan = register_churn_requirement(
+        ctx=ctx,
+        required_terms=[term for row in normalized_rows for term in row],
+        term_rows=normalized_rows,
+        source=str(source),
+        stage_label=str(stage_label),
+        max_terms_per_slot=int(max_terms_per_slot),
+    )
+    slots = [dict(slot) for slot in list(plan.get("slots") or [])]
+    if int(len(slots)) <= 0:
+        fallback_terms = list(
+            _normalize_vocab_terms(
+                getattr(ctx, "active_extra_terms", [])
+                or getattr(ctx, "vocab_lora_baseline_extra_terms", [])
+            )
+        )
+        fallback_sig = str(_hash_vocab_term_set(fallback_terms or ["baseline execution slot"]))
+        slots = [{
+            "signature": fallback_sig,
+            "slot_name": f"vocab_{fallback_sig}",
+            "terms": list(fallback_terms),
+            "locked_terms": [],
+            "variable_terms": list(fallback_terms),
+            "term_count": int(len(fallback_terms)),
+        }]
+
+    supervised_keys = {
+        _vocab_term_key(term)
+        for term in list(getattr(ctx, "supervised_class_names", []))
+        if _vocab_term_key(term)
+    }
+    slot_key_sets: List[set] = []
+    for slot in slots:
+        slot_key_sets.append({
+            _vocab_term_key(term)
+            for term in list(slot.get("terms") or [])
+            if _vocab_term_key(term)
+        })
+
+    slot_row_indices: List[List[int]] = [[] for _ in range(len(slots))]
+    neutral_indices: List[int] = []
+    for row_idx, row_terms in enumerate(normalized_rows):
+        row_extra = {
+            _vocab_term_key(term)
+            for term in list(row_terms)
+            if _vocab_term_key(term)
+        } - supervised_keys
+        if not row_extra:
+            neutral_indices.append(int(row_idx))
+            continue
+        best_slot = -1
+        best_overlap = 0
+        for slot_idx, slot_keys in enumerate(slot_key_sets):
+            overlap = int(len(row_extra & slot_keys))
+            if int(overlap) > int(best_overlap):
+                best_overlap = int(overlap)
+                best_slot = int(slot_idx)
+        if int(best_slot) >= 0:
+            slot_row_indices[int(best_slot)].append(int(row_idx))
+        else:
+            neutral_indices.append(int(row_idx))
+
+    if neutral_indices:
+        rng = np.random.default_rng(42)
+        rng.shuffle(neutral_indices)
+        slot_count = max(1, int(len(slots)))
+        for neutral_pos, row_idx in enumerate(neutral_indices):
+            slot_row_indices[int(neutral_pos) % slot_count].append(int(row_idx))
+
+    ordered_row_indices: List[int] = []
+    slot_groups: List[Dict[str, Any]] = []
+    exec_slots: List[Dict[str, Any]] = []
+    for slot_idx, slot in enumerate(slots):
+        row_indices = list(slot_row_indices[int(slot_idx)])
+        slot_def = dict(slot)
+        slot_def["row_indices"] = list(row_indices)
+        slot_def["row_count"] = int(len(row_indices))
+        exec_slots.append(slot_def)
+        if int(len(row_indices)) <= 0:
+            continue
+        start = int(len(ordered_row_indices))
+        ordered_row_indices.extend(row_indices)
+        end = int(len(ordered_row_indices))
+        slot_groups.append(
+            {
+                "slot_index": int(slot_idx),
+                "signature": str(slot.get("signature", "")).strip(),
+                "slot_name": str(slot.get("slot_name", f"vocab_{slot.get('signature', '')}")),
+                "row_indices": list(row_indices),
+                "row_count": int(len(row_indices)),
+                "start": int(start),
+                "end": int(end),
+            }
+        )
+
+    execution_plan = dict(plan)
+    execution_plan["source"] = str(source)
+    execution_plan["stage_label"] = str(stage_label)
+    execution_plan["slots"] = list(exec_slots)
+    execution_plan["slot_groups"] = list(slot_groups)
+    execution_plan["ordered_row_indices"] = list(ordered_row_indices)
+    execution_plan["row_count"] = int(len(normalized_rows))
+    execution_plan["term_rows"] = list(normalized_rows)
+    return execution_plan
+
+
 def select_active_vocab_lora_slot(ctx: PipelineContext) -> Optional[Dict[str, Any]]:
     plan_signature = str(getattr(ctx, "vocab_lora_latest_plan_signature", "") or "").strip()
     if not plan_signature:
@@ -1099,6 +1249,50 @@ def activate_vocab_lora_slot(ctx: PipelineContext, slot: Dict[str, Any]) -> Dict
         "class_count": int(len(ctx.class_names)),
         "extra_count": int(len(ctx.active_extra_terms)),
     }
+
+
+def capture_vocab_baseline_state(ctx: PipelineContext) -> None:
+    ctx.vocab_lora_baseline_extra_terms = list(
+        _normalize_vocab_terms(getattr(ctx, "active_extra_terms", []))
+    )
+    ctx.vocab_lora_baseline_class_names = list(
+        _normalize_vocab_terms(getattr(ctx, "class_names", []))
+    )
+    ctx.vocab_lora_baseline_term_to_idx = dict(
+        _semantic_term_index_map(ctx.vocab_lora_baseline_class_names)
+    )
+
+
+def clear_flashcard_stage_state(ctx: PipelineContext) -> None:
+    ctx.flashcard_rows = []
+    ctx.flashcard_row_terms = []
+
+
+def reset_vocab_stage_state(ctx: PipelineContext) -> Dict[str, Any]:
+    info = deactivate_vocab_lora_slot(ctx)
+
+    if not getattr(ctx, "vocab_lora_baseline_class_names", []):
+        capture_vocab_baseline_state(ctx)
+
+    ctx.active_extra_terms = list(
+        _normalize_vocab_terms(getattr(ctx, "vocab_lora_baseline_extra_terms", []))
+    )
+    ctx.class_names = list(
+        _normalize_vocab_terms(getattr(ctx, "vocab_lora_baseline_class_names", []))
+    )
+    if ctx.class_names:
+        ctx.semantic_term_to_idx = dict(
+            getattr(ctx, "vocab_lora_baseline_term_to_idx", {})
+            or _semantic_term_index_map(ctx.class_names)
+        )
+    ctx.vocab_lora_active_signature = ""
+    ctx.vocab_lora_active_terms = []
+    ctx.vocab_lora_latest_plan_signature = ""
+    ctx.vocab_lora_plan_slot_cursor = 0
+    ctx.vocab_lora_plan_registered_cycle = -1
+    ctx.vocab_lora_plan_registered_round = -1
+    ctx.vocab_churn_activation_pending = False
+    return info
 
 
 def deactivate_vocab_lora_slot(ctx: PipelineContext) -> Dict[str, Any]:
