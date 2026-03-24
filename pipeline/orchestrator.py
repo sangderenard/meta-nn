@@ -2681,6 +2681,7 @@ def _build_configs_from_args(args) -> dict:
                 specific_cap_mb=int(_g("pregestation_stage_cache_max_mb", "pregestation_cache_mb", default=-1)),
             )
         ),
+        deformations_per_clean=int(_g("pregestation_deformations_per_clean", default=2)),
         displacement_temperature=float(_g("pregestation_circle_displacement_temperature", default=0.4)),
         circle_radius_temperature=float(_g("pregestation_circle_radius_temperature", default=1.0)),
         seed=int(_g("seed", default=42)),

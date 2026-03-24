@@ -1157,6 +1157,86 @@ def _image_batch_to_bchw01(images: Any) -> np.ndarray:
         bchw = (bchw + 1.0) * 0.5
     return np.clip(bchw, 0.0, 1.0).astype(np.float32, copy=False)
 
+def build_flashcard_heuristic_mask(image: Any) -> np.ndarray:
+    """Return a spatial saliency mask for a single flashcard-style image.
+
+    AUTHORISED USE: gestation / flashcard datasets ONLY — specifically any
+    dataset where each image depicts exactly one concept and no ground-truth
+    spatial mask exists (e.g. the symbol pool: digits, letters, glyphs).
+    DO NOT use this for multi-object scenes, Berkeley SBD, or any dataset
+    that already provides per-label spatial masks.  In those contexts a
+    whole-image mask produced here would assign signal to background pixels
+    and corrupt spatial supervision.
+
+    The heuristic estimates the foreground extent by:
+      1. Converting to luma and computing per-pixel contrast against the
+         corner-sampled background estimate (robust to varying backgrounds).
+      2. Sharpening via local contrast normalisation (subtract a blurred
+         version) so characters on coloured backgrounds are detected
+         regardless of absolute brightness.
+      3. Normalising to [0, 1] so the output is a soft presence mask, not
+         a hard threshold — the network can still learn the spatial extent
+         rather than receiving a binary all-or-nothing signal.
+    """
+    chw = np.asarray(image, dtype=np.float32)
+    if int(chw.ndim) == 2:
+        chw = chw[None, ...]
+    if int(chw.ndim) == 4:
+        chw = chw[0]
+    # Normalise pixel range to [0, 1]
+    vmax = float(np.max(chw))
+    if vmax > 1.0:
+        chw = chw / 255.0
+    elif float(np.min(chw)) < 0.0:
+        chw = (chw + 1.0) * 0.5
+    chw = np.clip(chw, 0.0, 1.0)
+
+    c = int(chw.shape[0])
+    h = int(chw.shape[1])
+    w = int(chw.shape[2])
+    if h <= 0 or w <= 0:
+        return np.zeros((max(1, h), max(1, w)), dtype=np.float32)
+
+    # Luma (perceptual)
+    if c >= 3:
+        luma = 0.299 * chw[0] + 0.587 * chw[1] + 0.114 * chw[2]
+    else:
+        luma = chw[0]
+
+    # Estimate background brightness from a small border strip (avoids
+    # being fooled by large uniform foreground objects filling the centre).
+    border = max(1, min(4, h // 8, w // 8))
+    bg_sample = np.concatenate([
+        luma[:border, :].ravel(),
+        luma[-border:, :].ravel(),
+        luma[:, :border].ravel(),
+        luma[:, -border:].ravel(),
+    ])
+    bg_mean = float(np.median(bg_sample)) if int(bg_sample.size) > 0 else 0.5
+
+    # Absolute contrast against background
+    contrast = np.abs(luma - bg_mean)
+
+    # Local contrast normalisation: subtract a box-blurred version so that
+    # gradients inside large uniform regions are suppressed and fine structure
+    # (strokes, edges) is emphasised.
+    ksize = max(3, min(h // 6, w // 6) | 1)  # odd kernel
+    from scipy.ndimage import uniform_filter  # lazy import; scipy is already a dep
+    blurred = uniform_filter(luma, size=ksize)
+    local_contrast = np.abs(luma - blurred)
+
+    # Combine: global contrast + local stroke signal
+    combined = 0.6 * contrast + 0.4 * local_contrast
+
+    # Soft normalisation
+    hi = float(np.max(combined))
+    if hi < 1e-8:
+        # Featureless image — fall back to uniform mid-weight (not all-ones,
+        # which would be indistinguishable from an always-true term mask).
+        return np.full((h, w), 0.5, dtype=np.float32)
+    return np.clip(combined / hi, 0.0, 1.0).astype(np.float32)
+
+
 def build_observed_color_stack_from_terms(
     image: Any,
     term_row: Sequence[str] = (),
@@ -1297,6 +1377,7 @@ def build_term_mask_stacks_from_images(
     term_mask_overrides_batch: Optional[Sequence[Optional[Dict[str, Any]]]] = None,
     processing_device: Optional[Any] = None,
     registry: Optional[DatasetTermRegistry] = None,
+    flashcard_mode: bool = False,
 ) -> Tuple[List[np.ndarray], List[np.ndarray]]:
     bchw = _image_batch_to_bchw01(images)
     bsz = int(bchw.shape[0]) if int(bchw.ndim) == 4 else 0
@@ -1360,18 +1441,31 @@ def build_term_mask_stacks_from_images(
         # Terms like "berkeley sbd dataset", "object", "signal" are true for
         # every image in their dataset.  They have no spatial localisation so
         # they get a full-image mask intentionally, not as a lazy fallback.
+        #
+        # In flashcard_mode every remaining positive label that still has no
+        # mask receives the saliency mask from build_flashcard_heuristic_mask
+        # instead.  This is correct for flashcard/gestation datasets (symbol
+        # pool etc.) where each image IS the labelled concept and a foreground-
+        # saliency mask better describes spatial extent than an all-ones mask.
+        # DO NOT enable flashcard_mode for multi-object or segmentation datasets.
         if int(h) > 0 and int(w) > 0 and registry is not None:
             _idx_to_term_row = registry.idx_to_term
             y_row = y[int(row_idx)]
+            _flashcard_mask: Optional[np.ndarray] = None  # computed lazily once per image
             for ci in range(int(y_row.shape[0])):
                 if float(y_row[int(ci)]) < 0.5:
                     continue
                 if int(ci) in seen_idx:
                     continue
                 term_name = _idx_to_term_row.get(int(ci), "")
-                if not _is_always_true_term(term_name):
+                if _is_always_true_term(term_name):
+                    row_masks.append(np.ones((int(h), int(w)), dtype=np.float32))
+                elif flashcard_mode:
+                    if _flashcard_mask is None:
+                        _flashcard_mask = build_flashcard_heuristic_mask(bchw[int(row_idx)])
+                    row_masks.append(_flashcard_mask)
+                else:
                     continue
-                row_masks.append(np.ones((int(h), int(w)), dtype=np.float32))
                 row_indices.append(int(ci))
                 seen_idx.add(int(ci))
 

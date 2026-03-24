@@ -69,6 +69,7 @@ from semantic_dataset_loaders import (
     DatasetTermRegistry,
     DiskSemanticRowsDataset,
     build_combined_mask_stacks,
+    build_flashcard_heuristic_mask,
     build_loader_from_manifest,
     build_term_mask_stack_from_image,
     build_term_mask_stacks_from_images,
@@ -313,6 +314,9 @@ class PregestationDataConfig:
 
     # GPU-accelerated semantic preprocessing (deformations, mask ops)
     gpu_preprocess: bool = False
+
+    # Augmentation variants generated per base image in the stage cache
+    deformations_per_clean: int = 2
 
 
 # ---------------------------------------------------------------------------
@@ -779,7 +783,7 @@ class DataNode(PipelineNode):
             "samples_per_combo": self.preg_cfg.samples_per_combo,
             "mode_sequence": sorted(_mode_seq),
             "image_size": self.preg_cfg.image_size,
-            "mask_semantics_version": 10,
+            "mask_semantics_version": 12,
         })
         _raw_cached = _load_raw_stage_cache(_raw_cache_dir, _raw_cache_key)
         if _raw_cached is not None:
@@ -790,12 +794,13 @@ class DataNode(PipelineNode):
             all_label_indices = _raw_cached["all_label_indices"]
             all_term_rows = _raw_cached["all_term_rows"]
             all_mask_stacks = all_label_stacks
+            all_elem_term_lists: list = []
         else:
             _log(f"[data-node] pregestation raw cache MISS ({_raw_cache_key[:8]}…) — generating")
             all_images: list = []
             all_masks: list = []
             all_mask_stacks: list = []
-            all_elem_term_lists: list = []
+            all_elem_term_lists = []
             all_term_rows: list = []
             for mode in interruptible_tqdm(
                 _mode_seq,
@@ -817,29 +822,37 @@ class DataNode(PipelineNode):
                 for img_np, comp_mask, elem_stk, elem_tl, term_row in zip(
                     imgs, masks, mask_stacks, elem_term_lists, term_rows
                 ):
-                    all_images.append(img_np)
-                    all_masks.append(np.zeros((int(elem_stk.shape[1]), int(elem_stk.shape[2])), dtype=np.float32))
+                    all_images.append(img_np.astype(np.float16, copy=False))
+                    all_masks.append(np.zeros((int(elem_stk.shape[1]), int(elem_stk.shape[2])), dtype=np.float16))
                     all_mask_stacks.append(elem_stk)
                     all_elem_term_lists.append(list(elem_tl))
                     all_term_rows.append(_preg_normalize_vocab_terms(list(term_row)))
 
-            if not all_images:
-                _log("[data-node] WARNING: no pregestation images built")
-                return
+        if not all_images:
+            _log("[data-node] WARNING: no pregestation images built")
+            return
 
-            # ---- Build LOCAL registry for mask stack indices ----
-            from semantic_dataset_loaders import DatasetTermRegistry as _DTR
-            _local_vocab = sorted({t for row in all_term_rows for t in _preg_normalize_vocab_terms(row)})
-            _local_registry = _DTR()
-            _local_registry.register_many(_local_vocab)
-            _n_local = len(_local_vocab)
-            all_targets = targets_from_terms(all_term_rows, _local_registry.term_to_idx, _n_local)
+        # ---- Build registry once, authoritative for both HIT and MISS paths ----
+        # On HIT: restore the exact post-heuristic encounter-order vocab from the
+        # MISS build so that all_label_indices (which used MISS registry indices)
+        # remain valid.  On MISS: initialise with sorted terms for LoRA stability;
+        # heuristics will append new terms.
+        _local_registry = DatasetTermRegistry()
+        if _raw_cached is not None and "local_vocab" in _raw_cached:
+            _local_registry.register_many(list(_raw_cached["local_vocab"]))
+        else:
+            _local_registry.register_many(
+                sorted({t for row in all_term_rows for t in _preg_normalize_vocab_terms(row)})
+            )
 
-            # ---- Precompute per-label mask stacks from shared observed-color builder ----
-            all_label_stacks: list = []
-            all_label_indices: list = []
+        if _raw_cached is None:
+            # ---- Precompute per-label mask stacks (MISS only) ----
+            all_label_stacks = []
+            all_label_indices = []
+            _n_local = len(_local_registry)
+            _targets_local = targets_from_terms(all_term_rows, _local_registry.term_to_idx, _n_local)
             _images_np = np.stack([np.asarray(im, dtype=np.float32) for im in all_images], axis=0)
-            _targets_np = np.stack([np.asarray(t, dtype=np.float32).reshape(-1) for t in all_targets], axis=0)
+            _targets_np = np.stack([np.asarray(t, dtype=np.float32).reshape(-1) for t in _targets_local], axis=0)
             with semantic_processing_device(ctx, enabled=bool(self.preg_cfg.gpu_preprocess)) as _processing_device:
                 _heuristic_stacks, _heuristic_indices = build_term_mask_stacks_from_images(
                     images=_images_np,
@@ -861,7 +874,7 @@ class DataNode(PipelineNode):
                     else:
                         base_mask_np = np.ones((int(img_np.shape[1]), int(img_np.shape[2])), dtype=np.float32)
                     merged_stack, merged_idx = build_combined_mask_stacks(
-                        label_vec=all_targets[i],
+                        label_vec=_targets_local[i],
                         registry=_local_registry,
                         height=int(base_mask_np.shape[0]),
                         width=int(base_mask_np.shape[1]),
@@ -878,7 +891,7 @@ class DataNode(PipelineNode):
                         merged_idx,
                         registry=_local_registry,
                     )
-                    all_label_stacks.append(np.asarray(merged_stack, dtype=np.float32))
+                    all_label_stacks.append(np.asarray(merged_stack, dtype=np.float16))
                     all_label_indices.append(np.asarray(merged_idx, dtype=np.int64))
 
             # ---- Persist to disk cache ----
@@ -892,17 +905,14 @@ class DataNode(PipelineNode):
                 control=ctx,
             ) as _pbar:
                 _save_raw_stage_cache(_raw_cache_dir, _raw_cache_key, {
-                    "all_images": [np.asarray(im, dtype=np.float32) for im in all_images],
-                    "all_masks": [np.asarray(m, dtype=np.float32) for m in all_masks],
+                    "all_images": [np.asarray(im, dtype=np.float16) for im in all_images],
+                    "all_masks": [np.asarray(m, dtype=np.float16) for m in all_masks],
                     "all_label_stacks": list(all_label_stacks),
                     "all_label_indices": list(all_label_indices),
                     "all_term_rows": list(all_term_rows),
+                    "local_vocab": _local_registry.local_vocab,
                 }, progress_control=ctx)
                 _pbar.update(1)
-
-        if not all_images:
-            _log("[data-node] WARNING: no pregestation images built")
-            return
 
         # ---- Canonical target construction from terms (unified path) ----
         all_targets = targets_from_terms(all_term_rows, ctx.semantic_term_to_idx, target_dim)
@@ -928,8 +938,10 @@ class DataNode(PipelineNode):
                 batch_size=max(1, int(self.preg_cfg.batch_size)),
                 seed=int(self.preg_cfg.seed),
                 stage_cache_mb=int(self.preg_cfg.cache_mb),
+                deformations_per_clean=int(self.preg_cfg.deformations_per_clean),
                 processing_device=_processing_device,
                 force_rebuild=bool(self.possessions["pregestation"].force_next_rebuild),
+                registry=_local_registry,
             )
         self.possessions["pregestation"].force_next_rebuild = False
         selected_targets = [np.asarray(all_targets[int(i)], dtype=np.float32).reshape(-1) for i in selected_indices]
@@ -1088,6 +1100,7 @@ class DataNode(PipelineNode):
                     label_vecs=_targets_np,
                     registry=_local_registry_gest,
                     processing_device=_processing_device,
+                    flashcard_mode=True,
                 )
                 # --- Step 4: combine/fallback/composite per image ---
                 terms_rows: List[List[str]] = []
@@ -1169,6 +1182,7 @@ class DataNode(PipelineNode):
                 deformations_per_clean=max(0, int(self.gest_cfg.deformations_per_clean)),
                 processing_device=_processing_device,
                 force_rebuild=bool(self.possessions["gestation"].force_next_rebuild),
+                registry=_local_registry_gest,
             )
         self.possessions["gestation"].force_next_rebuild = False
         selected_targets = [np.asarray(targets[int(i)], dtype=np.float32).reshape(-1) for i in selected_indices]
@@ -2390,6 +2404,7 @@ def _build_semantic_stage_cache_dataset(
     include_clean: bool = True,
     processing_device: Optional[Any] = None,
     force_rebuild: bool = False,
+    registry: Optional["DatasetTermRegistry"] = None,
 ) -> Tuple[Dataset, List[int], Dict[str, Any]]:
     cache_args = _semantic_stage_cache_args(ctx=ctx, stage_cache_mb=int(stage_cache_mb))
     total_rows = min(
@@ -2402,8 +2417,13 @@ def _build_semantic_stage_cache_dataset(
     if int(total_rows) <= 0:
         raise RuntimeError(f"{str(stage_name)} requires non-empty semantic stage rows")
 
-    # Registry discovers terms in encounter order — grows as build proceeds.
-    registry = DatasetTermRegistry()
+    # Registry must match the one used to build mask_indices; if the caller
+    # already has one (e.g. the local registry used for label-stack building)
+    # it must be passed in so deformed-entry label_vecs reference the same
+    # index space as the stored mask_indices.  Only create a fresh one when
+    # no pre-existing registry is supplied.
+    if registry is None:
+        registry = DatasetTermRegistry()
     for row in terms_rows:
         registry.register_many(list(_normalize_vocab_terms(row)))
 

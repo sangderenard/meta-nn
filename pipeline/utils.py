@@ -198,11 +198,13 @@ def _classifier_output_dim(model: nn.Module) -> int:
     from wav_ml_models import TinyConvClassifier
     if isinstance(model, TinyConvClassifier):
         last = model.head[-1]
-        if isinstance(last, nn.Linear):
-            return int(last.out_features)
+        out_f = getattr(last, "out_features", None)
+        if out_f is not None:
+            return int(out_f)
     fc = getattr(model, "fc", None)
-    if isinstance(fc, nn.Linear):
-        return int(fc.out_features)
+    out_f = getattr(fc, "out_features", None)
+    if out_f is not None:
+        return int(out_f)
     raise RuntimeError(f"Unsupported classifier head for output-dim query: {type(model).__name__}")
 
 

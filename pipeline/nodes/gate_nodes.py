@@ -114,7 +114,9 @@ def _evaluate_loss_gate(
             channels_last=bool(channels_last),
             semantic_mask_supervision_mode=str(getattr(ctx.args, "semantic_mask_supervision_mode", "multihot_mix") or "multihot_mix"),
             semantic_cosine_weight=float(semantic_cosine_weight),
+            active_term_to_idx=dict(ctx.semantic_term_to_idx),
         )
+
 
 
 class PregestationEvalNode(PipelineNode):

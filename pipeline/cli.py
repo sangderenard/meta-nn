@@ -544,6 +544,12 @@ def parse_args():
         ),
     )
     p.add_argument(
+        "--pregestation-deformations-per-clean",
+        type=int,
+        default=2,
+        help="Augmentation variants generated per base pregestation image in the stage cache. Lower values reduce RAM and build time.",
+    )
+    p.add_argument(
         "--pregestation-stage-cache-max-mb",
         type=int,
         default=-1,
