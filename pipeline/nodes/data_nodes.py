@@ -1038,8 +1038,7 @@ class DataNode(PipelineNode):
         )
 
         images, initial_terms = _flatten_symbol_pool(
-            symbol_pool=symbol_pool, class_names=ctx.class_names,
-            semantic_term_to_idx=ctx.semantic_term_to_idx,
+            symbol_pool=symbol_pool,
             samples_per_term=self.gest_cfg.samples_per_term,
         )
         if not images:
@@ -1053,12 +1052,11 @@ class DataNode(PipelineNode):
         _gest_seed = int(getattr(ctx.args, "seed", 0) or 0)
         _raw_cache_dir = _raw_stage_cache_dir(ctx, "gestation")
         _raw_cache_key = _raw_stage_cache_key({
-            "class_names": sorted(ctx.class_names),
             "seed": _gest_seed,
             "samples_per_term": self.gest_cfg.samples_per_term,
             "image_size": self.gest_cfg.image_size,
             "pool_sig": _pool_sig,
-            "mask_semantics_version": 7,
+            "mask_semantics_version": 8,
         })
         _raw_cached = _load_raw_stage_cache(_raw_cache_dir, _raw_cache_key)
         if _raw_cached is not None:
@@ -1067,6 +1065,9 @@ class DataNode(PipelineNode):
             mask_stacks = _raw_cached["mask_stacks"]
             mask_indices = _raw_cached["mask_indices"]
             terms_rows = _raw_cached["terms_rows"]
+            # Rebuild local registry from stored vocab (encounter order, vocab-indifferent)
+            _local_registry_gest = DatasetTermRegistry()
+            _local_registry_gest.register_many(list(_raw_cached.get("local_vocab") or []))
         else:
             _log(f"[data-node] gestation raw cache MISS ({_raw_cache_key[:8]}…) — running inference")
 
@@ -1083,13 +1084,10 @@ class DataNode(PipelineNode):
                 )
             ]
 
-            # --- Step 2: build LOCAL registry and targets ---
-            from semantic_dataset_loaders import DatasetTermRegistry as _DTR
-            _local_vocab_gest = sorted({t for row in _all_terms for t in _normalize_vocab_terms(row)})
-            _local_registry_gest = _DTR()
-            _local_registry_gest.register_many(_local_vocab_gest)
-            _n_local_gest = len(_local_vocab_gest)
-            targets = targets_from_terms(_all_terms, _local_registry_gest.term_to_idx, _n_local_gest)
+            # --- Step 2: build LOCAL registry and targets (encounter order) ---
+            _local_registry_gest = DatasetTermRegistry()
+            _local_registry_gest.register_many([t for row in _all_terms for t in _normalize_vocab_terms(row)])
+            targets = targets_from_terms(_all_terms, _local_registry_gest.term_to_idx, len(_local_registry_gest))
 
             # --- Step 3: heuristic term-mask stacks — one vectorised call for ALL images ---
             _images_np = np.stack([np.asarray(images[i], dtype=np.float32) for i in range(_n_gest)], axis=0)
@@ -1152,11 +1150,12 @@ class DataNode(PipelineNode):
                     "mask_stacks": list(mask_stacks),
                     "mask_indices": list(mask_indices),
                     "terms_rows": list(terms_rows),
+                    "local_vocab": list(_local_registry_gest.local_vocab),
                 }, progress_control=ctx)
                 _pbar.update(1)
 
-        # ---- Canonical target construction from terms (unified path) ----
-        targets = targets_from_terms(terms_rows, ctx.semantic_term_to_idx, len(ctx.class_names))
+        # ---- Canonical target construction from terms (vocab-indifferent local registry) ----
+        targets = targets_from_terms(terms_rows, _local_registry_gest.term_to_idx, len(_local_registry_gest))
 
         _register_churn_terms(
             ctx,
@@ -2047,37 +2046,27 @@ def _bootstrap_latent_wav_pool(
 
 def _flatten_symbol_pool(
     symbol_pool: Dict[str, Any],
-    class_names: List[str],
-    semantic_term_to_idx: Dict[str, int],
     samples_per_term: int,
 ) -> Tuple[List[Any], List[List[str]]]:
     """Return (images, initial_terms) — one seed-term list per image.
+
+    Vocab-indifferent: loads ALL pool terms regardless of active vocabulary.
+    Batches with OOV terms are churned at training time, not filtered here.
 
     Targets are NOT built here.  Callers derive targets via
     ``targets_from_terms`` after enriching the term lists.
     """
     images: List[Any] = []
     initial_terms: List[List[str]] = []
-    _skipped_terms: List[str] = []
 
     for term, term_images in symbol_pool.items():
         term_lc = str(term).strip().lower()
-        idx = semantic_term_to_idx.get(term_lc, -1)
-        if idx < 0:
-            _skipped_terms.append(term_lc)
-            continue
         term_imgs = list(term_images)[:samples_per_term]
         for img in term_imgs:
             images.append(img)
             initial_terms.append([term_lc])
 
-    if _skipped_terms:
-        raise ValueError(
-            f"_flatten_symbol_pool: {len(_skipped_terms)} pool term(s) not in active vocabulary "
-            f"(silent label filtering is forbidden). "
-            f"Dropped: {sorted(set(_skipped_terms))[:20]}"
-        )
-    _log(f"[data-node] _flatten_symbol_pool: pool_terms={len(symbol_pool)} matched={len(images)} n_classes={len(class_names)}")
+    _log(f"[data-node] _flatten_symbol_pool: pool_terms={len(symbol_pool)} images={len(images)}")
     return images, initial_terms
 
 

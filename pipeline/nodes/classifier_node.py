@@ -544,8 +544,22 @@ class GestationTrainNode(IRTrainingNode):
         return ctx.gestation_loader is not None and ctx.classifier is not None
 
     def execute(self, ctx: PipelineContext) -> None:
-        ensure_vocab_lora_active(ctx, self.cfg)
         from pipeline.nodes.base import make_training_progress_callback
+        from pipeline.nodes.data_nodes import _register_churn_terms, _dataset_terms_rows
+
+        # Schedule through the churn system before training: ensures the active
+        # vocabulary slot covers the gestation terms regardless of lora state.
+        gestation_term_rows = _dataset_terms_rows(
+            getattr(ctx, "gestation_dataset", None), progress_control=ctx
+        )
+        _register_churn_terms(
+            ctx,
+            term_rows=gestation_term_rows,
+            source="gestation",
+            stage_label="stage1_gestation",
+        )
+
+        ensure_vocab_lora_active(ctx, self.cfg)
         preview_callback = make_classifier_step_preview_callback(ctx, self.node_id)
         weight_update_callback = make_runtime_weight_publish_callback(
             ctx,

@@ -1237,27 +1237,17 @@ def build_flashcard_heuristic_mask(image: Any) -> np.ndarray:
     return np.clip(combined / hi, 0.0, 1.0).astype(np.float32)
 
 
-def build_observed_color_stack_from_terms(
-    image: Any,
-    term_row: Sequence[str] = (),
-    processing_device: Optional[Any] = None,
-) -> Tuple[np.ndarray, List[str]]:
-    bchw = _image_batch_to_bchw01(np.asarray(image, dtype=np.float32))
-    h = int(bchw.shape[2]) if int(bchw.ndim) == 4 else 0
-    w = int(bchw.shape[3]) if int(bchw.ndim) == 4 else 0
-    resolved = torch.device("cpu")
-    if processing_device is not None:
-        try:
-            resolved = processing_device if isinstance(processing_device, torch.device) else torch.device(str(processing_device))
-            if resolved.type == "cuda" and not torch.cuda.is_available():
-                resolved = torch.device("cpu")
-        except Exception:
-            resolved = torch.device("cpu")
-    arr = torch.as_tensor(bchw, dtype=torch.float32, device=resolved)
-    arr = torch.clamp(arr, 0.0, 1.0)
-    if int(arr.ndim) != 4 or int(arr.shape[1]) < 3:
-        return np.zeros((0, h, w), dtype=np.float32), []
+def _compute_color_score_maps_bchw(arr: "torch.Tensor") -> "Dict[str, torch.Tensor]":
+    """Vectorised color-score computation for a BCHW float32 tensor clamped to [0,1].
 
+    All intermediate and output tensors share the batch dimension (B) so this
+    can be called once with an entire image batch rather than looping per image.
+    Returns a dict mapping color-term names to (B, H, W) score tensors where
+    each map is already per-image normalised to [0, 1].
+
+    Callers are responsible for clamping `arr` to [0, 1] and asserting ndim==4
+    and shape[1]>=3 before calling.
+    """
     r = arr[:, 0]
     g = arr[:, 1]
     b = arr[:, 2]
@@ -1266,44 +1256,39 @@ def build_observed_color_stack_from_terms(
     sat = torch.clamp(vmax - vmin, 0.0, 1.0)
     luma = torch.mean(arr[:, :3], dim=1)
 
-    def _norm01_batch(x: torch.Tensor) -> torch.Tensor:
+    def _norm01_batch(x: "torch.Tensor") -> "torch.Tensor":
         hi = torch.amax(x, dim=(1, 2), keepdim=True)
         valid = hi > 1e-8
         safe_hi = torch.where(valid, hi, torch.ones_like(hi))
         return torch.where(valid, torch.clamp(x / safe_hi, 0.0, 1.0), torch.zeros_like(x))
 
     # --- HSV decomposition for hue-angle-based chromatic binning ---
-    # chroma (= HSV value * HSV saturation = vmax - vmin) already computed as `sat`
     safe_delta = torch.where(sat > 1e-8, sat, torch.ones_like(sat))
     r_is_max = (r >= g) & (r >= b)
     g_is_max = (g > r) & (g >= b)
-    # hue in [0, 6) segments matching standard HSV
-    h_r = (g - b) / safe_delta          # segment when r is max: [-1, 1)
-    h_g = (b - r) / safe_delta + 2.0    # segment when g is max: [1, 3)
-    h_b = (r - g) / safe_delta + 4.0    # segment when b is max: [3, 5)
+    h_r = (g - b) / safe_delta
+    h_g = (b - r) / safe_delta + 2.0
+    h_b = (r - g) / safe_delta + 4.0
     hue_norm = torch.where(r_is_max, h_r, torch.where(g_is_max, h_g, h_b))
     hue_norm = hue_norm % 6.0
-    hue_deg = hue_norm * 60.0           # [0, 360) degrees
+    hue_deg = hue_norm * 60.0
     hue_deg = torch.where(sat > 1e-8, hue_deg, torch.zeros_like(hue_deg))
-    # HSV saturation (normalised by value) — gates achromatic pixels out of hue scoring
     safe_vmax = torch.where(vmax > 1e-8, vmax, torch.ones_like(vmax))
     hsv_sat = torch.where(vmax > 1e-8, sat / safe_vmax, torch.zeros_like(vmax))
 
-    _PI = torch.tensor(math.pi, dtype=torch.float32, device=resolved)
+    _PI = torch.tensor(math.pi, dtype=torch.float32, device=arr.device)
 
-    def _hue_bell(center_deg: float, half_width_deg: float) -> torch.Tensor:
-        """Cosine bell centred on `center_deg`, zero at ±half_width_deg. Handles 0°/360° wrap."""
+    def _hue_bell(center_deg: float, half_width_deg: float) -> "torch.Tensor":
         diff = torch.abs(hue_deg - center_deg)
         diff = torch.minimum(diff, 360.0 - diff)
         t = torch.clamp(diff / half_width_deg, 0.0, 1.0)
         return 0.5 * (1.0 + torch.cos(t * _PI))
 
-    def _chroma_mask(center_deg: float, half_width_deg: float, sat_lo: float = 0.15) -> torch.Tensor:
-        """Hue bell weighted by a smooth HSV-saturation gate and pixel value (brightness)."""
+    def _chroma_mask(center_deg: float, half_width_deg: float, sat_lo: float = 0.15) -> "torch.Tensor":
         gate = torch.clamp((hsv_sat - sat_lo) / 0.15, 0.0, 1.0)
         return _hue_bell(center_deg, half_width_deg) * gate * vmax
 
-    color_maps: Dict[str, torch.Tensor] = {
+    color_maps: Dict[str, "torch.Tensor"] = {
         # --- Tonal (hue-independent) ---
         "bright":  _norm01_batch(torch.clamp(luma, 0.0, 1.0)),
         "dark":    _norm01_batch(torch.clamp(1.0 - luma, 0.0, 1.0)),
@@ -1338,23 +1323,62 @@ def build_observed_color_stack_from_terms(
     gx[:, :, 1:-1] = luma[:, :, 2:] - luma[:, :, :-2]
     gy[:, 1:-1, :] = luma[:, 2:, :] - luma[:, :-2, :]
     color_maps["edge"] = _norm01_batch(torch.sqrt((gx * gx) + (gy * gy)))
+    return color_maps
 
+
+def _resolve_processing_device(processing_device: Optional[Any]) -> "torch.device":
+    resolved = torch.device("cpu")
+    if processing_device is not None:
+        try:
+            resolved = processing_device if isinstance(processing_device, torch.device) else torch.device(str(processing_device))
+            if resolved.type == "cuda" and not torch.cuda.is_available():
+                resolved = torch.device("cpu")
+        except Exception:
+            resolved = torch.device("cpu")
+    return resolved
+
+
+def _color_maps_to_observed_stack(
+    color_maps: "Dict[str, torch.Tensor]",
+    img_idx: int,
+    h: int,
+    w: int,
+) -> Tuple[np.ndarray, List[str]]:
+    """Extract per-image (img_idx) observed masks from a batched color_maps dict."""
     observed_masks: List[np.ndarray] = []
     observed_terms: List[str] = []
     for color_name in _SEMANTIC_COLOR_TERMS:
         score_t = color_maps.get(str(color_name))
-        if score_t is None or int(score_t.ndim) != 3 or int(score_t.shape[0]) <= 0:
+        if score_t is None or int(score_t.ndim) != 3 or int(score_t.shape[0]) <= img_idx:
             continue
-        score = np.asarray(score_t[0].detach().cpu().numpy(), dtype=np.float32)
-        vmax = float(np.max(score))
-        if vmax <= 1e-8:
+        score = score_t[img_idx].numpy().astype(np.float32, copy=False)
+        peak = float(np.max(score))
+        if peak <= 1e-8:
             continue
-        observed_masks.append(np.clip(score / vmax, 0.0, 1.0).astype(np.float32, copy=False))
+        observed_masks.append(np.clip(score / peak, 0.0, 1.0).astype(np.float32, copy=False))
         observed_terms.append(str(color_name))
-
     if len(observed_masks) <= 0:
         return np.zeros((0, h, w), dtype=np.float32), []
     return np.stack(observed_masks, axis=0).astype(np.float32, copy=False), list(observed_terms)
+
+
+def build_observed_color_stack_from_terms(
+    image: Any,
+    term_row: Sequence[str] = (),
+    processing_device: Optional[Any] = None,
+) -> Tuple[np.ndarray, List[str]]:
+    bchw = _image_batch_to_bchw01(np.asarray(image, dtype=np.float32))
+    h = int(bchw.shape[2]) if int(bchw.ndim) == 4 else 0
+    w = int(bchw.shape[3]) if int(bchw.ndim) == 4 else 0
+    resolved = _resolve_processing_device(processing_device)
+    arr = torch.as_tensor(bchw, dtype=torch.float32, device=resolved)
+    arr = torch.clamp(arr, 0.0, 1.0)
+    if int(arr.ndim) != 4 or int(arr.shape[1]) < 3:
+        return np.zeros((0, h, w), dtype=np.float32), []
+    color_maps = _compute_color_score_maps_bchw(arr)
+    # Move all maps to CPU in one pass before numpy extraction
+    cpu_maps: Dict[str, "torch.Tensor"] = {k: v.detach().cpu() for k, v in color_maps.items()}
+    return _color_maps_to_observed_stack(cpu_maps, img_idx=0, h=h, w=w)
 
 
 def _normalize_semantic_terms_batch(
@@ -1393,16 +1417,29 @@ def build_term_mask_stacks_from_images(
     if int(len(override_rows)) < int(bsz):
         override_rows.extend([None for _ in range(int(bsz) - int(len(override_rows)))])
 
+    # --- Compute color maps for ALL images in one vectorised pass ---
+    # This avoids the B×N_colors device→host round-trips that occur when
+    # calling build_observed_color_stack_from_terms per-image in a loop.
+    _cpu_color_maps: Optional[Dict[str, "torch.Tensor"]] = None
+    if registry is not None and int(bsz) > 0:
+        _resolved = _resolve_processing_device(processing_device)
+        _arr = torch.as_tensor(bchw, dtype=torch.float32, device=_resolved)
+        _arr = torch.clamp(_arr, 0.0, 1.0)
+        if int(_arr.ndim) == 4 and int(_arr.shape[1]) >= 3:
+            _batch_maps = _compute_color_score_maps_bchw(_arr)
+            # Transfer everything to CPU in a single pass before the per-image loop
+            _cpu_color_maps = {k: v.detach().cpu() for k, v in _batch_maps.items()}
+
     out_stack: List[np.ndarray] = []
     out_idx: List[np.ndarray] = []
     for row_idx in range(int(bsz)):
-        observed_stack, observed_terms = build_observed_color_stack_from_terms(
-            image=bchw[int(row_idx)],
-            processing_device=processing_device,
-        ) if registry is not None else (
-            np.zeros((0, int(h), int(w)), dtype=np.float32),
-            [],
-        )
+        if _cpu_color_maps is not None:
+            observed_stack, observed_terms = _color_maps_to_observed_stack(
+                _cpu_color_maps, img_idx=int(row_idx), h=int(h), w=int(w)
+            )
+        else:
+            observed_stack = np.zeros((0, int(h), int(w)), dtype=np.float32)
+            observed_terms = []
 
         row_masks: List[np.ndarray] = []
         row_indices: List[int] = []
