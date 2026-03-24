@@ -1,13 +1,19 @@
 """Smoke test: precomputed per-label mask stacks from element stacks."""
 import numpy as np
+from pipeline.vocabulary_defaults import DEFAULT_VOCABULARY
 from semantic_dataset_loaders import (
     _composite_mask_stack,
     elem_stacks_to_label_stacks,
 )
 
 size = 256
-n_classes = 10
-term_to_idx = {f"term_{i}": i for i in range(n_classes)}
+class_names = list(DEFAULT_VOCABULARY)
+n_classes = len(class_names)
+term_to_idx = {str(t).strip().lower(): i for i, t in enumerate(class_names)}
+
+# Pick four real terms for the two element groups
+group_a = [class_names[0], class_names[1]]
+group_b = [class_names[2], class_names[3]]
 
 targets = [np.zeros(n_classes, dtype=np.float32) for _ in range(4)]
 for i in range(4):
@@ -21,8 +27,7 @@ elem_stacks = [
     ])
     for _ in range(4)
 ]
-# bg covers term_0,term_1; disk covers term_2,term_3
-elem_term_lists_all = [[["term_0", "term_1"], ["term_2", "term_3"]]] * 4
+elem_term_lists_all = [[group_a, group_b]] * 4
 
 # Precompute per-label stacks
 label_stacks = []

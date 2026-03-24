@@ -10,6 +10,7 @@ from pipeline.nodes.classifier_node import (
     FakeClassFeedbackNode,
     _run_fake_class_refresh_epochs,
 )
+from pipeline.vocabulary_defaults import DEFAULT_VOCABULARY
 
 
 def test_fake_feedback_node_uses_current_refresh_signature():
@@ -30,10 +31,10 @@ def test_fake_feedback_node_uses_current_refresh_signature():
         device=torch.device("cpu"),
         amp_enabled=False,
         amp_dtype="float16",
-        class_names=["one", "two"],
-        payload_conditions=[np.array([1.0, 0.0], dtype=np.float32)],
+        class_names=list(DEFAULT_VOCABULARY),
+        payload_conditions=[np.zeros(len(DEFAULT_VOCABULARY), dtype=np.float32)],
         payload_masks=[np.ones((8, 8), dtype=np.float32)],
-        payload_terms=[["one", "berkeley sbd dataset"]],
+        payload_terms=[["signal", "berkeley sbd dataset"]],
         args=SimpleNamespace(
             fake_image_sentinel_label="GAN image",
             label_embedding_backend="sentence_transformers",
@@ -86,7 +87,7 @@ def test_fake_feedback_node_uses_current_refresh_signature():
     assert np.allclose(kwargs["payload_masks"][0], ctx.payload_masks[0])
     assert len(kwargs["payload_terms"]) == len(ctx.payload_terms)
     assert kwargs["payload_terms"][0] == ctx.payload_terms[0]
-    assert kwargs["condition_num_classes"] == 2
+    assert kwargs["condition_num_classes"] == len(DEFAULT_VOCABULARY)
     assert torch.equal(kwargs["fake_label_vector"], fake_vec)
     assert kwargs["z_dim"] == 64
     assert kwargs["epochs"] == 2
@@ -103,10 +104,10 @@ def test_fake_refresh_requires_mask_bundle():
             classifier=torch.nn.Linear(1, 1),
             generator=object(),
             discriminator=None,
-            payload_conditions=[np.array([1.0, 0.0], dtype=np.float32)],
+            payload_conditions=[np.zeros(len(DEFAULT_VOCABULARY), dtype=np.float32)],
             payload_masks=[],
-            payload_terms=[["one"]],
-            condition_num_classes=2,
+            payload_terms=[["signal"]],
+            condition_num_classes=len(DEFAULT_VOCABULARY),
             fake_label_vector=fake_vec,
             z_dim=8,
             device=torch.device("cpu"),
@@ -130,10 +131,10 @@ def test_fake_refresh_requires_row_provenance_bundle():
             classifier=torch.nn.Linear(1, 1),
             generator=object(),
             discriminator=None,
-            payload_conditions=[np.array([1.0, 0.0], dtype=np.float32)],
+            payload_conditions=[np.zeros(len(DEFAULT_VOCABULARY), dtype=np.float32)],
             payload_masks=[np.ones((8, 8), dtype=np.float32)],
             payload_terms=[],
-            condition_num_classes=2,
+            condition_num_classes=len(DEFAULT_VOCABULARY),
             fake_label_vector=fake_vec,
             z_dim=8,
             device=torch.device("cpu"),
@@ -173,7 +174,7 @@ def test_fake_refresh_preview_bundle_keeps_masks_attached():
             return torch.zeros((int(x.shape[0]),), device=x.device, dtype=torch.float32)
 
     classifier = TinyConvClassifier(
-        num_classes=2,
+        num_classes=len(DEFAULT_VOCABULARY),
         base_ch=16,
         max_ch=32,
         context_blocks=0,
@@ -187,10 +188,10 @@ def test_fake_refresh_preview_bundle_keeps_masks_attached():
         classifier=classifier,
         generator=generator,
         discriminator=discriminator,
-        payload_conditions=[np.array([1.0, 0.0], dtype=np.float32)],
+        payload_conditions=[np.zeros(len(DEFAULT_VOCABULARY), dtype=np.float32)],
         payload_masks=[np.ones((32, 32), dtype=np.float32)],
-        payload_terms=[["one", "berkeley sbd dataset"]],
-        condition_num_classes=2,
+        payload_terms=[["signal", "berkeley sbd dataset"]],
+        condition_num_classes=len(DEFAULT_VOCABULARY),
         fake_label_vector=fake_vec,
         z_dim=8,
         device=torch.device("cpu"),
@@ -210,7 +211,7 @@ def test_fake_refresh_preview_bundle_keeps_masks_attached():
     assert captured_batches
     preview_item = captured_batches[0][0]
     assert preview_item["payload_row_idx"] == 0
-    assert preview_item["payload_terms"] == ["one", "berkeley sbd dataset"]
+    assert preview_item["payload_terms"] == ["signal", "berkeley sbd dataset"]
     assert preview_item["target_mask"] is not None
     assert preview_item["detected_mask"] is not None
     assert preview_item["mask_source"] == "classifier_detected"

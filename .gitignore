@@ -1,5 +1,6 @@
 data/
 wav_pipeline_runs/
+/.venv/
 _tmp_graph_smoke/
 __pycache__/
 *.py[cod]
@@ -12,3 +13,5 @@ native/CMakeUserPresets.json
 native/CMakePresets.json
 pipeline_debug/
 .codex_tmp_weight_images/
+.venv/
+*.egg-info/

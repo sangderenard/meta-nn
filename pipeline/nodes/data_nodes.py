@@ -66,6 +66,7 @@ from pipeline.nodes.vocab_node import (
     select_active_vocab_lora_slot,
 )
 from semantic_dataset_loaders import (
+    DatasetTermRegistry,
     DiskSemanticRowsDataset,
     build_combined_mask_stacks,
     build_loader_from_manifest,
@@ -778,7 +779,7 @@ class DataNode(PipelineNode):
             "samples_per_combo": self.preg_cfg.samples_per_combo,
             "mode_sequence": sorted(_mode_seq),
             "image_size": self.preg_cfg.image_size,
-            "mask_semantics_version": 9,
+            "mask_semantics_version": 10,
         })
         _raw_cached = _load_raw_stage_cache(_raw_cache_dir, _raw_cache_key)
         if _raw_cached is not None:
@@ -826,14 +827,15 @@ class DataNode(PipelineNode):
                 _log("[data-node] WARNING: no pregestation images built")
                 return
 
-            # ---- Build LOCAL vocabulary for mask stack indices ----
+            # ---- Build LOCAL registry for mask stack indices ----
+            from semantic_dataset_loaders import DatasetTermRegistry as _DTR
             _local_vocab = sorted({t for row in all_term_rows for t in _preg_normalize_vocab_terms(row)})
-            _local_term_to_idx: Dict[str, int] = {t: i for i, t in enumerate(_local_vocab)}
+            _local_registry = _DTR()
+            _local_registry.register_many(_local_vocab)
             _n_local = len(_local_vocab)
-            all_targets = targets_from_terms(all_term_rows, _local_term_to_idx, _n_local)
+            all_targets = targets_from_terms(all_term_rows, _local_registry.term_to_idx, _n_local)
 
             # ---- Precompute per-label mask stacks from shared observed-color builder ----
-            idx_to_term = {int(i): str(name) for i, name in enumerate(_local_vocab)}
             all_label_stacks: list = []
             all_label_indices: list = []
             _images_np = np.stack([np.asarray(im, dtype=np.float32) for im in all_images], axis=0)
@@ -842,7 +844,7 @@ class DataNode(PipelineNode):
                 _heuristic_stacks, _heuristic_indices = build_term_mask_stacks_from_images(
                     images=_images_np,
                     label_vecs=_targets_np,
-                    idx_to_term=idx_to_term,
+                    registry=_local_registry,
                     processing_device=_processing_device,
                 )
                 for i in interruptible_tqdm(
@@ -860,12 +862,11 @@ class DataNode(PipelineNode):
                         base_mask_np = np.ones((int(img_np.shape[1]), int(img_np.shape[2])), dtype=np.float32)
                     merged_stack, merged_idx = build_combined_mask_stacks(
                         label_vec=all_targets[i],
-                        idx_to_term=idx_to_term,
+                        registry=_local_registry,
                         height=int(base_mask_np.shape[0]),
                         width=int(base_mask_np.shape[1]),
                         elem_stack=all_mask_stacks[i] if i < len(all_mask_stacks) else None,
                         elem_term_lists=all_elem_term_lists[i] if i < len(all_elem_term_lists) else None,
-                        term_to_idx=_local_term_to_idx,
                         heuristic_stack=np.asarray(_heuristic_stacks[i], dtype=np.float32),
                         heuristic_idx=np.asarray(_heuristic_indices[i], dtype=np.int64),
                         processing_device=_processing_device,
@@ -875,7 +876,7 @@ class DataNode(PipelineNode):
                     all_term_rows[i] = merge_terms_with_mask_indices(
                         all_term_rows[i],
                         merged_idx,
-                        idx_to_term=idx_to_term,
+                        registry=_local_registry,
                     )
                     all_label_stacks.append(np.asarray(merged_stack, dtype=np.float32))
                     all_label_indices.append(np.asarray(merged_idx, dtype=np.int64))
@@ -1070,12 +1071,13 @@ class DataNode(PipelineNode):
                 )
             ]
 
-            # --- Step 2: build LOCAL vocabulary and targets ---
+            # --- Step 2: build LOCAL registry and targets ---
+            from semantic_dataset_loaders import DatasetTermRegistry as _DTR
             _local_vocab_gest = sorted({t for row in _all_terms for t in _normalize_vocab_terms(row)})
-            _local_t2i_gest: Dict[str, int] = {t: i for i, t in enumerate(_local_vocab_gest)}
-            _local_i2t_gest = {int(i): str(name) for i, name in enumerate(_local_vocab_gest)}
+            _local_registry_gest = _DTR()
+            _local_registry_gest.register_many(_local_vocab_gest)
             _n_local_gest = len(_local_vocab_gest)
-            targets = targets_from_terms(_all_terms, _local_t2i_gest, _n_local_gest)
+            targets = targets_from_terms(_all_terms, _local_registry_gest.term_to_idx, _n_local_gest)
 
             # --- Step 3: heuristic term-mask stacks — one vectorised call for ALL images ---
             _images_np = np.stack([np.asarray(images[i], dtype=np.float32) for i in range(_n_gest)], axis=0)
@@ -1084,7 +1086,7 @@ class DataNode(PipelineNode):
                 _heuristic_stacks, _heuristic_indices = build_term_mask_stacks_from_images(
                     images=_images_np,
                     label_vecs=_targets_np,
-                    idx_to_term=_local_i2t_gest,
+                    registry=_local_registry_gest,
                     processing_device=_processing_device,
                 )
                 # --- Step 4: combine/fallback/composite per image ---
@@ -1106,7 +1108,7 @@ class DataNode(PipelineNode):
                     _w = int(h_stack.shape[-1]) if int(h_stack.ndim) >= 2 else int(_images_np.shape[3])
                     merged_stack, merged_idx = build_combined_mask_stacks(
                         label_vec=targets[int(i)],
-                        idx_to_term=_local_i2t_gest,
+                        registry=_local_registry_gest,
                         height=_h,
                         width=_w,
                         heuristic_stack=h_stack,
@@ -1116,7 +1118,7 @@ class DataNode(PipelineNode):
                     terms_rows.append(merge_terms_with_mask_indices(
                         _all_terms[i],
                         merged_idx,
-                        idx_to_term=_local_i2t_gest,
+                        registry=_local_registry_gest,
                     ))
                     masks.append(np.zeros((_h, _w), dtype=np.float32))
                     mask_stacks.append(np.asarray(merged_stack, dtype=np.float32))
@@ -2056,7 +2058,11 @@ def _flatten_symbol_pool(
             initial_terms.append([term_lc])
 
     if _skipped_terms:
-        _log(f"[data-node] _flatten_symbol_pool: {len(_skipped_terms)} pool terms not in vocab: {sorted(set(_skipped_terms))}")
+        raise ValueError(
+            f"_flatten_symbol_pool: {len(_skipped_terms)} pool term(s) not in active vocabulary "
+            f"(silent label filtering is forbidden). "
+            f"Dropped: {sorted(set(_skipped_terms))[:20]}"
+        )
     _log(f"[data-node] _flatten_symbol_pool: pool_terms={len(symbol_pool)} matched={len(images)} n_classes={len(class_names)}")
     return images, initial_terms
 
@@ -2396,9 +2402,10 @@ def _build_semantic_stage_cache_dataset(
     if int(total_rows) <= 0:
         raise RuntimeError(f"{str(stage_name)} requires non-empty semantic stage rows")
 
-    # Build local vocabulary from the union of all terms across rows.
-    local_vocab = sorted({t for row in terms_rows for t in _normalize_vocab_terms(row)})
-    local_term_to_idx: Dict[str, int] = {t: i for i, t in enumerate(local_vocab)}
+    # Registry discovers terms in encounter order — grows as build proceeds.
+    registry = DatasetTermRegistry()
+    for row in terms_rows:
+        registry.register_many(list(_normalize_vocab_terms(row)))
 
     candidates: List[SemanticWheelCandidate] = []
     for i in interruptible_tqdm(
@@ -2441,7 +2448,7 @@ def _build_semantic_stage_cache_dataset(
                     variant_idx=int(vi),
                     base_row_position=int(_base_pos),
                     seed=int(seed),
-                    term_to_idx=local_term_to_idx,
+                    registry=registry,
                     processing_device=processing_device,
                 )
             )
@@ -2455,7 +2462,7 @@ def _build_semantic_stage_cache_dataset(
         candidates=candidates,
         candidate_indices=list(range(int(total_rows))),
         build_entry_group=_entry_group,
-        local_vocab=local_vocab,
+        registry=registry,
         config=SemanticWheelConfig(
             purpose=str(stage_name),
             cache_root=_resolve_semantic_stage_cache_root(ctx=ctx, stage_name=str(stage_name)),
@@ -3285,16 +3292,27 @@ def _schedule_semantic_gate_indices(
     class_map = _semantic_term_index_map(class_names)
     active_terms_norm = _normalize_vocab_terms(active_terms)
     active_indices: List[int] = []
+    _gate_dropped: List[str] = []
     for term in active_terms_norm:
         key = re.sub(r"\s+", " ", str(term)).strip().lower()
         if not key:
             continue
         idx = class_map.get(key, None)
         if idx is None:
+            _gate_dropped.append(key)
             continue
         if int(idx) < 0 or int(idx) >= int(y.shape[1]):
-            continue
+            raise ValueError(
+                f"_build_payload_gate_condition_multi: term {key!r} maps to index "
+                f"{idx} which is out of bounds for label width {int(y.shape[1])}."
+            )
         active_indices.append(int(idx))
+    if _gate_dropped:
+        raise ValueError(
+            f"_build_payload_gate_condition_multi: {len(_gate_dropped)} term(s) not in "
+            f"active vocabulary (silent label filtering is forbidden). "
+            f"Dropped: {sorted(set(_gate_dropped))[:20]}"
+        )
     active_indices = list(dict.fromkeys(active_indices))
 
     _ = int(seed)  # Kept for API compatibility; scheduling is deterministic and staged.
@@ -3752,6 +3770,13 @@ def _unpack_masked_semantic_batch(batch: Any, context: str) -> Tuple[torch.Tenso
         raise RuntimeError(
             f"{str(context)} batch size mismatch: x={int(xb.shape[0])} m={int(mb.shape[0])}"
         )
+    # Graduate mask_stacks to float32 regardless of source dtype.
+    if "mask_stacks" in meta:
+        meta["mask_stacks"] = [
+            _mask_tensor_to_float01(s) if torch.is_tensor(s)
+            else _mask_tensor_to_float01(torch.as_tensor(s))
+            for s in meta["mask_stacks"]
+        ]
     return xb, _mask_tensor_to_float01(mb), meta
 
 
@@ -4088,12 +4113,22 @@ def rebuild_conditions_from_terms(
             term_to_idx[key] = int(i)
     c = max(1, int(len(class_names)))
     out: List[np.ndarray] = []
-    for row_terms in payload_terms:
+    for row_i, row_terms in enumerate(payload_terms):
         vec = np.zeros((c,), dtype=np.float32)
+        _pc_dropped: List[str] = []
         for t in row_terms:
-            idx = term_to_idx.get(str(t).strip().lower(), -1)
+            tk = str(t).strip().lower()
+            idx = term_to_idx.get(tk, -1)
             if 0 <= idx < c:
                 vec[idx] = 1.0
+            elif tk:
+                _pc_dropped.append(tk)
+        if _pc_dropped:
+            raise ValueError(
+                f"_expand_payload_conditions_batch row {row_i}: {len(_pc_dropped)} term(s) "
+                f"not in active vocabulary (silent label filtering is forbidden). "
+                f"Dropped: {sorted(set(_pc_dropped))[:20]}"
+            )
         out.append(vec)
     return out
 

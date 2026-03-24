@@ -24,6 +24,7 @@ from torch.utils.data import Dataset, Sampler
 from pipeline.filesystem_emergency import raise_if_filesystem_space_emergency
 from pipeline.progress import interruptible_tqdm
 from semantic_dataset_loaders import (
+    DatasetTermRegistry,
     SemanticDiskRow,
     _apply_degrade as _canonical_apply_degrade,
     _norm_txt,
@@ -351,7 +352,10 @@ def _load_seg_class_masks(
         term_name = str(VOC20_CLASSES[voc_idx]).strip().lower()
         local_idx = term_to_idx.get(term_name, -1)
         if local_idx < 0:
-            continue
+            raise ValueError(
+                f"_load_seg_class_masks: segmentation term {term_name!r} has no index "
+                f"in the provided mapping \u2014 every term in the data must have an index"
+            )
         binary = (seg == int(seg_id)).astype(np.float32, copy=False)
         fitted = _fit_mask_letterbox(binary, image_size=size)
         masks.append(fitted)
@@ -362,20 +366,28 @@ def _load_seg_class_masks(
 
     # "object" = union of all per-class segmentation masks.
     obj_idx = term_to_idx.get("object", -1)
-    if obj_idx >= 0:
-        foreground = np.clip(
-            np.sum(np.stack(masks, axis=0), axis=0), 0.0, 1.0
-        ).astype(np.float32, copy=False)
-        masks.append(foreground)
-        indices.append(int(obj_idx))
+    if obj_idx < 0:
+        raise ValueError(
+            "_load_seg_class_masks: term 'object' has no index "
+            "in the provided mapping \u2014 every term in the data must have an index"
+        )
+    foreground = np.clip(
+        np.sum(np.stack(masks, axis=0), axis=0), 0.0, 1.0
+    ).astype(np.float32, copy=False)
+    masks.append(foreground)
+    indices.append(int(obj_idx))
 
     # "signal" and "berkeley sbd dataset" = whole image.
     whole = np.ones((size, size), dtype=np.float32)
     for umbrella in ("signal", "berkeley sbd dataset"):
         u_idx = term_to_idx.get(umbrella, -1)
-        if u_idx >= 0:
-            masks.append(whole)
-            indices.append(int(u_idx))
+        if u_idx < 0:
+            raise ValueError(
+                f"_load_seg_class_masks: term {umbrella!r} has no index "
+                f"in the provided mapping \u2014 every term in the data must have an index"
+            )
+        masks.append(whole)
+        indices.append(int(u_idx))
 
     return (
         np.stack(masks, axis=0).astype(np.float32, copy=False),
@@ -506,13 +518,13 @@ def _apply_degrade(
 def _build_clean_entry(
     row: SemanticDiskRow,
     image_size: int,
-    idx_to_term: Dict[int, str],
+    registry: DatasetTermRegistry,
     processing_device: Optional[Any] = None,
 ) -> Dict[str, Any]:
     return _build_clean_entries_batch(
         rows=[row],
         image_size=int(image_size),
-        idx_to_term=idx_to_term,
+        registry=registry,
         processing_device=processing_device,
     )[0]
 
@@ -520,7 +532,7 @@ def _build_clean_entry(
 def _build_clean_entries_batch(
     rows: Sequence[SemanticDiskRow],
     image_size: int,
-    idx_to_term: Dict[int, str],
+    registry: DatasetTermRegistry,
     processing_device: Optional[Any] = None,
     preload_workers: int = 0,
     progress_control: Any = None,
@@ -535,24 +547,33 @@ def _build_clean_entries_batch(
     )
     image_batch = np.clip(np.asarray(image_u8_batch, dtype=np.float32) / 255.0, 0.0, 1.0).astype(np.float32, copy=False)
 
-    term_to_idx: Dict[str, int] = {str(v).strip().lower(): int(k) for k, v in idx_to_term.items()}
-    n_local = len(idx_to_term)
+    # Register row terms in the registry (idempotent for already-known terms).
+    for row in rows:
+        registry.register_many(list(row.terms))
+    n_local = len(registry)
     tonal_masks_per_row: List[Dict[str, np.ndarray]] = [{} for _ in rows]
     enriched_terms_per_row: List[List[str]] = [list(row.terms) for row in rows]
 
     # Build label_batch directly from the row terms. No image-level tonal/color
     # enrichment is allowed here.
     label_batch = np.stack(
-        targets_from_terms(enriched_terms_per_row, term_to_idx, n_local),
+        targets_from_terms(enriched_terms_per_row, registry.term_to_idx, n_local),
         axis=0,
     ).astype(np.float32, copy=False)
 
     heuristic_stacks, heuristic_indices = build_term_mask_stacks_from_images(
         images=image_batch,
         label_vecs=label_batch,
-        idx_to_term=idx_to_term,
         processing_device=processing_device,
+        registry=registry,
     )
+
+    # Registry may have grown (new color/tonal terms discovered by heuristic
+    # analysis).  Re-read the live mappings and pad label_batch to match.
+    n_local = len(registry)
+    if n_local > int(label_batch.shape[1]):
+        pad = np.zeros((int(label_batch.shape[0]), n_local - int(label_batch.shape[1])), dtype=np.float32)
+        label_batch = np.concatenate([label_batch, pad], axis=1).astype(np.float32, copy=False)
 
     out: List[Dict[str, Any]] = []
     for row_idx, row in interruptible_tqdm(
@@ -574,27 +595,26 @@ def _build_clean_entries_batch(
         seg_stack, seg_idx = _load_seg_class_masks(
             mask_path=str(row.mask_path or ""),
             image_size=size,
-            term_to_idx=term_to_idx,
+            term_to_idx=registry.term_to_idx,
         )
         extra_parts: List[Tuple[Any, Any]] = []
         if int(seg_stack.shape[0]) > 0:
             extra_parts.append((seg_stack, seg_idx))
         mask_stack, mask_indices = build_combined_mask_stacks(
             label_vec=label_vec,
-            idx_to_term=idx_to_term,
+            registry=registry,
             height=size,
             width=size,
             heuristic_stack=np.asarray(heuristic_stacks[int(row_idx)], dtype=np.float32),
             heuristic_idx=np.asarray(heuristic_indices[int(row_idx)], dtype=np.int64),
             tonal_masks=tonal_masks_per_row[int(row_idx)],
             extra_parts=extra_parts if extra_parts else None,
-            term_to_idx=term_to_idx,
             processing_device=processing_device,
         )
         cached_terms = merge_terms_with_mask_indices(
             enriched_terms_per_row[int(row_idx)],
             mask_indices,
-            idx_to_term=idx_to_term,
+            registry=registry,
         )
         out.append(
             {
@@ -612,7 +632,7 @@ def _build_deformed_entry(
     variant_idx: int,
     base_row_position: int,
     seed: int,
-    term_to_idx: Dict[str, int],
+    registry: DatasetTermRegistry,
     degrade_config: Optional[Dict[str, Any]] = None,
     processing_device: Optional[Any] = None,
 ) -> Dict[str, Any]:
@@ -625,34 +645,34 @@ def _build_deformed_entry(
         degrade_config=degrade_config,
         processing_device=processing_device,
     )
-    # Rebuild transient label_vec from the union of clean + deformation terms using local vocab.
+    # Register newly discovered degrade terms in the registry.
+    registry.register_many(list(term_masks.keys()))
+    # Rebuild transient label_vec from the union of clean + deformation terms.
     all_terms = list(normalize_vocab_terms(
         list(clean_entry.get("terms") or []) + [str(x) for x in list(term_masks.keys())]
     ))
-    n_local = max(len(term_to_idx), 1)
-    label_vec = targets_from_terms([all_terms], term_to_idx, n_local)[0]
+    n_local = max(len(registry), 1)
+    label_vec = targets_from_terms([all_terms], registry.term_to_idx, n_local)[0]
     size = int(x.shape[1])
-    idx_to_term_local = {int(v): str(k) for k, v in term_to_idx.items()}
     base_stack = np.asarray(clean_entry["mask_stack"], dtype=np.float32)
     base_idx = np.asarray(clean_entry["mask_indices"], dtype=np.int64).reshape(-1)
     distortion_stack, distortion_idx = term_mask_map_to_label_stack(
         term_masks,
         label_vec,
-        term_to_idx=term_to_idx,
+        registry=registry,
         height=size,
         width=size,
         processing_device=processing_device,
     )
     mask_stack, mask_indices = build_combined_mask_stacks(
         label_vec=label_vec,
-        idx_to_term=idx_to_term_local,
+        registry=registry,
         height=size,
         width=size,
         extra_parts=[
             (base_stack, base_idx),
             (distortion_stack, distortion_idx),
         ],
-        term_to_idx=term_to_idx,
         processing_device=processing_device,
     )
     return {
@@ -1140,6 +1160,23 @@ class SemanticWheelPayloadDataset(Dataset):
         self._h = int(image_hw[0])
         self._w = int(image_hw[1])
         self._n = int(len(bank))
+        # Build-time local vocab from the bank's dataset manifest.
+        self._local_vocab: List[str] = list(getattr(bank.dataset, "local_vocab", []) or [])
+        # Remap table: local_idx → global_idx.  None = no remap (use raw).
+        self._idx_remap: Optional[Dict[int, int]] = None
+
+    def set_active_term_to_idx(self, term_to_idx: Dict[str, int]) -> None:
+        """Rebuild the local→global index remap for the current pipeline vocab."""
+        if not self._local_vocab or not term_to_idx:
+            self._idx_remap = None
+            return
+        remap: Dict[int, int] = {}
+        for local_i, term in enumerate(self._local_vocab):
+            key = term.strip().lower()
+            global_i = term_to_idx.get(key, -1)
+            if global_i >= 0:
+                remap[local_i] = global_i
+        self._idx_remap = remap
 
     def __len__(self) -> int:
         return self._n
@@ -1158,14 +1195,44 @@ class SemanticWheelPayloadDataset(Dataset):
         if tuple(img.shape[-2:]) != (h, w):
             img = F.interpolate(img.unsqueeze(0), size=(h, w), mode="nearest").squeeze(0)
         mask_t = torch.zeros((1, h, w), dtype=torch.float32)
-        stack_t = torch.from_numpy(np.asarray(item.get("mask_stack"), dtype=np.float32))
-        idx_t = torch.from_numpy(np.asarray(item.get("mask_indices"), dtype=np.int64))
+        raw_stack = np.asarray(item.get("mask_stack"), dtype=np.float32)
+        raw_indices = np.asarray(item.get("mask_indices"), dtype=np.int64)
+        terms = list(item.get("terms") or [])
+
+        # Remap local-vocab mask indices to current global-vocab indices.
+        remap = self._idx_remap
+        if remap is not None and int(raw_indices.size) > 0:
+            remapped = np.empty_like(raw_indices)
+            _dropped: List[str] = []
+            for mi in range(int(raw_indices.size)):
+                local_i = int(raw_indices[mi])
+                global_i = remap.get(local_i, -1)
+                if global_i < 0:
+                    local_term = (
+                        self._local_vocab[local_i]
+                        if 0 <= local_i < len(self._local_vocab)
+                        else f"<local_idx {local_i}>"
+                    )
+                    _dropped.append(local_term)
+                    remapped[mi] = 0  # placeholder — will raise below
+                else:
+                    remapped[mi] = global_i
+            if _dropped:
+                raise ValueError(
+                    f"SemanticWheelPayloadDataset: {len(_dropped)} mask label(s) "
+                    f"not in active vocabulary (silent label filtering is forbidden). "
+                    f"Dropped: {_dropped[:20]}"
+                )
+            raw_indices = remapped
+
+        stack_t = torch.from_numpy(raw_stack)
+        idx_t = torch.from_numpy(raw_indices)
         return (
             img.clamp(0.0, 1.0).contiguous(),
             mask_t,
             stack_t,
             idx_t,
-            list(item.get("terms") or []),
+            terms,
         )
 
 
@@ -1203,7 +1270,7 @@ def ensure_semantic_candidate_cache(
     candidate_indices: Sequence[int],
     build_entry_group: Callable[[int, int], Sequence[Dict[str, Any]]],
     build_entry_groups_batch: Optional[Callable[[Sequence[Tuple[int, int]]], Sequence[Sequence[Dict[str, Any]]]]] = None,
-    local_vocab: Sequence[str],
+    registry: DatasetTermRegistry,
     config: SemanticWheelConfig,
 ) -> Dict[str, Any]:
     if len(candidates) <= 0 or len(candidate_indices) <= 0:
@@ -1228,7 +1295,7 @@ def ensure_semantic_candidate_cache(
         "lookahead_batches": int(config.lookahead_batches),
         "deformations_per_clean": int(config.deformations_per_clean),
         "include_clean": bool(config.include_clean),
-        "local_vocab": [str(t) for t in local_vocab],
+        "local_vocab": [str(t) for t in registry.local_vocab],
         "explicit_max_bytes": int(config.explicit_max_bytes),
         "sanity_cap_bytes": int(config.sanity_cap_bytes),
         "allow_large_override": bool(config.allow_large_override),
@@ -1253,7 +1320,6 @@ def ensure_semantic_candidate_cache(
         manifest
         and str(manifest.get("signature", "")) == str(signature)
         and str(manifest.get("candidate_signature", "")) == str(candidate_sig)
-        and list(manifest.get("local_vocab", [])) == [str(t) for t in local_vocab]
         and int(manifest.get("image_size", 0)) == int(config.image_size)
         and str(manifest.get("image_fit_mode", "")) == "letterbox_fill0"
         and str(manifest.get("mask_fit_mode", "")) == "letterbox_fill0"
@@ -1526,7 +1592,7 @@ def ensure_semantic_candidate_cache(
         "image_size": int(config.image_size),
         "image_fit_mode": "letterbox_fill0",
         "mask_fit_mode": "letterbox_fill0",
-        "local_vocab": [str(t) for t in local_vocab],
+        "local_vocab": [str(t) for t in registry.local_vocab],
         "batch_size": int(config.batch_size),
         "lookahead_batches": int(config.lookahead_batches),
         "deformations_per_clean": int(config.deformations_per_clean),
@@ -1622,14 +1688,10 @@ def ensure_semantic_wheel_cache(
 ) -> Dict[str, Any]:
     if len(rows) <= 0 or len(candidate_indices) <= 0:
         raise RuntimeError(f"{str(config.purpose)} requires non-empty semantic rows")
-    # Build local vocabulary from the union of all row terms.
-    local_vocab_set: set = set()
+    # Registry discovers terms in encounter order — grows as build proceeds.
+    registry = DatasetTermRegistry()
     for row in rows:
-        for t in normalize_vocab_terms([str(x) for x in list(row.terms)]):
-            local_vocab_set.add(str(t))
-    local_vocab: List[str] = sorted(local_vocab_set)
-    term_to_idx = {str(name): int(i) for i, name in enumerate(local_vocab)}
-    idx_to_term = {int(i): str(name) for i, name in enumerate(local_vocab)}
+        registry.register_many(list(normalize_vocab_terms([str(x) for x in list(row.terms)])))
     candidates: List[SemanticWheelCandidate] = []
     for row in interruptible_tqdm(
         rows,
@@ -1659,7 +1721,7 @@ def ensure_semantic_wheel_cache(
         clean = _build_clean_entry(
             row=row,
             image_size=int(config.image_size),
-            idx_to_term=idx_to_term,
+            registry=registry,
             processing_device=config.processing_device,
         )
         out: List[Dict[str, Any]] = []
@@ -1672,7 +1734,7 @@ def ensure_semantic_wheel_cache(
                     variant_idx=int(variant_idx),
                     base_row_position=int(base_row_pos),
                     seed=int(config.seed),
-                    term_to_idx=term_to_idx,
+                    registry=registry,
                     degrade_config=config.degrade_config,
                     processing_device=config.processing_device,
                 )
@@ -1684,7 +1746,7 @@ def ensure_semantic_wheel_cache(
         clean_entries = _build_clean_entries_batch(
             rows=batch_rows,
             image_size=int(config.image_size),
-            idx_to_term=idx_to_term,
+            registry=registry,
             processing_device=config.processing_device,
             preload_workers=int(config.preload_workers),
             progress_control=config.progress_control,
@@ -1701,7 +1763,7 @@ def ensure_semantic_wheel_cache(
                         variant_idx=int(variant_idx),
                         base_row_position=int(base_row_pos),
                         seed=int(config.seed),
-                        term_to_idx=term_to_idx,
+                        registry=registry,
                         degrade_config=config.degrade_config,
                         processing_device=config.processing_device,
                     )
@@ -1714,6 +1776,6 @@ def ensure_semantic_wheel_cache(
         candidate_indices=candidate_indices,
         build_entry_group=_entry_group,
         build_entry_groups_batch=_entry_groups_batch,
-        local_vocab=local_vocab,
+        registry=registry,
         config=config,
     )

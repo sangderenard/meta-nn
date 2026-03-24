@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import gzip
+import math
 import pickle
 import queue
 import json
@@ -164,6 +165,62 @@ def normalize_vocab_terms(terms: Sequence[str]) -> List[str]:
     return out
 
 
+class DatasetTermRegistry:
+    """Discovers unique terms from raw data in encounter order.
+
+    Assigns local indices 0..N-1 with NO relationship to any vocabulary list.
+    The index order is purely the order in which unique terms are first seen.
+    """
+
+    def __init__(self) -> None:
+        self._term_to_idx: Dict[str, int] = {}
+        self._idx_to_term: Dict[int, str] = {}
+
+    def register(self, term: str) -> int:
+        """Register a term.  Returns its local index (stable once assigned)."""
+        key = _norm_txt(str(term))
+        if not key:
+            raise ValueError("DatasetTermRegistry: cannot register an empty term")
+        idx = self._term_to_idx.get(key)
+        if idx is not None:
+            return idx
+        idx = len(self._term_to_idx)
+        self._term_to_idx[key] = idx
+        self._idx_to_term[idx] = key
+        return idx
+
+    def register_many(self, terms: Sequence[str]) -> List[int]:
+        """Register multiple terms.  Returns their local indices."""
+        return [self.register(t) for t in terms if _norm_txt(str(t))]
+
+    @property
+    def term_to_idx(self) -> Dict[str, int]:
+        return dict(self._term_to_idx)
+
+    @property
+    def idx_to_term(self) -> Dict[int, str]:
+        return dict(self._idx_to_term)
+
+    @property
+    def local_vocab(self) -> List[str]:
+        """All registered terms in encounter order."""
+        return [self._idx_to_term[i] for i in range(len(self._idx_to_term))]
+
+    def __len__(self) -> int:
+        return len(self._term_to_idx)
+
+    def __contains__(self, term: str) -> bool:
+        return _norm_txt(str(term)) in self._term_to_idx
+
+    def extra_terms_beyond_supervised(self, supervised_names: Sequence[str]) -> List[str]:
+        """Return terms in this registry that are NOT in the supervised set.
+
+        These are the terms the churn/LoRA system needs to find slots for.
+        """
+        supervised_set = {_norm_txt(str(s)) for s in supervised_names if _norm_txt(str(s))}
+        return [t for t in self.local_vocab if t not in supervised_set]
+
+
 def targets_from_terms(
     terms_rows: Sequence[Sequence[str]],
     term_to_idx: Dict[str, int],
@@ -183,24 +240,37 @@ def targets_from_terms(
     """
     out: List[np.ndarray] = []
     nc = max(1, int(n_classes))
+    dropped: List[str] = []
     for terms in terms_rows:
         y = np.zeros(nc, dtype=np.float32)
         for term in terms:
-            idx = term_to_idx.get(re.sub(r"\s+", " ", str(term)).strip().lower(), -1)
+            key = re.sub(r"\s+", " ", str(term)).strip().lower()
+            if not key:
+                continue
+            idx = term_to_idx.get(key, -1)
             if 0 <= idx < nc:
                 y[idx] = 1.0
+            else:
+                dropped.append(key)
         out.append(y)
+    if dropped:
+        raise ValueError(
+            f"targets_from_terms: {len(dropped)} term(s) not in active vocabulary "
+            f"(silent label filtering is forbidden). "
+            f"First dropped: {dropped[:20]}"
+        )
     return out
 
 
 def merge_terms_with_mask_indices(
     terms: Sequence[str],
     mask_indices: Any,
-    idx_to_term: Optional[Dict[int, str]] = None,
+    registry: Optional["DatasetTermRegistry"] = None,
 ) -> List[str]:
     merged = list(normalize_vocab_terms([str(x) for x in list(terms or [])]))
-    if not isinstance(idx_to_term, dict) or not idx_to_term:
+    if registry is None:
         return merged
+    idx_to_term = registry.idx_to_term
     extra_terms: List[str] = []
     idx_arr = np.asarray(mask_indices, dtype=np.int64).reshape(-1)
     for cls_idx in idx_arr.tolist():
@@ -663,29 +733,20 @@ def term_mask_map_to_label_stack(
     term_mask_map: Optional[Dict[str, Any]],
     label_vec: Any,
     *,
-    term_to_idx: Optional[Dict[str, int]] = None,
-    idx_to_term: Optional[Dict[int, str]] = None,
+    registry: Optional["DatasetTermRegistry"] = None,
     height: int = 0,
     width: int = 0,
     processing_device: Optional[Any] = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
     if not isinstance(term_mask_map, dict) or not term_mask_map:
         return np.zeros((0, int(max(0, height)), int(max(0, width))), dtype=np.float32), np.zeros((0,), dtype=np.int64)
-    lut = {
-        _norm_txt(str(k)): int(v)
-        for k, v in ((term_to_idx or {}).items())
-        if str(k).strip()
-    }
-    if not lut and isinstance(idx_to_term, dict):
-        lut = {
-            _norm_txt(str(term)): int(idx)
-            for idx, term in idx_to_term.items()
-            if str(term).strip()
-        }
     raw_masks: List[np.ndarray] = []
     indices: List[int] = []
     for raw_term, raw_mask in term_mask_map.items():
-        ci = int(lut.get(_norm_txt(str(raw_term)), -1))
+        tk = _norm_txt(str(raw_term))
+        if not tk:
+            continue
+        ci = registry.register(tk) if registry is not None else -1
         if ci < 0:
             continue
         arr = np.asarray(raw_mask, dtype=np.float32)
@@ -758,7 +819,13 @@ def combine_label_mask_stacks(
             processing_device=processing_device,
         )  # [pair_count, H, W]
         vmax_per = np.max(batch_norm.reshape(int(pair_count), -1), axis=1)  # [pair_count]
-        valid_mask = (np.asarray(idx_arr[:int(pair_count)], dtype=np.int64) >= 0) & (vmax_per > 1e-8)
+        neg = np.where(np.asarray(idx_arr[:int(pair_count)], dtype=np.int64) < 0)[0]
+        if int(neg.size) > 0:
+            raise ValueError(
+                f"combine_label_mask_stacks: received negative indices at "
+                f"positions {neg.tolist()} — upstream must assign every term an index"
+            )
+        valid_mask = vmax_per > 1e-8
         for si in np.where(valid_mask)[0]:
             cls_idx = int(idx_arr[int(si)])
             rows.append(batch_norm[int(si)])
@@ -771,18 +838,17 @@ def combine_label_mask_stacks(
         _w = int(max(1, width))
         for ci in missing:
             word = str((idx_to_term or {}).get(int(ci), f"<unknown idx {ci}>"))
-            warnings.warn(
-                f"combine_label_mask_stacks: label idx={ci} ('{word}') has no spatial mask — "
-                f"assigning whole-image fallback mask",
-                stacklevel=2,
-            )
-            print(
-                f"[mask-stack] WARNING: label idx={ci} ('{word}') has no spatial mask — "
-                f"assigning whole-image fallback mask",
-                flush=True,
-            )
-            rows.append(np.ones((_h, _w), dtype=np.float32))
-            indices.append(ci)
+            if _is_always_true_term(word):
+                # Always-true terms (dataset labels, "object", "signal")
+                # intentionally receive a whole-image mask.
+                rows.append(np.ones((_h, _w), dtype=np.float32))
+                indices.append(ci)
+            else:
+                raise ValueError(
+                    f"combine_label_mask_stacks: label idx={ci} ('{word}') is positive "
+                    f"but has no spatial mask and is not an always-true category — "
+                    f"every labelled term must have a mask"
+                )
     if len(rows) <= 0:
         return np.zeros((0, int(max(0, height)), int(max(0, width))), dtype=np.float32), np.zeros((0,), dtype=np.int64)
     return np.stack(rows, axis=0).astype(np.float32, copy=False), np.asarray(indices, dtype=np.int64)
@@ -812,15 +878,19 @@ def elem_stacks_to_label_stacks(
     covered: set[int] = set()
     n_elems = min(int(stack.shape[0]), int(len(elem_term_lists)))
     if n_elems > 0:
-        # Batch-scale all element masks to [0, 1] at once (no attention normalization).
         batch_norm = _normalize_stack_row_batch(stack[:n_elems], height=int(h), width=int(w))
         for ei in range(n_elems):
             mask_e = batch_norm[ei]
             for term in elem_term_lists[int(ei)]:
-                tk = _norm_txt(str(term))  # cached
+                tk = _norm_txt(str(term))
+                if not tk:
+                    continue
                 ci = int(term_to_idx.get(tk, -1))
                 if ci < 0:
-                    continue
+                    raise ValueError(
+                        f"elem_stacks_to_label_stacks: term {tk!r} has no index in the "
+                        f"provided mapping — every term in the data must have an index"
+                    )
                 out_masks.append(mask_e)
                 out_idx.append(ci)
                 covered.add(int(ci))
@@ -834,15 +904,25 @@ def _is_dataset_label_term(term: str) -> bool:
     return bool(_norm_txt(str(term)).endswith(_DATASET_LABEL_SUFFIX))
 
 
+def _is_always_true_term(term: str) -> bool:
+    """Return True for terms that are always true for every image in their dataset.
+
+    These are dataset-level labels (e.g. "berkeley sbd dataset") and ingested
+    item signals ("signal", "object").  They should receive whole-image masks
+    on first sight rather than being silently dropped or patched downstream.
+    """
+    normed = _norm_txt(str(term))
+    return bool(normed.endswith(_DATASET_LABEL_SUFFIX) or normed in _INGESTED_ITEM_MASK_TERMS)
+
+
 def build_combined_mask_stacks(
     label_vec: Any,
-    idx_to_term: Dict[int, str],
+    registry: "DatasetTermRegistry",
     height: int,
     width: int,
     *,
     elem_stack: Optional[Any] = None,
     elem_term_lists: Optional[Sequence[Sequence[str]]] = None,
-    term_to_idx: Optional[Dict[str, int]] = None,
     heuristic_stack: Optional[Any] = None,
     heuristic_idx: Optional[Any] = None,
     tonal_masks: Optional[Dict[str, Any]] = None,
@@ -859,8 +939,8 @@ def build_combined_mask_stacks(
     y = np.asarray(label_vec, dtype=np.float32).reshape(-1)
     h = int(max(1, height))
     w = int(max(1, width))
-    if term_to_idx is None:
-        term_to_idx = {str(v).strip().lower(): int(k) for k, v in idx_to_term.items()}
+    term_to_idx = registry.term_to_idx
+    idx_to_term = registry.idx_to_term
 
     parts: List[Tuple[Any, Any]] = []
     has_elem = elem_stack is not None and elem_term_lists is not None
@@ -880,9 +960,10 @@ def build_combined_mask_stacks(
         _tonal_slices: List[np.ndarray] = []
         _tonal_idxs: List[int] = []
         for _tterm, _tmask in tonal_masks.items():
-            _tidx = int(term_to_idx.get(str(_tterm).strip().lower(), -1))
-            if _tidx < 0:
+            _tk = str(_tterm).strip().lower()
+            if not _tk:
                 continue
+            _tidx = registry.register(_tk)
             _tmask_np = np.asarray(_tmask, dtype=np.float32)
             if int(_tmask_np.ndim) == 2 and int(_tmask_np.size) > 0:
                 _tonal_slices.append(_tmask_np)
@@ -917,7 +998,7 @@ def build_combined_mask_stacks(
         width=w,
         processing_device=processing_device,
         strict=True,
-        idx_to_term=idx_to_term,
+        idx_to_term=registry.idx_to_term,
     )
 
     return (
@@ -929,13 +1010,13 @@ def build_combined_mask_stacks(
 def build_term_mask_stack_from_image(
     image: Any,
     label_vec: Any,
-    idx_to_term: Optional[Dict[int, str]] = None,
+    registry: Optional["DatasetTermRegistry"] = None,
     term_mask_overrides: Optional[Dict[str, Any]] = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
     stacks, indices = build_term_mask_stacks_from_images(
         images=np.asarray(image, dtype=np.float32)[None, ...],
         label_vecs=np.asarray(label_vec, dtype=np.float32).reshape(1, -1),
-        idx_to_term=idx_to_term,
+        registry=registry,
         term_mask_overrides_batch=[term_mask_overrides] if isinstance(term_mask_overrides, dict) else None,
     )
     return stacks[0], indices[0]
@@ -952,8 +1033,7 @@ def assemble_semantic_mask_layers(
     *,
     image: Any,
     label_vec: Any,
-    idx_to_term: Optional[Dict[int, str]] = None,
-    term_to_idx: Optional[Dict[str, int]] = None,
+    registry: Optional["DatasetTermRegistry"] = None,
     original_parts: Optional[Sequence[Tuple[Any, Any]]] = None,
     deformation_term_masks: Optional[Dict[str, Any]] = None,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -963,31 +1043,11 @@ def assemble_semantic_mask_layers(
     y = np.asarray(label_vec, dtype=np.float32).reshape(-1).copy()
 
     parts: List[Tuple[Any, Any]] = []
-    for raw_stack, raw_idx in (list(original_parts) if original_parts is not None else []):
-        parts.append((raw_stack, raw_idx))
-
-    if isinstance(deformation_term_masks, dict) and deformation_term_masks and isinstance(term_to_idx, dict):
-        for term in normalize_vocab_terms([str(x) for x in list(deformation_term_masks.keys())]):
-            ti = int(term_to_idx.get(_norm_txt(term), -1))
-            if 0 <= int(ti) < int(y.size):
-                y[int(ti)] = 1.0
-        deformation_stack, deformation_idx = term_mask_map_to_label_stack(
-            deformation_term_masks,
-            y,
-            term_to_idx=term_to_idx,
-            height=int(h),
-            width=int(w),
-        )
-        if int(deformation_stack.shape[0]) > 0 and int(deformation_idx.size) > 0:
-            parts.append((deformation_stack, deformation_idx))
 
     detected_stack, detected_idx = build_term_mask_stack_from_image(
         image=chw,
         label_vec=y,
-        idx_to_term=idx_to_term,
-    ) if isinstance(idx_to_term, dict) and idx_to_term else (
-        np.zeros((0, int(h), int(w)), dtype=np.float32),
-        np.zeros((0,), dtype=np.int64),
+        registry=registry,
     )
     if int(detected_stack.shape[0]) > 0 and int(detected_idx.size) > 0:
         parts.append((detected_stack, detected_idx))
@@ -1132,32 +1192,65 @@ def build_observed_color_stack_from_terms(
         safe_hi = torch.where(valid, hi, torch.ones_like(hi))
         return torch.where(valid, torch.clamp(x / safe_hi, 0.0, 1.0), torch.zeros_like(x))
 
+    # --- HSV decomposition for hue-angle-based chromatic binning ---
+    # chroma (= HSV value * HSV saturation = vmax - vmin) already computed as `sat`
+    safe_delta = torch.where(sat > 1e-8, sat, torch.ones_like(sat))
+    r_is_max = (r >= g) & (r >= b)
+    g_is_max = (g > r) & (g >= b)
+    # hue in [0, 6) segments matching standard HSV
+    h_r = (g - b) / safe_delta          # segment when r is max: [-1, 1)
+    h_g = (b - r) / safe_delta + 2.0    # segment when g is max: [1, 3)
+    h_b = (r - g) / safe_delta + 4.0    # segment when b is max: [3, 5)
+    hue_norm = torch.where(r_is_max, h_r, torch.where(g_is_max, h_g, h_b))
+    hue_norm = hue_norm % 6.0
+    hue_deg = hue_norm * 60.0           # [0, 360) degrees
+    hue_deg = torch.where(sat > 1e-8, hue_deg, torch.zeros_like(hue_deg))
+    # HSV saturation (normalised by value) — gates achromatic pixels out of hue scoring
+    safe_vmax = torch.where(vmax > 1e-8, vmax, torch.ones_like(vmax))
+    hsv_sat = torch.where(vmax > 1e-8, sat / safe_vmax, torch.zeros_like(vmax))
+
+    _PI = torch.tensor(math.pi, dtype=torch.float32, device=resolved)
+
+    def _hue_bell(center_deg: float, half_width_deg: float) -> torch.Tensor:
+        """Cosine bell centred on `center_deg`, zero at ±half_width_deg. Handles 0°/360° wrap."""
+        diff = torch.abs(hue_deg - center_deg)
+        diff = torch.minimum(diff, 360.0 - diff)
+        t = torch.clamp(diff / half_width_deg, 0.0, 1.0)
+        return 0.5 * (1.0 + torch.cos(t * _PI))
+
+    def _chroma_mask(center_deg: float, half_width_deg: float, sat_lo: float = 0.15) -> torch.Tensor:
+        """Hue bell weighted by a smooth HSV-saturation gate and pixel value (brightness)."""
+        gate = torch.clamp((hsv_sat - sat_lo) / 0.15, 0.0, 1.0)
+        return _hue_bell(center_deg, half_width_deg) * gate * vmax
+
     color_maps: Dict[str, torch.Tensor] = {
-        "bright": _norm01_batch(torch.clamp(luma, 0.0, 1.0)),
-        "dark": _norm01_batch(torch.clamp(1.0 - luma, 0.0, 1.0)),
-        "warm": _norm01_batch(torch.clamp((r + 0.5 * g) - b, 0.0, 1.0) * torch.clamp(sat, 0.0, 1.0)),
-        "cool": _norm01_batch(torch.clamp((b + 0.5 * g) - r, 0.0, 1.0) * torch.clamp(sat, 0.0, 1.0)),
-        "red": _norm01_batch(torch.clamp(r - torch.maximum(g, b), 0.0, 1.0) * torch.clamp(sat - 0.05, 0.0, 1.0)),
-        "orange": _norm01_batch(
-            torch.clamp(r - b - 0.05, 0.0, 1.0)
-            * torch.clamp(r - g - 0.08, 0.0, 1.0)
-            * torch.clamp(g - b - 0.02, 0.0, 1.0)
-            * torch.clamp(sat - 0.10, 0.0, 1.0)
+        # --- Tonal (hue-independent) ---
+        "bright":  _norm01_batch(torch.clamp(luma, 0.0, 1.0)),
+        "dark":    _norm01_batch(torch.clamp(1.0 - luma, 0.0, 1.0)),
+        "warm":    _norm01_batch(torch.clamp((r + 0.5 * g) - b, 0.0, 1.0) * torch.clamp(sat, 0.0, 1.0)),
+        "cool":    _norm01_batch(torch.clamp((b + 0.5 * g) - r, 0.0, 1.0) * torch.clamp(sat, 0.0, 1.0)),
+        # --- Chromatic: hue-angle binning via cosine bell on [0°, 360°) ---
+        # Each color is credited only when the pixel's actual HSV hue falls within
+        # that color's angular window, so a pixel that is orange (hue ≈ 30°) will
+        # not bleed into the red bin (centred at 0°).
+        "red":     _norm01_batch(_chroma_mask(  0.0, 22.0)),   # 338°–22°  (wraps)
+        "orange":  _norm01_batch(_chroma_mask( 30.0, 17.0)),   # 13°–47°
+        "yellow":  _norm01_batch(_chroma_mask( 60.0, 22.0)),   # 38°–82°
+        "green":   _norm01_batch(_chroma_mask(120.0, 50.0)),   # 70°–170°
+        "cyan":    _norm01_batch(_chroma_mask(180.0, 25.0)),   # 155°–205°
+        "blue":    _norm01_batch(_chroma_mask(240.0, 42.0)),   # 198°–282°
+        "magenta": _norm01_batch(_chroma_mask(300.0, 33.0)),   # 267°–333°
+        # Brown: orange-amber hue, dark, moderately saturated
+        "brown":   _norm01_batch(
+            _hue_bell(25.0, 22.0)
+            * torch.clamp((hsv_sat - 0.25) / 0.15, 0.0, 1.0)
+            * torch.clamp((vmax - 0.15) / 0.10, 0.0, 1.0)
+            * torch.clamp((0.62 - vmax) / 0.15, 0.0, 1.0)
         ),
-        "green": _norm01_batch(torch.clamp(g - torch.maximum(r, b), 0.0, 1.0) * torch.clamp(sat - 0.05, 0.0, 1.0)),
-        "blue": _norm01_batch(torch.clamp(b - torch.maximum(r, g), 0.0, 1.0) * torch.clamp(sat - 0.05, 0.0, 1.0)),
-        "yellow": _norm01_batch(torch.clamp(torch.minimum(r, g) - b, 0.0, 1.0) * torch.clamp(sat - 0.05, 0.0, 1.0)),
-        "cyan": _norm01_batch(torch.clamp(torch.minimum(g, b) - r, 0.0, 1.0) * torch.clamp(sat - 0.05, 0.0, 1.0)),
-        "magenta": _norm01_batch(torch.clamp(torch.minimum(r, b) - g, 0.0, 1.0) * torch.clamp(sat - 0.05, 0.0, 1.0)),
-        "brown": _norm01_batch(
-            torch.clamp(r - g, 0.0, 1.0)
-            * torch.clamp(g - b, 0.0, 1.0)
-            * torch.clamp(vmax, 0.15, 0.75)
-            * torch.clamp(0.85 - vmax, 0.0, 1.0)
-        ),
-        "black": _norm01_batch(torch.clamp(0.22 - vmax, 0.0, 1.0)),
-        "white": _norm01_batch(torch.clamp(vmin - 0.78, 0.0, 1.0) * torch.clamp(0.20 - sat, 0.0, 1.0)),
-        "gray": _norm01_batch(torch.clamp(0.18 - sat, 0.0, 1.0) * torch.clamp(1.0 - torch.abs(vmax - 0.5) * 2.2, 0.0, 1.0)),
+        # --- Achromatic: based on chroma / value, not hue ---
+        "black":   _norm01_batch(torch.clamp(0.22 - vmax, 0.0, 1.0)),
+        "white":   _norm01_batch(torch.clamp(vmin - 0.78, 0.0, 1.0) * torch.clamp(0.20 - sat, 0.0, 1.0)),
+        "gray":    _norm01_batch(torch.clamp(0.18 - sat, 0.0, 1.0) * torch.clamp(1.0 - torch.abs(vmax - 0.5) * 2.2, 0.0, 1.0)),
         "neutral": _norm01_batch(torch.clamp(0.25 - sat, 0.0, 1.0) * torch.clamp(vmax - 0.05, 0.0, 1.0)),
     }
     gx = torch.zeros_like(luma)
@@ -1201,9 +1294,9 @@ def _normalize_semantic_terms_batch(
 def build_term_mask_stacks_from_images(
     images: Any,
     label_vecs: Any,
-    idx_to_term: Optional[Dict[int, str]] = None,
     term_mask_overrides_batch: Optional[Sequence[Optional[Dict[str, Any]]]] = None,
     processing_device: Optional[Any] = None,
+    registry: Optional[DatasetTermRegistry] = None,
 ) -> Tuple[List[np.ndarray], List[np.ndarray]]:
     bchw = _image_batch_to_bchw01(images)
     bsz = int(bchw.shape[0]) if int(bchw.ndim) == 4 else 0
@@ -1221,12 +1314,11 @@ def build_term_mask_stacks_from_images(
 
     out_stack: List[np.ndarray] = []
     out_idx: List[np.ndarray] = []
-    term_to_idx = {str(v).strip().lower(): int(k) for k, v in (idx_to_term or {}).items()} if isinstance(idx_to_term, dict) else {}
     for row_idx in range(int(bsz)):
         observed_stack, observed_terms = build_observed_color_stack_from_terms(
             image=bchw[int(row_idx)],
             processing_device=processing_device,
-        ) if term_to_idx else (
+        ) if registry is not None else (
             np.zeros((0, int(h), int(w)), dtype=np.float32),
             [],
         )
@@ -1237,9 +1329,10 @@ def build_term_mask_stacks_from_images(
 
         observed_count = min(int(observed_stack.shape[0]), int(len(observed_terms)))
         for pos in range(int(observed_count)):
-            cls_idx = int(term_to_idx.get(_norm_txt(str(observed_terms[int(pos)])), -1))
-            if cls_idx < 0:
+            _obs_tk = _norm_txt(str(observed_terms[int(pos)]))
+            if not _obs_tk:
                 continue
+            cls_idx = registry.register(_obs_tk)
             row_masks.append(np.asarray(observed_stack[int(pos)], dtype=np.float32))
             row_indices.append(int(cls_idx))
             seen_idx.add(int(cls_idx))
@@ -1249,7 +1342,7 @@ def build_term_mask_stacks_from_images(
             override_stack, override_idx = term_mask_map_to_label_stack(
                 override_row,
                 y[int(row_idx)],
-                term_to_idx=term_to_idx,
+                registry=registry,
                 height=int(h),
                 width=int(w),
                 processing_device=processing_device,
@@ -1262,6 +1355,25 @@ def build_term_mask_stacks_from_images(
                 row_masks.append(np.asarray(override_stack[int(pos)], dtype=np.float32))
                 row_indices.append(int(cls_idx))
                 seen_idx.add(int(cls_idx))
+
+        # -- Graduate always-true terms to whole-image masks on first sight --
+        # Terms like "berkeley sbd dataset", "object", "signal" are true for
+        # every image in their dataset.  They have no spatial localisation so
+        # they get a full-image mask intentionally, not as a lazy fallback.
+        if int(h) > 0 and int(w) > 0 and registry is not None:
+            _idx_to_term_row = registry.idx_to_term
+            y_row = y[int(row_idx)]
+            for ci in range(int(y_row.shape[0])):
+                if float(y_row[int(ci)]) < 0.5:
+                    continue
+                if int(ci) in seen_idx:
+                    continue
+                term_name = _idx_to_term_row.get(int(ci), "")
+                if not _is_always_true_term(term_name):
+                    continue
+                row_masks.append(np.ones((int(h), int(w)), dtype=np.float32))
+                row_indices.append(int(ci))
+                seen_idx.add(int(ci))
 
         if len(row_masks) <= 0:
             out_stack.append(np.zeros((0, int(h), int(w)), dtype=np.float32))
@@ -1383,6 +1495,8 @@ def _unit_interval_axis(length: int) -> np.ndarray:
     if n <= 1:
         return np.zeros((1,), dtype=np.float32)
     return np.linspace(0.0, 1.0, num=int(n), dtype=np.float32)
+
+
 
 
 def _apply_degrade(
@@ -1667,16 +1781,8 @@ class DiskSemanticRowsDataset(Dataset):
         self.degrade = bool(degrade)
         self.degrade_seed = int(degrade_seed)
         self.class_names = [str(name) for name in list(class_names or []) if str(name).strip()]
-        self.term_to_idx = {
-            _norm_txt(str(name)): int(i)
-            for i, name in enumerate(self.class_names)
-            if str(name).strip()
-        }
-        self.idx_to_term = {
-            int(i): str(name)
-            for i, name in enumerate(self.class_names)
-            if str(name).strip()
-        }
+        self.registry = DatasetTermRegistry()
+        self.registry.register_many(self.class_names)
         cfg = dict(degrade_config) if isinstance(degrade_config, dict) else {}
         self.degrade_config = {
             "blur_prob": float(cfg.get("blur_prob", 0.55)),
@@ -1806,8 +1912,7 @@ class DiskSemanticRowsDataset(Dataset):
             y, mask_stack_np, mask_idx_np = assemble_semantic_mask_layers(
                 image=x,
                 label_vec=y,
-                idx_to_term=self.idx_to_term,
-                term_to_idx=self.term_to_idx,
+                registry=self.registry,
                 original_parts=[(cached_stack_array, cached_stack_indices)],
                 deformation_term_masks=degrade_term_masks,
             )
@@ -1985,7 +2090,7 @@ def _load_row_mask_cache_bundle(cache_file: str) -> Optional[Dict[str, np.ndarra
 def _build_and_store_row_mask_cache(
     cache_root: Path,
     image_path: Path,
-    idx_to_term: Optional[Dict[int, str]],
+    registry: Optional["DatasetTermRegistry"],
     terms: Sequence[str],
     mask_path: str = "",
     layout: Optional[Dict[str, Any]] = None,
@@ -2057,19 +2162,12 @@ def _build_and_store_row_mask_cache(
         _vm = float(np.max(explicit_mask))
         explicit_mask = (explicit_mask / _vm).astype(np.float32) if _vm > 1e-8 else np.zeros_like(explicit_mask, dtype=np.float32)
 
-    term_to_idx = {
-        _norm_txt(str(term)): int(idx)
-        for idx, term in ((idx_to_term or {}).items() if isinstance(idx_to_term, dict) else [])
-        if str(term).strip()
-    }
-    label_vec = targets_from_terms([list(terms)], term_to_idx, max(len(term_to_idx), 1))[0]
+    _t2i = registry.term_to_idx if registry is not None else {}
+    label_vec = targets_from_terms([list(terms)], _t2i, max(len(_t2i), 1))[0]
     _, inferred_stack, inferred_idx = assemble_semantic_mask_layers(
         image=chw,
         label_vec=label_vec,
-        idx_to_term=idx_to_term,
-        term_to_idx=term_to_idx,
-        original_parts=None,
-        deformation_term_masks=None,
+        registry=registry,
     )
     try:
         np.savez_compressed(
@@ -2111,7 +2209,8 @@ def _materialize_semantic_row_mask_cache(
     }
     if int(len(rows)) <= 0:
         return info
-    idx_to_term = {int(i): str(name) for i, name in enumerate(class_names)}
+    _registry = DatasetTermRegistry()
+    _registry.register_many(list(class_names))
     workers = int(max_workers)
     if workers <= 0:
         workers = min(8, max(1, (os.cpu_count() or 1)))
@@ -2131,7 +2230,7 @@ def _materialize_semantic_row_mask_cache(
         stack, indices, created = _build_and_store_row_mask_cache(
             cache_root=cache_root,
             image_path=Path(str(row.image_path)),
-            idx_to_term=idx_to_term,
+            registry=_registry,
             terms=row.terms,
             mask_path=str(row.mask_path or ""),
             layout=(dict(row.layout) if isinstance(row.layout, dict) else None),

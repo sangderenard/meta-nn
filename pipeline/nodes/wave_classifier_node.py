@@ -750,17 +750,25 @@ def _wave_semantic_label_from_weighted_angular_centroid(
         if key and key not in name_to_idx:
             name_to_idx[key] = int(i)
     weights = np.zeros((int(rows),), dtype=np.float32)
+    _wc_dropped: List[str] = []
     for term, cnt in term_counts.items():
         key = re.sub(r"\s+", " ", str(term)).strip().lower()
         if not key:
             continue
         idx = name_to_idx.get(key, None)
         if idx is None:
+            _wc_dropped.append(key)
             continue
         w = float(max(0, int(cnt)))
         if w <= 0.0:
             continue
         weights[int(idx)] += float(w)
+    if _wc_dropped:
+        raise ValueError(
+            f"_wave_semantic_label_from_weighted_angular_centroid: {len(_wc_dropped)} "
+            f"term(s) not in semantic class names (silent label filtering is forbidden). "
+            f"Dropped: {sorted(set(_wc_dropped))[:20]}"
+        )
     active = np.where(weights > 0.0)[0].astype(np.int64)
     if int(active.size) <= 0:
         return "", 0.0, 0

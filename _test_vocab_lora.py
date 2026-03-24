@@ -30,6 +30,7 @@ from wav_ml_models import (
     tiny_classifier_lora_named_modules,
     tiny_classifier_lora_snapshot,
 )
+from pipeline.vocabulary_defaults import DEFAULT_VOCABULARY
 
 
 def _ok(msg: str) -> None:
@@ -92,18 +93,18 @@ def test_lora_slot_inherits_base_placement() -> None:
 def test_vocab_plan_select_and_activate() -> None:
     print("\n--- test_vocab_plan_select_and_activate ---")
     ctx = PipelineContext(args=SimpleNamespace())
-    ctx.supervised_class_names = ["signal", "object"]
-    ctx.active_extra_terms = ["warm", "cool", "legacy a", "legacy b", "legacy c"]
+    ctx.supervised_class_names = list(DEFAULT_VOCABULARY)
+    ctx.active_extra_terms = ["extra warm a", "extra cool b", "legacy term a", "legacy term b", "legacy term c"]
     ctx.class_names = list(ctx.supervised_class_names) + list(ctx.active_extra_terms)
     ctx.vocab_lora_max_terms = 5
 
     plan = register_churn_requirement(
         ctx=ctx,
-        required_terms=["signal", "warm", "cool", "alpha", "beta", "gamma", "delta", "epsilon"],
+        required_terms=["signal", "extra warm a", "extra cool b", "dataset alpha", "dataset beta", "dataset gamma", "dataset delta", "dataset epsilon"],
         term_rows=[
-            ["signal", "alpha", "beta"],
-            ["signal", "gamma", "delta"],
-            ["signal", "epsilon", "alpha"],
+            ["signal", "dataset alpha", "dataset beta"],
+            ["signal", "dataset gamma", "dataset delta"],
+            ["signal", "dataset epsilon", "dataset alpha"],
         ],
         source="berkeley_refresh",
         stage_label="stage2_berkeley",
@@ -123,8 +124,8 @@ def test_vocab_plan_select_and_activate() -> None:
 
 def test_yb_from_terms() -> None:
     print("\n--- test_yb_from_terms ---")
-    active_term_to_idx = {"signal": 0, "object": 1, "alpha": 2, "mnist dataset": 3, "legacy slot": 4}
-    terms_rows = [["signal", "alpha", "mnist dataset"]]
+    active_term_to_idx = {"signal": 0, "object": 1, "dataset alpha": 2, "dataset beta": 3, "dataset gamma": 4}
+    terms_rows = [["signal", "dataset alpha", "dataset beta"]]
     yb = _yb_from_terms(
         terms_rows=terms_rows,
         active_term_to_idx=active_term_to_idx,
@@ -135,28 +136,28 @@ def test_yb_from_terms() -> None:
     assert tuple(y_np.shape) == (1, 5), y_np.shape
     assert float(y_np[0, 0]) > 0.5   # signal
     assert float(y_np[0, 1]) < 0.5   # object — not in terms
-    assert float(y_np[0, 2]) > 0.5   # alpha
-    assert float(y_np[0, 3]) > 0.5   # mnist dataset
-    assert float(y_np[0, 4]) < 0.5   # legacy slot — not in terms
+    assert float(y_np[0, 2]) > 0.5   # dataset alpha
+    assert float(y_np[0, 3]) > 0.5   # dataset beta
+    assert float(y_np[0, 4]) < 0.5   # dataset gamma — not in terms
     _ok("_yb_from_terms builds multi-hot targets from terms rows")
 
 
 def test_stage_local_execution_plan_ignores_hijacked_live_signature() -> None:
     print("\n--- test_stage_local_execution_plan_ignores_hijacked_live_signature ---")
     ctx = PipelineContext(args=SimpleNamespace())
-    ctx.supervised_class_names = ["berkeley sbd dataset", "object", "signal"]
-    ctx.active_extra_terms = ["person", "car", "cat", "sheep", "semantic slot 5"]
+    ctx.supervised_class_names = list(DEFAULT_VOCABULARY)
+    ctx.active_extra_terms = ["extra person", "extra car", "extra cat", "extra sheep", "extra slot 5"]
     ctx.class_names = list(ctx.supervised_class_names) + list(ctx.active_extra_terms)
     ctx.vocab_lora_max_terms = 5
     capture_vocab_baseline_state(ctx)
 
     payload_plan = register_churn_requirement(
         ctx=ctx,
-        required_terms=["berkeley sbd dataset", "object", "signal", "person", "car", "cat", "sheep"],
+        required_terms=["berkeley sbd dataset", "object", "signal", "extra person", "extra car", "extra cat", "extra sheep"],
         term_rows=[
-            ["berkeley sbd dataset", "object", "signal", "person"],
-            ["berkeley sbd dataset", "object", "signal", "cat"],
-            ["berkeley sbd dataset", "object", "signal", "sheep"],
+            ["berkeley sbd dataset", "object", "signal", "extra person"],
+            ["berkeley sbd dataset", "object", "signal", "extra cat"],
+            ["berkeley sbd dataset", "object", "signal", "extra sheep"],
         ],
         source="payload_bank",
         stage_label="payload_bank",
@@ -166,10 +167,10 @@ def test_stage_local_execution_plan_ignores_hijacked_live_signature() -> None:
 
     flashcard_plan = register_churn_requirement(
         ctx=ctx,
-        required_terms=["digit 0", "digit 1", "letter a", "letter b", "mnist dataset", "emnist dataset"],
+        required_terms=["flash digit 0", "flash digit 1", "flash letter a", "flash letter b", "flash mnist", "flash emnist"],
         term_rows=[
-            ["digit 0", "mnist dataset"],
-            ["letter a", "emnist dataset"],
+            ["flash digit 0", "flash mnist"],
+            ["flash letter a", "flash emnist"],
         ],
         source="flashcard_symbol_pool",
         stage_label="flashcard_requirements",
@@ -181,11 +182,11 @@ def test_stage_local_execution_plan_ignores_hijacked_live_signature() -> None:
     execution_plan = build_stage_vocab_lora_execution_plan(
         ctx=ctx,
         term_rows=[
-            ["berkeley sbd dataset", "object", "signal", "person"],
-            ["berkeley sbd dataset", "object", "signal", "cat"],
-            ["berkeley sbd dataset", "object", "signal", "sheep"],
-            ["digit 0", "mnist dataset"],
-            ["letter a", "emnist dataset"],
+            ["berkeley sbd dataset", "object", "signal", "extra person"],
+            ["berkeley sbd dataset", "object", "signal", "extra cat"],
+            ["berkeley sbd dataset", "object", "signal", "extra sheep"],
+            ["flash digit 0", "flash mnist"],
+            ["flash letter a", "flash emnist"],
         ],
         source="payload_stage_g_generator",
         stage_label="stage_g_generator",
@@ -195,8 +196,8 @@ def test_stage_local_execution_plan_ignores_hijacked_live_signature() -> None:
     all_slot_terms = set()
     for slot in slots:
         all_slot_terms.update(slot.get("terms", []))
-    assert "sheep" in all_slot_terms, all_slot_terms
-    assert "digit 0" in all_slot_terms, all_slot_terms
+    assert "extra sheep" in all_slot_terms, all_slot_terms
+    assert "flash digit 0" in all_slot_terms, all_slot_terms
     ordered = list(execution_plan.get("ordered_row_indices") or [])
     assert sorted(ordered) == [0, 1, 2, 3, 4], ordered
     assert sum(int(slot.get("row_count", 0)) for slot in slots) == 5, slots
@@ -207,17 +208,17 @@ def test_stage_local_execution_plan_ignores_hijacked_live_signature() -> None:
 def test_stage_local_execution_plan_keeps_rows_vocab_aligned() -> None:
     print("\n--- test_stage_local_execution_plan_keeps_rows_vocab_aligned ---")
     ctx = PipelineContext(args=SimpleNamespace())
-    ctx.supervised_class_names = ["signal"]
-    ctx.active_extra_terms = ["person", "cat", "digit 0", "letter a", "semantic slot 5"]
+    ctx.supervised_class_names = list(DEFAULT_VOCABULARY)
+    ctx.active_extra_terms = ["extra person", "extra cat", "flash digit 0", "flash letter a", "extra slot 5"]
     ctx.class_names = list(ctx.supervised_class_names) + list(ctx.active_extra_terms)
     ctx.vocab_lora_max_terms = 2
     capture_vocab_baseline_state(ctx)
 
     term_rows = [
-        ["signal", "person"],
-        ["signal", "cat"],
-        ["signal", "digit 0"],
-        ["signal", "letter a"],
+        ["signal", "extra person"],
+        ["signal", "extra cat"],
+        ["signal", "flash digit 0"],
+        ["signal", "flash letter a"],
     ]
     execution_plan = build_stage_vocab_lora_execution_plan(
         ctx=ctx,
@@ -265,16 +266,16 @@ def test_stage_loader_preserves_subset_order_when_unshuffled() -> None:
 def test_reset_vocab_stage_state_restores_baseline() -> None:
     print("\n--- test_reset_vocab_stage_state_restores_baseline ---")
     ctx = PipelineContext(args=SimpleNamespace())
-    ctx.supervised_class_names = ["signal"]
-    ctx.active_extra_terms = ["warm", "cool", "legacy a"]
+    ctx.supervised_class_names = list(DEFAULT_VOCABULARY)
+    ctx.active_extra_terms = ["extra warm a", "extra cool b", "legacy term a"]
     ctx.class_names = list(ctx.supervised_class_names) + list(ctx.active_extra_terms)
     ctx.vocab_lora_max_terms = 3
     capture_vocab_baseline_state(ctx)
 
     plan = register_churn_requirement(
         ctx=ctx,
-        required_terms=["signal", "alpha", "beta", "gamma", "delta"],
-        term_rows=[["signal", "alpha"], ["signal", "beta"], ["signal", "gamma"], ["signal", "delta"]],
+        required_terms=["signal", "dataset alpha", "dataset beta", "dataset gamma", "dataset delta"],
+        term_rows=[["signal", "dataset alpha"], ["signal", "dataset beta"], ["signal", "dataset gamma"], ["signal", "dataset delta"]],
         source="stage_c_lora",
         stage_label="stage_c_lora",
         max_terms_per_slot=3,
@@ -286,11 +287,10 @@ def test_reset_vocab_stage_state_restores_baseline() -> None:
     ctx.vocab_churn_activation_pending = True
 
     reset_vocab_stage_state(ctx)
-    assert ctx.active_extra_terms == ["warm", "cool", "legacy a"], ctx.active_extra_terms
-    assert ctx.class_names == ["signal", "warm", "cool", "legacy a"], ctx.class_names
-    assert ctx.semantic_term_to_idx == {
-        "signal": 0, "warm": 1, "cool": 2, "legacy a": 3,
-    }, ctx.semantic_term_to_idx
+    assert ctx.active_extra_terms == ["extra warm a", "extra cool b", "legacy term a"], ctx.active_extra_terms
+    assert ctx.class_names == list(DEFAULT_VOCABULARY) + ["extra warm a", "extra cool b", "legacy term a"], ctx.class_names
+    expected_term_to_idx = {str(t).strip().lower(): i for i, t in enumerate(list(DEFAULT_VOCABULARY) + ["extra warm a", "extra cool b", "legacy term a"])}
+    assert ctx.semantic_term_to_idx == expected_term_to_idx, ctx.semantic_term_to_idx
     assert str(ctx.lora_active_slot) == "", ctx.lora_active_slot
     assert str(ctx.vocab_lora_active_signature) == "", ctx.vocab_lora_active_signature
     assert list(ctx.vocab_lora_active_terms) == [], ctx.vocab_lora_active_terms
@@ -303,16 +303,26 @@ def test_reset_vocab_stage_state_restores_baseline() -> None:
 def test_flashcard_dataset_emits_full_frame_masks_and_aligned_indices() -> None:
     print("\n--- test_flashcard_dataset_emits_full_frame_masks_and_aligned_indices ---")
     ctx = PipelineContext(args=SimpleNamespace())
-    ctx.supervised_class_names = ["signal"]
-    ctx.active_extra_terms = ["digit 0", "mnist dataset"]
-    ctx.class_names = ["signal", "digit 0", "mnist dataset"]
-    ctx.semantic_term_to_idx = {"signal": 0, "digit 0": 1, "mnist dataset": 2}
+    ctx.supervised_class_names = list(DEFAULT_VOCABULARY)
+    ctx.active_extra_terms = ["flash digit 0", "flash mnist"]
+    ctx.class_names = list(ctx.supervised_class_names) + list(ctx.active_extra_terms)
+    n_classes = len(ctx.class_names)
+    ctx.semantic_term_to_idx = {str(t).strip().lower(): i for i, t in enumerate(ctx.class_names)}
+
+    signal_idx = ctx.semantic_term_to_idx["signal"]
+    flash_digit_idx = ctx.semantic_term_to_idx["flash digit 0"]
+    flash_mnist_idx = ctx.semantic_term_to_idx["flash mnist"]
+
+    condition = np.zeros(n_classes, dtype=np.float32)
+    condition[signal_idx] = 1.0
+    condition[flash_digit_idx] = 1.0
+    condition[flash_mnist_idx] = 1.0
 
     sample = {
         "image": np.ones((3, 8, 8), dtype=np.float32),
-        "condition": np.asarray([1.0, 1.0, 1.0], dtype=np.float32),
+        "condition": condition,
         "mask": np.ones((1, 8, 8), dtype=np.float32),
-        "terms": ["signal", "digit 0", "mnist dataset"],
+        "terms": ["signal", "flash digit 0", "flash mnist"],
         "mask_mode": "full_frame_per_label",
     }
     ds = _FlashcardDataset(samples=[sample], image_hw=(8, 8), active_term_to_idx=ctx.semantic_term_to_idx)
@@ -321,29 +331,39 @@ def test_flashcard_dataset_emits_full_frame_masks_and_aligned_indices() -> None:
     assert torch.allclose(mask, torch.ones((1, 8, 8), dtype=torch.float32)), mask
     assert tuple(stack.shape) == (3, 8, 8), stack.shape
     assert torch.allclose(stack, torch.ones((3, 8, 8), dtype=torch.float32)), stack
-    assert idx.tolist() == [0, 1, 2], idx
-    assert terms == ["signal", "digit 0", "mnist dataset"], terms
+    assert sorted(idx.tolist()) == sorted([signal_idx, flash_digit_idx, flash_mnist_idx]), idx
+    assert terms == ["signal", "flash digit 0", "flash mnist"], terms
     _ok("flashcard dataset emits full-frame masks and aligned mask indices")
 
 
 def test_flashcard_label_dropout_preserves_full_frame_contract() -> None:
     print("\n--- test_flashcard_label_dropout_preserves_full_frame_contract ---")
     ctx = PipelineContext(args=SimpleNamespace())
-    ctx.supervised_class_names = ["signal"]
-    ctx.active_extra_terms = ["digit 0", "mnist dataset"]
-    ctx.class_names = ["signal", "digit 0", "mnist dataset"]
-    ctx.semantic_term_to_idx = {"signal": 0, "digit 0": 1, "mnist dataset": 2}
+    ctx.supervised_class_names = list(DEFAULT_VOCABULARY)
+    ctx.active_extra_terms = ["flash digit 0", "flash mnist"]
+    ctx.class_names = list(ctx.supervised_class_names) + list(ctx.active_extra_terms)
+    n_classes = len(ctx.class_names)
+    ctx.semantic_term_to_idx = {str(t).strip().lower(): i for i, t in enumerate(ctx.class_names)}
+
+    signal_idx = ctx.semantic_term_to_idx["signal"]
+    flash_digit_idx = ctx.semantic_term_to_idx["flash digit 0"]
+    flash_mnist_idx = ctx.semantic_term_to_idx["flash mnist"]
+
+    condition = np.zeros(n_classes, dtype=np.float32)
+    condition[signal_idx] = 1.0
+    condition[flash_digit_idx] = 1.0
+    condition[flash_mnist_idx] = 1.0
 
     sample = {
         "image": np.ones((3, 8, 8), dtype=np.float32),
-        "condition": np.asarray([1.0, 1.0, 1.0], dtype=np.float32),
+        "condition": condition,
         "mask": np.ones((1, 8, 8), dtype=np.float32),
-        "terms": ["signal", "digit 0", "mnist dataset"],
+        "terms": ["signal", "flash digit 0", "flash mnist"],
         "mask_mode": "full_frame_per_label",
     }
     ds = _FlashcardDataset(samples=[sample], image_hw=(8, 8), active_term_to_idx=ctx.semantic_term_to_idx)
     xb, mb, stack, idx, terms = ds[0]
-    yb = _yb_from_terms([terms], ctx.semantic_term_to_idx, len(ctx.class_names), torch.device("cpu"))
+    yb = _yb_from_terms([terms], ctx.semantic_term_to_idx, n_classes, torch.device("cpu"))
     cfg = LabelMaskDropoutConfig(drop_rate=1.0, min_keep_labels=1, max_drop_frac=1.0)
     yb_drop, stacks_drop, indices_drop = _apply_label_mask_dropout(
         yb=yb,

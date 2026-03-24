@@ -1,6 +1,7 @@
 """Smoke test: pregestation target enrichment and shuffled train manifests."""
 from __future__ import annotations
 
+from typing import List
 import numpy as np
 import torch
 from torch.utils.data import Dataset, TensorDataset
@@ -10,7 +11,9 @@ from pipeline.semantic_wheel_cache import StatefulSequentialDeckSampler
 from pipeline.nodes.vocab_node import (
     _build_pregestation_logic_rows,
 )
+from pipeline.vocabulary_defaults import DEFAULT_VOCABULARY
 from semantic_dataset_loaders import (
+    DatasetTermRegistry,
     StageDatasetManifest,
     assemble_semantic_mask_layers,
     build_observed_color_stack_from_terms,
@@ -56,29 +59,18 @@ def test_pregestation_targets_include_observed_terms() -> None:
     assert len(observed_terms) > 0, term_rows[int(chosen)]
     _ok("pregestation target rows include shared observed-color masks")
 
-    class_names = [
-        "up",
-        "down",
-        "left",
-        "right",
-        "white",
-        "black",
-        "gray",
-        "signal",
-        "shape",
-        "object",
-        "bright",
-        "dark",
-        "warm",
-        "cool",
-    ]
+    class_names = list(DEFAULT_VOCABULARY)
     idx_to_term = {int(i): str(name) for i, name in enumerate(class_names)}
     term_to_idx = {str(name).strip().lower(): int(i) for i, name in enumerate(class_names)}
     y = np.zeros((len(class_names),), dtype=np.float32)
     for term in term_rows[int(chosen)]:
-        idx = int(term_to_idx.get(str(term).strip().lower(), -1))
-        if idx >= 0:
-            y[int(idx)] = 1.0
+        tk = str(term).strip().lower()
+        idx = int(term_to_idx.get(tk, -1))
+        if idx < 0:
+            raise ValueError(
+                f"test: term {tk!r} not in test vocabulary — every term needs an index"
+            )
+        y[int(idx)] = 1.0
     # Geometric elem_stacks cover all base terms (dark, signal, shape, color, direction).
     explicit_stack, explicit_idx = elem_stacks_to_label_stacks(
         elem_stack=mask_stacks[int(chosen)],
@@ -128,16 +120,15 @@ def test_stage_manifest_shuffle_with_ordered_subset() -> None:
 
 def test_assemble_semantic_mask_layers_returns_stack_and_idx() -> None:
     print("\n--- test_assemble_semantic_mask_layers_returns_stack_and_idx ---")
-    class_names = ["signal", "object", "red"]
-    idx_to_term = {int(i): str(name) for i, name in enumerate(class_names)}
-    term_to_idx = {str(name).strip().lower(): int(i) for i, name in enumerate(class_names)}
+    class_names = list(DEFAULT_VOCABULARY)
+    reg = DatasetTermRegistry()
+    reg.register_many(class_names)
     label_vec = np.ones((len(class_names),), dtype=np.float32)
     image = np.zeros((3, 8, 8), dtype=np.float32)
     y, assembled_stack, assembled_idx = assemble_semantic_mask_layers(
         image=image,
         label_vec=label_vec,
-        idx_to_term=idx_to_term,
-        term_to_idx=term_to_idx,
+        registry=reg,
     )
     assert int(np.asarray(y).shape[0]) == len(class_names)
     assert int(np.asarray(assembled_stack).ndim) == 3
@@ -200,7 +191,7 @@ def test_chunked_stage_loader_uses_sequential_subset_access() -> None:
 if __name__ == "__main__":
     test_pregestation_targets_include_observed_terms()
     test_stage_manifest_shuffle_with_ordered_subset()
-    test_special_label_masks_use_ingested_mask_semantics()
+    test_assemble_semantic_mask_layers_returns_stack_and_idx()
     test_stateful_sequential_deck_sampler_continues_partial_pass()
     test_chunked_stage_loader_uses_sequential_subset_access()
     print("\nALL TESTS PASSED")

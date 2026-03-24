@@ -9,6 +9,7 @@ from pipeline.preview import (
     build_transformer_preview_frames,
     make_transformer_step_preview_callback,
 )
+from pipeline.vocabulary_defaults import DEFAULT_VOCABULARY
 from pipeline.weight_image_cache import (
     checkpoint_thumbnail_path,
     checkpoint_thumbnail_root,
@@ -20,6 +21,21 @@ from wav_ml_viewer import _TransformerStatusOpenGLViewer
 
 
 def test_build_classifier_preview_frames_formats_masks_and_scores():
+    n_classes = len(DEFAULT_VOCABULARY)
+    # Build probs/target with hits at known positions
+    signal_idx = DEFAULT_VOCABULARY.index("signal")
+    object_idx = DEFAULT_VOCABULARY.index("object")
+    red_idx = DEFAULT_VOCABULARY.index("red")
+
+    probs = torch.zeros(n_classes, dtype=torch.float32)
+    probs[signal_idx] = 0.1
+    probs[object_idx] = 0.9
+    probs[red_idx] = 0.4
+
+    target_vec = torch.zeros(n_classes, dtype=torch.float32)
+    target_vec[object_idx] = 1.0
+    target_vec[red_idx] = 1.0
+
     payload_batch = [
         {
             "global_step": 3,
@@ -32,8 +48,8 @@ def test_build_classifier_preview_frames_formats_masks_and_scores():
                 ],
                 dtype=torch.float32,
             ),
-            "probs": torch.tensor([0.1, 0.9, 0.4], dtype=torch.float32),
-            "target_vec": torch.tensor([0.0, 1.0, 1.0], dtype=torch.float32),
+            "probs": probs,
+            "target_vec": target_vec,
             "target_mask": torch.tensor([[1.0, 0.0], [1.0, 0.0]], dtype=torch.float32),
             "detected_mask": torch.tensor([[1.0, 1.0], [0.0, 0.0]], dtype=torch.float32),
             "loss": 0.75,
@@ -43,7 +59,7 @@ def test_build_classifier_preview_frames_formats_masks_and_scores():
 
     eff_loss, frames = build_classifier_preview_frames(
         payload_batch,
-        class_names=["zero", "one", "two"],
+        class_names=list(DEFAULT_VOCABULARY),
         cycle_id=2,
         round_id=7,
     )
@@ -53,8 +69,9 @@ def test_build_classifier_preview_frames_formats_masks_and_scores():
     frame = frames[0]
     assert frame["caption"].startswith("[C] cycle=2 round=7 step=3/9")
     assert frame["titles"] == ["C target +mask", "C mask diff", "C detected +mask"]
-    assert frame["rows"][0] == ["one", "two"]
-    assert "one:0.900" in frame["rows"][2]
+    assert "object" in frame["rows"][0]
+    assert "red" in frame["rows"][0]
+    assert "object:0.900" in frame["rows"][2]
     assert frame["images"][0].shape == (2, 2, 4)
     assert frame["images"][1].shape == (2, 2, 3)
     assert frame["images"][2].shape == (2, 2, 4)
@@ -86,7 +103,7 @@ def test_build_transformer_preview_frames_renders_wave_triplet():
         render_config=cfg,
         image_hw=(16, 16),
         sample_bits=16,
-        class_names=["zero", "one"],
+        class_names=list(DEFAULT_VOCABULARY),
         cycle_id=1,
         round_id=2,
     )
@@ -116,7 +133,7 @@ def test_transformer_preview_callback_enqueues_frames_and_publishes_loss():
     ctx = SimpleNamespace(
         viewer_proxy=_FakeViewer(),
         render_config=RenderConfig(width=32, downsample=1, max_points=32),
-        class_names=["zero", "one"],
+        class_names=list(DEFAULT_VOCABULARY),
         cycle=4,
         round_id=5,
         args=SimpleNamespace(image_size=16, sample_bits=16),

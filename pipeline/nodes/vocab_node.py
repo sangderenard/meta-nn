@@ -315,10 +315,31 @@ class BuildFlashcardRowsNode(PipelineNode):
 
     def execute(self, ctx: PipelineContext) -> None:
         import numpy as np
+        import hashlib
+
+        if not self.cfg.flashcard_enabled or ctx.payload_bank is None:
+            clear_flashcard_stage_state(ctx)
+            return
+
+        # --- Cache key: skip rebuild when inputs haven't changed. ---
+        _cache_parts = [
+            "|".join(sorted(str(t).lower() for t in (ctx.class_names or []))),
+            "|".join(sorted((ctx.symbol_pool or {}).keys())),
+            str(len(ctx.payload_bank)),
+            str(self.cfg.flashcard_rows_per_term),
+            str(self.cfg.seed),
+            str(self.cfg.image_size),
+        ]
+        _cache_key = hashlib.sha256("\n".join(_cache_parts).encode()).hexdigest()[:24]
+        if (
+            getattr(ctx, "_flashcard_cache_key", None) == _cache_key
+            and getattr(ctx, "flashcard_rows", None)
+            and getattr(ctx, "flashcard_row_terms", None)
+        ):
+            _log(f"[flashcard] cache hit ({_cache_key[:12]}…) — reusing {len(ctx.flashcard_rows)} rows")
+            return
 
         clear_flashcard_stage_state(ctx)
-        if not self.cfg.flashcard_enabled or ctx.payload_bank is None:
-            return
 
         # Register the raw symbol pool terms with churn BEFORE filtering,
         # so the LoRA system sees demand for terms not yet in the vocab.
@@ -346,10 +367,22 @@ class BuildFlashcardRowsNode(PipelineNode):
 
         def _condition_builder(terms, embedding=None):
             vec = np.zeros(len(class_names_local), dtype=np.float32)
+            _dropped = []
             for t in (terms or []):
-                idx = name_to_idx.get(str(t).lower())
+                key = str(t).lower()
+                if not key:
+                    continue
+                idx = name_to_idx.get(key)
                 if idx is not None:
                     vec[idx] = 1.0
+                else:
+                    _dropped.append(key)
+            if _dropped:
+                raise ValueError(
+                    f"flashcard _condition_builder: {len(_dropped)} term(s) not in active vocabulary "
+                    f"(silent label filtering is forbidden). "
+                    f"Dropped: {_dropped[:20]}"
+                )
             return vec
 
         flashcard_images, flashcard_conditions, flashcard_row_terms, info = _build_reference_flashcard_payload_rows(
@@ -384,8 +417,9 @@ class BuildFlashcardRowsNode(PipelineNode):
 
         ctx.flashcard_rows = list(flashcard_rows)
         ctx.flashcard_row_terms = list(flashcard_row_terms)
+        ctx._flashcard_cache_key = _cache_key
         _log(f"[flashcard] built {len(ctx.flashcard_rows)} rows "
-             f"(info: {info.get('rows_added', 0)} added)")
+             f"(info: {info.get('rows_added', 0)} added, key={_cache_key[:12]}…)")
 
 
 def _build_reference_flashcard_payload_rows(
@@ -1219,8 +1253,36 @@ def activate_vocab_lora_slot(ctx: PipelineContext, slot: Dict[str, Any]) -> Dict
         active_terms=slot_terms,
         total_slots=int(total_slots),
     )
+    supervised = list(getattr(ctx, "supervised_class_names", []))
+    baseline_class_names = list(getattr(ctx, "vocab_lora_baseline_class_names", []))
+    new_class_names = supervised + list(active_extra)
+
+    # --- Supervised-prefix invariant: the first N supervised indices must
+    #     never change identity or ordering. ---
+    if baseline_class_names:
+        baseline_supervised = list(getattr(ctx, "vocab_lora_baseline_term_to_idx", {}).keys())[:len(supervised)]
+        if list(supervised) != list(baseline_supervised[:len(supervised)]) and baseline_supervised:
+            raise RuntimeError(
+                f"activate_vocab_lora_slot: supervised prefix violation — "
+                f"expected {baseline_supervised[:len(supervised)]!r} but got "
+                f"{list(supervised)!r}. The supervised indices must never change."
+            )
+
+    # --- Architectural-width ceiling: class_names must not exceed the
+    #     model's output dimension if a classifier is available. ---
+    _clf = getattr(ctx, "classifier", None)
+    if _clf is not None:
+        from pipeline.utils import _classifier_output_dim
+        _arch_width = _classifier_output_dim(_clf)
+        if len(new_class_names) > _arch_width:
+            raise RuntimeError(
+                f"activate_vocab_lora_slot: class_names length "
+                f"({len(new_class_names)}) exceeds classifier architectural "
+                f"width ({_arch_width}). Use _expand_classifier_outputs first."
+            )
+
     ctx.active_extra_terms = list(active_extra)
-    ctx.class_names = list(getattr(ctx, "supervised_class_names", [])) + list(active_extra)
+    ctx.class_names = new_class_names
     ctx.semantic_term_to_idx = _semantic_term_index_map(ctx.class_names)
     ctx.vocab_lora_active_signature = str(slot.get("signature", "") or "")
     ctx.vocab_lora_active_terms = list(_normalize_vocab_terms(slot.get("terms") or []))
@@ -1266,6 +1328,7 @@ def capture_vocab_baseline_state(ctx: PipelineContext) -> None:
 def clear_flashcard_stage_state(ctx: PipelineContext) -> None:
     ctx.flashcard_rows = []
     ctx.flashcard_row_terms = []
+    ctx._flashcard_cache_key = None
 
 
 def reset_vocab_stage_state(ctx: PipelineContext) -> Dict[str, Any]:
@@ -1462,8 +1525,16 @@ def _normalize_vocab_terms(terms: Sequence[str]) -> List[str]:
 def _normalize_extra_terms(active_terms: Sequence[str], total_slots: int) -> List[str]:
     out = _normalize_vocab_terms(active_terms)
     slots = max(0, int(total_slots))
+    if len(out) >= slots:
+        return out[:slots]
+    existing_keys = {t.strip().lower() for t in out}
+    filler_idx = 1
     while len(out) < slots:
-        out.append(f"semantic slot {int(len(out)) + 1}")
+        candidate = f"semantic slot {filler_idx}"
+        if candidate not in existing_keys:
+            out.append(candidate)
+            existing_keys.add(candidate)
+        filler_idx += 1
     return out[:slots]
 
 
@@ -2657,8 +2728,6 @@ def _build_pregestation_logic_rows(
                 # normalization of the stack is the single mask passed to the
                 # dataloader at training time.
 
-                bg_terms = ["dark", "signal", "shape"]
-                bg_mask = np.ones((size, size), dtype=np.float32)
                 disk_mask = disk.astype(np.float32, copy=False)
 
                 # Heuristic: detect if actual circle position is diagonal
@@ -2683,19 +2752,23 @@ def _build_pregestation_logic_rows(
                 if _h_centered and _v_centered:
                     _circle_center_terms.append("center")
 
+                # Circle element: only labels that describe the circle object itself.
+                # Tonal / color detection ("dark", "bright", etc.) is handled by the
+                # heuristic image analysis pass and is intentionally omitted here.
                 circle_terms = _hdet_active_dirs + [str(color), "object", "signal", "shape"] + extra_terms + _circle_center_terms
 
                 if _include_depth and len(_depth_labels) >= 2:
-                    # Cross is always at (0.5, 0.5) — always gets all center labels
-                    cross_terms = ["gray", "shape", "signal", "horizontal center", "vertical center", "center"]
+                    # Cross is always at (0.5, 0.5) — always gets all center labels.
+                    # "gray" is omitted here; the heuristic detects it from pixel values.
+                    cross_terms = ["object", "signal", "shape", "horizontal center", "vertical center", "center"]
                     cross_mask = _cross_alpha.astype(np.float32, copy=False)
-                    elem_masks = [bg_mask, disk_mask, cross_mask]
-                    elem_term_lists = [bg_terms, circle_terms, cross_terms]
-                    merged = _normalize_vocab_terms(bg_terms + circle_terms + cross_terms)
+                    elem_masks = [disk_mask, cross_mask]
+                    elem_term_lists = [circle_terms, cross_terms]
+                    merged = _normalize_vocab_terms(circle_terms + cross_terms)
                 else:
-                    elem_masks = [bg_mask, disk_mask]
-                    elem_term_lists = [bg_terms, circle_terms]
-                    merged = _normalize_vocab_terms(bg_terms + circle_terms)
+                    elem_masks = [disk_mask]
+                    elem_term_lists = [circle_terms]
+                    merged = _normalize_vocab_terms(circle_terms)
 
                 elem_stack = np.stack(elem_masks, axis=0)  # [k, H, W]
 

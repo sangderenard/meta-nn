@@ -125,13 +125,25 @@ class _FlashcardDataset(Dataset):
         active_indices: List[int] = []
         seen_indices = set()
         terms_row = list(sample.get("terms") or [])
+        _dropped: List[str] = []
         for term in terms_row:
             key = str(term).strip().lower()
+            if not key:
+                continue
             term_idx = int(current_term_to_idx.get(key, -1))
-            if int(term_idx) < 0 or int(term_idx) in seen_indices:
+            if int(term_idx) < 0:
+                _dropped.append(key)
+                continue
+            if int(term_idx) in seen_indices:
                 continue
             seen_indices.add(int(term_idx))
             active_indices.append(int(term_idx))
+        if _dropped:
+            raise ValueError(
+                f"_FlashcardDataset.__getitem__: {len(_dropped)} term(s) not in active vocabulary "
+                f"(silent label filtering is forbidden). "
+                f"Dropped: {_dropped[:20]}"
+            )
 
         if active_indices:
             stack_t = mask_t.repeat(int(len(active_indices)), 1, 1)
@@ -602,6 +614,7 @@ class GeneratorTrainNode(IRTrainingNode):
             bank=_payload_bank_obj,
             image_hw=image_hw,
         )
+        _ds.set_active_term_to_idx(dict(getattr(ctx, "semantic_term_to_idx", {}) or {}))
 
         # ----------------------------------------------------------------
         # Sort ALL rows by slot affinity — no rows are ever discarded.
@@ -710,6 +723,7 @@ class GeneratorTrainNode(IRTrainingNode):
             current_class_names = list(ctx.class_names or [])
             current_n_classes = max(1, len(current_class_names))
             current_term_to_idx = dict(ctx.semantic_term_to_idx)
+            _ds.set_active_term_to_idx(current_term_to_idx)
             if _fc_ds is not None:
                 _fc_ds.set_active_term_to_idx(current_term_to_idx)
 

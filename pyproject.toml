@@ -1,0 +1,61 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "meta-nn"
+version = "0.1.0"
+description = "Graph-shaped meta network: cooperating nodes for vocabulary, data, staged training, gating, and feeding."
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "pillow",
+    "scipy",
+    "torch",
+    "torchvision",
+    "tqdm",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest>=7.0",
+]
+all = [
+    "beautifulsoup4",
+    "colorama",
+    "ebooklib",
+    "edge-tts",
+    "PyOpenGL",
+    "pygame",
+    "pyttsx3",
+    "sentence-transformers",
+]
+
+[tool.setuptools]
+# Flat layout — root-level .py modules + pipeline package
+py-modules = [
+    "semantic_dataset_loaders",
+    "wav_ml_core",
+    "wav_ml_models",
+    "wav_ml_viewer",
+    "wav_ml_gui_main",
+    "wav_stride_viewer",
+    "wav_pipeline_graph",
+    "wav_config_transformer_pipeline",
+    "berkeley_sbd_pretrain",
+    "nodus_server",
+    "make_weight_image",
+    "update_readme_graphs",
+    "screensaver",
+    "semantic_dataset_loaders",
+]
+packages = ["pipeline", "pipeline.nodes", "pipeline.config"]
+
+[tool.setuptools.package-data]
+"pipeline.config" = ["*.json"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests", ".", "pipeline"]
+python_files = ["test_*.py", "_test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]

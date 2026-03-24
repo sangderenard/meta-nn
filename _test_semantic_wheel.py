@@ -24,7 +24,8 @@ from pipeline.semantic_wheel_cache import (
     ensure_semantic_candidate_cache,
     ensure_semantic_wheel_cache,
 )
-from semantic_dataset_loaders import SemanticDiskRow, semantic_mask_stack_collate
+from semantic_dataset_loaders import DatasetTermRegistry, SemanticDiskRow, semantic_mask_stack_collate
+from pipeline.vocabulary_defaults import DEFAULT_VOCABULARY
 
 
 def _ok(msg: str) -> None:
@@ -32,13 +33,9 @@ def _ok(msg: str) -> None:
 
 
 def _make_rows(root: Path, n_rows: int = 3) -> tuple[list[SemanticDiskRow], list[str]]:
-    class_names = [
-        "berkeley sbd dataset",
-        "object",
-        "signal",
-        "red object",
-        "noise damage",
-    ]
+    class_names = list(DEFAULT_VOCABULARY)
+    term_to_idx = {str(t).strip().lower(): i for i, t in enumerate(class_names)}
+    row_terms = ["berkeley sbd dataset", "object", "signal", "red"]
     rows: list[SemanticDiskRow] = []
     for i in range(n_rows):
         img = np.zeros((12, 10, 3), dtype=np.uint8)
@@ -50,16 +47,10 @@ def _make_rows(root: Path, n_rows: int = 3) -> tuple[list[SemanticDiskRow], list
         mask_path = root / f"mask_{i}.png"
         Image.fromarray(img, mode="RGB").save(img_path)
         Image.fromarray(mask, mode="L").save(mask_path)
-        y = np.zeros((len(class_names),), dtype=np.float32)
-        y[0] = 1.0
-        y[1] = 1.0
-        y[2] = 1.0
-        if i % 2 == 0:
-            y[3] = 1.0
         rows.append(
             SemanticDiskRow(
                 image_path=str(img_path),
-                terms=["berkeley sbd dataset", "object", "signal", "red object"],
+                terms=list(row_terms),
                 source="berkeley_sbd_train",
                 mask_path=str(mask_path),
             )
@@ -109,8 +100,8 @@ def test_roundtrip() -> None:
         assert mb.dtype == torch.float32
         assert float(torch.amax(mb).item()) <= 1.0
         assert float(torch.amin(mb).item()) >= 0.0
-        assert meta["mask_stacks"][0].dtype == torch.uint8
-        _ok("dataloader unpack normalizes uint8 masks to float01")
+        assert meta["mask_stacks"][0].dtype == torch.float32
+        _ok("dataloader unpack graduates mask_stacks to float32")
 
         # Build yb from terms at batch time (canonical path)
         active_term_to_idx = {str(n): i for i, n in enumerate(class_names)}
@@ -172,7 +163,9 @@ def test_generic_candidate_deck_rotation() -> None:
     with tempfile.TemporaryDirectory(dir=".") as td:
         root = Path(td)
         label_dim = 5
-        local_vocab = [f"term-{i}" for i in range(5)]
+        real_terms = list(DEFAULT_VOCABULARY[:label_dim])
+        registry = DatasetTermRegistry()
+        registry.register_many(real_terms)
         images: list[np.ndarray] = []
         candidates: list[SemanticWheelCandidate] = []
         for i in range(5):
@@ -183,7 +176,7 @@ def test_generic_candidate_deck_rotation() -> None:
             candidates.append(
                 SemanticWheelCandidate(
                     cache_key=f"candidate-{i}",
-                    terms=[f"term-{i}"],
+                    terms=[real_terms[i]],
                     source="synthetic",
                 )
             )
@@ -215,14 +208,14 @@ def test_generic_candidate_deck_rotation() -> None:
             candidates=candidates,
             candidate_indices=list(range(5)),
             build_entry_group=_entry_group,
-            local_vocab=local_vocab,
+            registry=registry,
             config=cfg,
         )
         second = ensure_semantic_candidate_cache(
             candidates=candidates,
             candidate_indices=list(range(5)),
             build_entry_group=_entry_group,
-            local_vocab=local_vocab,
+            registry=registry,
             config=cfg,
         )
         first_rows = [int(x) for x in list(first.get("base_candidate_indices") or [])]
@@ -237,10 +230,11 @@ def test_generic_candidate_cache_expiry_respected() -> None:
     print("\n--- test_generic_candidate_cache_expiry_respected ---")
     with tempfile.TemporaryDirectory(dir=".") as td:
         root = Path(td)
-        label_dim = 3
-        local_vocab = [f"term-{i}" for i in range(4)]
+        real_terms = list(DEFAULT_VOCABULARY[:4])
+        registry = DatasetTermRegistry()
+        registry.register_many(real_terms)
         candidates = [
-            SemanticWheelCandidate(cache_key=f"candidate-{i}", terms=[f"term-{i}"], source="synthetic")
+            SemanticWheelCandidate(cache_key=f"candidate-{i}", terms=[real_terms[i]], source="synthetic")
             for i in range(4)
         ]
 
@@ -268,21 +262,21 @@ def test_generic_candidate_cache_expiry_respected() -> None:
             candidates=candidates,
             candidate_indices=list(range(4)),
             build_entry_group=_entry_group,
-            local_vocab=local_vocab,
+            registry=registry,
             config=cfg,
         )
         second = ensure_semantic_candidate_cache(
             candidates=candidates,
             candidate_indices=list(range(4)),
             build_entry_group=_entry_group,
-            local_vocab=local_vocab,
+            registry=registry,
             config=cfg,
         )
         third = ensure_semantic_candidate_cache(
             candidates=candidates,
             candidate_indices=list(range(4)),
             build_entry_group=_entry_group,
-            local_vocab=local_vocab,
+            registry=registry,
             config=cfg,
         )
         assert bool(first.get("cache_hit", False)) is False
@@ -296,10 +290,11 @@ def test_generic_candidate_cache_prunes_old_variants_and_tmp_dirs() -> None:
     with tempfile.TemporaryDirectory(dir=".") as td:
         root = Path(td)
         cache_root = root / "cache"
-        label_dim = 2
-        local_vocab = [f"term-{i}" for i in range(3)]
+        real_terms = list(DEFAULT_VOCABULARY[:3])
+        registry = DatasetTermRegistry()
+        registry.register_many(real_terms)
         candidates = [
-            SemanticWheelCandidate(cache_key=f"candidate-{i}", terms=[f"term-{i}"], source="synthetic")
+            SemanticWheelCandidate(cache_key=f"candidate-{i}", terms=[real_terms[i]], source="synthetic")
             for i in range(3)
         ]
 
@@ -326,7 +321,7 @@ def test_generic_candidate_cache_prunes_old_variants_and_tmp_dirs() -> None:
             candidates=candidates,
             candidate_indices=list(range(3)),
             build_entry_group=_entry_group,
-            local_vocab=local_vocab,
+            registry=registry,
             config=cfg_a,
         )
         stale_tmp = cache_root / "prune_probe_deadbeef_tmp"
@@ -351,7 +346,7 @@ def test_generic_candidate_cache_prunes_old_variants_and_tmp_dirs() -> None:
             candidates=candidates,
             candidate_indices=list(range(3)),
             build_entry_group=_entry_group,
-            local_vocab=local_vocab,
+            registry=registry,
             config=cfg_b,
         )
         remaining = sorted(
