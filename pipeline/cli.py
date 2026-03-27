@@ -1571,6 +1571,18 @@ def parse_args():
     )
     p.add_argument("--no-training-preview-enabled", dest="training_preview_enabled", action="store_false")
     p.add_argument("--training-preview-topk", type=int, default=6)
+    p.add_argument(
+        "--network-preview-output-panels",
+        type=int,
+        default=2,
+        help="How many viewer panels a network preview may claim for its output atlas (1 or 2).",
+    )
+    p.add_argument(
+        "--network-preview-confidence-floor",
+        type=float,
+        default=0.0,
+        help="Only tile network slots whose confidence is at least this value.",
+    )
     p.add_argument("--training-preview-generator-samples", type=int, default=4)
     p.add_argument("--training-preview-every-round", type=int, default=1)
     p.add_argument(

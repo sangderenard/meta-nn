@@ -556,8 +556,8 @@ class GeneratorTrainNode(IRTrainingNode):
         from pipeline.nodes.base import make_training_progress_callback
         from pipeline.nodes.vocab_node import (
             activate_vocab_lora_slot,
-            build_stage_vocab_lora_execution_plan,
             clear_flashcard_stage_state,
+            prepare_churn_scheduled_loader,
             reset_vocab_stage_state,
         )
 
@@ -607,8 +607,7 @@ class GeneratorTrainNode(IRTrainingNode):
             _cleanup_stage_state()
             return
 
-        from torch.utils.data import ConcatDataset, Subset
-        from pipeline.nodes.data_nodes import build_stage_loaders
+        from torch.utils.data import ConcatDataset
 
         _ds = SemanticWheelPayloadDataset(
             bank=_payload_bank_obj,
@@ -616,28 +615,12 @@ class GeneratorTrainNode(IRTrainingNode):
         )
         _ds.set_active_term_to_idx(dict(getattr(ctx, "semantic_term_to_idx", {}) or {}))
 
-        # ----------------------------------------------------------------
-        # Sort ALL rows by slot affinity — no rows are ever discarded.
-        # Each row is assigned to exactly one slot (best-overlap).  Rows
-        # with no extra terms (neutral) are spread across slots for variety.
-        # The resulting sorted index list is walked contiguously; the LoRA
-        # is switched at each slot boundary.
-        # ----------------------------------------------------------------
         _supervised_keys = {str(n).strip().lower() for n in list(getattr(ctx, "supervised_class_names", []))}
         _all_pt = ctx.payload_terms or []
         _n_rows = min(len(_all_pt), len(_ds))
         _fc_terms = list(getattr(ctx, "flashcard_row_terms", []) or [])
         _fc_rows = list(getattr(ctx, "flashcard_rows", []) or [])
         _combined_term_rows = list(_all_pt[:_n_rows]) + list(_fc_terms)
-        _execution_plan = build_stage_vocab_lora_execution_plan(
-            ctx=ctx,
-            term_rows=_combined_term_rows,
-            source="payload_stage_g_generator",
-            stage_label=self.node_id,
-        ) if _combined_term_rows else {"slots": [], "slot_groups": [], "ordered_row_indices": []}
-        planned_slots = list(_execution_plan.get("slots") or [])
-        _slot_boundaries = list(_execution_plan.get("slot_groups") or [])
-        _sorted_indices = list(_execution_plan.get("ordered_row_indices") or [])
 
         # --- DIAGNOSTIC: what does the payload bank actually contain? ---
         _diag_extra_term_counts: Dict[str, int] = {}
@@ -659,20 +642,6 @@ class GeneratorTrainNode(IRTrainingNode):
             f"  sample row 5 terms: {list(_all_pt[5]) if len(_all_pt) > 5 else '(n/a)'}"
         )
 
-        # Build a lookup: slot_index → set of lowered extra term keys
-        _slot_key_sets: List[set] = []
-        for _sd in planned_slots:
-            _slot_key_sets.append({str(t).strip().lower() for t in (_sd.get("terms") or [])})
-
-        # --- DIAGNOSTIC: what do the planned slots look like? ---
-        _log(
-            f"[stageG DIAG] {len(planned_slots)} planned slots:\n" +
-            "\n".join(
-                f"  slot {_si}: sig={str(_sd.get('signature',''))[:12]} "
-                f"terms={sorted(_slot_key_sets[_si])}"
-                for _si, _sd in enumerate(planned_slots)
-            )
-        )
         _fc_ds = None
         if _fc_terms and _fc_rows:
             _fc_ds = _FlashcardDataset(
@@ -688,14 +657,48 @@ class GeneratorTrainNode(IRTrainingNode):
         else:
             _full_ds = _ds
 
-        def _combined_row_to_dataset_index(row_idx: int) -> int:
-            row_idx_i = int(row_idx)
-            if int(row_idx_i) < int(_n_rows):
-                return int(row_idx_i)
-            return int(len(_ds) + (row_idx_i - _n_rows))
+        _schedule_info = prepare_churn_scheduled_loader(
+            ctx=ctx,
+            dataset=_full_ds,
+            term_rows=_combined_term_rows,
+            source="payload_stage_g_generator",
+            stage_label=self.node_id,
+            loader_name="stage_g_generator_churn",
+            batch_size=self.cfg.batch_size,
+            num_workers=1,
+            device_type=str(ctx.device.type),
+            seed=int(getattr(ctx.args, "seed", 0) or 0),
+            prefetch_factor=2,
+            pin_memory=True,
+            persistent_workers=True,
+        ) if _combined_term_rows else {
+            "slots": [],
+            "swap_map": [],
+            "ordered_row_indices": [],
+            "loader": None,
+        }
+        planned_slots = list(_schedule_info.get("slots") or [])
+        _slot_boundaries = list(_schedule_info.get("swap_map") or [])
+        _sorted_indices = list(_schedule_info.get("ordered_row_indices") or [])
 
-        if not _sorted_indices:
-            _log("[stageG] WARNING: no rows assigned to any slot — cannot train")
+        # Build a lookup: slot_index → set of lowered extra term keys
+        _slot_key_sets: List[set] = []
+        for _sd in planned_slots:
+            _slot_key_sets.append({str(t).strip().lower() for t in (_sd.get("terms") or [])})
+
+        # --- DIAGNOSTIC: what do the planned slots look like? ---
+        _log(
+            f"[stageG DIAG] {len(planned_slots)} planned slots:\n" +
+            "\n".join(
+                f"  slot {_si}: sig={str(_sd.get('signature',''))[:12]} "
+                f"terms={sorted(_slot_key_sets[_si])}"
+                for _si, _sd in enumerate(planned_slots)
+            )
+        )
+
+        if not _slot_boundaries:
+            _why = str(_schedule_info.get("scheduler_reason", "") or "no slot schedule emitted")
+            _log(f"[stageG] WARNING: churn scheduler produced no executable slot schedule — {_why}")
             _cleanup_stage_state()
             return
 
@@ -711,10 +714,10 @@ class GeneratorTrainNode(IRTrainingNode):
         slots_trained = 0
 
         for _group in _slot_boundaries:
+            slot_def = dict(_group.get("slot") or {})
             _si = int(_group.get("slot_index", -1))
-            if not (0 <= _si < len(planned_slots)):
+            if not slot_def:
                 continue
-            slot_def = planned_slots[_si]
             slot_signature = str(slot_def.get("signature", "")).strip()
             slot_name = str(slot_def.get("slot_name", f"vocab_{slot_signature}"))
 
@@ -728,9 +731,10 @@ class GeneratorTrainNode(IRTrainingNode):
                 _fc_ds.set_active_term_to_idx(current_term_to_idx)
 
             _group_indices = list(_group.get("row_indices") or [])
-            _group_dataset_indices = [_combined_row_to_dataset_index(_gi) for _gi in _group_indices]
-            _group_ds = Subset(_full_ds, _group_dataset_indices)
-            _group_ds.use_semantic_mask_stack_collate = True
+            _slot_loader = _group.get("loader", None)
+            if _slot_loader is None:
+                _log(f"[stageG] WARNING: slot {slot_name} has no scheduled loader — skipping")
+                continue
 
             _log(
                 f"[stageG] slot {slot_name}: {len(_group_indices)} rows, "
@@ -749,18 +753,6 @@ class GeneratorTrainNode(IRTrainingNode):
                 f"  sample row {_sample_gi} terms: {_sample_terms}\n"
                 f"  -> matched in active vocab: {_sample_matched}\n"
                 f"  -> NOT in active vocab (lost!): {_sample_unmatched}"
-            )
-
-            _slot_loader, _ = build_stage_loaders(
-                dataset=_group_ds,
-                name=f"generator_slot_{slot_name}",
-                batch_size=self.cfg.batch_size,
-                num_workers=1,
-                device_type=str(ctx.device.type),
-                pin_memory=True,
-                prefetch_factor=2,
-                persistent_workers=True,
-                shuffle_train=False,
             )
 
             trained_g, trained_d, metrics_list = train_conditional_generator_discriminator(

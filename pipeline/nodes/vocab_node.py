@@ -803,58 +803,89 @@ def _normalize_term_rows(rows: Optional[Sequence[Sequence[str]]]) -> List[List[s
     return out
 
 
-def _partition_terms_by_dependencies(
+def _resolve_churn_loader_spec(
     *,
-    variable_terms: Sequence[str],
-    term_rows: Sequence[Sequence[str]],
-    capacity: int,
-) -> List[List[str]]:
-    ordered_terms = _normalize_vocab_terms(variable_terms)
-    if int(len(ordered_terms)) <= 0:
-        return []
-    if int(capacity) <= 0:
-        return [list(ordered_terms)]
-    allowed = {_vocab_term_key(term) for term in ordered_terms}
-    freq: Dict[str, int] = {str(term): 0 for term in ordered_terms}
-    pair_weights: Dict[Tuple[str, str], int] = {}
-    for raw_row in term_rows:
-        row_terms = [
-            _vocab_term_key(term)
-            for term in _normalize_vocab_terms([str(x) for x in list(raw_row)])
-            if _vocab_term_key(term) in allowed
-        ]
-        if int(len(row_terms)) <= 0:
-            continue
-        row_unique = list(dict.fromkeys(row_terms))
-        for term in row_unique:
-            freq[str(term)] = int(freq.get(str(term), 0)) + 1
-        for i in range(int(len(row_unique))):
-            for j in range(int(i + 1), int(len(row_unique))):
-                pair = tuple(sorted((str(row_unique[i]), str(row_unique[j]))))
-                pair_weights[pair] = int(pair_weights.get(pair, 0)) + 1
-    seed_order = sorted(
-        [str(term) for term in ordered_terms],
-        key=lambda term: (-int(freq.get(str(term), 0)), str(term)),
+    dataset: Optional[Any],
+    base_loader: Optional[Any],
+    batch_size: int,
+    num_workers: int,
+    device_type: str,
+    seed: int,
+    prefetch_factor: int,
+    pin_memory: Optional[bool],
+    persistent_workers: bool,
+) -> Dict[str, Any]:
+    resolved_dataset = dataset
+    resolved_batch_size = max(1, int(batch_size) if int(batch_size) > 0 else 1)
+    resolved_num_workers = max(0, int(num_workers))
+    resolved_device_type = str(device_type or "").strip()
+    resolved_prefetch = max(0, int(prefetch_factor))
+    resolved_persistent = bool(persistent_workers)
+    resolved_pin = bool(pin_memory) if pin_memory is not None else (str(resolved_device_type).lower() == "cuda")
+
+    if base_loader is not None:
+        resolved_dataset = resolved_dataset if resolved_dataset is not None else getattr(base_loader, "dataset", None)
+        try:
+            resolved_batch_size = max(1, int(getattr(base_loader, "batch_size", resolved_batch_size) or resolved_batch_size))
+        except Exception:
+            pass
+        try:
+            resolved_num_workers = max(0, int(getattr(base_loader, "num_workers", resolved_num_workers)))
+        except Exception:
+            pass
+        try:
+            resolved_prefetch = max(0, int(getattr(base_loader, "prefetch_factor", resolved_prefetch) or resolved_prefetch))
+        except Exception:
+            pass
+        try:
+            resolved_persistent = bool(getattr(base_loader, "persistent_workers", resolved_persistent))
+        except Exception:
+            pass
+        if pin_memory is None:
+            try:
+                resolved_pin = bool(getattr(base_loader, "pin_memory", resolved_pin))
+            except Exception:
+                pass
+
+    return {
+        "dataset": resolved_dataset,
+        "batch_size": int(resolved_batch_size),
+        "num_workers": int(resolved_num_workers),
+        "device_type": str(resolved_device_type),
+        "seed": max(0, int(seed)),
+        "prefetch_factor": int(resolved_prefetch),
+        "pin_memory": bool(resolved_pin),
+        "persistent_workers": bool(resolved_persistent),
+    }
+
+
+def _build_churn_loader_from_indices(
+    *,
+    loader_name: str,
+    loader_spec: Dict[str, Any],
+    ordered_indices: Sequence[int],
+) -> Tuple[Optional[Any], int]:
+    from semantic_dataset_loaders import StageDatasetManifest, build_loader_from_manifest
+
+    dataset = loader_spec.get("dataset")
+    ordered = [int(i) for i in list(ordered_indices or []) if int(i) >= 0]
+    if dataset is None or int(len(ordered)) <= 0:
+        return None, 0
+
+    manifest = StageDatasetManifest(
+        name=str(loader_name),
+        dataset=dataset,
+        batch_size=max(1, int(loader_spec.get("batch_size", 1))),
+        seed=max(0, int(loader_spec.get("seed", 0))),
+        num_workers=max(0, int(loader_spec.get("num_workers", 0))),
+        device_type=str(loader_spec.get("device_type", "")),
+        ordered_indices=list(ordered),
+        prefetch_factor=max(0, int(loader_spec.get("prefetch_factor", 0))),
+        pin_memory=bool(loader_spec.get("pin_memory", False)),
+        persistent_workers=bool(loader_spec.get("persistent_workers", False)),
+        shuffle=False,
     )
-    groups: List[List[str]] = []
-    for term in seed_order:
-        best_group_idx = -1
-        best_score = -1
-        for gi, group in enumerate(groups):
-            if int(len(group)) >= int(capacity):
-                continue
-            score = 0
-            for other in group:
-                pair = tuple(sorted((str(term), str(other))))
-                score += int(pair_weights.get(pair, 0))
-            if int(score) > int(best_score):
-                best_score = int(score)
-                best_group_idx = int(gi)
-        if int(best_group_idx) < 0:
-            groups.append([str(term)])
-        else:
-            groups[int(best_group_idx)].append(str(term))
-    return [list(_normalize_vocab_terms(group)) for group in groups if group]
+    return build_loader_from_manifest(manifest=manifest)
 
 
 def plan_vocab_lora_requirements(
@@ -882,52 +913,10 @@ def plan_vocab_lora_requirements(
     required_extra_set = {_vocab_term_key(term) for term in required_extra}
     current_vocab_fit = bool(required_extra_set.issubset(current_extra_set))
     max_terms = max(1, int(max_terms_per_slot) if int(max_terms_per_slot) > 0 else int(getattr(ctx, "vocab_lora_max_terms", 0) or len(current_extra) or len(required_extra) or 1))
-    # Exclude locked terms already covered by the supervised (inbuilt) set — they
-    # don't need LoRA slot capacity since they're always present in the classifier.
-    locked_terms_non_supervised = [
-        t for t in locked_terms if _vocab_term_key(t) not in supervised_set
-    ]
-    fixed_locked_terms = list(locked_terms_non_supervised[: int(max_terms)])
-    variable_terms = [
-        str(term)
-        for term in required_extra
-        if _vocab_term_key(term) not in locked_set
-    ]
-    variable_capacity = max(0, int(max_terms) - int(len(fixed_locked_terms)))
     normalized_rows = _normalize_term_rows(term_rows)
-    grouped_terms = _partition_terms_by_dependencies(
-        variable_terms=variable_terms,
-        term_rows=normalized_rows,
-        capacity=max(1, int(variable_capacity) if int(variable_capacity) > 0 else 1),
-    )
+    _ = locked_terms
+    _ = locked_set
     slot_defs: List[Dict[str, Any]] = []
-    for slot_terms in grouped_terms or [[]]:
-        all_terms = _normalize_vocab_terms(list(fixed_locked_terms) + list(slot_terms))
-        if int(len(all_terms)) <= 0:
-            continue
-        signature = _hash_vocab_term_set(all_terms)
-        slot_defs.append(
-            {
-                "signature": str(signature),
-                "slot_name": f"vocab_{str(signature)}",
-                "terms": list(all_terms),
-                "locked_terms": [str(t) for t in fixed_locked_terms],
-                "variable_terms": list(_normalize_vocab_terms(slot_terms)),
-                "term_count": int(len(all_terms)),
-            }
-        )
-    if int(len(slot_defs)) <= 0 and int(len(required_extra)) > 0:
-        signature = _hash_vocab_term_set(required_extra)
-        slot_defs = [
-            {
-                "signature": str(signature),
-                "slot_name": f"vocab_{str(signature)}",
-                "terms": list(_normalize_vocab_terms(list(fixed_locked_terms) + list(variable_terms))),
-                "locked_terms": [str(t) for t in fixed_locked_terms],
-                "variable_terms": list(_normalize_vocab_terms(variable_terms)),
-                "term_count": int(len(_normalize_vocab_terms(list(fixed_locked_terms) + list(variable_terms)))),
-            }
-        ]
     plan_signature = _hash_vocab_term_set(required_extra)
     return {
         "signature": str(plan_signature),
@@ -943,9 +932,9 @@ def plan_vocab_lora_requirements(
             if _vocab_term_key(term) in supervised_set
         ],
         "current_vocab_fit": bool(current_vocab_fit),
-        "needs_split": bool(int(len(slot_defs)) > 1),
+        "needs_split": False,
         "slot_capacity": int(max_terms),
-        "variable_capacity": int(variable_capacity),
+        "variable_capacity": int(max_terms),
         "slots": list(slot_defs),
         "slot_count": int(len(slot_defs)),
         "term_rows_observed": int(len(normalized_rows)),
@@ -1054,52 +1043,51 @@ def _source_should_drive_vocab_activation(source: str, stage_label: str) -> bool
 def get_all_planned_lora_slots(ctx: PipelineContext) -> List[Dict[str, Any]]:
     """Return the full ordered list of LoRA slots for the current churn plan.
 
-    Mirrors the logic that StageCLoRANode used inline: reads the latest plan from
-    ctx.vocab_lora_plan_cache and falls back to a single synthesized slot from the
-    currently active churn state when no multi-slot plan exists.  All consumers
-    (Stage C, Stage G, etc.) call this instead of duplicating the lookup.
+    Reads the latest churn plan from ctx.vocab_lora_plan_cache. This returns
+    only slots explicitly produced by the churn scheduler.
     """
     plan_signature = str(getattr(ctx, "vocab_lora_latest_plan_signature", "") or "").strip()
     plan = (
         dict(getattr(ctx, "vocab_lora_plan_cache", {}).get(plan_signature, {}) or {})
         if plan_signature else {}
     )
-    slots = list(plan.get("slots") or [])
-    if slots:
-        return slots
-
-    # Fallback: synthesize a single-slot entry from whatever churn has active.
-    active_sig = str(getattr(ctx, "vocab_lora_active_signature", "") or "").strip()
-    if not active_sig:
-        active_sig = hashlib.sha1(
-            "|".join(str(x) for x in list(getattr(ctx, "active_extra_terms", []))
-            ).encode("utf-8", errors="ignore")
-        ).hexdigest()[:16]
-    fallback_terms = list(
-        getattr(ctx, "vocab_lora_active_terms", [])
-        or getattr(ctx, "active_extra_terms", [])
-    )
-    return [{"signature": active_sig, "slot_name": f"vocab_{active_sig}", "terms": fallback_terms}]
+    return list(plan.get("slots") or [])
 
 
-def build_stage_vocab_lora_execution_plan(
+def prepare_churn_scheduled_loader(
     ctx: PipelineContext,
     *,
+    dataset: Optional[Any] = None,
+    base_loader: Optional[Any] = None,
     term_rows: Sequence[Sequence[str]],
     source: str,
     stage_label: str,
+    loader_name: str = "",
+    batch_size: int = 0,
+    num_workers: int = 0,
+    device_type: str = "",
+    seed: int = 0,
+    prefetch_factor: int = 2,
+    pin_memory: Optional[bool] = None,
+    persistent_workers: bool = False,
     max_terms_per_slot: int = 0,
 ) -> Dict[str, Any]:
     normalized_rows = _normalize_term_rows(term_rows)
+    resolved_loader_name = str(loader_name or stage_label or source or "churn_loader")
     if int(len(normalized_rows)) <= 0:
         return {
             "signature": "",
             "source": str(source),
             "stage_label": str(stage_label),
+            "loader_name": str(resolved_loader_name),
             "slots": [],
             "slot_groups": [],
             "ordered_row_indices": [],
+            "swap_map": [],
+            "loader": None,
+            "loader_row_count": 0,
             "row_count": 0,
+            "term_rows": [],
         }
 
     plan = register_churn_requirement(
@@ -1110,101 +1098,103 @@ def build_stage_vocab_lora_execution_plan(
         stage_label=str(stage_label),
         max_terms_per_slot=int(max_terms_per_slot),
     )
-    slots = [dict(slot) for slot in list(plan.get("slots") or [])]
-    if int(len(slots)) <= 0:
-        fallback_terms = list(
-            _normalize_vocab_terms(
-                getattr(ctx, "active_extra_terms", [])
-                or getattr(ctx, "vocab_lora_baseline_extra_terms", [])
-            )
+    from pipeline.churn_scheduler import build_churn_row_schedule
+
+    schedule = build_churn_row_schedule(
+        ctx=ctx,
+        plan=dict(plan),
+        term_rows=normalized_rows,
+        source=str(source),
+        stage_label=str(stage_label),
+        max_terms_per_slot=int(max_terms_per_slot),
+    )
+
+    loader_spec = _resolve_churn_loader_spec(
+        dataset=dataset,
+        base_loader=base_loader,
+        batch_size=int(batch_size),
+        num_workers=int(num_workers),
+        device_type=str(device_type),
+        seed=int(seed),
+        prefetch_factor=int(prefetch_factor),
+        pin_memory=pin_memory,
+        persistent_workers=bool(persistent_workers),
+    )
+    ordered_row_indices = [int(i) for i in list(schedule.get("ordered_row_indices") or [])]
+    sorted_loader, sorted_loader_rows = _build_churn_loader_from_indices(
+        loader_name=str(resolved_loader_name),
+        loader_spec=loader_spec,
+        ordered_indices=ordered_row_indices,
+    )
+
+    slots = [dict(slot) for slot in list(schedule.get("slots") or [])]
+    swap_map: List[Dict[str, Any]] = []
+    loader_batch_size = max(1, int(loader_spec.get("batch_size", 1)))
+    for group in list(schedule.get("slot_groups") or []):
+        slot_idx = int(group.get("slot_index", -1))
+        row_indices = [int(i) for i in list(group.get("row_indices") or [])]
+        slot_def = dict(slots[int(slot_idx)]) if 0 <= int(slot_idx) < int(len(slots)) else {}
+        group_loader, group_loader_rows = _build_churn_loader_from_indices(
+            loader_name=f"{str(resolved_loader_name)}_slot_{int(slot_idx)}",
+            loader_spec=loader_spec,
+            ordered_indices=row_indices,
         )
-        fallback_sig = str(_hash_vocab_term_set(fallback_terms or ["baseline execution slot"]))
-        slots = [{
-            "signature": fallback_sig,
-            "slot_name": f"vocab_{fallback_sig}",
-            "terms": list(fallback_terms),
-            "locked_terms": [],
-            "variable_terms": list(fallback_terms),
-            "term_count": int(len(fallback_terms)),
-        }]
-
-    supervised_keys = {
-        _vocab_term_key(term)
-        for term in list(getattr(ctx, "supervised_class_names", []))
-        if _vocab_term_key(term)
-    }
-    slot_key_sets: List[set] = []
-    for slot in slots:
-        slot_key_sets.append({
-            _vocab_term_key(term)
-            for term in list(slot.get("terms") or [])
-            if _vocab_term_key(term)
-        })
-
-    slot_row_indices: List[List[int]] = [[] for _ in range(len(slots))]
-    neutral_indices: List[int] = []
-    for row_idx, row_terms in enumerate(normalized_rows):
-        row_extra = {
-            _vocab_term_key(term)
-            for term in list(row_terms)
-            if _vocab_term_key(term)
-        } - supervised_keys
-        if not row_extra:
-            neutral_indices.append(int(row_idx))
-            continue
-        best_slot = -1
-        best_overlap = 0
-        for slot_idx, slot_keys in enumerate(slot_key_sets):
-            overlap = int(len(row_extra & slot_keys))
-            if int(overlap) > int(best_overlap):
-                best_overlap = int(overlap)
-                best_slot = int(slot_idx)
-        if int(best_slot) >= 0:
-            slot_row_indices[int(best_slot)].append(int(row_idx))
-        else:
-            neutral_indices.append(int(row_idx))
-
-    if neutral_indices:
-        rng = np.random.default_rng(42)
-        rng.shuffle(neutral_indices)
-        slot_count = max(1, int(len(slots)))
-        for neutral_pos, row_idx in enumerate(neutral_indices):
-            slot_row_indices[int(neutral_pos) % slot_count].append(int(row_idx))
-
-    ordered_row_indices: List[int] = []
-    slot_groups: List[Dict[str, Any]] = []
-    exec_slots: List[Dict[str, Any]] = []
-    for slot_idx, slot in enumerate(slots):
-        row_indices = list(slot_row_indices[int(slot_idx)])
-        slot_def = dict(slot)
-        slot_def["row_indices"] = list(row_indices)
-        slot_def["row_count"] = int(len(row_indices))
-        exec_slots.append(slot_def)
-        if int(len(row_indices)) <= 0:
-            continue
-        start = int(len(ordered_row_indices))
-        ordered_row_indices.extend(row_indices)
-        end = int(len(ordered_row_indices))
-        slot_groups.append(
+        start = int(group.get("start", 0))
+        end = int(group.get("end", start))
+        swap_map.append(
             {
                 "slot_index": int(slot_idx),
-                "signature": str(slot.get("signature", "")).strip(),
-                "slot_name": str(slot.get("slot_name", f"vocab_{slot.get('signature', '')}")),
+                "slot": dict(slot_def),
                 "row_indices": list(row_indices),
                 "row_count": int(len(row_indices)),
                 "start": int(start),
                 "end": int(end),
+                "start_batch": int(start // max(1, loader_batch_size)),
+                "end_batch": int(math.ceil(float(end) / float(max(1, loader_batch_size)))),
+                "loader": group_loader,
+                "loader_row_count": int(group_loader_rows),
             }
         )
 
-    execution_plan = dict(plan)
-    execution_plan["source"] = str(source)
-    execution_plan["stage_label"] = str(stage_label)
-    execution_plan["slots"] = list(exec_slots)
-    execution_plan["slot_groups"] = list(slot_groups)
-    execution_plan["ordered_row_indices"] = list(ordered_row_indices)
-    execution_plan["row_count"] = int(len(normalized_rows))
-    execution_plan["term_rows"] = list(normalized_rows)
+    scheduled = dict(plan)
+    scheduled["source"] = str(source)
+    scheduled["stage_label"] = str(stage_label)
+    scheduled["loader_name"] = str(resolved_loader_name)
+    scheduled["slots"] = list(slots)
+    scheduled["slot_groups"] = list(schedule.get("slot_groups") or [])
+    scheduled["ordered_row_indices"] = list(ordered_row_indices)
+    scheduled["swap_map"] = list(swap_map)
+    scheduled["loader"] = sorted_loader
+    scheduled["loader_row_count"] = int(sorted_loader_rows)
+    scheduled["row_count"] = int(len(normalized_rows))
+    scheduled["term_rows"] = list(normalized_rows)
+    scheduled["scheduler_stub"] = bool(schedule.get("scheduler_stub", False))
+    scheduled["scheduler_status"] = str(schedule.get("scheduler_status", ""))
+    scheduled["scheduler_reason"] = str(schedule.get("scheduler_reason", ""))
+    return scheduled
+
+
+def build_stage_vocab_lora_execution_plan(
+    ctx: PipelineContext,
+    *,
+    term_rows: Sequence[Sequence[str]],
+    source: str,
+    stage_label: str,
+    max_terms_per_slot: int = 0,
+) -> Dict[str, Any]:
+    scheduled = prepare_churn_scheduled_loader(
+        ctx=ctx,
+        term_rows=term_rows,
+        source=str(source),
+        stage_label=str(stage_label),
+        loader_name=f"{str(stage_label)}_execution_plan",
+        max_terms_per_slot=int(max_terms_per_slot),
+    )
+    execution_plan = dict(scheduled)
+    execution_plan.pop("loader", None)
+    execution_plan.pop("loader_row_count", None)
+    execution_plan.pop("swap_map", None)
+    execution_plan.pop("loader_name", None)
     return execution_plan
 
 

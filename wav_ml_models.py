@@ -377,6 +377,34 @@ class TinyConvClassifier(nn.Module):
         self.register_buffer("label_embed_bank", torch.zeros((0, 0), dtype=torch.float32), persistent=True)
         self.register_buffer("label_embed_enabled", torch.zeros((1,), dtype=torch.uint8), persistent=True)
 
+        # Permanently resident vocabulary-extension network.
+        # Slot is registered as None until attach_hypergraph_net() is called.
+        # Typed as nn.Module to avoid importing from the pipeline package.
+        self.add_module("hypergraph_net", None)
+
+    # ------------------------------------------------------------------
+    # HypergraphNet attachment and training-mode control
+    # ------------------------------------------------------------------
+
+    def attach_hypergraph_net(self, net: nn.Module) -> None:
+        """Attach *net* as the permanent vocabulary-extension submodule."""
+        self.hypergraph_net = net  # __setattr__ routes nn.Module into _modules
+
+    def set_hypergraph_net_training(self, enabled: bool) -> None:
+        """Freeze or unfreeze the hypergraph net independently of the backbone."""
+        if self.hypergraph_net is None:
+            return
+        self.hypergraph_net.requires_grad_(enabled)
+        self.hypergraph_net.train(enabled)
+
+    def set_backbone_training(self, enabled: bool) -> None:
+        """Freeze or unfreeze every submodule except the hypergraph net."""
+        for name, mod in self.named_children():
+            if name == "hypergraph_net":
+                continue
+            mod.requires_grad_(enabled)
+            mod.train(enabled)
+
     def extract_feature_map(self, x: torch.Tensor) -> torch.Tensor:
         return self.features(x)
 
@@ -466,7 +494,11 @@ class TinyConvClassifier(nn.Module):
             y = F.interpolate(y, size=output_hw, mode="bilinear", align_corners=False)
         return y
 
-    def forward_with_aux(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
+    def forward_with_aux(
+        self,
+        x: torch.Tensor,
+        active_hg_keys: Optional[List[str]] = None,
+    ) -> Dict[str, torch.Tensor]:
         feature_map = self.extract_feature_map(x)
         feat = self.head[0](feature_map)
         feat = self.head[1](feat)
@@ -483,10 +515,16 @@ class TinyConvClassifier(nn.Module):
                 feature_map=feature_map,
                 output_hw=(int(x.shape[-2]), int(x.shape[-1])),
             )
+        if self.hypergraph_net is not None:
+            out["hypergraph_logits"] = self.hypergraph_net.logits(feat, active_hg_keys)
         return out
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.forward_with_aux(x)["logits"]
+    def forward(
+        self,
+        x: torch.Tensor,
+        active_hg_keys: Optional[List[str]] = None,
+    ) -> torch.Tensor:
+        return self.forward_with_aux(x, active_hg_keys)["logits"]
 
 
 def prime_tiny_classifier_label_bank_for_state_dict(

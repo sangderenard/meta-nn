@@ -967,6 +967,7 @@ class SaveRestoreNode(PipelineNode):
 
         # Model state dicts
         _models = {
+            "active_network": ctx.active_network,
             "classifier": ctx.classifier,
             "transformer": ctx.transformer,
             "generator": ctx.generator,
@@ -974,6 +975,7 @@ class SaveRestoreNode(PipelineNode):
             "wave_classifier": ctx.wave_classifier,
         }
         _optimizers = {
+            "active_network": ctx.active_network_optimizer,
             "classifier": ctx.classifier_optimizer,
             "transformer": ctx.transformer_optimizer,
             "generator": ctx.generator_optimizer,
@@ -985,6 +987,7 @@ class SaveRestoreNode(PipelineNode):
             "transformer": ctx.transformer_lr_controller,
         }
         _grad_scalers = {
+            "active_network": ctx.active_network_grad_scaler,
             "classifier": ctx.classifier_grad_scaler,
             "transformer": ctx.transformer_grad_scaler,
             "generator": ctx.generator_grad_scaler,
@@ -1238,6 +1241,7 @@ class SaveRestoreNode(PipelineNode):
 
         # 2. Restore model weights
         _models = {
+            "active_network": ctx.active_network,
             "classifier": ctx.classifier,
             "transformer": ctx.transformer,
             "generator": ctx.generator,
@@ -1245,6 +1249,7 @@ class SaveRestoreNode(PipelineNode):
             "wave_classifier": ctx.wave_classifier,
         }
         _optimizers = {
+            "active_network": ctx.active_network_optimizer,
             "classifier": ctx.classifier_optimizer,
             "transformer": ctx.transformer_optimizer,
             "generator": ctx.generator_optimizer,
@@ -1256,6 +1261,7 @@ class SaveRestoreNode(PipelineNode):
             "transformer": ctx.transformer_lr_controller,
         }
         _grad_scalers = {
+            "active_network": ctx.active_network_grad_scaler,
             "classifier": ctx.classifier_grad_scaler,
             "transformer": ctx.transformer_grad_scaler,
             "generator": ctx.generator_grad_scaler,
@@ -1266,7 +1272,8 @@ class SaveRestoreNode(PipelineNode):
             sd_key = f"{name}_state"
             if model is not None and sd_key in ckpt:
                 try:
-                    prime_tiny_classifier_label_bank_for_state_dict(model, ckpt[sd_key])
+                    if name == "classifier":
+                        prime_tiny_classifier_label_bank_for_state_dict(model, ckpt[sd_key])
                     model.load_state_dict(ckpt[sd_key], strict=False)
                     _log(f"[restore] loaded {name} weights")
                 except Exception as exc:

@@ -93,13 +93,14 @@ from pipeline.plan_protocol import (
 # --- node imports ----------------------------------------------------------
 from pipeline.nodes.classifier_node import (
     ClassifierConfig,
-    BuildClassifierNode,
-    PregestationTrainNode,
-    GestationTrainNode,
-    BerkeleyRefreshTrainNode,
-    LoRARoundNode,
-    FakeClassFeedbackNode,
     SyncGateReplicaNode,
+)
+from pipeline.nodes.speculative_node import (
+    SpeculativeNetConfig,
+    BuildSpeculativeNetNode,
+    SpeculativePregestationNode,
+    SpeculativeGestationNode,
+    SpeculativeBerkeleyNode,
 )
 from pipeline.nodes.transformer_node import (
     TransformerConfig,
@@ -1637,6 +1638,35 @@ def build_pipeline_graph(
     """
     g = PipelineGraph(name="wav_ml_pipeline")
 
+    stage_image_sizes = {
+        int(pregestation_cfg.image_size),
+        int(gestation_cfg.image_size),
+        int(berkeley_data_cfg.image_size),
+    }
+    if len(stage_image_sizes) != 1:
+        raise ValueError(
+            "[orchestrator] speculative network requires matching image_size across "
+            "pregestation, gestation, and berkeley_data loaders"
+        )
+    speculative_cfg = SpeculativeNetConfig(
+        image_size=int(pregestation_cfg.image_size),
+        in_channels=3,
+        sentence_transformer_model=str(
+            getattr(embedding_cfg, "model_name", "sentence-transformers/all-MiniLM-L6-v2")
+            or "sentence-transformers/all-MiniLM-L6-v2"
+        ),
+        lr=float(classifier_cfg.lr),
+        weight_decay=float(classifier_cfg.weight_decay),
+        grad_clip=float(classifier_cfg.grad_clip),
+        amp=bool(classifier_cfg.amp),
+        amp_dtype=str(classifier_cfg.amp_dtype),
+        channels_last=bool(classifier_cfg.channels_last),
+        stage0_epochs=int(classifier_cfg.stage0_epochs),
+        stage1_epochs=int(classifier_cfg.stage1_epochs),
+        stage2_epochs=int(classifier_cfg.stage2_epochs),
+        log_every=int(classifier_cfg.log_every),
+    )
+
     # ---------------------------------------------------------------
     # Register all nodes
     # ---------------------------------------------------------------
@@ -1644,7 +1674,7 @@ def build_pipeline_graph(
     # Initialisation (run-once)
     g.add_node(WavePoolNode(wave_pool_cfg))
     g.add_node(InitVocabNode(vocab_cfg))
-    g.add_node(BuildClassifierNode(classifier_cfg))
+    g.add_node(BuildSpeculativeNetNode(speculative_cfg))
     g.add_node(ConfigSearchNode(transformer_cfg))
     g.add_node(BuildTransformerNode(transformer_cfg))
     g.add_node(BuildGANNode(generator_cfg))
@@ -1673,14 +1703,12 @@ def build_pipeline_graph(
     _berk_refresh_cond = _make_berk_refresh_cond(_data_node)
 
     # Training stages
-    g.add_node(PregestationTrainNode(classifier_cfg))
-    g.add_node(GestationTrainNode(classifier_cfg))
-    g.add_node(BerkeleyRefreshTrainNode(classifier_cfg))
+    g.add_node(SpeculativePregestationNode(speculative_cfg))
+    g.add_node(SpeculativeGestationNode(speculative_cfg))
+    g.add_node(SpeculativeBerkeleyNode(speculative_cfg))
     g.add_node(TransformerTrainNode(transformer_cfg))
     g.add_node(GeneratorTrainNode(generator_cfg))
     g.add_node(WaveClassifierTrainNode(wave_cfg))
-    g.add_node(LoRARoundNode(classifier_cfg))
-    g.add_node(FakeClassFeedbackNode(classifier_cfg))
 
     # Gate checks
     g.add_node(PregestationEvalNode(classifier_cfg))
@@ -1820,13 +1848,6 @@ def build_pipeline_graph(
     g.add_edge("gate_transformer", "stage_g_generator",
                condition=_all_gates_passed, label="after_all_gates", condition_id=_CONDITION_ID_ALL_GATES)
     g.add_edge("stage_g_generator", "gate_generator",
-               condition=_all_gates_passed, label="after_all_gates", condition_id=_CONDITION_ID_ALL_GATES)
-
-    # == Stage C — LoRA + fake-class ================================
-
-    g.add_edge("gate_berkeley", "stage_c_lora",
-               condition=_all_gates_passed, label="after_all_gates", condition_id=_CONDITION_ID_ALL_GATES)
-    g.add_edge("stage_c_lora", "stage_fake_feedback",
                condition=_all_gates_passed, label="after_all_gates", condition_id=_CONDITION_ID_ALL_GATES)
 
     # == Stage W — Wave classifier ==================================

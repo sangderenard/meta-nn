@@ -96,6 +96,7 @@ class DataPossession:
     name: str                                        # e.g. "pregestation"
     tier: str = "ram"                                 # "disk" | "ram" | "gpu"
     ctx_attrs: List[str] = field(default_factory=list)  # e.g. ["pregestation_loader", "pregestation_dataset"]
+    required_ctx_attrs: List[str] = field(default_factory=list)  # attrs that must be non-None for the possession to be reusable
     expiry_fn: Optional[Callable[["PipelineContext"], bool]] = None   # True → stale
     size_fn: Optional[Callable[[], int]] = None       # bytes held, 0 if not built
     built: bool = False
@@ -526,7 +527,11 @@ class DataNode(PipelineNode):
             name="pregestation",
             tier="ram",
             ctx_attrs=["pregestation_loader", "pregestation_dataset", "pregestation_eval_loader", "pregestation_eval_dataset", "pregestation_logic_rows"],
-            expiry_fn=lambda ctx: self._check_item_exhaustion("pregestation", getattr(ctx, "pregestation_loader", None)),
+            required_ctx_attrs=["pregestation_loader", "pregestation_dataset", "pregestation_eval_loader", "pregestation_eval_dataset"],
+            expiry_fn=lambda ctx: (
+                (not self._possession_ctx_ready(ctx, "pregestation"))
+                or self._check_item_exhaustion("pregestation", getattr(ctx, "pregestation_loader", None))
+            ),
             size_fn=lambda: self._estimate_possession_bytes("pregestation"),
             pass_cap=self.preg_cfg.cache_mb * 1024 * 1024,
         )
@@ -534,7 +539,11 @@ class DataNode(PipelineNode):
             name="gestation",
             tier="ram",
             ctx_attrs=["gestation_loader", "gestation_dataset", "gestation_eval_loader", "gestation_eval_dataset"],
-            expiry_fn=lambda ctx: self._check_item_exhaustion("gestation", getattr(ctx, "gestation_loader", None)),
+            required_ctx_attrs=["gestation_loader", "gestation_dataset", "gestation_eval_loader", "gestation_eval_dataset"],
+            expiry_fn=lambda ctx: (
+                (not self._possession_ctx_ready(ctx, "gestation"))
+                or self._check_item_exhaustion("gestation", getattr(ctx, "gestation_loader", None))
+            ),
             size_fn=lambda: self._estimate_possession_bytes("gestation"),
             pass_cap=self.gest_cfg.cache_mb * 1024 * 1024,
         )
@@ -542,7 +551,11 @@ class DataNode(PipelineNode):
             name="berkeley",
             tier="ram",
             ctx_attrs=["berkeley_refresh_loader", "berkeley_gate_val_loader", "berkeley_cache"],
-            expiry_fn=lambda ctx: self._check_item_exhaustion("berkeley", getattr(ctx, "berkeley_refresh_loader", None)),
+            required_ctx_attrs=["berkeley_refresh_loader", "berkeley_gate_val_loader"],
+            expiry_fn=lambda ctx: (
+                (not self._possession_ctx_ready(ctx, "berkeley"))
+                or self._check_item_exhaustion("berkeley", getattr(ctx, "berkeley_refresh_loader", None))
+            ),
             size_fn=lambda: self._estimate_possession_bytes("berkeley"),
         )
         self.possessions["payload"] = DataPossession(
@@ -552,14 +565,16 @@ class DataNode(PipelineNode):
                 "payload_bank", "payload_conditions", "payload_masks",
                 "payload_bank_ready",
             ],
-            expiry_fn=lambda ctx: self._payload_last_build_round < 0,
+            required_ctx_attrs=["payload_bank", "payload_conditions", "payload_masks", "payload_terms"],
+            expiry_fn=lambda ctx: not self._possession_ctx_ready(ctx, "payload"),
             size_fn=lambda: self._estimate_possession_bytes("payload"),
         )
         self.possessions["payload_validation"] = DataPossession(
             name="payload_validation",
             tier="ram",
             ctx_attrs=["payload_validation_loader", "payload_validation_dataset"],
-            expiry_fn=lambda ctx: self._payload_validation_last_build_round < 0,
+            required_ctx_attrs=["payload_validation_loader", "payload_validation_dataset"],
+            expiry_fn=lambda ctx: not self._possession_ctx_ready(ctx, "payload_validation"),
             size_fn=lambda: self._estimate_possession_bytes("payload_validation"),
         )
 
@@ -596,6 +611,32 @@ class DataNode(PipelineNode):
         # This gives the housekeeping log a size figure without being exact.
         # Counting every tensor/array precisely is not worth the complexity.
         return 0
+
+    def _required_ctx_attrs_for_possession(self, possession_name: str) -> List[str]:
+        poss = self.possessions.get(str(possession_name))
+        if poss is None:
+            return []
+        attrs = list(poss.required_ctx_attrs or poss.ctx_attrs)
+        return [str(attr).strip() for attr in attrs if str(attr).strip()]
+
+    def _possession_ctx_ready(self, ctx: PipelineContext, possession_name: str) -> bool:
+        poss = self.possessions.get(str(possession_name))
+        if poss is None or not poss.built:
+            return False
+        for attr in self._required_ctx_attrs_for_possession(possession_name):
+            if not hasattr(ctx, attr):
+                return False
+            if getattr(ctx, attr) is None:
+                return False
+        return True
+
+    def _provider_should_rebuild(self, ctx: PipelineContext, possession_name: str) -> bool:
+        poss = self.possessions.get(str(possession_name))
+        if poss is None:
+            return True
+        if bool(poss.force_next_rebuild):
+            return True
+        return not self._possession_ctx_ready(ctx, possession_name)
 
     def declare_subnodes(self) -> List[Dict[str, Any]]:
         return [
@@ -745,14 +786,10 @@ class DataNode(PipelineNode):
     # ------------------------------------------------------------------
 
     def provide_pregestation(self, ctx: PipelineContext) -> None:
-        # Idempotency guard: the edge condition schedules rebuilds; this prevents a
-        # double-build when both preg edges fire for the same target on the same round.
-        if self._preg_last_build_round == ctx.total_rounds_completed:
-            return
-
-        # Suppress rebuild: keep whatever loaders are already in place
-        if getattr(ctx, "suppress_rebuild_enabled", lambda: False)() and ctx.pregestation_loader is not None:
+        if getattr(ctx, "suppress_rebuild_enabled", lambda: False)() and self._possession_ctx_ready(ctx, "pregestation"):
             _log("[data-node] provide_pregestation skipped — suppress_rebuild active")
+            return
+        if not self._provider_should_rebuild(ctx, "pregestation"):
             return
 
         # Release stale loaders before rebuild
@@ -1011,14 +1048,10 @@ class DataNode(PipelineNode):
              f"(entries_per_clean={entries_per_clean}) batch_size={self.preg_cfg.batch_size}")
 
     def provide_gestation(self, ctx: PipelineContext) -> None:
-        # Idempotency guard: the edge condition schedules rebuilds; this prevents a
-        # double-build when both gestation edges fire for the same target on the same round.
-        if self._gest_last_build_round == ctx.total_rounds_completed:
-            return
-
-        # Suppress rebuild: keep whatever loaders are already in place
-        if getattr(ctx, "suppress_rebuild_enabled", lambda: False)() and ctx.gestation_loader is not None:
+        if getattr(ctx, "suppress_rebuild_enabled", lambda: False)() and self._possession_ctx_ready(ctx, "gestation"):
             _log("[data-node] provide_gestation skipped — suppress_rebuild active")
+            return
+        if not self._provider_should_rebuild(ctx, "gestation"):
             return
 
         # Release stale loaders before rebuild
@@ -1243,14 +1276,10 @@ class DataNode(PipelineNode):
         # Skip rebuild if stage_2_berkeley is deselected in the GUI.
         if not getattr(ctx, "is_node_selected", lambda _: True)("stage_2_berkeley"):
             return
-        # Idempotency guard: the edge condition (_berk_refresh_cond) gates when this
-        # callback fires; guard only against an unexpected double-call on the same round.
-        if self._bdata_last_build_round == ctx.total_rounds_completed:
-            return
-
-        # Suppress rebuild: keep whatever loaders are already in place
-        if getattr(ctx, "suppress_rebuild_enabled", lambda: False)() and ctx.berkeley_refresh_loader is not None:
+        if getattr(ctx, "suppress_rebuild_enabled", lambda: False)() and self._possession_ctx_ready(ctx, "berkeley"):
             _log("[data-node] provide_berkeley_data skipped — suppress_rebuild active")
+            return
+        if not self._provider_should_rebuild(ctx, "berkeley"):
             return
 
         # Release old loaders/cache before building replacements
@@ -1351,16 +1380,11 @@ class DataNode(PipelineNode):
         _log(f"[data-node] berkeley refresh loader built at round {ctx.total_rounds_completed}")
 
     def provide_payload(self, ctx: PipelineContext) -> None:
-        # Idempotency guard: prevents double-build when both payload edges fire on the same round.
-        if self._payload_last_build_round == ctx.total_rounds_completed:
-            return
         _force = bool(self.possessions["payload"].force_next_rebuild)
-        # Suppress rebuild overrides force — keep existing data if already present.
-        if getattr(ctx, "suppress_rebuild_enabled", lambda: False)() and ctx.payload_bank:
+        if getattr(ctx, "suppress_rebuild_enabled", lambda: False)() and self._possession_ctx_ready(ctx, "payload"):
             _log("[data-node] provide_payload skipped — suppress_rebuild active")
             return
-        # Skip if already built this pipeline run and no forced rebuild requested.
-        if self._payload_last_build_round >= 0 and not _force:
+        if (not _force) and (not self._provider_should_rebuild(ctx, "payload")):
             return
 
         # Release old data before rebuild
@@ -1441,16 +1465,11 @@ class DataNode(PipelineNode):
         _log(f"[data-node] payload bank: {len(out_images)} rows")
 
     def provide_payload_validation(self, ctx: PipelineContext) -> None:
-        # Idempotency guard: prevents double-build on the same round.
-        if self._payload_validation_last_build_round == ctx.total_rounds_completed:
-            return
         _force = bool(self.possessions["payload_validation"].force_next_rebuild)
-        # Suppress rebuild: keep existing data if already present.
-        if getattr(ctx, "suppress_rebuild_enabled", lambda: False)() and ctx.payload_validation_loader:
+        if getattr(ctx, "suppress_rebuild_enabled", lambda: False)() and self._possession_ctx_ready(ctx, "payload_validation"):
             _log("[data-node] provide_payload_validation skipped — suppress_rebuild active")
             return
-        # Skip if already built this pipeline run and not forced.
-        if self._payload_validation_last_build_round >= 0 and not _force:
+        if (not _force) and (not self._provider_should_rebuild(ctx, "payload_validation")):
             return
 
         ctx.payload_validation_loader = None
@@ -1510,6 +1529,135 @@ class DataNode(PipelineNode):
         it only materializes the validation loader consumed by Gate 2.
         """
         self.provide_payload_validation(ctx)
+
+
+# ---------------------------------------------------------------------------
+# Runtime loader contracts — shared by all classifier stages / gates
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class RuntimeLoaderContract:
+    consumer_id: str
+    provider_method: str
+    loader_attr: str
+    churn_source: str = ""
+    stage_label: str = ""
+
+
+_RUNTIME_LOADER_CONTRACTS: Dict[str, RuntimeLoaderContract] = {
+    "stage_0_pregestation": RuntimeLoaderContract(
+        consumer_id="stage_0_pregestation",
+        provider_method="provide_pregestation",
+        loader_attr="pregestation_loader",
+    ),
+    "gate_0_pregestation_eval": RuntimeLoaderContract(
+        consumer_id="gate_0_pregestation_eval",
+        provider_method="provide_pregestation_eval",
+        loader_attr="pregestation_eval_loader",
+    ),
+    "stage_1_gestation": RuntimeLoaderContract(
+        consumer_id="stage_1_gestation",
+        provider_method="provide_gestation",
+        loader_attr="gestation_loader",
+        churn_source="gestation",
+        stage_label="stage1_gestation",
+    ),
+    "gate_1_gestation_eval": RuntimeLoaderContract(
+        consumer_id="gate_1_gestation_eval",
+        provider_method="provide_gestation_eval",
+        loader_attr="gestation_eval_loader",
+        churn_source="gestation",
+        stage_label="gate_1_gestation_eval",
+    ),
+    "stage_2_berkeley": RuntimeLoaderContract(
+        consumer_id="stage_2_berkeley",
+        provider_method="provide_berkeley_data",
+        loader_attr="berkeley_refresh_loader",
+        churn_source="berkeley_refresh",
+        stage_label="stage_2_berkeley",
+    ),
+    "stage_c_lora": RuntimeLoaderContract(
+        consumer_id="stage_c_lora",
+        provider_method="provide_berkeley_data",
+        loader_attr="berkeley_refresh_loader",
+    ),
+    "gate_berkeley": RuntimeLoaderContract(
+        consumer_id="gate_berkeley",
+        provider_method="provide_gate_data",
+        loader_attr="payload_validation_loader",
+        churn_source="payload_validation",
+        stage_label="gate_berkeley",
+    ),
+}
+
+
+def ensure_runtime_loader_contract(
+    ctx: PipelineContext,
+    *,
+    consumer_id: str,
+    require_non_empty: bool = True,
+) -> Dict[str, Any]:
+    """Resolve a stage/gate loader through DataNode ownership.
+
+    The dataset may keep arbitrary local index spaces; this helper only asks the
+    loader's dataset for per-row term strings and defers all vocabulary/LoRA
+    scheduling to churn via ``_register_churn_terms``.
+    """
+    contract = _RUNTIME_LOADER_CONTRACTS.get(str(consumer_id))
+    if contract is None:
+        raise RuntimeError(f"{str(consumer_id)} has no runtime loader contract")
+
+    loader = getattr(ctx, contract.loader_attr, None)
+    if loader is None:
+        data_node = getattr(ctx, "data", None)
+        provider = getattr(data_node, contract.provider_method, None)
+        if not callable(provider):
+            raise RuntimeError(
+                f"{str(consumer_id)} requires {contract.loader_attr}; "
+                f"DataNode.{contract.provider_method} is unavailable"
+            )
+        try:
+            provider(ctx)
+        except Exception as exc:
+            raise RuntimeError(
+                f"{str(consumer_id)} failed to materialize {contract.loader_attr} "
+                f"via DataNode.{contract.provider_method}"
+            ) from exc
+        loader = getattr(ctx, contract.loader_attr, None)
+
+    if loader is None:
+        raise RuntimeError(
+            f"{str(consumer_id)} requires {contract.loader_attr}; "
+            "provisioning returned without a loader"
+        )
+
+    loader_len = -1
+    try:
+        loader_len = int(len(loader))
+    except Exception as exc:
+        if bool(require_non_empty):
+            raise RuntimeError(
+                f"{str(consumer_id)} requires {contract.loader_attr} to report a positive length"
+            ) from exc
+    if bool(require_non_empty) and int(loader_len) <= 0:
+        raise RuntimeError(f"{str(consumer_id)} requires a non-empty {contract.loader_attr}")
+
+    if str(contract.churn_source).strip():
+        _register_churn_terms(
+            ctx,
+            term_rows=_dataset_terms_rows(getattr(loader, "dataset", None), progress_control=ctx),
+            source=str(contract.churn_source),
+            stage_label=str(contract.stage_label or contract.consumer_id),
+        )
+
+    return {
+        "consumer_id": str(contract.consumer_id),
+        "provider_method": str(contract.provider_method),
+        "loader_attr": str(contract.loader_attr),
+        "loader": loader,
+        "loader_len": int(loader_len),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -2528,39 +2676,65 @@ def _selected_source_counts(rows: Sequence[Any], indices: Sequence[int]) -> Dict
     return counts
 
 
+def _terms_from_dataset_item(item: Any) -> List[str]:
+    if isinstance(item, dict):
+        terms = item.get("terms", item.get("terms_row", item.get("terms_rows", [])))
+        if isinstance(terms, (list, tuple)):
+            return list(_normalize_vocab_terms([str(x) for x in list(terms)]))
+        return []
+    if isinstance(item, (tuple, list)):
+        for value in reversed(list(item)):
+            if isinstance(value, (list, tuple)):
+                return list(_normalize_vocab_terms([str(x) for x in list(value)]))
+    return []
+
+
+def _dataset_terms_entry(dataset: Optional[Dataset], index: int) -> List[str]:
+    if dataset is None:
+        return []
+    terms_reader = getattr(dataset, "read_terms_entry", None)
+    if callable(terms_reader):
+        try:
+            terms = terms_reader(int(index))
+        except Exception:
+            return []
+        return list(_normalize_vocab_terms(terms if isinstance(terms, (list, tuple)) else []))
+    reader = getattr(dataset, "read_numpy_entry", None)
+    if callable(reader):
+        try:
+            item = reader(int(index))
+        except Exception:
+            return []
+        return _terms_from_dataset_item(item)
+    base_dataset = getattr(dataset, "dataset", None)
+    base_indices = getattr(dataset, "indices", None)
+    if base_dataset is not None and base_indices is not None:
+        try:
+            base_index = base_indices[int(index)]
+        except Exception:
+            return []
+        return _dataset_terms_entry(base_dataset, int(base_index))
+    try:
+        item = dataset[int(index)]
+    except Exception:
+        return []
+    return _terms_from_dataset_item(item)
+
+
 def _dataset_terms_rows(dataset: Optional[Dataset], max_rows: int = 0, progress_control: Any = None) -> List[List[str]]:
     if dataset is None:
         return []
     limit = int(max_rows) if int(max_rows) > 0 else int(len(dataset))
     out: List[List[str]] = []
-    reader = getattr(dataset, "read_numpy_entry", None)
-    if callable(reader):
-        for idx in interruptible_tqdm(
-            range(int(limit)),
-            desc="[data-node] reading dataset terms",
-            unit="row",
-            leave=False,
-            dynamic_ncols=True,
-            control=progress_control,
-        ):
-            try:
-                item = reader(int(idx))
-            except Exception:
-                out.append([])
-                continue
-            terms = item.get("terms", []) if isinstance(item, dict) else []
-            out.append(list(_normalize_vocab_terms(terms if isinstance(terms, (list, tuple)) else [])))
-        return out
-    for idx in range(int(limit)):
-        try:
-            item = dataset[int(idx)]
-        except Exception:
-            out.append([])
-            continue
-        if isinstance(item, (tuple, list)) and int(len(item)) >= 6 and isinstance(item[5], (list, tuple)):
-            out.append(list(_normalize_vocab_terms([str(x) for x in list(item[5])])))
-        else:
-            out.append([])
+    for idx in interruptible_tqdm(
+        range(int(limit)),
+        desc="[data-node] reading dataset terms",
+        unit="row",
+        leave=False,
+        dynamic_ncols=True,
+        control=progress_control,
+    ):
+        out.append(_dataset_terms_entry(dataset, int(idx)))
     return out
 
 
@@ -3705,6 +3879,7 @@ def _build_payload_validation_gate_dataset(
     )
     selected_base_rows = [int(x) for x in list(wheel_result.get("base_row_indices") or [])]
     terms_rows: List[List[str]] = []
+    terms_reader = getattr(ds, "read_terms_entry", None)
     for i in interruptible_tqdm(
         range(int(len(ds))),
         desc="[payload val] reading labels",
@@ -3713,8 +3888,11 @@ def _build_payload_validation_gate_dataset(
         dynamic_ncols=True,
         control=ctx,
     ):
-        item = ds.read_numpy_entry(int(i))
-        terms_rows.append(list(_normalize_vocab_terms(item.get("terms") or [])))
+        if callable(terms_reader):
+            terms_rows.append(list(_normalize_vocab_terms(terms_reader(int(i)))))
+        else:
+            item = ds.read_numpy_entry(int(i))
+            terms_rows.append(list(_normalize_vocab_terms(item.get("terms") or [])))
     labels_np = np.zeros((int(len(ds)), 0), dtype=np.float32)
     refresh_rows_total = int(sum(int(v.get("refresh_selected", 0)) for v in source_stats.values()))
     refresh_rows_berkeley_train = int(source_stats.get("berkeley_sbd_train", {}).get("refresh_selected", 0))
@@ -4279,6 +4457,7 @@ def _build_berkeley_payload_bank(
     ds = SemanticWheelDataset(cache_dir=str(wheel_result.get("cache_dir", "")), return_mask_stack=False)
     selected_base_rows = [int(x) for x in list(wheel_result.get("base_row_indices") or [])]
     out_per_row_terms: List[List[str]] = []
+    terms_reader = getattr(ds, "read_terms_entry", None)
     for i in interruptible_tqdm(
         range(int(len(ds))),
         desc="[payload bank] reading targets",
@@ -4287,8 +4466,11 @@ def _build_berkeley_payload_bank(
         dynamic_ncols=True,
         control=ctx,
     ):
-        item = ds.read_numpy_entry(int(i))
-        out_per_row_terms.append(list(item.get("terms") or []))
+        if callable(terms_reader):
+            out_per_row_terms.append(list(terms_reader(int(i))))
+        else:
+            item = ds.read_numpy_entry(int(i))
+            out_per_row_terms.append(list(item.get("terms") or []))
     out_terms = [
         list(_normalize_vocab_terms(getattr(rows[int(idx)], "terms", [])))
         for idx in selected_base_rows

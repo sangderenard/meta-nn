@@ -915,7 +915,11 @@ class PipelineGraph:
                 for edge in incoming:
                     edge_condition_id = str(edge.condition_id or "").strip()
                     if edge_condition_id:
-                        if guard_results.get(edge_condition_id, False):
+                        if edge_condition_id in guard_results:
+                            if guard_results.get(edge_condition_id, False):
+                                active_incoming.append(edge)
+                            continue
+                        if edge.is_active(ctx):
                             active_incoming.append(edge)
                         continue
                     if edge.is_active(ctx):

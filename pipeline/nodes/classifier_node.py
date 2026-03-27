@@ -76,6 +76,7 @@ from pipeline.nodes.data_nodes import (
     _apply_network_dropout_rate,
     _auto_berkeley_refresh_batch_size,
     _dataset_terms_rows,
+    ensure_runtime_loader_contract,
     _expand_semantic_mask_supervision_batch,
     _forward_classifier_outputs_require_mask,
     _payload_condition_bank_tensor,
@@ -414,55 +415,57 @@ class PregestationTrainNode(IRTrainingNode):
 
     def should_run(self, ctx: PipelineContext) -> bool:
         # Always attempt until gate passes; harmless to run again after passing.
-        return ctx.pregestation_loader is not None and ctx.classifier is not None
+        return ctx.classifier is not None
 
     def execute(self, ctx: PipelineContext) -> None:
-        ensure_vocab_lora_active(ctx, self.cfg)
-        from pipeline.nodes.base import make_training_progress_callback
-        preview_callback = make_classifier_step_preview_callback(ctx, self.node_id)
-        weight_update_callback = make_runtime_weight_publish_callback(
-            ctx,
-            model_name="classifier",
-            model=ctx.classifier,
-            node_id=self.node_id,
-        )
-        result = _run_classifier_refresh_epochs(
-            classifier=ctx.classifier,
-            optimizer=ctx.classifier_optimizer,
-            loader=ctx.pregestation_loader,
-            device=ctx.device,
-            epochs=self.cfg.stage0_epochs,
-            amp_enabled=ctx.amp_enabled,
-            amp_dtype=ctx.amp_dtype,
-            grad_clip=self.cfg.grad_clip,
-            grad_accum_steps=self.cfg.grad_accum_steps,
-            semantic_cosine_weight=self.cfg.semantic_cosine_weight,
-            grad_scaler=ctx.classifier_grad_scaler,
-            channels_last=self.cfg.channels_last,
-            stage_label="stage0_pregestation",
-            log_every=self.cfg.log_every,
-            step_preview_callback=preview_callback,
-            progress_callback=make_training_progress_callback(
+        loader_info = ensure_runtime_loader_contract(ctx, consumer_id=self.node_id)
+        try:
+            ensure_vocab_lora_active(ctx, self.cfg)
+            from pipeline.nodes.base import make_training_progress_callback
+            preview_callback = make_classifier_step_preview_callback(ctx, self.node_id)
+            weight_update_callback = make_runtime_weight_publish_callback(
                 ctx,
-                self.node_id,
-                "stage0_pregestation",
-                publish_loss=(preview_callback is None),
-            ),
-            stop_requested=ctx.stop_requested,
-            pause_requested=ctx.paused,
-            ipc_pump=getattr(ctx.viewer_proxy, "pump", None),
-            weight_update_callback=weight_update_callback,
-            active_term_to_idx=dict(ctx.semantic_term_to_idx),
-            n_active_classes=len(ctx.class_names),
-            label_mask_dropout_cfg=_make_label_dropout_cfg(self.cfg),
-            args=ctx.args,
-        )
+                model_name="classifier",
+                model=ctx.classifier,
+                node_id=self.node_id,
+            )
+            result = _run_classifier_refresh_epochs(
+                classifier=ctx.classifier,
+                optimizer=ctx.classifier_optimizer,
+                loader=loader_info["loader"],
+                device=ctx.device,
+                epochs=self.cfg.stage0_epochs,
+                amp_enabled=ctx.amp_enabled,
+                amp_dtype=ctx.amp_dtype,
+                grad_clip=self.cfg.grad_clip,
+                grad_accum_steps=self.cfg.grad_accum_steps,
+                semantic_cosine_weight=self.cfg.semantic_cosine_weight,
+                grad_scaler=ctx.classifier_grad_scaler,
+                channels_last=self.cfg.channels_last,
+                stage_label="stage0_pregestation",
+                log_every=self.cfg.log_every,
+                step_preview_callback=preview_callback,
+                progress_callback=make_training_progress_callback(
+                    ctx,
+                    self.node_id,
+                    "stage0_pregestation",
+                    publish_loss=(preview_callback is None),
+                ),
+                stop_requested=ctx.stop_requested,
+                pause_requested=ctx.paused,
+                ipc_pump=getattr(ctx.viewer_proxy, "pump", None),
+                weight_update_callback=weight_update_callback,
+                active_term_to_idx=dict(ctx.semantic_term_to_idx),
+                n_active_classes=len(ctx.class_names),
+                label_mask_dropout_cfg=_make_label_dropout_cfg(self.cfg),
+                args=ctx.args,
+            )
 
-        loss = float(result.get("loss", float("inf")))
-        ctx.log_metric("stage0", "loss", loss)
-        _log(f"[stage0] loss={loss:.4f}")
-
-        deactivate_vocab_lora_slot(ctx)
+            loss = float(result.get("loss", float("inf")))
+            ctx.log_metric("stage0", "loss", loss)
+            _log(f"[stage0] loss={loss:.4f}")
+        finally:
+            deactivate_vocab_lora_slot(ctx)
 
 
 # ---------------------------------------------------------------------------
@@ -541,69 +544,60 @@ class GestationTrainNode(IRTrainingNode):
         }
 
     def should_run(self, ctx: PipelineContext) -> bool:
-        return ctx.gestation_loader is not None and ctx.classifier is not None
+        if not super().should_run(ctx):
+            return False
+        return ctx.classifier is not None
 
     def execute(self, ctx: PipelineContext) -> None:
         from pipeline.nodes.base import make_training_progress_callback
-        from pipeline.nodes.data_nodes import _register_churn_terms, _dataset_terms_rows
+        loader_info = ensure_runtime_loader_contract(ctx, consumer_id=self.node_id)
 
-        # Schedule through the churn system before training: ensures the active
-        # vocabulary slot covers the gestation terms regardless of lora state.
-        gestation_term_rows = _dataset_terms_rows(
-            getattr(ctx, "gestation_dataset", None), progress_control=ctx
-        )
-        _register_churn_terms(
-            ctx,
-            term_rows=gestation_term_rows,
-            source="gestation",
-            stage_label="stage1_gestation",
-        )
-
-        ensure_vocab_lora_active(ctx, self.cfg)
-        preview_callback = make_classifier_step_preview_callback(ctx, self.node_id)
-        weight_update_callback = make_runtime_weight_publish_callback(
-            ctx,
-            model_name="classifier",
-            model=ctx.classifier,
-            node_id=self.node_id,
-        )
-        result = _run_classifier_refresh_epochs(
-            classifier=ctx.classifier,
-            optimizer=ctx.classifier_optimizer,
-            loader=ctx.gestation_loader,
-            device=ctx.device,
-            epochs=self.cfg.stage1_epochs,
-            amp_enabled=ctx.amp_enabled,
-            amp_dtype=ctx.amp_dtype,
-            grad_clip=self.cfg.grad_clip,
-            grad_accum_steps=self.cfg.grad_accum_steps,
-            semantic_cosine_weight=self.cfg.semantic_cosine_weight,
-            grad_scaler=ctx.classifier_grad_scaler,
-            channels_last=self.cfg.channels_last,
-            stage_label="stage1_gestation",
-            log_every=self.cfg.log_every,
-            step_preview_callback=preview_callback,
-            progress_callback=make_training_progress_callback(
+        try:
+            ensure_vocab_lora_active(ctx, self.cfg)
+            preview_callback = make_classifier_step_preview_callback(ctx, self.node_id)
+            weight_update_callback = make_runtime_weight_publish_callback(
                 ctx,
-                self.node_id,
-                "stage1_gestation",
-                publish_loss=(preview_callback is None),
-            ),
-            stop_requested=ctx.stop_requested,
-            pause_requested=ctx.paused,
-            ipc_pump=getattr(ctx.viewer_proxy, "pump", None),
-            weight_update_callback=weight_update_callback,
-            active_term_to_idx=dict(ctx.semantic_term_to_idx),
-            n_active_classes=len(ctx.class_names),
-            label_mask_dropout_cfg=_make_label_dropout_cfg(self.cfg),
-            args=ctx.args,
-        )
+                model_name="classifier",
+                model=ctx.classifier,
+                node_id=self.node_id,
+            )
+            result = _run_classifier_refresh_epochs(
+                classifier=ctx.classifier,
+                optimizer=ctx.classifier_optimizer,
+                loader=loader_info["loader"],
+                device=ctx.device,
+                epochs=self.cfg.stage1_epochs,
+                amp_enabled=ctx.amp_enabled,
+                amp_dtype=ctx.amp_dtype,
+                grad_clip=self.cfg.grad_clip,
+                grad_accum_steps=self.cfg.grad_accum_steps,
+                semantic_cosine_weight=self.cfg.semantic_cosine_weight,
+                grad_scaler=ctx.classifier_grad_scaler,
+                channels_last=self.cfg.channels_last,
+                stage_label="stage1_gestation",
+                log_every=self.cfg.log_every,
+                step_preview_callback=preview_callback,
+                progress_callback=make_training_progress_callback(
+                    ctx,
+                    self.node_id,
+                    "stage1_gestation",
+                    publish_loss=(preview_callback is None),
+                ),
+                stop_requested=ctx.stop_requested,
+                pause_requested=ctx.paused,
+                ipc_pump=getattr(ctx.viewer_proxy, "pump", None),
+                weight_update_callback=weight_update_callback,
+                active_term_to_idx=dict(ctx.semantic_term_to_idx),
+                n_active_classes=len(ctx.class_names),
+                label_mask_dropout_cfg=_make_label_dropout_cfg(self.cfg),
+                args=ctx.args,
+            )
 
-        loss = float(result.get("loss", float("inf")))
-        ctx.log_metric("stage1", "loss", loss)
-        _log(f"[stage1] loss={loss:.4f}")
-
-        deactivate_vocab_lora_slot(ctx)
+            loss = float(result.get("loss", float("inf")))
+            ctx.log_metric("stage1", "loss", loss)
+            _log(f"[stage1] loss={loss:.4f}")
+        finally:
+            deactivate_vocab_lora_slot(ctx)
 
 
 # ---------------------------------------------------------------------------
@@ -680,63 +674,66 @@ class BerkeleyRefreshTrainNode(IRTrainingNode):
             ],
         }
 
+    def should_run(self, ctx: PipelineContext) -> bool:
+        if not super().should_run(ctx):
+            return False
+        return ctx.classifier is not None
+
     def execute(self, ctx: PipelineContext) -> None:
-        # Self-heal: when edge traversal callbacks are skipped or out-of-order,
-        # stage-2 must still request its required loader instead of crashing/skipping.
-        if ctx.berkeley_refresh_loader is None:
-            data_node = getattr(ctx, "data", None)
-            provide = getattr(data_node, "provide_berkeley_data", None)
-            if callable(provide):
-                try:
-                    provide(ctx)
-                except Exception as exc:
-                    _log(f"[stage2_berkeley] loader request failed: {exc}")
-        ensure_vocab_lora_active(ctx, self.cfg)
-        from pipeline.nodes.base import make_training_progress_callback
-        preview_callback = make_classifier_step_preview_callback(ctx, self.node_id)
-        weight_update_callback = make_runtime_weight_publish_callback(
-            ctx,
-            model_name="classifier",
-            model=ctx.classifier,
-            node_id=self.node_id,
-        )
-        result = _run_classifier_refresh_epochs(
-            classifier=ctx.classifier,
-            optimizer=ctx.classifier_optimizer,
-            loader=ctx.berkeley_refresh_loader,
-            device=ctx.device,
-            epochs=self.cfg.stage2_epochs,
-            amp_enabled=ctx.amp_enabled,
-            amp_dtype=ctx.amp_dtype,
-            grad_clip=self.cfg.grad_clip,
-            grad_accum_steps=self.cfg.grad_accum_steps,
-            semantic_cosine_weight=self.cfg.semantic_cosine_weight,
-            grad_scaler=ctx.classifier_grad_scaler,
-            channels_last=self.cfg.channels_last,
-            stage_label="stage2_berkeley",
-            log_every=self.cfg.log_every,
-            step_preview_callback=preview_callback,
-            progress_callback=make_training_progress_callback(
+        loader_info = ensure_runtime_loader_contract(ctx, consumer_id=self.node_id)
+
+        try:
+            ensure_vocab_lora_active(ctx, self.cfg)
+            from pipeline.nodes.base import make_training_progress_callback
+            preview_callback = make_classifier_step_preview_callback(ctx, self.node_id)
+            weight_update_callback = make_runtime_weight_publish_callback(
                 ctx,
-                self.node_id,
-                "stage2_berkeley",
-                publish_loss=(preview_callback is None),
-            ),
-            stop_requested=ctx.stop_requested,
-            pause_requested=ctx.paused,
-            ipc_pump=getattr(ctx.viewer_proxy, "pump", None),
-            weight_update_callback=weight_update_callback,
-            args=ctx.args,
-            active_term_to_idx=dict(ctx.semantic_term_to_idx),
-            n_active_classes=len(ctx.class_names),
-            label_mask_dropout_cfg=_make_label_dropout_cfg(self.cfg),
-        )
+                model_name="classifier",
+                model=ctx.classifier,
+                node_id=self.node_id,
+            )
+            result = _run_classifier_refresh_epochs(
+                classifier=ctx.classifier,
+                optimizer=ctx.classifier_optimizer,
+                loader=loader_info["loader"],
+                device=ctx.device,
+                epochs=self.cfg.stage2_epochs,
+                amp_enabled=ctx.amp_enabled,
+                amp_dtype=ctx.amp_dtype,
+                grad_clip=self.cfg.grad_clip,
+                grad_accum_steps=self.cfg.grad_accum_steps,
+                semantic_cosine_weight=self.cfg.semantic_cosine_weight,
+                grad_scaler=ctx.classifier_grad_scaler,
+                channels_last=self.cfg.channels_last,
+                stage_label="stage2_berkeley",
+                log_every=self.cfg.log_every,
+                step_preview_callback=preview_callback,
+                progress_callback=make_training_progress_callback(
+                    ctx,
+                    self.node_id,
+                    "stage2_berkeley",
+                    publish_loss=(preview_callback is None),
+                ),
+                stop_requested=ctx.stop_requested,
+                pause_requested=ctx.paused,
+                ipc_pump=getattr(ctx.viewer_proxy, "pump", None),
+                weight_update_callback=weight_update_callback,
+                args=ctx.args,
+                active_term_to_idx=dict(ctx.semantic_term_to_idx),
+                n_active_classes=len(ctx.class_names),
+                label_mask_dropout_cfg=_make_label_dropout_cfg(self.cfg),
+            )
 
-        loss = float(result.get("loss", float("inf")))
-        ctx.log_metric("stage2", "loss", loss)
-        _log(f"[stage2] loss={loss:.4f}")
+            if not bool(result.get("ran", True)) and str(result.get("reason", "") or "") in {"missing_loader", "empty_loader"}:
+                raise RuntimeError(
+                    f"stage_2_berkeley did not execute ({str(result.get('reason', 'unknown'))})"
+                )
 
-        deactivate_vocab_lora_slot(ctx)
+            loss = float(result.get("loss", float("inf")))
+            ctx.log_metric("stage2", "loss", loss)
+            _log(f"[stage2] loss={loss:.4f}")
+        finally:
+            deactivate_vocab_lora_slot(ctx)
 
 
 # ---------------------------------------------------------------------------
@@ -824,24 +821,28 @@ class LoRARoundNode(IRTrainingNode):
         }
 
     def execute(self, ctx: PipelineContext) -> None:
-        if not self.cfg.lora_enabled or ctx.classifier is None or ctx.berkeley_refresh_loader is None:
+        if not self.cfg.lora_enabled or ctx.classifier is None:
             return
+        loader_info = ensure_runtime_loader_contract(ctx, consumer_id=self.node_id)
 
         from wav_ml_models import (
             ensure_tiny_classifier_lora_slot,
             install_tiny_classifier_lora,
             set_tiny_classifier_lora_state,
         )
-        from pipeline.nodes.vocab_node import activate_vocab_lora_slot, build_stage_vocab_lora_execution_plan
+        from pipeline.nodes.vocab_node import activate_vocab_lora_slot, prepare_churn_scheduled_loader
 
-        refresh_term_rows = _dataset_terms_rows(getattr(ctx.berkeley_refresh_loader, "dataset", None), progress_control=ctx)
-        execution_plan = build_stage_vocab_lora_execution_plan(
+        refresh_term_rows = _dataset_terms_rows(getattr(loader_info["loader"], "dataset", None), progress_control=ctx)
+        scheduled_refresh = prepare_churn_scheduled_loader(
             ctx=ctx,
+            base_loader=loader_info["loader"],
             term_rows=refresh_term_rows,
             source="stage_c_lora",
             stage_label=self.node_id,
+            loader_name="stage_c_lora_churn",
+            seed=int(getattr(ctx.args, "seed", 0) or 0),
         )
-        planned_slots = list(execution_plan.get("slots") or [])
+        planned_swaps = list(scheduled_refresh.get("swap_map") or [])
 
         # -- Install LoRA adapters once ------------------------------------
         install_tiny_classifier_lora(
@@ -858,12 +859,19 @@ class LoRARoundNode(IRTrainingNode):
         )
 
         # -- Sweep every planned slot --------------------------------------
+        if not planned_swaps:
+            _why = str(scheduled_refresh.get("scheduler_reason", "") or "no slot schedule emitted")
+            _log(f"[stageC] WARNING: churn scheduler produced no executable slot schedule — {_why}")
+            return
+
         slots_trained = 0
-        for slot_def in planned_slots:
+        for slot_plan in planned_swaps:
+            slot_def = dict(slot_plan.get("slot") or {})
             slot_signature = str(slot_def.get("signature", "")).strip()
             slot_name = str(slot_def.get("slot_name", f"vocab_{slot_signature}"))
             slot_terms = list(slot_def.get("terms") or [])
-            if not slot_signature or not slot_terms:
+            slot_loader = slot_plan.get("loader", None)
+            if not slot_signature or not slot_terms or slot_loader is None:
                 continue
 
             # Activate this slot's vocabulary in the pipeline context
@@ -879,7 +887,7 @@ class LoRARoundNode(IRTrainingNode):
             _run_classifier_refresh_epochs(
                 classifier=ctx.classifier,
                 optimizer=ctx.classifier_optimizer,
-                loader=ctx.berkeley_refresh_loader,
+                loader=slot_loader,
                 device=ctx.device,
                 epochs=1,
                 max_steps=self.cfg.stageC_steps_per_slot,
@@ -922,7 +930,7 @@ class LoRARoundNode(IRTrainingNode):
             slots_trained += 1
 
             _log(
-                f"[stageC] slot {slots_trained}/{len(planned_slots)} "
+                f"[stageC] slot {slots_trained}/{len(planned_swaps)} "
                 f"name={slot_name} terms={len(slot_terms)} signature={slot_signature[:12]}"
             )
 

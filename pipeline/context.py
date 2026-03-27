@@ -224,14 +224,22 @@ class PipelineContext:
     # ---- models ---------------------------------------------------------
     #  Each model slot is populated by its node's first execution.
 
-    # Main semantic classifier (TinyConvClassifier)
+    # ---- Active network (NetworkContract) — replaces TinyConvClassifier ----
+    # Any network that satisfies pipeline.network_api.NetworkContract can be
+    # stored here.  The training loop, gate nodes, and preview system speak
+    # only the contract API; they never reference architecture-specific attrs.
+    active_network: Optional[nn.Module] = None
+    active_network_optimizer: Optional[torch.optim.Optimizer] = None
+    active_network_grad_scaler: Optional[Any] = None
+    active_network_criterion: Optional[Any] = None   # PrototypeLoss or equivalent
+
+    # Legacy classifier slot — kept so existing nodes that still reference
+    # ctx.classifier do not crash before they are migrated.  New code must
+    # use active_network.  This field will be removed once migration is done.
     classifier: Optional[nn.Module] = None
     classifier_optimizer: Optional[torch.optim.Optimizer] = None
     classifier_lr_controller: Optional[Any] = None
     classifier_grad_scaler: Optional[Any] = None
-
-    # Gate evaluation builds a temporary replica on demand; this field exists
-    # for condition-expression compatibility but is always None at rest.
     gate_classifier: Optional[nn.Module] = None
 
     # Patch-based wav→image transformer (WavePatchTransformer)

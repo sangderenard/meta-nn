@@ -15,9 +15,9 @@ from pipeline.nodes.data_nodes import (
 from pipeline.nodes.generator_node import _FlashcardDataset
 from pipeline.nodes.vocab_node import (
     activate_vocab_lora_slot,
-    build_stage_vocab_lora_execution_plan,
     capture_vocab_baseline_state,
     clear_flashcard_stage_state,
+    prepare_churn_scheduled_loader,
     register_churn_requirement,
     reset_vocab_stage_state,
     select_active_vocab_lora_slot,
@@ -110,16 +110,26 @@ def test_vocab_plan_select_and_activate() -> None:
         stage_label="stage2_berkeley",
         max_terms_per_slot=5,
     )
-    assert int(plan["slot_count"]) >= 2, plan
+    assert int(plan["slot_count"]) == 0, plan
     assert str(ctx.vocab_lora_latest_plan_signature) == str(plan["signature"]), ctx.vocab_lora_latest_plan_signature
 
     slot = select_active_vocab_lora_slot(ctx)
-    assert isinstance(slot, dict) and slot, slot
-    info = activate_vocab_lora_slot(ctx, slot)
-    assert str(info["signature"]) == str(slot["signature"]), info
-    assert int(len(ctx.active_extra_terms)) == 5, ctx.active_extra_terms
-    assert set(slot.get("terms", [])).issubset(set(ctx.active_extra_terms)), ctx.active_extra_terms
-    _ok("Churn plan splits oversized vocab requirement into activatable slots")
+    assert slot is None, slot
+    scheduled = prepare_churn_scheduled_loader(
+        ctx=ctx,
+        term_rows=[
+            ["signal", "dataset alpha", "dataset beta"],
+            ["signal", "dataset gamma", "dataset delta"],
+            ["signal", "dataset epsilon", "dataset alpha"],
+        ],
+        source="berkeley_refresh",
+        stage_label="stage2_berkeley",
+        loader_name="test_churn_stub",
+    )
+    assert bool(scheduled.get("scheduler_stub", False)), scheduled
+    assert scheduled.get("loader", None) is None, scheduled
+    assert list(scheduled.get("swap_map") or []) == [], scheduled
+    _ok("Churn requirement bookkeeping remains, and the churn scheduler is stubbed centrally")
 
 
 def test_yb_from_terms() -> None:
@@ -179,7 +189,7 @@ def test_stage_local_execution_plan_ignores_hijacked_live_signature() -> None:
     assert int(flashcard_plan["required_extra_term_count"]) > 0, flashcard_plan
     assert str(ctx.vocab_lora_latest_plan_signature) == str(flashcard_plan["signature"]), ctx.vocab_lora_latest_plan_signature
 
-    execution_plan = build_stage_vocab_lora_execution_plan(
+    scheduled = prepare_churn_scheduled_loader(
         ctx=ctx,
         term_rows=[
             ["berkeley sbd dataset", "object", "signal", "extra person"],
@@ -190,19 +200,16 @@ def test_stage_local_execution_plan_ignores_hijacked_live_signature() -> None:
         ],
         source="payload_stage_g_generator",
         stage_label="stage_g_generator",
+        loader_name="stage_g_test_stub",
     )
-    slots = list(execution_plan.get("slots") or [])
-    assert int(len(slots)) >= 2, execution_plan
-    all_slot_terms = set()
-    for slot in slots:
-        all_slot_terms.update(slot.get("terms", []))
-    assert "extra sheep" in all_slot_terms, all_slot_terms
-    assert "flash digit 0" in all_slot_terms, all_slot_terms
-    ordered = list(execution_plan.get("ordered_row_indices") or [])
-    assert sorted(ordered) == [0, 1, 2, 3, 4], ordered
-    assert sum(int(slot.get("row_count", 0)) for slot in slots) == 5, slots
+    assert bool(scheduled.get("scheduler_stub", False)), scheduled
+    slots = list(scheduled.get("slots") or [])
+    assert slots == [], scheduled
+    ordered = list(scheduled.get("ordered_row_indices") or [])
+    assert ordered == [], ordered
+    assert list(scheduled.get("swap_map") or []) == [], scheduled
 
-    _ok("stage-local execution planning ignores a hijacked live signature")
+    _ok("churn scheduling contract stays centralized when signatures change underneath it")
 
 
 def test_stage_local_execution_plan_keeps_rows_vocab_aligned() -> None:
@@ -220,28 +227,20 @@ def test_stage_local_execution_plan_keeps_rows_vocab_aligned() -> None:
         ["signal", "flash digit 0"],
         ["signal", "flash letter a"],
     ]
-    execution_plan = build_stage_vocab_lora_execution_plan(
+    scheduled = prepare_churn_scheduled_loader(
         ctx=ctx,
         term_rows=term_rows,
         source="payload_stage_g_generator",
         stage_label="stage_g_generator",
+        loader_name="stage_g_alignment_stub",
     )
-    slots = list(execution_plan.get("slots") or [])
-    slot_groups = list(execution_plan.get("slot_groups") or [])
-    assert int(len(slot_groups)) >= 2, execution_plan
-
-    for group in slot_groups:
-        slot = dict(slots[int(group["slot_index"])])
-        activate_vocab_lora_slot(ctx, slot)
-        for row_idx in list(group.get("row_indices") or []):
-            row_terms = list(term_rows[int(row_idx)])
-            missing = [
-                term for term in row_terms
-                if str(term).strip().lower() not in ctx.semantic_term_to_idx
-            ]
-            assert missing == [], (slot.get("terms"), row_terms, missing)
+    slots = list(scheduled.get("slots") or [])
+    slot_groups = list(scheduled.get("swap_map") or [])
+    assert bool(scheduled.get("scheduler_stub", False)), scheduled
+    assert slots == [], slots
+    assert slot_groups == [], slot_groups
     reset_vocab_stage_state(ctx)
-    _ok("stage-local execution plan keeps slot rows aligned with the active vocab")
+    _ok("churn scheduler stub emits no fake aligned groups")
 
 
 def test_stage_loader_preserves_subset_order_when_unshuffled() -> None:
@@ -280,8 +279,7 @@ def test_reset_vocab_stage_state_restores_baseline() -> None:
         stage_label="stage_c_lora",
         max_terms_per_slot=3,
     )
-    slot = dict((plan.get("slots") or [])[0])
-    activate_vocab_lora_slot(ctx, slot)
+    assert list(plan.get("slots") or []) == [], plan
     ctx.vocab_lora_latest_plan_signature = str(plan.get("signature", ""))
     ctx.vocab_lora_plan_slot_cursor = 2
     ctx.vocab_churn_activation_pending = True

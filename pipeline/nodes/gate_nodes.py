@@ -35,22 +35,24 @@ from torch.utils.data import DataLoader
 
 from pipeline.context import PipelineContext
 from pipeline.graph import PipelineNode
+from pipeline.network_api import coerce_network_output
 from pipeline.nodes.base import (
     GatedNode,
     autocast_context,
     cuda_supports_dtype,
     gpu_resident,
     resolve_amp_dtype,
-    resolve_non_training_device,
     _save_pipeline_checkpoint,
 )
 from pipeline.nodes.save_restore_node import _classifier_checkpoint_metadata
 from pipeline.nodes.data_nodes import (
+    ensure_runtime_loader_contract,
     _expand_semantic_mask_supervision_batch,
     _forward_classifier_outputs_require_mask,
     _semantic_mask_bce_loss,
     _unpack_masked_semantic_batch,
 )
+from pipeline.nodes.speculative_node import _build_speculative_batch, _slice_speculative_batch_to_device
 from pipeline.utils import (
     _classifier_supervision_loss,
     _is_cuda_backend_engine_error,
@@ -64,33 +66,237 @@ CLASSIFIER_SEMANTIC_COSINE_WEIGHT = 0.35
 
 
 def _gate_eval_model(ctx: PipelineContext, *, channels_last: bool = False) -> tuple[nn.Module, torch.device, str]:
-    """Build a temporary frozen replica of the classifier for gate evaluation.
-
-    The replica is created fresh each time and NOT stored on ctx so that no
-    duplicate model weights linger in RAM between evaluations.
-    """
-    model = getattr(ctx, "classifier", None)
+    """Return the active recognition network for gate evaluation."""
+    del channels_last
+    model = getattr(ctx, "active_network", None)
     if model is None:
-        raise RuntimeError("Gate evaluation requires a classifier")
-    gate_device = resolve_non_training_device(ctx)
-    gate_model = model  # fallback: use training classifier directly
+        raise RuntimeError("Gate evaluation requires an active_network")
     try:
-        from pipeline.nodes.classifier_node import _sync_gate_classifier_replica
-
-        gate_model, _info = _sync_gate_classifier_replica(
-            source_classifier=model,
-            gate_classifier=None,
-            gate_device=gate_device,
-            channels_last=bool(channels_last),
-        )
-    except Exception:
-        pass
-    try:
-        gate_device = next(gate_model.parameters()).device
+        gate_device = next(model.parameters()).device
     except StopIteration:
         gate_device = torch.device("cpu")
-    gate_name = "gate_classifier" if gate_model is not model else "classifier"
-    return gate_model, gate_device, gate_name
+    return model, gate_device, "active_network"
+
+
+def _assigned_slot_confidence_probs(
+    assignments: Sequence[Dict[str, Any]],
+    slot_confidence: torch.Tensor,
+    vocab_size: int,
+) -> torch.Tensor:
+    """Project slot confidence onto vocab indices via slot→target assignments."""
+
+    probs = torch.zeros(
+        int(slot_confidence.shape[0]),
+        int(vocab_size),
+        device=slot_confidence.device,
+        dtype=slot_confidence.dtype,
+    )
+    for b, sample in enumerate(list(assignments or [])):
+        slot_to_target = list(sample.get("slot_to_target") or [])
+        for slot_i, target_i in enumerate(slot_to_target):
+            if target_i is None:
+                continue
+            ti = int(target_i)
+            if 0 <= ti < int(vocab_size) and 0 <= int(slot_i) < int(slot_confidence.shape[1]):
+                probs[b, ti] = torch.maximum(probs[b, ti], slot_confidence[b, int(slot_i)])
+    return probs
+
+
+def _evaluate_active_network_gate(
+    *,
+    ctx: PipelineContext,
+    loader: DataLoader,
+    device: torch.device,
+    max_steps: int,
+) -> Dict[str, Any]:
+    model = getattr(ctx, "active_network", None)
+    criterion = getattr(ctx, "active_network_criterion", None)
+    if model is None or criterion is None:
+        raise RuntimeError("Gate evaluation requires active_network and active_network_criterion")
+
+    vocab_phrases = list(getattr(ctx, "class_names", []) or [])
+    active_term_to_idx = dict(getattr(ctx, "semantic_term_to_idx", {}) or {})
+    vocab_matrix = getattr(criterion, "vocab_matrix", None)
+    if vocab_matrix is None:
+        raise RuntimeError("Gate evaluation requires criterion.vocab_matrix")
+
+    runtime_amp_enabled = bool(getattr(model, "_runtime_amp_enabled", False))
+    amp_dtype = str(getattr(model, "_runtime_amp_dtype", "fp16") or "fp16")
+    amp_dtype_t = resolve_amp_dtype(amp_dtype) if runtime_amp_enabled else torch.float16
+    if runtime_amp_enabled and not cuda_supports_dtype(device=device, dtype=amp_dtype_t):
+        print(
+            f"[gate-eval] disabling AMP on device={device} because amp_dtype={amp_dtype} is unsupported there",
+            flush=True,
+        )
+        runtime_amp_enabled = False
+    runtime_channels_last = bool(getattr(model, "_runtime_channels_last", False))
+    eval_chunk_cap = int(getattr(model, "_runtime_microbatch_cap", 0) or 0)
+
+    model.eval()
+    total_loss = 0.0
+    mask_loss_total = 0.0
+    n = 0
+    steps = 0
+    probs_all: List[torch.Tensor] = []
+    targets_all: List[torch.Tensor] = []
+
+    def _is_cuda_oom(exc: BaseException) -> bool:
+        txt = str(exc).lower()
+        if "out of memory" not in txt:
+            return False
+        return ("cuda" in txt) or ("cudnn" in txt) or ("cublas" in txt)
+
+    for batch in loader:
+        xb, mb, batch_meta = _unpack_masked_semantic_batch(batch, context="active-network gate evaluation")
+        spec = _build_speculative_batch(
+            xb,
+            mb,
+            batch_meta,
+            vocab_phrases=vocab_phrases,
+            criterion_vocab_matrix=vocab_matrix,
+            active_term_to_idx=active_term_to_idx,
+            device=torch.device("cpu"),
+        )
+        if spec is None:
+            continue
+        batch_n = int(spec["image"].shape[0])
+        eval_chunk = int(eval_chunk_cap) if int(eval_chunk_cap) > 0 else int(batch_n)
+        eval_chunk = max(1, min(int(eval_chunk), int(batch_n)))
+
+        while True:
+            try:
+                batch_loss = 0.0
+                batch_mask_loss = 0.0
+                batch_seen = 0
+                batch_probs: List[torch.Tensor] = []
+                batch_targets: List[torch.Tensor] = []
+                for start in range(0, int(batch_n), int(eval_chunk)):
+                    stop = min(int(batch_n), int(start + eval_chunk))
+                    spec_part = _slice_speculative_batch_to_device(
+                        spec,
+                        start=start,
+                        stop=stop,
+                        device=device,
+                        channels_last=runtime_channels_last,
+                    )
+                    with torch.no_grad():
+                        with autocast_context(device=device, enabled=runtime_amp_enabled, amp_dtype=amp_dtype_t):
+                            raw_out = (
+                                model.forward_batch(spec_part["image"], spec_part["batch_vocab"])
+                                if hasattr(model, "forward_batch") and callable(getattr(model, "forward_batch"))
+                                else model(spec_part["image"], spec_part["batch_vocab"])
+                            )
+                            out = coerce_network_output(raw_out)
+                            aux = out.aux if isinstance(out.aux, dict) else {}
+                            loss_dict = criterion(
+                                pred_vectors=out.slot_vectors,
+                                pred_masks=out.slot_masks,
+                                target_vectors=spec_part["target_vectors"],
+                                target_masks=spec_part["target_masks"],
+                                target_valid=spec_part["target_valid"],
+                                present_mask=spec_part["present_mask"],
+                                confidence_logits=out.slot_confidence,
+                                slot_selection_logits=aux.get("slot_selection_logits"),
+                            )
+
+                    part_n = int(stop - start)
+                    batch_loss += float(loss_dict["loss"].item()) * part_n
+                    _mask_loss = loss_dict.get("mask_loss", 0.0)
+                    if isinstance(_mask_loss, torch.Tensor):
+                        _mask_loss = float(_mask_loss.item())
+                    batch_mask_loss += float(_mask_loss) * part_n
+                    batch_seen += part_n
+
+                    assignments = loss_dict.get("assignments") or out.assignments or []
+                    sample_probs = _assigned_slot_confidence_probs(
+                        assignments=assignments,
+                        slot_confidence=out.slot_confidence.sigmoid(),
+                        vocab_size=len(vocab_phrases),
+                    )
+                    batch_probs.append(sample_probs.detach().cpu())
+                    batch_targets.append(spec_part["present_mask"].detach().to(torch.float32).cpu())
+                    del spec_part, raw_out, out, loss_dict
+
+                total_loss += float(batch_loss)
+                mask_loss_total += float(batch_mask_loss)
+                n += int(batch_seen)
+                probs_all.extend(batch_probs)
+                targets_all.extend(batch_targets)
+                break
+            except RuntimeError as exc:
+                if device.type == "cuda" and _is_cuda_backend_engine_error(exc):
+                    if bool(runtime_amp_enabled):
+                        runtime_amp_enabled = False
+                        setattr(model, "_runtime_amp_enabled", False)
+                        torch.cuda.empty_cache()
+                        print("[gate-eval] backend engine selection failed; retrying with AMP disabled", flush=True)
+                        continue
+                    if bool(runtime_channels_last):
+                        runtime_channels_last = False
+                        setattr(model, "_runtime_channels_last", False)
+                        model = model.to(memory_format=torch.contiguous_format)
+                        xb = xb.contiguous()
+                        torch.cuda.empty_cache()
+                        print("[gate-eval] backend engine selection failed; retrying with contiguous tensors", flush=True)
+                        continue
+                if device.type != "cuda" or (not _is_cuda_oom(exc)) or int(eval_chunk) <= 1:
+                    raise
+                next_chunk = max(1, int(eval_chunk) // 2)
+                if int(next_chunk) > 1:
+                    next_chunk = 1 << (int(next_chunk).bit_length() - 1)
+                if bool(runtime_channels_last):
+                    runtime_channels_last = False
+                    setattr(model, "_runtime_channels_last", False)
+                    model = model.to(memory_format=torch.contiguous_format)
+                torch.cuda.empty_cache()
+                print(
+                    f"[gate-eval] CUDA OOM at eval_chunk={eval_chunk}; retrying eval_chunk={next_chunk}",
+                    flush=True,
+                )
+                eval_chunk = int(next_chunk)
+
+        steps += 1
+        if steps == 1 or steps % 10 == 0:
+            running_loss = total_loss / max(1, n)
+            limit_str = f"/{max_steps}" if max_steps > 0 else ""
+            print(f"[gate-eval] step={steps}{limit_str} samples={n} loss={running_loss:.4f}", flush=True)
+        del xb, mb, spec
+        if max_steps > 0 and steps >= int(max_steps):
+            break
+
+    if n <= 0:
+        return {
+            "loss": 0.0,
+            "mask_bce": 0.0,
+            "macro_f1": 0.0,
+            "micro_f1": 0.0,
+            "bit_acc": 0.0,
+            "mean_confidence": 0.0,
+            "num_samples": 0,
+        }
+
+    probs = torch.cat(probs_all, dim=0)
+    targets = torch.cat(targets_all, dim=0).float()
+    preds = (probs >= 0.5).float()
+    tp = (preds * targets).sum(dim=0)
+    fp = (preds * (1.0 - targets)).sum(dim=0)
+    fn = ((1.0 - preds) * targets).sum(dim=0)
+    macro_f1 = torch.mean((2.0 * tp) / (2.0 * tp + fp + fn + 1e-8)).item()
+    tp_m = tp.sum()
+    fp_m = fp.sum()
+    fn_m = fn.sum()
+    micro_f1 = ((2.0 * tp_m) / (2.0 * tp_m + fp_m + fn_m + 1e-8)).item()
+    bit_acc = preds.eq(targets).float().mean().item()
+    mean_conf = torch.maximum(probs, 1.0 - probs).mean().item()
+    return {
+        "loss": total_loss / max(1, n),
+        "mask_bce": mask_loss_total / max(1, n),
+        "macro_f1": float(macro_f1),
+        "micro_f1": float(micro_f1),
+        "bit_acc": float(bit_acc),
+        "mean_confidence": float(mean_conf),
+        "num_samples": int(n),
+    }
 
 
 def _evaluate_loss_gate(
@@ -101,47 +307,41 @@ def _evaluate_loss_gate(
     channels_last: bool = False,
     semantic_cosine_weight: float = CLASSIFIER_SEMANTIC_COSINE_WEIGHT,
 ) -> Dict[str, Any]:
+    del semantic_cosine_weight
     gate_model, gate_device, gate_name = _gate_eval_model(ctx, channels_last=channels_last)
     with gpu_resident(ctx, [(gate_model, gate_name)], device=gate_device) if gate_device.type == "cuda" else nullcontext():
-        return _evaluate_berkeley_classifier_gate(
-            classifier=gate_model,
+        return _evaluate_active_network_gate(
+            ctx=ctx,
             loader=loader,
             device=gate_device,
             max_steps=max(0, int(max_steps)),
-            active_classes=max(0, int(len(ctx.class_names))),
-            amp_enabled=False,
-            amp_dtype=str(getattr(ctx.args, "amp_dtype", "float16") or "float16"),
-            channels_last=bool(channels_last),
-            semantic_mask_supervision_mode=str(getattr(ctx.args, "semantic_mask_supervision_mode", "multihot_mix") or "multihot_mix"),
-            semantic_cosine_weight=float(semantic_cosine_weight),
-            active_term_to_idx=dict(ctx.semantic_term_to_idx),
         )
 
 
 
 class PregestationEvalNode(PipelineNode):
-    """Gate 0: Evaluate held-out Stage-0 logic rows on the frozen classifier replica."""
+    """Gate 0: Evaluate held-out Stage-0 rows on the active network."""
 
     node_id = "gate_0_pregestation_eval"
     description = "Gate 0 Eval: pre-gestation validation loss"
     runtime_object_type = "evaluator"
     runtime_faculty = "gate"
-    gpu_models = ["classifier"]
+    gpu_models = ["active_network"]
 
     def __init__(self, cfg: Any) -> None:
         self.cfg = cfg
 
     def should_run(self, ctx: PipelineContext) -> bool:
-        return ctx.pregestation_eval_loader is not None and ctx.classifier is not None
+        return ctx.active_network is not None and ctx.active_network_criterion is not None
 
     def execute(self, ctx: PipelineContext) -> None:
+        loader_info = ensure_runtime_loader_contract(ctx, consumer_id=self.node_id)
         max_steps = int(getattr(ctx.args, "gate_pregestation_eval_max_steps", 10) or 10)
         result = _evaluate_loss_gate(
             ctx=ctx,
-            loader=ctx.pregestation_eval_loader,
+            loader=loader_info["loader"],
             max_steps=max_steps,
-            channels_last=bool(getattr(self.cfg, "channels_last", False)),
-            semantic_cosine_weight=float(getattr(self.cfg, "semantic_cosine_weight", CLASSIFIER_SEMANTIC_COSINE_WEIGHT)),
+            channels_last=False,
         )
         loss = float(result.get("loss", float("inf")))
         ctx.gate_pregestation.required_consecutive = int(getattr(self.cfg, "stage0_required_consecutive", 1))
@@ -160,14 +360,14 @@ class PregestationEvalNode(PipelineNode):
 
 
 class GestationEvalNode(GatedNode):
-    """Gate 1: Evaluate held-out gestation rows on the frozen classifier replica."""
+    """Gate 1: Evaluate held-out gestation rows on the active network."""
 
     node_id = "gate_1_gestation_eval"
     description = "Gate 1 Eval: gestation validation loss"
     runtime_object_type = "evaluator"
     runtime_faculty = "gate"
     required_gates = ["gate_pregestation"]
-    gpu_models = ["classifier"]
+    gpu_models = ["active_network"]
 
     def __init__(self, cfg: Any) -> None:
         self.cfg = cfg
@@ -175,16 +375,18 @@ class GestationEvalNode(GatedNode):
     def should_run(self, ctx: PipelineContext) -> bool:
         if ctx.is_gate_bypassed("gate_gestation"):
             return False
-        return ctx.gestation_eval_loader is not None and ctx.classifier is not None
+        if not super().should_run(ctx):
+            return False
+        return ctx.active_network is not None and ctx.active_network_criterion is not None
 
     def execute(self, ctx: PipelineContext) -> None:
+        loader_info = ensure_runtime_loader_contract(ctx, consumer_id=self.node_id)
         max_steps = int(getattr(ctx.args, "gate_gestation_eval_max_steps", 10) or 10)
         result = _evaluate_loss_gate(
             ctx=ctx,
-            loader=ctx.gestation_eval_loader,
+            loader=loader_info["loader"],
             max_steps=max_steps,
-            channels_last=bool(getattr(self.cfg, "channels_last", False)),
-            semantic_cosine_weight=float(getattr(self.cfg, "semantic_cosine_weight", CLASSIFIER_SEMANTIC_COSINE_WEIGHT)),
+            channels_last=False,
         )
         loss = float(result.get("loss", float("inf")))
         ctx.gate_gestation.required_consecutive = int(getattr(self.cfg, "stage1_required_consecutive", 1))
@@ -208,7 +410,7 @@ class GestationEvalNode(GatedNode):
 
 @dataclass
 class BerkeleyGateConfig:
-    """Thresholds for the Berkeley SBD classifier gate."""
+    """Thresholds for the Berkeley SBD active-network gate."""
 
     # Minimum mean classification confidence (model certainty)
     confidence_target: float = 0.55
@@ -227,69 +429,46 @@ class BerkeleyGateConfig:
 
 
 class BerkeleyGateNode(GatedNode):
-    """Gate 2: Evaluate classifier confidence and F1 on Berkeley validation set.
+    """Gate 2: Evaluate active-network confidence and F1 on Berkeley validation set.
 
-    Requires Gate 0 + Gate 1.  Uses the frozen gate_classifier replica on CPU
-    to avoid disrupting training-mode batch-norm statistics on the main model.
-
-    The gate passes when both confidence AND macro-F1 exceed their targets
-    for the required consecutive rounds.
+    Requires Gate 0 + Gate 1.  The gate passes when both confidence and
+    macro-F1 exceed their targets for the required consecutive rounds.
     """
 
     node_id = "gate_berkeley"
-    description = "Gate 2 Eval: semantic classifier confidence + macro-F1"
+    description = "Gate 2 Eval: active-network confidence + macro-F1"
     runtime_object_type = "evaluator"
     runtime_faculty = "gate"
     required_gates = ["gate_pregestation", "gate_gestation"]
-    gpu_models = ["classifier"]
+    gpu_models = ["active_network"]
 
-    def __init__(self, cfg: BerkeleyGateConfig) -> None:
+    def __init__(self, cfg: BerkeleyGateConfig, classifier_cfg: Any = None) -> None:
         self.cfg = cfg
+        self.classifier_cfg = classifier_cfg
 
     def should_run(self, ctx: PipelineContext) -> bool:
         if not super().should_run(ctx):
             return False
-        return ctx.classifier is not None
+        return ctx.active_network is not None and ctx.active_network_criterion is not None
 
     def execute(self, ctx: PipelineContext) -> None:
-        if ctx.payload_validation_loader is None:
-            data_node = getattr(ctx, "data", None)
-            provide_gate_data = getattr(data_node, "provide_gate_data", None)
-            if callable(provide_gate_data):
-                try:
-                    provide_gate_data(ctx)
-                except Exception as exc:
-                    _log(f"[gate2] loader request failed: {exc}")
-        if ctx.payload_validation_loader is None:
-            _log("[gate2] hold (missing payload_validation_loader)")
-            return
+        loader_info = ensure_runtime_loader_contract(ctx, consumer_id=self.node_id)
         gate_model, gate_device, gate_name = _gate_eval_model(ctx, channels_last=False)
         with gpu_resident(ctx, [(gate_model, gate_name)], device=gate_device) if gate_device.type == "cuda" else nullcontext():
-            result = _evaluate_berkeley_classifier_gate(
-                classifier=gate_model,
-                loader=ctx.payload_validation_loader,
+            result = _evaluate_active_network_gate(
+                ctx=ctx,
+                loader=loader_info["loader"],
                 device=gate_device,
                 max_steps=int(getattr(ctx.args, "gate_berkeley_eval_max_steps", 10) or 10),
-                active_classes=max(0, int(len(ctx.class_names))),
-                amp_enabled=False,
-                amp_dtype=str(getattr(ctx.args, "amp_dtype", "float16") or "float16"),
-                channels_last=False,
-                semantic_mask_supervision_mode=str(getattr(ctx.args, "semantic_mask_supervision_mode", "multihot_mix") or "multihot_mix"),
-                semantic_cosine_weight=float(CLASSIFIER_SEMANTIC_COSINE_WEIGHT),
-                active_term_to_idx=dict(ctx.semantic_term_to_idx),
-                n_active_classes=len(ctx.class_names),
             )
 
         confidence = float(result.get("mean_confidence", 0.0))
         macro_f1 = float(result.get("macro_f1", 0.0))
         loss = float(result.get("loss", float("inf")))
 
-        # Combined metric: harmonic mean of normalised confidence and F1
         conf_norm = min(1.0, confidence / max(1e-6, self.cfg.confidence_target))
         f1_norm = min(1.0, macro_f1 / max(1e-6, self.cfg.f1_target))
         combined = 2.0 * conf_norm * f1_norm / max(1e-6, conf_norm + f1_norm)
-
-        # Both metrics must individually meet their targets
         passes = (
             confidence >= self.cfg.confidence_target
             and macro_f1 >= self.cfg.f1_target
@@ -302,7 +481,6 @@ class BerkeleyGateNode(GatedNode):
                 round_id=ctx.round_id, metric=combined, threshold=0.99, above=True
             )
         else:
-            # Record a sub-threshold metric to reset consecutive counter
             ctx.gate_berkeley.record(
                 round_id=ctx.round_id, metric=0.0, threshold=0.99, above=True
             )

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import bisect
 import hashlib
 import json
 import math
@@ -835,6 +836,21 @@ def _wheel_signature(config_blob: Dict[str, Any]) -> str:
     return str(hashlib.sha256(json.dumps(config_blob, sort_keys=True, ensure_ascii=True).encode("utf-8")).hexdigest())
 
 
+def _sidecar_terms_json(terms: Sequence[Any]) -> str:
+    return json.dumps(
+        list(normalize_vocab_terms([str(x) for x in list(terms)])),
+        ensure_ascii=True,
+        separators=(",", ":"),
+    )
+
+
+def _decode_terms_json(payload: str) -> List[str]:
+    try:
+        return list(normalize_vocab_terms(json.loads(str(payload))))
+    except Exception:
+        return []
+
+
 def _chunk_payload(entries: Sequence[Dict[str, Any]], image_size: int) -> Tuple[Dict[str, np.ndarray], Dict[str, Any]]:
     n = int(len(entries))
     if int(n) <= 0:
@@ -876,11 +892,7 @@ def _chunk_payload(entries: Sequence[Dict[str, Any]], image_size: int) -> Tuple[
     assoc_mask_ids: List[int] = []
     assoc_label_indices: List[int] = []
     for entry, (_img_u8, stack_f, stack_idx) in zip(entries, norm_entries):
-        terms_json = json.dumps(
-            list(normalize_vocab_terms([str(x) for x in list(entry.get("terms") or [])])),
-            ensure_ascii=True,
-            separators=(",", ":"),
-        )
+        terms_json = _sidecar_terms_json(list(entry.get("terms") or []))
         term_id = terms_bank_lut.get(str(terms_json), -1)
         if int(term_id) < 0:
             term_id = int(len(terms_bank_rows))
@@ -977,14 +989,80 @@ class SemanticWheelDataset(Dataset):
         self.chunk_offsets: List[int] = [0]
         for count in self.chunk_rows:
             self.chunk_offsets.append(int(self.chunk_offsets[-1] + int(count)))
+        self._chunk_offsets_np = np.asarray(self.chunk_offsets, dtype=np.int64)
         self.total_rows = int(self.chunk_offsets[-1])
         self.lookahead_batches = int(self.manifest.get("lookahead_batches", 0))
         self._chunk_cache: Dict[int, Dict[str, np.ndarray]] = {}
         self._chunk_lru: List[int] = []
         self._max_cached_chunks = max(2, int(self.lookahead_batches) + 1)
+        self._terms_sidecar_enabled = False
+        self._terms_bank_cache: List[List[str]] = []
+        self._row_term_refs = np.zeros((0,), dtype=np.int32)
+        self._row_chunk_indices = np.zeros((0,), dtype=np.int32)
+        self._row_chunk_offsets = np.zeros((0,), dtype=np.int32)
+        self._load_terms_sidecar()
 
     def __len__(self) -> int:
         return int(self.total_rows)
+
+    def _load_terms_sidecar(self) -> None:
+        sidecar_name = str(self.manifest.get("terms_sidecar", "terms_index_sidecar.npz") or "terms_index_sidecar.npz")
+        sidecar_path = self.cache_dir / sidecar_name
+        if not sidecar_path.exists():
+            return
+        try:
+            with np.load(str(sidecar_path), allow_pickle=False) as z:
+                terms_bank_raw = np.asarray(z.get("terms_bank", np.asarray([], dtype="<U1")))
+                row_term_refs = np.asarray(z.get("row_term_refs", np.zeros((0,), dtype=np.int32)), dtype=np.int32).reshape(-1)
+                row_chunk_indices = np.asarray(z.get("row_chunk_indices", np.zeros((0,), dtype=np.int32)), dtype=np.int32).reshape(-1)
+                row_chunk_offsets = np.asarray(z.get("row_chunk_offsets", np.zeros((0,), dtype=np.int32)), dtype=np.int32).reshape(-1)
+            if int(row_term_refs.size) != int(self.total_rows):
+                return
+            if int(row_chunk_indices.size) != int(self.total_rows) or int(row_chunk_offsets.size) != int(self.total_rows):
+                return
+            self._terms_bank_cache = [_decode_terms_json(str(x)) for x in terms_bank_raw.tolist()]
+            self._row_term_refs = row_term_refs
+            self._row_chunk_indices = row_chunk_indices
+            self._row_chunk_offsets = row_chunk_offsets
+            self._terms_sidecar_enabled = True
+        except Exception:
+            self._terms_sidecar_enabled = False
+            self._terms_bank_cache = []
+            self._row_term_refs = np.zeros((0,), dtype=np.int32)
+            self._row_chunk_indices = np.zeros((0,), dtype=np.int32)
+            self._row_chunk_offsets = np.zeros((0,), dtype=np.int32)
+
+    def _terms_from_chunk_payload(self, payload: Dict[str, np.ndarray], row_offset: int) -> List[str]:
+        terms_bank = np.asarray(payload.get("terms_bank", np.asarray([], dtype="<U1")))
+        terms_refs = np.asarray(payload.get("terms_refs", np.zeros((0,), dtype=np.int32)), dtype=np.int32).reshape(-1)
+        term_ref = int(terms_refs[int(row_offset)]) if 0 <= int(row_offset) < int(terms_refs.size) else -1
+        if 0 <= int(term_ref) < int(terms_bank.shape[0]):
+            return _decode_terms_json(str(terms_bank[int(term_ref)]))
+        return []
+
+    def _terms_from_sidecar_row(self, index: int) -> List[str]:
+        if not bool(self._terms_sidecar_enabled):
+            return []
+        if int(index) < 0 or int(index) >= int(self._row_term_refs.size):
+            return []
+        term_ref = int(self._row_term_refs[int(index)])
+        if 0 <= int(term_ref) < int(len(self._terms_bank_cache)):
+            return list(self._terms_bank_cache[int(term_ref)])
+        return []
+
+    def read_terms_entry(self, index: int) -> List[str]:
+        chunk_idx, row_offset = self._locate(int(index))
+        if bool(self._terms_sidecar_enabled):
+            terms = self._terms_from_sidecar_row(int(index))
+            if int(len(terms)) > 0:
+                return terms
+        payload = self._load_chunk(int(chunk_idx))
+        return self._terms_from_chunk_payload(payload=payload, row_offset=int(row_offset))
+
+    def iter_terms(self, max_rows: int = 0):
+        limit = int(max_rows) if int(max_rows) > 0 else int(self.total_rows)
+        for idx in range(int(limit)):
+            yield self.read_terms_entry(int(idx))
 
     def _chunk_path(self, chunk_idx: int) -> Path:
         return self.cache_dir / f"chunk_{int(chunk_idx):04d}.npz"
@@ -1015,31 +1093,34 @@ class SemanticWheelDataset(Dataset):
             idx = int(self.total_rows) + idx
         if idx < 0 or idx >= int(self.total_rows):
             raise IndexError(idx)
-        for chunk_idx in range(int(len(self.chunk_rows))):
-            start = int(self.chunk_offsets[int(chunk_idx)])
-            stop = int(self.chunk_offsets[int(chunk_idx) + 1])
-            if int(start) <= int(idx) < int(stop):
-                return int(chunk_idx), int(idx - start)
+        if bool(self._terms_sidecar_enabled) and int(idx) < int(self._row_chunk_indices.size):
+            chunk_idx = int(self._row_chunk_indices[int(idx)])
+            row_off = int(self._row_chunk_offsets[int(idx)])
+            if 0 <= int(chunk_idx) < int(len(self.chunk_rows)):
+                return int(chunk_idx), int(row_off)
+        # Binary search keeps locate O(log n_chunks) regardless of wheel size.
+        chunk_idx = int(bisect.bisect_right(self.chunk_offsets, int(idx)) - 1)
+        chunk_idx = max(0, min(int(chunk_idx), int(len(self.chunk_rows)) - 1))
+        start = int(self.chunk_offsets[int(chunk_idx)])
+        stop = int(self.chunk_offsets[int(chunk_idx) + 1])
+        if int(start) <= int(idx) < int(stop):
+            return int(chunk_idx), int(idx - start)
         raise IndexError(idx)
 
     def read_numpy_entry(self, index: int) -> Dict[str, np.ndarray]:
         chunk_idx, row_offset = self._locate(int(index))
         payload = self._load_chunk(int(chunk_idx))
         images = np.asarray(payload["images"], dtype=np.uint8)
-        terms_bank = np.asarray(payload.get("terms_bank", np.asarray([], dtype="<U1")))
-        terms_refs = np.asarray(payload.get("terms_refs", np.zeros((0,), dtype=np.int32)), dtype=np.int32).reshape(-1)
         mask_bank = np.asarray(payload["mask_bank"], dtype=np.float32)
         assoc_offsets = np.asarray(payload["assoc_offsets"], dtype=np.int64).reshape(-1)
         assoc_mask_ids = np.asarray(payload["assoc_mask_ids"], dtype=np.int32).reshape(-1)
         assoc_label_indices = np.asarray(payload["assoc_label_indices"], dtype=np.int32).reshape(-1)
-        term_ref = int(terms_refs[int(row_offset)]) if 0 <= int(row_offset) < int(terms_refs.size) else -1
-        if 0 <= int(term_ref) < int(terms_bank.shape[0]):
-            try:
-                terms = list(normalize_vocab_terms(json.loads(str(terms_bank[int(term_ref)]))))
-            except Exception:
-                terms = []
+        if bool(self._terms_sidecar_enabled):
+            terms = self._terms_from_sidecar_row(int(index))
+            if int(len(terms)) <= 0:
+                terms = self._terms_from_chunk_payload(payload=payload, row_offset=int(row_offset))
         else:
-            terms = []
+            terms = self._terms_from_chunk_payload(payload=payload, row_offset=int(row_offset))
         a0 = int(assoc_offsets[int(row_offset)]) if int(row_offset) < int(assoc_offsets.size) else 0
         a1 = int(assoc_offsets[int(row_offset) + 1]) if int(row_offset + 1) < int(assoc_offsets.size) else int(a0)
         mask_ids = np.asarray(assoc_mask_ids[int(a0): int(a1)], dtype=np.int32)
@@ -1503,8 +1584,26 @@ def ensure_semantic_candidate_cache(
     selected_base_rows: List[int] = []
     current_entries: List[Dict[str, Any]] = []
     cap_exceeded = False
+    sidecar_terms_bank_rows: List[str] = []
+    sidecar_terms_bank_lut: Dict[str, int] = {}
+    sidecar_row_term_refs: List[int] = []
+    sidecar_row_chunk_indices: List[int] = []
+    sidecar_row_chunk_offsets: List[int] = []
+    queued_chunk_idx: int = 0
 
     spec_batches = _group_spec_batches(ordered_candidates)
+
+    def _accumulate_sidecar_chunk(entries: Sequence[Dict[str, Any]], chunk_idx: int) -> None:
+        for row_offset, entry in enumerate(entries):
+            terms_json = _sidecar_terms_json(list(entry.get("terms") or []))
+            term_id = sidecar_terms_bank_lut.get(str(terms_json), -1)
+            if int(term_id) < 0:
+                term_id = int(len(sidecar_terms_bank_rows))
+                sidecar_terms_bank_lut[str(terms_json)] = int(term_id)
+                sidecar_terms_bank_rows.append(str(terms_json))
+            sidecar_row_term_refs.append(int(term_id))
+            sidecar_row_chunk_indices.append(int(chunk_idx))
+            sidecar_row_chunk_offsets.append(int(row_offset))
 
     def _estimate_chunk_bytes(entries: Sequence[Dict[str, Any]]) -> int:
         return int(sum(
@@ -1540,6 +1639,8 @@ def ensure_semantic_candidate_cache(
                     if int(writer_state["total_raw_bytes"]) + int(est_bytes) > int(effective_limit):
                         cap_exceeded = True
                         break
+                _accumulate_sidecar_chunk(chunk_to_write, queued_chunk_idx)
+                queued_chunk_idx += 1
                 _queue_write_item((chunk_to_write,))
             if not cap_exceeded:
                 selected_base_rows.append(int(base_row_idx))
@@ -1551,6 +1652,8 @@ def ensure_semantic_candidate_cache(
             if int(writer_state["total_raw_bytes"]) + int(est_bytes) > int(effective_limit):
                 cap_exceeded = True
         if not cap_exceeded:
+            _accumulate_sidecar_chunk(current_entries, queued_chunk_idx)
+            queued_chunk_idx += 1
             _queue_write_item((list(current_entries),))
 
     # Signal writer to finish and wait
@@ -1582,6 +1685,48 @@ def ensure_semantic_candidate_cache(
     chunk_rows = list(writer_state["chunk_rows"])
     chunk_bytes = list(writer_state["chunk_bytes"])
     total_raw_bytes = int(writer_state["total_raw_bytes"])
+    if int(len(sidecar_row_term_refs)) != int(sum(chunk_rows)):
+        shutil.rmtree(str(temp_dir), ignore_errors=True)
+        raise RuntimeError(
+            f"{str(config.purpose)} sidecar row mismatch: refs={int(len(sidecar_row_term_refs))} "
+            f"written={int(sum(chunk_rows))}"
+        )
+    _terms_sidecar_path = temp_dir / "terms_index_sidecar.npz"
+    max_terms_len = max((len(str(x)) for x in sidecar_terms_bank_rows), default=1)
+    sidecar_terms_bank = (
+        np.asarray(sidecar_terms_bank_rows, dtype=f"<U{int(max_terms_len)}")
+        if int(len(sidecar_terms_bank_rows)) > 0
+        else np.asarray([], dtype="<U1")
+    )
+    local_vocab_rows = [str(t) for t in list(registry.local_vocab)]
+    max_vocab_len = max((len(str(x)) for x in local_vocab_rows), default=1)
+    local_vocab_arr = (
+        np.asarray(local_vocab_rows, dtype=f"<U{int(max_vocab_len)}")
+        if int(len(local_vocab_rows)) > 0
+        else np.asarray([], dtype="<U1")
+    )
+    chunk_offsets: List[int] = [0]
+    for count in chunk_rows:
+        chunk_offsets.append(int(chunk_offsets[-1] + int(count)))
+    try:
+        np.savez_compressed(
+            str(_terms_sidecar_path),
+            version=np.asarray([1], dtype=np.int32),
+            local_vocab=local_vocab_arr,
+            terms_bank=sidecar_terms_bank,
+            row_term_refs=np.asarray(sidecar_row_term_refs, dtype=np.int32),
+            row_chunk_indices=np.asarray(sidecar_row_chunk_indices, dtype=np.int32),
+            row_chunk_offsets=np.asarray(sidecar_row_chunk_offsets, dtype=np.int32),
+            chunk_offsets=np.asarray(chunk_offsets, dtype=np.int64),
+        )
+    except Exception as exc:
+        raise_if_filesystem_space_emergency(
+            config.progress_control,
+            exc,
+            note="semantic wheel terms sidecar write",
+            write_path=_terms_sidecar_path,
+        )
+        raise
     now_ts = float(time.time())
 
     final_manifest = {
@@ -1608,6 +1753,8 @@ def ensure_semantic_candidate_cache(
         "chunk_bytes": [int(x) for x in chunk_bytes],
         "chunk_count": int(len(chunk_rows)),
         "total_rows": int(sum(chunk_rows)),
+        "terms_sidecar": str(_terms_sidecar_path.name),
+        "terms_sidecar_rows": int(len(sidecar_row_term_refs)),
         "base_row_count": int(len(selected_base_rows)),
         "base_row_indices": [int(x) for x in selected_base_rows],
         "base_candidate_indices": [int(x) for x in selected_base_rows],
