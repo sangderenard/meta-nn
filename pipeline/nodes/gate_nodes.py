@@ -129,8 +129,20 @@ def _evaluate_active_network_gate(
             flush=True,
         )
         runtime_amp_enabled = False
+    if runtime_amp_enabled:
+        for _p in model.parameters():
+            if bool(_p.is_floating_point()):
+                if _p.dtype == torch.float64:
+                    print("[gate-eval] disabling AMP because active-network parameters are float64", flush=True)
+                    runtime_amp_enabled = False
+                break
     runtime_channels_last = bool(getattr(model, "_runtime_channels_last", False))
     eval_chunk_cap = int(getattr(model, "_runtime_microbatch_cap", 0) or 0)
+    runtime_tensor_dtype: Optional[torch.dtype] = None
+    for _p in model.parameters():
+        if bool(_p.is_floating_point()):
+            runtime_tensor_dtype = _p.dtype
+            break
 
     model.eval()
     total_loss = 0.0
@@ -177,6 +189,7 @@ def _evaluate_active_network_gate(
                         start=start,
                         stop=stop,
                         device=device,
+                        tensor_dtype=runtime_tensor_dtype,
                         channels_last=runtime_channels_last,
                     )
                     with torch.no_grad():

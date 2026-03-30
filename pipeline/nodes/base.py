@@ -1080,6 +1080,145 @@ def _load_json(path: Path):
         return None
 
 
+def _checkpoint_blob_timestamp(path: Optional[Path], blob: Any) -> float:
+    if isinstance(blob, dict):
+        for key in ("timestamp", "checkpoint_timestamp", "saved_at", "ts"):
+            raw = blob.get(key)
+            if raw is None:
+                continue
+            try:
+                value = float(raw)
+            except Exception:
+                continue
+            if value > 0.0:
+                return value
+    if path is not None:
+        try:
+            return float(path.stat().st_mtime)
+        except Exception:
+            pass
+    return 0.0
+
+
+def _normalize_active_network_resume_overlay(blob: Any) -> Optional[Dict[str, Any]]:
+    if not isinstance(blob, dict):
+        return None
+    has_explicit_state = isinstance(blob.get("active_network_state"), dict)
+    has_optimizer_state = "active_network_optimizer_state" in blob
+    has_scaler_state = "active_network_grad_scaler_state" in blob
+    checkpoint_kind = str(blob.get("checkpoint_kind", "") or "").strip().lower()
+    has_step_resume_marker = checkpoint_kind == "speculative_optimizer_step"
+    has_model_export_state = isinstance(blob.get("state_dict"), dict)
+    if not (has_explicit_state or has_optimizer_state or has_scaler_state or has_step_resume_marker):
+        return None
+
+    normalized: Dict[str, Any] = {}
+    if has_explicit_state:
+        normalized["active_network_state"] = blob["active_network_state"]
+    elif has_model_export_state:
+        normalized["active_network_state"] = blob["state_dict"]
+    else:
+        return None
+
+    for key in (
+        "active_network_optimizer_state",
+        "active_network_grad_scaler_state",
+        "round_id",
+        "cycle",
+        "total_rounds_completed",
+        "timestamp",
+        "run_tag",
+        "segment",
+        "optimizer_steps",
+        "checkpoint_kind",
+    ):
+        if key in blob:
+            normalized[key] = blob[key]
+    return normalized
+
+
+def _load_checkpoint_with_optional_active_network_overlay(
+    checkpoint_path: Optional[Path],
+    *,
+    overlay_path: Optional[Path] = None,
+) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
+    meta: Dict[str, Any] = {
+        "checkpoint_path": str(checkpoint_path) if checkpoint_path is not None else "",
+        "checkpoint_exists": bool(checkpoint_path is not None and checkpoint_path.exists()),
+        "overlay_path": str(overlay_path) if overlay_path is not None else "",
+        "overlay_exists": bool(overlay_path is not None and overlay_path.exists()),
+        "overlay_recognized": False,
+        "overlay_applied": False,
+        "replay_safe": True,
+        "errors": [],
+    }
+
+    checkpoint_blob: Optional[Dict[str, Any]] = None
+    if bool(meta["checkpoint_exists"]) and checkpoint_path is not None:
+        try:
+            loaded = _torch_load_cpu(str(checkpoint_path))
+            if isinstance(loaded, dict):
+                checkpoint_blob = dict(loaded)
+            else:
+                meta["errors"].append(f"checkpoint_not_dict:{checkpoint_path}")
+        except Exception as exc:
+            meta["errors"].append(f"checkpoint_load_failed:{checkpoint_path}:{type(exc).__name__}:{exc}")
+
+    overlay_blob: Optional[Dict[str, Any]] = None
+    if bool(meta["overlay_exists"]) and overlay_path is not None:
+        try:
+            loaded = _torch_load_cpu(str(overlay_path))
+            overlay_blob = _normalize_active_network_resume_overlay(loaded)
+            meta["overlay_recognized"] = bool(overlay_blob is not None)
+        except Exception as exc:
+            meta["errors"].append(f"overlay_load_failed:{overlay_path}:{type(exc).__name__}:{exc}")
+
+    if checkpoint_blob is None and overlay_blob is None:
+        return None, meta
+
+    result = dict(checkpoint_blob) if checkpoint_blob is not None else {}
+    checkpoint_ts = _checkpoint_blob_timestamp(checkpoint_path, checkpoint_blob)
+    overlay_ts = _checkpoint_blob_timestamp(overlay_path, overlay_blob)
+
+    overlay_is_newer = overlay_blob is not None and (
+        checkpoint_blob is None or overlay_ts > checkpoint_ts
+    )
+    if overlay_is_newer and overlay_blob is not None:
+        for key in (
+            "active_network_state",
+            "active_network_optimizer_state",
+            "active_network_grad_scaler_state",
+            "round_id",
+            "cycle",
+            "total_rounds_completed",
+            "timestamp",
+            "run_tag",
+            "segment",
+            "optimizer_steps",
+            "checkpoint_kind",
+        ):
+            if key in overlay_blob:
+                result[key] = overlay_blob[key]
+        result["_resume_overlay_applied"] = True
+        result["_resume_replay_safe"] = False
+        if overlay_path is not None:
+            result["_resume_overlay_path"] = str(overlay_path)
+        result["_resume_overlay_timestamp"] = float(overlay_ts)
+        meta["overlay_applied"] = True
+        meta["replay_safe"] = False
+    else:
+        result["_resume_replay_safe"] = True
+        if overlay_blob is not None and checkpoint_blob is not None:
+            meta["overlay_skipped_reason"] = "overlay_not_newer_than_checkpoint"
+
+    effective_path = checkpoint_path
+    if effective_path is None and overlay_path is not None and overlay_blob is not None:
+        effective_path = overlay_path
+    if effective_path is not None:
+        result["_resume_checkpoint_path"] = str(effective_path)
+    return result, meta
+
+
 def _save_pipeline_checkpoint(path: Path, payload: Dict):
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = path.with_suffix(path.suffix + ".tmp")

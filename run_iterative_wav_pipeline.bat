@@ -103,6 +103,10 @@ set "ORCH_CYCLES=8"
 set "ORCH_ROUNDS=2"
 set "NON_TRAINING_DEVICE=cuda:0"
 set "GLOBAL_GRAD_ACCUM_STEPS=4"
+set "STAGE0_GRAD_ACCUM_STEPS=-1"
+set "STAGE1_GRAD_ACCUM_STEPS=-1"
+set "STAGE2_GRAD_ACCUM_STEPS=100"
+set "SPECULATIVE_SAVE_ON_GRAD_STEP=1"
 set "CLASSIFIER_BATCH_SIZE=4"
 set "GEN_EPOCHS_PER_ROUND=5"
 set "GEN_STEPS_PER_ROUND=64"
@@ -135,7 +139,7 @@ REM set "GESTATION_REBUILD_EVERY_N_ROUNDS=2"
 REM set "BERKELEY_REFRESH_ROUND_EVERY=2"
 set "BERKELEY_REFRESH_EPOCHS=1"
 set "BERKELEY_REFRESH_MAX_STEPS=256"
-set "BERKELEY_REFRESH_BATCH_SIZE=0"
+set "BERKELEY_REFRESH_BATCH_SIZE=4"
 set "BERKELEY_REFRESH_LOADER_BATCH_SIZE=64"
 set "BERKELEY_REFRESH_CACHE_BATCHES=0"
 set "BERKELEY_REFRESH_CACHE_DEVICE=auto"
@@ -380,6 +384,8 @@ if "%GD_VOCAB_LIBRARY_AUTOLOAD%"=="1" (
 if not "%GD_VOCAB_LIBRARY_DIR%"=="" set "GD_VOCAB_ARG=%GD_VOCAB_ARG% --gd-vocab-library-dir ""%GD_VOCAB_LIBRARY_DIR%"""
 set "WAVE_ZERO_SHOT_ARG="
 if not "%WAVE_ZERO_SHOT_QUERY_TEXTS%"=="" set "WAVE_ZERO_SHOT_ARG=--wave-zero-shot-query-texts ""%WAVE_ZERO_SHOT_QUERY_TEXTS%"""
+set "SPECULATIVE_SAVE_ON_GRAD_STEP_ARG=--no-speculative-save-on-grad-step"
+if "%SPECULATIVE_SAVE_ON_GRAD_STEP%"=="1" set "SPECULATIVE_SAVE_ON_GRAD_STEP_ARG=--speculative-save-on-grad-step"
 set "CLASSIFIER_SUBSET_REFRESH_ARG="
 if "%CLASSIFIER_SUBSET_FRESH_ROUND_SAMPLING%"=="1" (
   set "CLASSIFIER_SUBSET_REFRESH_ARG=--classifier-subset-fresh-round-sampling"
@@ -596,6 +602,7 @@ set "RUN_EXTRA_ARG=%~2"
   --amp-dtype bfloat16 ^
   --no-cudnn-benchmark ^
   --grad-accum-steps %GLOBAL_GRAD_ACCUM_STEPS% ^
+  %SPECULATIVE_SAVE_ON_GRAD_STEP_ARG% ^
   --no-loader-persistent-workers ^
   --loader-prefetch-factor 4 ^
   --max-files %MAX_FILES% ^
@@ -644,6 +651,9 @@ set "RUN_EXTRA_ARG=%~2"
   --patch-size %TRANS_PATCH_SIZE% ^
   --transformer-batch-size %TRANS_BATCH_SIZE% ^
   --transformer-round-batch-size %TRANS_ROUND_BATCH_SIZE% ^
+  --stage0-grad-accum-steps %STAGE0_GRAD_ACCUM_STEPS% ^
+  --stage1-grad-accum-steps %STAGE1_GRAD_ACCUM_STEPS% ^
+  --stage2-grad-accum-steps %STAGE2_GRAD_ACCUM_STEPS% ^
   --joint-transformer-batch-size %TRANS_JOINT_BATCH_SIZE% ^
   --transformer-eval-batch-size %TRANS_EVAL_BATCH_SIZE% ^
   --transformer-d-model %TRANS_D_MODEL% ^

@@ -141,7 +141,44 @@ def parse_args():
     p.add_argument("--channels-last", action="store_true", help="Use NHWC memory format for image tensors/models.")
     p.add_argument("--compile-models", action="store_true", help="Use torch.compile for classifier/transformer models.")
     p.add_argument("--compile-mode", default="default")
-    p.add_argument("--grad-accum-steps", type=int, default=1, help="Micro-batch accumulation factor.")
+    p.add_argument(
+        "--stage0-grad-accum-steps",
+        type=int,
+        default=-1,
+        help="Stage 0: Micro-batch accumulation factor (-1 = per epoch).",
+    )
+    p.add_argument(
+        "--stage1-grad-accum-steps",
+        type=int,
+        default=-1,
+        help="Stage 1: Micro-batch accumulation factor (-1 = per epoch).",
+    )
+    p.add_argument(
+        "--stage2-grad-accum-steps",
+        type=int,
+        default=-1,
+        help="Stage 2: Micro-batch accumulation factor (-1 = per epoch).",
+    )
+    # Deprecated/compatibility: keep for now, but not used
+    p.add_argument("--grad-accum-steps", type=int, default=1, help="(Deprecated) Micro-batch accumulation factor.")
+    p.add_argument(
+        "--speculative-grad-accum-steps",
+        type=int,
+        default=-1,
+        help="(Deprecated) Speculative-network accumulation: 0 disables, -1 uses one optimizer step per full loader pass, N uses N loader batches per step.",
+    )
+    p.add_argument(
+        "--speculative-save-on-grad-step",
+        dest="speculative_save_on_grad_step",
+        action="store_true",
+        default=False,
+        help="Save active_network.pt after every speculative-network optimizer step. Intended for extreme gradient accumulation (ultra-large batches).",
+    )
+    p.add_argument(
+        "--no-speculative-save-on-grad-step",
+        dest="speculative_save_on_grad_step",
+        action="store_false",
+    )
     p.add_argument("--classifier-grad-clip", type=float, default=1.0, help="Gradient clip norm for classifier optimizer steps.")
     p.add_argument("--classifier-semantic-soft-target-max", type=float, default=0.0, help="Max soft target for negative classes in classifier BCE, set by cosine similarity to active label centroid.")
     p.add_argument("--classifier-semantic-cosine-weight", type=float, default=0.35, help="Weight for semantic cosine embedding loss in classifier supervision.")

@@ -49,7 +49,7 @@ from pipeline.nodus_loss_store import (
     NodusWeightStateStore,
     WeightStateMeta,
 )
-from pipeline.nodes.base import _save_pipeline_checkpoint
+from pipeline.nodes.base import _load_checkpoint_with_optional_active_network_overlay, _save_pipeline_checkpoint
 from pipeline.weight_map import parameter_plan_from_render_spec, resolve_weight_render_spec
 from wav_ml_models import prime_tiny_classifier_label_bank_for_state_dict
 
@@ -1073,10 +1073,20 @@ class SaveRestoreNode(PipelineNode):
         target_round: int,
         target_cycle: int,
     ) -> Tuple[Optional[Path], Optional[Dict[str, Any]]]:
-        candidate_paths: List[Path] = []
         live_ckpt = out_dir / "pipeline_checkpoint.pt"
-        if live_ckpt.exists():
-            candidate_paths.append(live_ckpt)
+        live_overlay = out_dir / "active_network.pt"
+        candidate_blobs: List[Tuple[Path, Dict[str, Any]]] = []
+        if live_ckpt.exists() or live_overlay.exists():
+            ckpt, meta = _load_checkpoint_with_optional_active_network_overlay(
+                live_ckpt if live_ckpt.exists() else None,
+                overlay_path=live_overlay if live_overlay.exists() else None,
+            )
+            for err in list(meta.get("errors", []) or []):
+                _log(f"[restore] WARNING: {err}")
+            if isinstance(ckpt, dict):
+                candidate_path = live_ckpt if live_ckpt.exists() else live_overlay
+                if candidate_path is not None:
+                    candidate_blobs.append((candidate_path, ckpt))
 
         backup_root = out_dir / "_weight_backup"
         if backup_root.is_dir():
@@ -1087,17 +1097,17 @@ class SaveRestoreNode(PipelineNode):
             )
             for backup_dir in backup_dirs:
                 ckpt_path = backup_dir / "pipeline_checkpoint.pt"
-                if ckpt_path.exists():
-                    candidate_paths.append(ckpt_path)
+                if not ckpt_path.exists():
+                    continue
+                ckpt, meta = _load_checkpoint_with_optional_active_network_overlay(ckpt_path, overlay_path=None)
+                for err in list(meta.get("errors", []) or []):
+                    _log(f"[restore] WARNING: {err}")
+                if isinstance(ckpt, dict):
+                    candidate_blobs.append((ckpt_path, ckpt))
 
         fallback_path: Optional[Path] = None
         fallback_ckpt: Optional[Dict[str, Any]] = None
-        for ckpt_path in candidate_paths:
-            try:
-                ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-            except Exception as exc:
-                _log(f"[restore] WARNING: could not load checkpoint candidate {ckpt_path}: {exc}")
-                continue
+        for ckpt_path, ckpt in candidate_blobs:
             if fallback_path is None and isinstance(ckpt, dict):
                 fallback_path = ckpt_path
                 fallback_ckpt = ckpt
@@ -1192,10 +1202,19 @@ class SaveRestoreNode(PipelineNode):
         _ckpt_round = int(ckpt.get("round_id", -1))
         _ckpt_cycle = int(ckpt.get("cycle", -1))
         _is_exact_target = (_ckpt_round == int(target_round) and _ckpt_cycle == int(target_cycle))
+        _resume_replay_safe = bool(ckpt.get("_resume_replay_safe", True))
         try:
-            replay_allowed = _is_exact_target and (ckpt_path.resolve() == live_ckpt_path.resolve())
+            replay_allowed = (
+                _is_exact_target
+                and (ckpt_path.resolve() == live_ckpt_path.resolve())
+                and _resume_replay_safe
+            )
         except Exception:
-            replay_allowed = _is_exact_target and (str(ckpt_path) == str(live_ckpt_path))
+            replay_allowed = (
+                _is_exact_target
+                and (str(ckpt_path) == str(live_ckpt_path))
+                and _resume_replay_safe
+            )
         if not _is_exact_target:
             if startup_restore:
                 raise RuntimeError(
@@ -1205,6 +1224,11 @@ class SaveRestoreNode(PipelineNode):
                 f"[restore] WARNING: checkpoint has round={_ckpt_round} cycle={_ckpt_cycle}, "
                 f"target was round={target_round} cycle={target_cycle}; "
                 "restoring best-available fallback, replay disabled"
+            )
+        elif not _resume_replay_safe:
+            _log(
+                "[restore] using a newer active-network step checkpoint overlay; "
+                "skipping training-material replay for this resume"
             )
 
         ctx.cycle = max(0, int(ckpt.get("cycle", target_cycle) or target_cycle))

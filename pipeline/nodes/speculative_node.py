@@ -42,6 +42,7 @@ from pipeline.nodes.base import (
     IRStateSpec,
     IRTensorPortSpec,
     IRTrainingNode,
+    _save_pipeline_checkpoint,
     autocast_context,
     cuda_supports_dtype,
     make_grad_scaler,
@@ -53,11 +54,17 @@ from pipeline.nodes.base import (
     StageStopRequested,
 )
 from pipeline.nodes.data_nodes import (
+    _apply_network_dropout_rate,
     ensure_runtime_loader_contract,
     _unpack_masked_semantic_batch,
 )
 from pipeline.preview import make_speculative_step_preview_callback
 from pipeline.utils import _is_cuda_backend_engine_error
+
+
+# Global precision for the speculative network.  Change this one value to
+# switch between float32 and float64 across both training and gate evaluation.
+SPECULATIVE_NETWORK_DTYPE: str = "float64"
 
 
 def _log(msg: str) -> None:
@@ -226,6 +233,38 @@ def _collect_nonfinite_param_names(module: nn.Module, *, grads: bool = False, ma
     return out
 
 
+def _snapshot_param_grads(module: nn.Module) -> List[tuple[nn.Parameter, Optional[torch.Tensor]]]:
+    snapshots: List[tuple[nn.Parameter, Optional[torch.Tensor]]] = []
+    for param in module.parameters():
+        if not bool(param.requires_grad):
+            continue
+        grad = getattr(param, "grad", None)
+        snapshots.append((param, None if grad is None else grad.detach().clone()))
+    return snapshots
+
+
+def _restore_param_grads(snapshots: Sequence[tuple[nn.Parameter, Optional[torch.Tensor]]]) -> None:
+    for param, grad in list(snapshots or []):
+        if grad is None:
+            param.grad = None
+            continue
+        current_grad = getattr(param, "grad", None)
+        if current_grad is None:
+            param.grad = grad.detach().clone()
+        else:
+            current_grad.detach().copy_(grad)
+
+
+def _scale_param_grads_(module: nn.Module, scale: float) -> None:
+    scale = float(scale)
+    if scale == 1.0:
+        return
+    for param in module.parameters():
+        grad = getattr(param, "grad", None)
+        if grad is not None:
+            grad.detach().mul_(scale)
+
+
 class _RejectSpeculativeBatch(RuntimeError):
     """Reject a single training batch without aborting the whole stage."""
 
@@ -263,14 +302,14 @@ class SpeculativeNetConfig:
     vector_weight: float = 1.0      # slot→matched-target embedding distance
     enable_mask_loss: bool = True
     mask_weight: float = 0.7        # per-slot mask reconstruction BCE
-    dustbin_cost: float = 1.25      # one-to-one matcher dustbin penalty
+    dustbin_cost: float = 0.8       # one-to-one matcher dustbin penalty
 
     # Selection / certainty losses
     enable_selection_loss: bool = True
-    selection_weight: float = 0.5   # vocab-presence selection pressure
-    selection_temp: float = 6.0     # calibrated logsumexp temperature
+    selection_weight: float = 0.65  # per-slot cross-entropy over present items
+    selection_temp: float = 6.0     # calibrated logsumexp temperature (display only)
     enable_confidence_loss: bool = True
-    confidence_weight: float = 0.5  # slot confidence (1=real, 0=dustbin)
+    confidence_weight: float = 0.25 # slot confidence (1=real, 0=dustbin)
 
     # Sequential ordering / canvas-discipline losses
     enable_mask_order_loss: bool = True
@@ -283,20 +322,25 @@ class SpeculativeNetConfig:
     enable_residual_mask_loss: bool = True
     residual_mask_weight: float = 0.20
     residual_mask_detach_canvas: bool = True
+    mask_fn_weight: float = 2.0      # false-negative weight in mask BCE (>1 = missing content penalised harder)
 
     # Hypergraph / state-rollout losses and priors
     hypergraph_prior_weight: float = 0.35
     duplicate_penalty: float = 1.25
     hypergraph_alpha: float = 0.5
-    predictive_hypergraph_momentum: float = 0.96
+    predictive_hypergraph_momentum: float = 0.80
 
     # ---- Optimiser ------------------------------------------------------
     lr: float = 5e-4
     weight_decay: float = 1e-5
     grad_clip: float = 1.0
+    # 0 = disable accumulation; -1 = one optimiser step per full loader pass.
+    # Positive values step once per N loader batches.
+    grad_accum_steps: int = -1
+    network_dropout: float = 0.0
 
     # ---- Runtime / memory -----------------------------------------------
-    network_dtype: str = "float64"
+    network_dtype: str = SPECULATIVE_NETWORK_DTYPE
     amp: bool = False
     amp_dtype: str = "fp16"
     channels_last: bool = False
@@ -310,6 +354,12 @@ class SpeculativeNetConfig:
     # ---- Progress logging -----------------------------------------------
     # 0 = silent; N = print one line every N optimiser steps
     log_every: int = 50
+
+    # ---- Checkpoint on optimizer step -----------------------------------
+    # When True, write active_network.pt to disk after every optimizer step.
+    # Intended for extreme gradient accumulation (ultra-large batches) where
+    # each step is expensive and losing one would be costly.
+    save_on_grad_step: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -535,8 +585,14 @@ def _criterion_loss_items(criterion: Any) -> List[Dict[str, Any]]:
     ]
 
 
-def _init_loss_metric_accumulators(criterion: Any) -> Dict[str, float]:
-    return {str(item.get("key", "")): 0.0 for item in _criterion_loss_items(criterion) if str(item.get("key", "")).strip()}
+def _init_loss_metric_accumulators(
+    criterion: Any,
+) -> Dict[str, float]:
+    return {
+        str(item.get("key", "")): 0.0
+        for item in _criterion_loss_items(criterion)
+        if str(item.get("key", "")).strip()
+    }
 
 
 def _format_loss_rows(
@@ -567,6 +623,97 @@ def _format_loss_rows(
     return rows
 
 
+def _speculative_diversity_bias(
+    *,
+    net: nn.Module,
+    slot_selection_probs: Any,
+    vocab_matrix: torch.Tensor,
+    vocab_phrases: Sequence[str],
+) -> torch.Tensor:
+    if not isinstance(slot_selection_probs, torch.Tensor):
+        return torch.zeros(0, device=vocab_matrix.device, dtype=vocab_matrix.dtype)
+    if int(slot_selection_probs.ndim) != 3:
+        return slot_selection_probs.new_zeros(slot_selection_probs.shape)
+
+    slot_decoder = getattr(net, "slot_decoder", None)
+    prior = getattr(slot_decoder, "hypergraph_prior", None)
+    if prior is None:
+        return slot_selection_probs.new_zeros(slot_selection_probs.shape)
+
+    bsz, n_slots, vocab_size = [int(x) for x in slot_selection_probs.shape]
+    if vocab_size <= 0:
+        return slot_selection_probs.new_zeros(slot_selection_probs.shape)
+
+    vocab_basis = vocab_matrix.to(
+        device=slot_selection_probs.device,
+        dtype=slot_selection_probs.dtype,
+    )
+    if int(vocab_basis.ndim) != 2 or int(vocab_basis.shape[0]) != int(vocab_size):
+        return slot_selection_probs.new_zeros(slot_selection_probs.shape)
+    vocab_basis = F.normalize(vocab_basis, dim=-1, eps=1e-6)
+
+    hypergraph = getattr(net, "hypergraph", None)
+    alpha = float(max(1e-6, getattr(net, "hypergraph_alpha", 0.5)))
+    base_log_prior = slot_selection_probs.new_full((vocab_size,), -math.log(float(max(1, vocab_size))))
+    pair_log_prior = slot_selection_probs.new_full(
+        (vocab_size, vocab_size),
+        -math.log(float(max(1, vocab_size))),
+    )
+    if hasattr(hypergraph, "vocab_statistics") and callable(getattr(hypergraph, "vocab_statistics")):
+        try:
+            stats = hypergraph.vocab_statistics(vocab_phrases, alpha=alpha)
+            base_log_prior = stats.get("base_log_prior", base_log_prior).to(
+                device=slot_selection_probs.device,
+                dtype=slot_selection_probs.dtype,
+            )
+            pair_log_prior = stats.get("pair_log_prior", pair_log_prior).to(
+                device=slot_selection_probs.device,
+                dtype=slot_selection_probs.dtype,
+            )
+        except Exception:
+            pass
+
+    predictive_node_state = getattr(prior, "predictive_node_state", None)
+    predictive_pair_state = getattr(prior, "predictive_pair_state", None)
+    if isinstance(predictive_node_state, torch.Tensor):
+        predictive_node = predictive_node_state.to(
+            device=slot_selection_probs.device,
+            dtype=slot_selection_probs.dtype,
+        ).clamp(0.0, 1.0)
+    else:
+        predictive_node = slot_selection_probs.new_zeros(vocab_size)
+    if isinstance(predictive_pair_state, torch.Tensor):
+        predictive_pair = predictive_pair_state.to(
+            device=slot_selection_probs.device,
+            dtype=slot_selection_probs.dtype,
+        ).clamp(0.0, 1.0)
+    else:
+        predictive_pair = slot_selection_probs.new_zeros(vocab_size, vocab_size)
+
+    selected_mass = torch.cumsum(slot_selection_probs, dim=1) - slot_selection_probs
+    selected_dist = selected_mass / selected_mass.sum(dim=-1, keepdim=True).clamp_min(1.0)
+
+    base_prob = base_log_prior.exp().clamp(0.0, 1.0).view(1, 1, vocab_size)
+    observed_pair_prob = pair_log_prior.exp().clamp(0.0, 1.0)
+    predictive_node = predictive_node.view(1, 1, vocab_size)
+    semantic_similarity = torch.matmul(vocab_basis, vocab_basis.transpose(0, 1)).clamp(0.0, 1.0)
+
+    observed_pair_penalty = torch.einsum("bnv,vw->bnw", selected_dist, observed_pair_prob)
+    predictive_pair_penalty = torch.einsum("bnv,vw->bnw", selected_dist, predictive_pair)
+    semantic_redundancy = torch.einsum("bnv,vw->bnw", selected_dist, semantic_similarity)
+
+    rarity_bonus = 1.0 - base_prob
+    freshness_bonus = 1.0 - predictive_node
+
+    return (
+        (float(getattr(prior, "rarity_bonus_weight", 0.0)) * rarity_bonus)
+        + (float(getattr(prior, "freshness_bonus_weight", 0.0)) * freshness_bonus)
+        - (float(getattr(prior, "cooccurrence_penalty_weight", 0.0)) * observed_pair_penalty)
+        - (float(getattr(prior, "predictive_pair_penalty_weight", 0.0)) * predictive_pair_penalty)
+        - (float(getattr(prior, "semantic_similarity_penalty_weight", 0.0)) * semantic_redundancy)
+    )
+
+
 def _run_speculative_net_epochs(
     net: nn.Module,
     criterion: Any,           # PrototypeLoss — accessed via duck typing
@@ -577,6 +724,8 @@ def _run_speculative_net_epochs(
     vocab_phrases: List[str],
     active_term_to_idx: Dict[str, int],
     grad_clip: float = 1.0,
+    grad_accum_steps: int = -1,
+    network_dropout: float = 0.0,
     log_every: int = 50,
     stage_label: str = "speculative",
     step_preview_callback: Optional[Callable] = None,
@@ -590,6 +739,7 @@ def _run_speculative_net_epochs(
     amp_dtype: str = "fp16",
     channels_last: bool = False,
     max_forward_batch_cap: int = 0,
+    optimizer_step_save_callback: Optional[Callable[[], None]] = None,
 ) -> Dict[str, Any]:
     """Train *net* for *epochs* passes over *loader*.
 
@@ -623,6 +773,7 @@ def _run_speculative_net_epochs(
     if runtime_tensor_dtype == torch.float64 and bool(runtime_amp_enabled):
         _log(f"[{stage_label}] disabling AMP because active-network parameters are float64")
         runtime_amp_enabled = False
+        setattr(net, "_runtime_amp_enabled", False)
     runtime_channels_last = bool(channels_last)
     use_scaler = bool(
         grad_scaler is not None
@@ -632,6 +783,7 @@ def _run_speculative_net_epochs(
     )
 
     net.train()
+    network_dropout = float(max(0.0, min(0.95, network_dropout)))
     total_loss = 0.0
     n_samples = 0
     optimizer_steps = 0
@@ -639,6 +791,102 @@ def _run_speculative_net_epochs(
     t_start = time.time()
     stop_now = False
     skipped_batches = 0
+    last_grad_norm_value = float("nan")
+    grad_accum_cfg = int(grad_accum_steps)
+    accumulate_full_epoch = int(grad_accum_cfg) < 0
+    target_grad_accum_batches = 1 if int(grad_accum_cfg) == 0 else max(1, int(grad_accum_cfg))
+    pending_grad_batches = 0
+    last_batch_terms_context = "samples=[]"
+    grad_accum_desc = (
+        "full-epoch"
+        if bool(accumulate_full_epoch)
+        else ("disabled" if int(grad_accum_cfg) == 0 else f"{int(target_grad_accum_batches)} batches/step")
+    )
+    _log(
+        f"[{stage_label}] regulation grad_clip={float(grad_clip):.4f} "
+        f"network_dropout={network_dropout:.4f} "
+        f"grad_accum={grad_accum_desc}"
+    )
+    optimizer.zero_grad(set_to_none=True)
+
+    def _finish_accumulated_step(*, batch_terms_context: str) -> bool:
+        nonlocal pending_grad_batches
+        nonlocal skipped_batches
+        nonlocal optimizer_steps
+        nonlocal last_grad_norm_value
+
+        if int(pending_grad_batches) <= 0:
+            return False
+
+        if use_scaler:
+            grad_scaler.unscale_(optimizer)
+        _scale_param_grads_(net, 1.0 / float(max(1, int(pending_grad_batches))))
+
+        bad_grad_names = _collect_nonfinite_param_names(net, grads=True)
+        if bad_grad_names:
+            optimizer.zero_grad(set_to_none=True)
+            pending_grad_batches = 0
+            skipped_batches += 1
+            _log(
+                f"[{stage_label}] rejecting accumulated step with non-finite gradients: "
+                + ", ".join(bad_grad_names)
+                + f" | {batch_terms_context}"
+            )
+            return False
+
+        grad_norm = nn.utils.clip_grad_norm_(net.parameters(), float(grad_clip))
+        grad_norm_value = float(grad_norm.detach().item()) if isinstance(grad_norm, torch.Tensor) else float(grad_norm)
+        last_grad_norm_value = float(grad_norm_value)
+        if not math.isfinite(grad_norm_value):
+            optimizer.zero_grad(set_to_none=True)
+            pending_grad_batches = 0
+            skipped_batches += 1
+            _log(
+                f"[{stage_label}] rejecting accumulated step with non-finite gradient norm: "
+                f"{grad_norm_value} | {batch_terms_context}"
+            )
+            return False
+
+        param_snapshots = [
+            (param, param.detach().clone())
+            for param in net.parameters()
+            if bool(param.requires_grad)
+        ]
+        if use_scaler:
+            grad_scaler.step(optimizer)
+            grad_scaler.update()
+        else:
+            optimizer.step()
+
+        bad_param_names = _collect_nonfinite_param_names(net, grads=False)
+        if bad_param_names:
+            for param, snapshot in param_snapshots:
+                param.data.copy_(snapshot)
+            optimizer.state.clear()
+            optimizer.zero_grad(set_to_none=True)
+            pending_grad_batches = 0
+            skipped_batches += 1
+            _log(
+                f"[{stage_label}] rejected accumulated optimizer step with non-finite parameters: "
+                + ", ".join(bad_param_names)
+                + f" | {batch_terms_context}"
+            )
+            return False
+
+        optimizer_steps += 1
+        if weight_update_callback is not None:
+            try:
+                weight_update_callback(optimizer_steps)
+            except Exception:
+                pass
+        if optimizer_step_save_callback is not None:
+            try:
+                optimizer_step_save_callback()
+            except Exception:
+                pass
+        optimizer.zero_grad(set_to_none=True)
+        pending_grad_batches = 0
+        return True
 
     for _epoch in range(epochs):
         if stop_now:
@@ -674,7 +922,8 @@ def _run_speculative_net_epochs(
             )
             if spec is None:
                 continue
-            optimizer.zero_grad(set_to_none=True)
+            if network_dropout > 0.0:
+                _apply_network_dropout_rate(net, network_dropout)
             terms_rows = list(meta.get("terms_rows") or [[] for _ in range(int(spec["image"].shape[0]))])
             total_batch_n = int(spec["image"].shape[0])
             slice_cap = int(max_forward_batch_cap) if int(max_forward_batch_cap) > 0 else int(total_batch_n)
@@ -687,6 +936,11 @@ def _run_speculative_net_epochs(
             predicted_confidence_parts: List[torch.Tensor] = []
             batch_terms_context = _format_terms_rows_brief(terms_rows)
             batch_rejection_message: Optional[str] = None
+            batch_grad_snapshot = (
+                _snapshot_param_grads(net)
+                if int(pending_grad_batches) > 0
+                else None
+            )
             while True:
                 try:
                     step_loss_value = 0.0
@@ -762,6 +1016,42 @@ def _run_speculative_net_epochs(
                                         terms_rows=slice_terms_rows,
                                         sample_offset=start,
                                     )
+                                slot_selection_logits = aux.get("slot_selection_logits")
+                                adjusted_selection_logits = slot_selection_logits
+                                if isinstance(slot_selection_logits, torch.Tensor):
+                                    diversity_bias = _speculative_diversity_bias(
+                                        net=net,
+                                        slot_selection_probs=aux.get("slot_selection_probs"),
+                                        vocab_matrix=vocab_matrix,
+                                        vocab_phrases=vocab_phrases,
+                                    )
+                                    diversity_weight = float(
+                                        max(
+                                            0.0,
+                                            getattr(getattr(net, "slot_decoder", None), "hypergraph_prior_weight", 0.0),
+                                        )
+                                    )
+                                    if (
+                                        float(diversity_weight) > 0.0
+                                        and isinstance(diversity_bias, torch.Tensor)
+                                        and tuple(diversity_bias.shape) == tuple(slot_selection_logits.shape)
+                                    ):
+                                        raw_selection_logits = slot_selection_logits
+                                        slot_prior_bias = aux.get("slot_prior_bias")
+                                        if (
+                                            isinstance(slot_prior_bias, torch.Tensor)
+                                            and tuple(slot_prior_bias.shape) == tuple(slot_selection_logits.shape)
+                                        ):
+                                            raw_selection_logits = slot_selection_logits - (
+                                                float(diversity_weight)
+                                                * slot_prior_bias.to(
+                                                    device=slot_selection_logits.device,
+                                                    dtype=slot_selection_logits.dtype,
+                                                )
+                                            )
+                                        adjusted_selection_logits = raw_selection_logits + (
+                                            float(diversity_weight) * diversity_bias
+                                        )
                                 loss_dict = criterion(
                                     pred_vectors=out.slot_vectors,
                                     pred_masks=out.slot_masks,
@@ -770,7 +1060,7 @@ def _run_speculative_net_epochs(
                                     target_valid=spec_part["target_valid"],
                                     present_mask=spec_part["present_mask"],
                                     confidence_logits=out.slot_confidence,
-                                    slot_selection_logits=aux.get("slot_selection_logits"),
+                                    slot_selection_logits=adjusted_selection_logits,
                                 )
                                 loss_nonfinite = _collect_nonfinite_tensor_stats(
                                     [
@@ -872,12 +1162,18 @@ def _run_speculative_net_epochs(
                     break
                 except _RejectSpeculativeBatch as exc:
                     batch_rejection_message = str(exc)
-                    optimizer.zero_grad(set_to_none=True)
+                    if batch_grad_snapshot is None:
+                        optimizer.zero_grad(set_to_none=True)
+                    else:
+                        _restore_param_grads(batch_grad_snapshot)
                     break
                 except torch.OutOfMemoryError:
                     if device.type != "cuda":
                         raise
-                    optimizer.zero_grad(set_to_none=True)
+                    if batch_grad_snapshot is None:
+                        optimizer.zero_grad(set_to_none=True)
+                    else:
+                        _restore_param_grads(batch_grad_snapshot)
                     gc.collect()
                     try:
                         torch.cuda.synchronize(device)
@@ -906,7 +1202,10 @@ def _run_speculative_net_epochs(
                     _log(f"[{stage_label}] cuda oom; retrying with smaller microbatch cap {int(slice_cap)}")
                 except RuntimeError as exc:
                     if device.type == "cuda" and _is_cuda_backend_engine_error(exc):
-                        optimizer.zero_grad(set_to_none=True)
+                        if batch_grad_snapshot is None:
+                            optimizer.zero_grad(set_to_none=True)
+                        else:
+                            _restore_param_grads(batch_grad_snapshot)
                         if bool(runtime_amp_enabled):
                             runtime_amp_enabled = False
                             use_scaler = False
@@ -922,7 +1221,10 @@ def _run_speculative_net_epochs(
                             _log(f"[{stage_label}] backend engine selection failed; retrying with contiguous tensors")
                             continue
                     if device.type == "cuda" and _is_cuda_oom(exc):
-                        optimizer.zero_grad(set_to_none=True)
+                        if batch_grad_snapshot is None:
+                            optimizer.zero_grad(set_to_none=True)
+                        else:
+                            _restore_param_grads(batch_grad_snapshot)
                         gc.collect()
                         try:
                             torch.cuda.empty_cache()
@@ -949,54 +1251,6 @@ def _run_speculative_net_epochs(
                 del xb, mb, spec
                 continue
 
-            if use_scaler:
-                grad_scaler.unscale_(optimizer)
-            bad_grad_names = _collect_nonfinite_param_names(net, grads=True)
-            if bad_grad_names:
-                optimizer.zero_grad(set_to_none=True)
-                skipped_batches += 1
-                _log(
-                    f"[{stage_label}] rejecting batch with non-finite gradients: "
-                    + ", ".join(bad_grad_names)
-                    + f" | {batch_terms_context}"
-                )
-                del xb, mb, spec
-                continue
-            grad_norm = nn.utils.clip_grad_norm_(net.parameters(), float(grad_clip))
-            grad_norm_value = float(grad_norm.detach().item()) if isinstance(grad_norm, torch.Tensor) else float(grad_norm)
-            if not math.isfinite(grad_norm_value):
-                optimizer.zero_grad(set_to_none=True)
-                skipped_batches += 1
-                _log(
-                    f"[{stage_label}] rejecting batch with non-finite gradient norm: "
-                    f"{grad_norm_value} | {batch_terms_context}"
-                )
-                del xb, mb, spec
-                continue
-            param_snapshots = [
-                (param, param.detach().clone())
-                for param in net.parameters()
-                if bool(param.requires_grad)
-            ]
-            if use_scaler:
-                grad_scaler.step(optimizer)
-                grad_scaler.update()
-            else:
-                optimizer.step()
-            bad_param_names = _collect_nonfinite_param_names(net, grads=False)
-            if bad_param_names:
-                for param, snapshot in param_snapshots:
-                    param.data.copy_(snapshot)
-                optimizer.state.clear()
-                optimizer.zero_grad(set_to_none=True)
-                skipped_batches += 1
-                _log(
-                    f"[{stage_label}] rejected optimizer step with non-finite parameters: "
-                    + ", ".join(bad_param_names)
-                    + f" | {batch_terms_context}"
-                )
-                del xb, mb, spec
-                continue
             if (
                 predicted_selection_parts
                 and predicted_confidence_parts
@@ -1010,13 +1264,11 @@ def _run_speculative_net_epochs(
                     )
                 except Exception:
                     pass
-            optimizer_steps += 1
-
-            if weight_update_callback is not None:
-                try:
-                    weight_update_callback(optimizer_steps)
-                except Exception:
-                    pass
+            pending_grad_batches += 1
+            last_batch_terms_context = batch_terms_context
+            stepped_this_batch = False
+            if (not bool(accumulate_full_epoch)) and int(pending_grad_batches) >= int(target_grad_accum_batches):
+                stepped_this_batch = bool(_finish_accumulated_step(batch_terms_context=batch_terms_context))
 
             batch_n = int(total_batch_n)
             batch_loss = float(step_loss_value) / float(max(1, step_seen))
@@ -1099,10 +1351,22 @@ def _run_speculative_net_epochs(
                     denom=float(batch_n),
                     per_row=3,
                 )
+                grad_txt = (
+                    f"{last_grad_norm_value:.3g}/{float(grad_clip):.3g}"
+                    if bool(stepped_this_batch) and math.isfinite(last_grad_norm_value)
+                    else f"pending/{float(grad_clip):.3g}"
+                )
+                accum_txt = (
+                    f"{int(pending_grad_batches)}/epoch"
+                    if bool(accumulate_full_epoch)
+                    else f"{int(pending_grad_batches)}/{int(target_grad_accum_batches)}"
+                )
                 _log(
                     f"[{stage_label}] step={global_step} "
                     f"loss={avg_loss:.4f} "
                     f"{' | '.join(loss_rows)} "
+                    f"accum={accum_txt} "
+                    f"grad={grad_txt} "
                     f"sps={n_samples / elapsed:.1f}"
                 )
 
@@ -1123,6 +1387,13 @@ def _run_speculative_net_epochs(
             del xb, mb, spec
             if stop_now:
                 break
+
+        if stop_now:
+            optimizer.zero_grad(set_to_none=True)
+            pending_grad_batches = 0
+            break
+        if int(pending_grad_batches) > 0:
+            _finish_accumulated_step(batch_terms_context=last_batch_terms_context)
 
     net.eval()
     return {
@@ -1216,6 +1487,7 @@ class BuildSpeculativeNetNode(PipelineNode):
             hypergraph_prior_weight=self.cfg.hypergraph_prior_weight,
             duplicate_penalty=self.cfg.duplicate_penalty,
             hypergraph_alpha=self.cfg.hypergraph_alpha,
+            network_dropout=self.cfg.network_dropout,
             predictive_hypergraph_momentum=self.cfg.predictive_hypergraph_momentum,
         ).to(device=ctx.device, dtype=model_dtype)
         if self.cfg.channels_last:
@@ -1224,6 +1496,8 @@ class BuildSpeculativeNetNode(PipelineNode):
         setattr(model, "_runtime_amp_dtype", str(self.cfg.amp_dtype))
         setattr(model, "_runtime_channels_last", bool(self.cfg.channels_last))
         setattr(model, "_runtime_microbatch_cap", int(self.cfg.max_forward_batch_cap))
+        setattr(model, "_runtime_grad_accum_steps", int(self.cfg.grad_accum_steps))
+        setattr(model, "_runtime_network_dropout", float(max(0.0, min(0.95, self.cfg.network_dropout))))
         if hasattr(model, "set_preview_preferences") and callable(getattr(model, "set_preview_preferences")):
             try:
                 model.set_preview_preferences(
@@ -1261,6 +1535,7 @@ class BuildSpeculativeNetNode(PipelineNode):
             enable_residual_mask_loss=self.cfg.enable_residual_mask_loss,
             residual_mask_weight=self.cfg.residual_mask_weight,
             residual_mask_detach_canvas=self.cfg.residual_mask_detach_canvas,
+            mask_fn_weight=self.cfg.mask_fn_weight,
         )
 
         optimizer = torch.optim.AdamW(
@@ -1350,6 +1625,45 @@ class _SpeculativeBaseTrainNode(IRTrainingNode):
             model=ctx.active_network,
             node_id=self.node_id,
         )
+
+        step_save_cb: Optional[Callable[[], None]] = None
+        if self.cfg.save_on_grad_step:
+            _out_dir = getattr(ctx, "output_dir", None)
+            if _out_dir is not None:
+                _net = ctx.active_network
+                _opt = ctx.active_network_optimizer
+                _scaler = getattr(ctx, "active_network_grad_scaler", None)
+                _label = stage_label
+                def _make_step_save(_out_dir, _net, _opt, _scaler, _label, _ctx):
+                    def _cb():
+                        _path = _out_dir / "active_network.pt"
+                        state_dict = _net.state_dict()
+                        payload = {
+                            "checkpoint_kind": "speculative_optimizer_step",
+                            "timestamp": float(time.time()),
+                            "segment": str(_label),
+                            "round_id": int(getattr(_ctx, "round_id", 0) or 0),
+                            "cycle": int(getattr(_ctx, "cycle", 0) or 0),
+                            "total_rounds_completed": int(getattr(_ctx, "total_rounds_completed", 0) or 0),
+                            "run_tag": str(getattr(_ctx, "run_tag", "") or ""),
+                            "active_network_state": state_dict,
+                            "state_dict": state_dict,
+                        }
+                        if _opt is not None:
+                            try:
+                                payload["active_network_optimizer_state"] = _opt.state_dict()
+                            except Exception:
+                                pass
+                        if _scaler is not None and hasattr(_scaler, "state_dict"):
+                            try:
+                                payload["active_network_grad_scaler_state"] = _scaler.state_dict()
+                            except Exception:
+                                pass
+                        _save_pipeline_checkpoint(_path, payload)
+                        _log(f"[{_label}] mid-step checkpoint saved")
+                    return _cb
+                step_save_cb = _make_step_save(_out_dir, _net, _opt, _scaler, _label, ctx)
+
         result = _run_speculative_net_epochs(
             net=ctx.active_network,
             criterion=ctx.active_network_criterion,
@@ -1360,6 +1674,8 @@ class _SpeculativeBaseTrainNode(IRTrainingNode):
             vocab_phrases=list(ctx.class_names),
             active_term_to_idx=dict(ctx.semantic_term_to_idx),
             grad_clip=self.cfg.grad_clip,
+            grad_accum_steps=self.cfg.grad_accum_steps,
+            network_dropout=self.cfg.network_dropout,
             log_every=self.cfg.log_every,
             stage_label=stage_label,
             step_preview_callback=preview_cb,
@@ -1376,6 +1692,7 @@ class _SpeculativeBaseTrainNode(IRTrainingNode):
             amp_dtype=self.cfg.amp_dtype,
             channels_last=self.cfg.channels_last,
             max_forward_batch_cap=self.cfg.max_forward_batch_cap,
+            optimizer_step_save_callback=step_save_cb,
         )
         loss = float(result.get("loss", float("inf")))
         ctx.log_metric(metric_stage, "loss", loss)

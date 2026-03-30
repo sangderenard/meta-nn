@@ -27,6 +27,7 @@ from pipeline.semantic_wheel_cache import (
 from pipeline.vocabulary_defaults import DEFAULT_VOCABULARY
 from semantic_dataset_loaders import (
     DatasetTermRegistry,
+    SemanticDiskRow,
     build_term_mask_stacks_from_images,
     collect_semantic_disk_rows,
 )
@@ -110,6 +111,7 @@ def test_collect_semantic_disk_rows_remaps_voc_bits_by_name() -> None:
     with tempfile.TemporaryDirectory(dir=".") as td:
         root = Path(td)
         (root / "img").mkdir(parents=True, exist_ok=True)
+        (root / "cls").mkdir(parents=True, exist_ok=True)
         (root / "cache").mkdir(parents=True, exist_ok=True)
         (root / "train.txt").write_text("sample_train\n", encoding="utf-8")
         (root / "val.txt").write_text("sample_val\n", encoding="utf-8")
@@ -125,6 +127,13 @@ def test_collect_semantic_disk_rows_remaps_voc_bits_by_name() -> None:
         val_labels[0, 14] = 1.0
         np.savez(root / "cache" / "sbd_train_multilabel.npz", labels=train_labels)
         np.savez(root / "cache" / "sbd_val_multilabel.npz", labels=val_labels)
+        train_seg = np.zeros((10, 10), dtype=np.int32)
+        train_seg[1:6, 1:5] = 1
+        train_seg[3:9, 5:9] = 7
+        val_seg = np.zeros((10, 10), dtype=np.int32)
+        val_seg[2:9, 2:8] = 15
+        np.savez(root / "cls" / "sample_train.npz", segmentation=train_seg)
+        np.savez(root / "cls" / "sample_val.npz", segmentation=val_seg)
 
         # class_names is the full supervised vocabulary — same as the real
         # classifier training pipeline passes.
@@ -149,6 +158,82 @@ def test_collect_semantic_disk_rows_remaps_voc_bits_by_name() -> None:
         # val_labels[0,14]=1 → VOC20[14]="person"
         assert "person" in val_terms_norm
         _ok("Berkeley multilabel rows remap VOC cache bits by class name instead of raw position")
+
+
+def test_collect_semantic_disk_rows_rejects_berkeley_label_without_mask() -> None:
+    print("\n--- test_collect_semantic_disk_rows_rejects_berkeley_label_without_mask ---")
+    with tempfile.TemporaryDirectory(dir=".") as td:
+        root = Path(td)
+        (root / "img").mkdir(parents=True, exist_ok=True)
+        (root / "cls").mkdir(parents=True, exist_ok=True)
+        (root / "cache").mkdir(parents=True, exist_ok=True)
+        (root / "train.txt").write_text("bad_train\n", encoding="utf-8")
+        (root / "val.txt").write_text("good_val\n", encoding="utf-8")
+
+        for stem, fill in (("bad_train", 80), ("good_val", 180)):
+            image = np.full((10, 10, 3), fill_value=int(fill), dtype=np.uint8)
+            Image.fromarray(image, mode="RGB").save(root / "img" / f"{stem}.jpg")
+
+        train_labels = np.zeros((1, 20), dtype=np.float32)
+        train_labels[0, 14] = 1.0  # "person"
+        val_labels = np.zeros((1, 20), dtype=np.float32)
+        val_labels[0, 6] = 1.0  # "car"
+        np.savez(root / "cache" / "sbd_train_multilabel.npz", labels=train_labels)
+        np.savez(root / "cache" / "sbd_val_multilabel.npz", labels=val_labels)
+
+        bad_train_seg = np.zeros((10, 10), dtype=np.int32)
+        bad_train_seg[2:8, 2:8] = 7  # "car" only; cached label says "person"
+        good_val_seg = np.zeros((10, 10), dtype=np.int32)
+        good_val_seg[1:9, 1:9] = 7
+        np.savez(root / "cls" / "bad_train.npz", segmentation=bad_train_seg)
+        np.savez(root / "cls" / "good_val.npz", segmentation=good_val_seg)
+
+        rows, info = collect_semantic_disk_rows(str(root), list(DEFAULT_VOCABULARY))
+
+        assert int(info["available_rows"]) == 1, info
+        assert int(info["berkeley_rejected_rows"]) == 1, info
+        assert int(info["berkeley_label_mask_mismatch_rows"]) == 1, info
+        assert all(str(row.source) != "berkeley_sbd_train" for row in rows), rows
+        val_row = next(row for row in rows if str(row.source) == "berkeley_sbd_val")
+        assert "car" in {t.strip().lower() for t in val_row.terms}
+        _ok("Berkeley rows with label/mask disagreement are rejected during row collection")
+
+
+def test_berkeley_wheel_drops_resized_out_support_label_only() -> None:
+    print("\n--- test_berkeley_wheel_drops_resized_out_support_label_only ---")
+    with tempfile.TemporaryDirectory(dir=".") as td:
+        root = Path(td)
+        bad_img = np.full((12, 12, 3), fill_value=96, dtype=np.uint8)
+        bad_path = root / "tiny_person.png"
+        Image.fromarray(bad_img, mode="RGB").save(bad_path)
+        tiny_person_seg = np.zeros((333, 500), dtype=np.int32)
+        tiny_person_seg[40:41, 60:65] = 15
+        tiny_seg_path = root / "tiny_person.npz"
+        np.savez(tiny_seg_path, segmentation=tiny_person_seg)
+
+        semantic_rows = [
+            SemanticDiskRow(
+                image_path=str(bad_path),
+                terms=["berkeley sbd dataset", "object", "signal", "person"],
+                source="berkeley_sbd_train",
+                mask_path=str(tiny_seg_path),
+            ),
+        ]
+        registry = DatasetTermRegistry()
+        clean_entries = semantic_wheel_cache._build_clean_entries_batch(
+            rows=semantic_rows,
+            image_size=16,
+            registry=registry,
+        )
+
+        assert len(clean_entries) == 1, clean_entries
+        entry = clean_entries[0]
+        assert isinstance(entry, dict), entry
+        entry_terms = {str(t).strip().lower() for t in list(entry.get("terms") or [])}
+        assert "person" not in entry_terms, entry_terms
+        assert "signal" in entry_terms, entry_terms
+        assert "berkeley sbd dataset" in entry_terms, entry_terms
+        _ok("Berkeley support labels that vanish during resize are dropped from the row while the image survives")
 
 
 def test_churn_node_does_not_inject_terms_on_its_own() -> None:
@@ -303,6 +388,8 @@ if __name__ == "__main__":
     test_gate_replica_sync_realigns_label_bank()
     test_checkpoint_prime_realigns_label_bank_before_load()
     test_collect_semantic_disk_rows_remaps_voc_bits_by_name()
+    test_collect_semantic_disk_rows_rejects_berkeley_label_without_mask()
+    test_berkeley_wheel_drops_resized_out_support_label_only()
     test_churn_node_does_not_inject_terms_on_its_own()
     test_semantic_candidate_cache_batch_build_preserves_order()
     test_term_mask_stacks_torch_path_matches_default()

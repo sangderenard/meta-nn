@@ -299,7 +299,8 @@ def _load_seg_class_masks(
     mask_path: str,
     image_size: int,
     term_to_idx: Dict[str, int],
-) -> Tuple[np.ndarray, np.ndarray]:
+    return_drop_terms: bool = False,
+) -> Tuple[np.ndarray, np.ndarray] | Tuple[np.ndarray, np.ndarray, List[str]]:
     """Decompose a Berkeley SBD segmentation map into per-class binary masks.
 
     The segmentation values are categorical class IDs (0 = background, 1-20 =
@@ -341,10 +342,17 @@ def _load_seg_class_masks(
     try:
         from berkeley_sbd_pretrain import VOC20_CLASSES
     except ImportError:
-        return np.zeros((0, size, size), dtype=np.float32), np.zeros((0,), dtype=np.int64)
+        empty = (
+            np.zeros((0, size, size), dtype=np.float32),
+            np.zeros((0,), dtype=np.int64),
+        )
+        if bool(return_drop_terms):
+            return empty[0], empty[1], []
+        return empty
 
     masks: List[np.ndarray] = []
     indices: List[int] = []
+    dropped_terms: List[str] = []
     present_ids = set(int(v) for v in np.unique(seg) if int(v) > 0)
     for seg_id in sorted(present_ids):
         voc_idx = int(seg_id) - 1  # seg IDs are 1-based; VOC20_CLASSES is 0-based
@@ -359,11 +367,20 @@ def _load_seg_class_masks(
             )
         binary = (seg == int(seg_id)).astype(np.float32, copy=False)
         fitted = _fit_mask_letterbox(binary, image_size=size)
+        if float(np.max(fitted)) <= 1e-8:
+            dropped_terms.append(str(term_name))
+            continue
         masks.append(fitted)
         indices.append(int(local_idx))
 
     if not masks:
-        return np.zeros((0, size, size), dtype=np.float32), np.zeros((0,), dtype=np.int64)
+        empty = (
+            np.zeros((0, size, size), dtype=np.float32),
+            np.zeros((0,), dtype=np.int64),
+        )
+        if bool(return_drop_terms):
+            return empty[0], empty[1], list(normalize_vocab_terms(dropped_terms))
+        return empty
 
     # "object" = union of all per-class segmentation masks.
     obj_idx = term_to_idx.get("object", -1)
@@ -390,10 +407,11 @@ def _load_seg_class_masks(
         masks.append(whole)
         indices.append(int(u_idx))
 
-    return (
-        np.stack(masks, axis=0).astype(np.float32, copy=False),
-        np.asarray(indices, dtype=np.int64),
-    )
+    out_stack = np.stack(masks, axis=0).astype(np.float32, copy=False)
+    out_idx = np.asarray(indices, dtype=np.int64)
+    if bool(return_drop_terms):
+        return out_stack, out_idx, list(normalize_vocab_terms(dropped_terms))
+    return out_stack, out_idx
 
 
 def _sobel_edge_map(gray: np.ndarray) -> np.ndarray:
@@ -586,6 +604,7 @@ def _build_clean_entries_batch(
         dynamic_ncols=True,
         control=progress_control,
     ):
+        row_terms_local = list(enriched_terms_per_row[int(row_idx)])
         label_vec = np.asarray(label_batch[int(row_idx)], dtype=np.float32)
         creation_mask_u8 = creation_masks_u8[int(row_idx)]
         creation_mask = (
@@ -593,11 +612,28 @@ def _build_clean_entries_batch(
             if creation_mask_u8 is not None
             else np.zeros((size, size), dtype=np.float32)
         )
-        seg_stack, seg_idx = _load_seg_class_masks(
+        seg_stack, seg_idx, dropped_seg_terms = _load_seg_class_masks(
             mask_path=str(row.mask_path or ""),
             image_size=size,
             term_to_idx=registry.term_to_idx,
+            return_drop_terms=True,
         )
+        if int(len(dropped_seg_terms)) > 0:
+            dropped_keys = {_norm_txt(term) for term in list(dropped_seg_terms)}
+            row_terms_local = [
+                str(term)
+                for term in row_terms_local
+                if _norm_txt(str(term)) not in dropped_keys
+            ]
+            label_vec = targets_from_terms([row_terms_local], registry.term_to_idx, n_local)[0]
+            issue = (
+                "Dropping Berkeley label rows whose support masks vanished after resize: "
+                f"image={str(getattr(row, 'image_path', ''))!r} "
+                f"source={str(getattr(row, 'source', ''))!r} "
+                f"dropped_terms={list(dropped_seg_terms)} "
+                f"image_size={int(size)}"
+            )
+            print(f"[wheel cache] WARNING: {issue}", flush=True)
         extra_parts: List[Tuple[Any, Any]] = []
         if int(seg_stack.shape[0]) > 0:
             extra_parts.append((seg_stack, seg_idx))
@@ -613,7 +649,7 @@ def _build_clean_entries_batch(
             processing_device=processing_device,
         )
         cached_terms = merge_terms_with_mask_indices(
-            enriched_terms_per_row[int(row_idx)],
+            row_terms_local,
             mask_indices,
             registry=registry,
         )

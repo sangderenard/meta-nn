@@ -206,7 +206,7 @@ def _resolve_non_training_device(args, device: torch.device) -> torch.device:
 
 
 def _load_resume_state(args, output_dir: Path) -> dict:
-    from pipeline.nodes.base import _load_json, _torch_load_cpu
+    from pipeline.nodes.base import _load_checkpoint_with_optional_active_network_overlay, _load_json
 
     resume_enabled = bool(_arg_value(args, "auto_resume", default=False)) or bool(
         str(_arg_value(args, "resume_from", default="") or "").strip()
@@ -219,19 +219,24 @@ def _load_resume_state(args, output_dir: Path) -> dict:
 
     resume_summary = None
     resume_pipeline_ckpt = None
+    resume_checkpoint_meta = {}
     if resume_enabled:
         summary_path = resume_dir / "summary.json"
         ckpt_path = resume_dir / "pipeline_checkpoint.pt"
+        overlay_path = resume_dir / "active_network.pt"
         resume_summary = _load_json(summary_path) if summary_path.exists() else None
-        if ckpt_path.exists():
-            try:
-                resume_pipeline_ckpt = _torch_load_cpu(str(ckpt_path))
-            except Exception as exc:
-                _log(f"[orchestrator] WARNING: could not load resume checkpoint {ckpt_path}: {exc}")
+        resume_pipeline_ckpt, resume_checkpoint_meta = _load_checkpoint_with_optional_active_network_overlay(
+            ckpt_path if ckpt_path.exists() else None,
+            overlay_path=overlay_path if overlay_path.exists() else None,
+        )
+        for err in list(resume_checkpoint_meta.get("errors", []) or []):
+            _log(f"[orchestrator] WARNING: {err}")
         _log(
             "[orchestrator] resume mode: "
             f"dir={resume_dir} summary={1 if summary_path.exists() else 0} "
-            f"ckpt={1 if ckpt_path.exists() else 0}"
+            f"ckpt={1 if ckpt_path.exists() else 0} "
+            f"overlay={1 if overlay_path.exists() else 0} "
+            f"overlay_applied={1 if resume_checkpoint_meta.get('overlay_applied', False) else 0}"
         )
 
     return {
@@ -239,6 +244,7 @@ def _load_resume_state(args, output_dir: Path) -> dict:
         "dir": resume_dir,
         "summary": resume_summary,
         "pipeline_ckpt": resume_pipeline_ckpt,
+        "pipeline_ckpt_meta": resume_checkpoint_meta,
     }
 
 
@@ -1658,6 +1664,8 @@ def build_pipeline_graph(
         lr=float(classifier_cfg.lr),
         weight_decay=float(classifier_cfg.weight_decay),
         grad_clip=float(classifier_cfg.grad_clip),
+        grad_accum_steps=int(getattr(classifier_cfg, "speculative_grad_accum_steps", -1)),
+        network_dropout=float(classifier_cfg.label_dropout_network_rate),
         amp=bool(classifier_cfg.amp),
         amp_dtype=str(classifier_cfg.amp_dtype),
         channels_last=bool(classifier_cfg.channels_last),
@@ -1665,6 +1673,7 @@ def build_pipeline_graph(
         stage1_epochs=int(classifier_cfg.stage1_epochs),
         stage2_epochs=int(classifier_cfg.stage2_epochs),
         log_every=int(classifier_cfg.log_every),
+        save_on_grad_step=bool(getattr(classifier_cfg, "speculative_save_on_grad_step", False)),
     )
 
     # ---------------------------------------------------------------
@@ -2511,7 +2520,13 @@ def _build_configs_from_args(args) -> dict:
         lr=float(_g("classifier_lr", default=2e-3)),
         weight_decay=float(_g("classifier_weight_decay", default=1e-5)),
         grad_clip=float(_g("classifier_grad_clip", default=1.0)),
+        stage0_grad_accum_steps=int(_g("stage0_grad_accum_steps", default=-1)),
+        stage1_grad_accum_steps=int(_g("stage1_grad_accum_steps", default=-1)),
+        stage2_grad_accum_steps=int(_g("stage2_grad_accum_steps", default=100)),
+        # Deprecated/compatibility
         grad_accum_steps=int(_g("grad_accum_steps", "classifier_grad_accum", default=1)),
+        speculative_grad_accum_steps=int(_g("speculative_grad_accum_steps", default=-1)),
+        speculative_save_on_grad_step=bool(_g("speculative_save_on_grad_step", default=False)),
         lr_cycles=float(_g("lr_sine_cycles", "classifier_lr_cycles", default=1.0)),
         lr_tail_fraction=float(_g("lr_sine_tail_fraction", default=0.15)),
         lr_min_scale=float(_g("lr_sine_min_scale", default=0.0)),

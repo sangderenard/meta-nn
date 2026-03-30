@@ -35,6 +35,7 @@ from pipeline.progress import interruptible_tqdm
 _IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".bmp", ".webp", ".tif", ".tiff"}
 _SEMANTIC_DISK_ROWS_CACHE_LOCK = threading.Lock()
 _SEMANTIC_DISK_ROWS_CACHE: Dict[str, Tuple[List["SemanticDiskRow"], Dict[str, Any]]] = {}
+_SEMANTIC_DISK_ROWS_CACHE_VERSION = 2
 _SEMANTIC_COLOR_TERMS: Tuple[str, ...] = (
     "bright",
     "dark",
@@ -415,6 +416,68 @@ def _read_sbd_split_file(root, split_name: str):
     return [], []
 
 
+def _load_sbd_segmentation_array(mask_path: str) -> Tuple[Optional[np.ndarray], str]:
+    mask_txt = str(mask_path or "").strip()
+    if not mask_txt:
+        return None, "Berkeley segmentation mask path is empty"
+    mp = Path(mask_txt)
+    if not mp.exists():
+        return None, f"Berkeley segmentation mask path does not exist: {mask_txt!r}"
+
+    seg = None
+    load_exc: Optional[Exception] = None
+    if str(mp.suffix).strip().lower() in (".mat", ".npz"):
+        npz_path = mp.with_suffix(".npz")
+        mat_path = mp.with_suffix(".mat")
+        try:
+            if npz_path.exists():
+                with np.load(str(npz_path), allow_pickle=False) as z:
+                    seg = np.asarray(z["segmentation"], dtype=np.int32)
+            elif mat_path.exists():
+                from scipy.io import loadmat
+
+                blob = loadmat(str(mat_path), squeeze_me=False, struct_as_record=False)
+                gtcls = blob.get("GTcls", None)
+                try:
+                    seg = np.asarray(gtcls[0, 0].Segmentation, dtype=np.int32)
+                except Exception:
+                    try:
+                        seg = np.asarray(gtcls.Segmentation[0, 0], dtype=np.int32)
+                    except Exception:
+                        seg = None
+        except Exception as exc:
+            load_exc = exc
+            seg = None
+    if seg is None:
+        reason = f"could not load Berkeley segmentation array from {mask_txt!r}"
+        if load_exc is not None:
+            reason = f"{reason}: {load_exc!r}"
+        return None, reason
+
+    arr = np.asarray(seg, dtype=np.int32)
+    if int(arr.ndim) != 2 or int(arr.size) <= 0:
+        return None, f"invalid Berkeley segmentation shape for {mask_txt!r}: {tuple(arr.shape)}"
+    return arr, ""
+
+
+def _sbd_segmentation_term_names(seg: np.ndarray) -> Tuple[List[str], str]:
+    try:
+        from berkeley_sbd_pretrain import VOC20_CLASSES
+    except ImportError as exc:
+        return [], f"VOC20_CLASSES unavailable while decoding Berkeley segmentation terms: {exc!r}"
+
+    present_ids = sorted(
+        int(v)
+        for v in np.unique(np.asarray(seg, dtype=np.int32))
+        if 0 < int(v) <= int(len(VOC20_CLASSES))
+    )
+    terms = [
+        str(VOC20_CLASSES[int(seg_id) - 1]).strip().lower()
+        for seg_id in present_ids
+    ]
+    return list(normalize_vocab_terms(terms)), ""
+
+
 @dataclass
 class SemanticDiskRow:
     image_path: str
@@ -453,6 +516,7 @@ def _clone_semantic_disk_rows(rows: Sequence[SemanticDiskRow]) -> List[SemanticD
 def _semantic_disk_rows_cache_key(data_root: str, class_names: Sequence[str], source_root: str = "") -> str:
     norm_classes = [re.sub(r"\s+", " ", str(name)).strip().lower() for name in class_names]
     payload = {
+        "cache_version": int(_SEMANTIC_DISK_ROWS_CACHE_VERSION),
         "data_root": str(Path(str(data_root).strip() or "data/berkeley_sbd").resolve()),
         "source_root": str(Path(str(source_root).strip()).resolve()) if str(source_root).strip() else "",
         "class_names": norm_classes,
@@ -2486,7 +2550,7 @@ def _disk_rows_cache_path(data_root: str, cache_key: str) -> Path:
 
 def _disk_rows_freshness_sig(root: Path, ext_root: Path) -> str:
     """Cheap string fingerprint of on-disk data; changes when files are added/replaced."""
-    parts: List[str] = []
+    parts: List[str] = [f"cache_version:{int(_SEMANTIC_DISK_ROWS_CACHE_VERSION)}"]
     for split_name in ("train", "val"):
         lp = root / "cache" / f"sbd_{split_name}_multilabel.npz"
         try:
@@ -2494,6 +2558,49 @@ def _disk_rows_freshness_sig(root: Path, ext_root: Path) -> str:
             parts.append(f"{split_name}:{st.st_mtime:.0f}:{st.st_size}")
         except Exception:
             parts.append(f"{split_name}:missing")
+    seen_paths: set[str] = set()
+    for split_file in (
+        root / "train_noval.txt",
+        root / "train.txt",
+        root / "val.txt",
+        root / "dataset" / "train_noval.txt",
+        root / "dataset" / "train.txt",
+        root / "dataset" / "val.txt",
+        root / "benchmark_RELEASE" / "dataset" / "train_noval.txt",
+        root / "benchmark_RELEASE" / "dataset" / "train.txt",
+        root / "benchmark_RELEASE" / "dataset" / "val.txt",
+    ):
+        split_key = str(split_file.resolve()) if split_file.exists() else str(split_file)
+        if split_key in seen_paths:
+            continue
+        seen_paths.add(split_key)
+        try:
+            st = split_file.stat()
+            parts.append(f"split:{split_file.name}:{st.st_mtime:.0f}:{st.st_size}")
+        except Exception:
+            continue
+    for cls_dir in (
+        root / "cls",
+        root / "dataset" / "cls",
+        root / "benchmark_RELEASE" / "dataset" / "cls",
+    ):
+        cls_key = str(cls_dir.resolve()) if cls_dir.exists() else str(cls_dir)
+        if cls_key in seen_paths:
+            continue
+        seen_paths.add(cls_key)
+        if not cls_dir.exists():
+            parts.append(f"cls:{cls_dir.name}:missing")
+            continue
+        count = 0
+        latest = 0.0
+        try:
+            for pattern in ("*.npz", "*.mat"):
+                for fp in cls_dir.glob(pattern):
+                    count += 1
+                    latest = max(float(latest), float(fp.stat().st_mtime))
+            parts.append(f"cls:{cls_dir.name}:{count}:{latest:.0f}")
+        except Exception:
+            parts.append(f"cls:{cls_dir.name}:sig_error")
     if ext_root.exists():
         try:
             ds_dirs = sorted(
@@ -2551,7 +2658,7 @@ def collect_semantic_disk_rows(
                 with _SEMANTIC_DISK_ROWS_CACHE_LOCK:
                     _SEMANTIC_DISK_ROWS_CACHE[cache_key] = (_clone_semantic_disk_rows(_rows), dict(_info))
                 print(
-                    f"[collect-disk-rows] disk cache hit — {len(_rows)} rows"
+                    f"[collect-disk-rows] disk cache hit - {len(_rows)} rows"
                     f" in {_info['row_build_seconds']:.3f}s",
                     flush=True,
                 )
@@ -2566,6 +2673,10 @@ def collect_semantic_disk_rows(
     loaded_split_counts: Dict[str, int] = {"train": 0, "val": 0}
     missing_images = 0
     startup_row_threads = 1
+    berkeley_rejected_rows = 0
+    berkeley_mask_load_failures = 0
+    berkeley_empty_mask_rows = 0
+    berkeley_label_mask_mismatch_rows = 0
 
     berkeley_dataset_idx = int(class_lut.get("berkeley sbd dataset", -1))
     object_idx = int(class_lut.get("object", -1))
@@ -2637,24 +2748,106 @@ def collect_semantic_disk_rows(
         split_workers = _resolve_semantic_startup_threads(len(split_specs_rows))
         startup_row_threads = max(int(startup_row_threads), int(split_workers))
 
-        def _build_berkeley_row(spec: Tuple[Path, np.ndarray, str, str, str, List[str]]) -> SemanticDiskRow:
-            ip, yv_base, mask_path_local, source_key_local, _, voc_terms = spec
-            base_terms = ["berkeley sbd dataset", "object", "signal"] + [str(t) for t in voc_terms]
+        def _warn_berkeley_rejection(issue: str) -> None:
+            warnings.warn(issue, RuntimeWarning, stacklevel=2)
+            print(f"[collect-disk-rows] WARNING: {issue}", flush=True)
+
+        def _build_berkeley_row(
+            spec: Tuple[Path, np.ndarray, str, str, str, List[str]]
+        ) -> Tuple[Optional[SemanticDiskRow], Dict[str, int]]:
+            ip, _yv_base, mask_path_local, source_key_local, split_name_local, voc_terms = spec
+            cached_voc_terms = list(normalize_vocab_terms([str(t) for t in list(voc_terms or [])]))
+            seg, seg_reason = _load_sbd_segmentation_array(mask_path_local)
+            if seg is None:
+                _warn_berkeley_rejection(
+                    "Rejecting Berkeley training item before wheel build because its segmentation "
+                    f"mask is unavailable: split={split_name_local} image={str(ip)!r} "
+                    f"mask={str(mask_path_local)!r} reason={seg_reason}"
+                )
+                return None, {
+                    "rejected": 1,
+                    "mask_load_failure": 1,
+                    "empty_mask": 0,
+                    "label_mask_mismatch": 0,
+                }
+            mask_voc_terms, term_reason = _sbd_segmentation_term_names(seg)
+            if str(term_reason).strip():
+                _warn_berkeley_rejection(
+                    "Rejecting Berkeley training item before wheel build because its segmentation "
+                    f"terms could not be decoded: split={split_name_local} image={str(ip)!r} "
+                    f"mask={str(mask_path_local)!r} reason={term_reason}"
+                )
+                return None, {
+                    "rejected": 1,
+                    "mask_load_failure": 1,
+                    "empty_mask": 0,
+                    "label_mask_mismatch": 0,
+                }
+            mask_keys = {_norm_txt(term) for term in mask_voc_terms if _norm_txt(term)}
+            if len(mask_keys) <= 0:
+                _warn_berkeley_rejection(
+                    "Rejecting Berkeley training item before wheel build because it has no "
+                    f"positive VOC class masks: split={split_name_local} image={str(ip)!r} "
+                    f"mask={str(mask_path_local)!r}"
+                )
+                return None, {
+                    "rejected": 1,
+                    "mask_load_failure": 0,
+                    "empty_mask": 1,
+                    "label_mask_mismatch": 0,
+                }
+            cached_keys = {_norm_txt(term) for term in cached_voc_terms if _norm_txt(term)}
+            missing_from_mask = [
+                str(term)
+                for term in cached_voc_terms
+                if _norm_txt(term) not in mask_keys
+            ]
+            extra_in_mask = [
+                str(term)
+                for term in mask_voc_terms
+                if _norm_txt(term) not in cached_keys
+            ]
+            if missing_from_mask or extra_in_mask:
+                _warn_berkeley_rejection(
+                    "Rejecting Berkeley training item before wheel build because cached labels "
+                    "and segmentation masks disagree: "
+                    f"split={split_name_local} image={str(ip)!r} "
+                    f"label_terms={cached_voc_terms} mask_terms={mask_voc_terms} "
+                    f"missing_from_mask={missing_from_mask} extra_in_mask={extra_in_mask}"
+                )
+                return None, {
+                    "rejected": 1,
+                    "mask_load_failure": 0,
+                    "empty_mask": 0,
+                    "label_mask_mismatch": 1,
+                }
+            base_terms = ["berkeley sbd dataset", "object", "signal"] + [str(t) for t in mask_voc_terms]
             terms = list(normalize_vocab_terms(base_terms))
             return SemanticDiskRow(
                 image_path=str(ip),
                 terms=terms,
                 source=str(source_key_local),
                 mask_path=str(mask_path_local),
-            )
+            ), {
+                "rejected": 0,
+                "mask_load_failure": 0,
+                "empty_mask": 0,
+                "label_mask_mismatch": 0,
+            }
 
-        for row in _ordered_thread_map(
+        for row, row_meta in _ordered_thread_map(
             split_specs_rows,
             _build_berkeley_row,
             max_workers=int(split_workers),
             desc=f"[berkeley/{split_name}] loading rows",
             progress_control=progress_control,
         ):
+            berkeley_rejected_rows += int(row_meta.get("rejected", 0))
+            berkeley_mask_load_failures += int(row_meta.get("mask_load_failure", 0))
+            berkeley_empty_mask_rows += int(row_meta.get("empty_mask", 0))
+            berkeley_label_mask_mismatch_rows += int(row_meta.get("label_mask_mismatch", 0))
+            if row is None:
+                continue
             rows.append(row)
             source_counts[str(source_key)] = int(source_counts.get(str(source_key), 0)) + 1
             loaded_split_counts[str(split_name)] = int(loaded_split_counts.get(str(split_name), 0)) + 1
@@ -2730,6 +2923,10 @@ def collect_semantic_disk_rows(
         "available_external": int(max(0, int(len(rows)) - int(loaded_split_counts.get("train", 0)) - int(loaded_split_counts.get("val", 0)))),
         "source_counts": {str(k): int(v) for k, v in source_counts.items()},
         "missing_images": int(missing_images),
+        "berkeley_rejected_rows": int(berkeley_rejected_rows),
+        "berkeley_mask_load_failures": int(berkeley_mask_load_failures),
+        "berkeley_empty_mask_rows": int(berkeley_empty_mask_rows),
+        "berkeley_label_mask_mismatch_rows": int(berkeley_label_mask_mismatch_rows),
         "external_source_root": str(ext_root),
         "external_source_signature": ext_sig,
         "external_unmapped_skipped": int(external_unmapped_skipped),
@@ -2752,7 +2949,7 @@ def collect_semantic_disk_rows(
         _bundle = {"freshness_sig": _freshness_sig, "rows": rows, "info": info}
         with gzip.open(str(_disk_cache_file), "wb", compresslevel=1) as _f:
             pickle.dump(_bundle, _f, protocol=pickle.HIGHEST_PROTOCOL)
-        print(f"[collect-disk-rows] disk cache written → {_disk_cache_file}", flush=True)
+        print(f"[collect-disk-rows] disk cache written -> {_disk_cache_file}", flush=True)
     except Exception as _write_exc:
         raise_if_filesystem_space_emergency(
             progress_control,

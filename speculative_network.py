@@ -71,6 +71,20 @@ def _count_nonfinite(x: Optional[torch.Tensor]) -> int:
     return int((~torch.isfinite(x.detach())).sum().item())
 
 
+def _clamp_dropout_rate(rate: float) -> float:
+    return float(max(0.0, min(0.95, rate)))
+
+
+def _dropout1d(rate: float) -> nn.Module:
+    p = _clamp_dropout_rate(rate)
+    return nn.Dropout(p) if p > 0.0 else nn.Identity()
+
+
+def _dropout2d(rate: float) -> nn.Module:
+    p = _clamp_dropout_rate(rate)
+    return nn.Dropout2d(p) if p > 0.0 else nn.Identity()
+
+
 # ============================================================
 # Sentence-transformer vocabulary bank
 # ============================================================
@@ -196,7 +210,8 @@ class ObservedHypergraph:
             overlap = len(seed.intersection(key))
             if overlap <= 0:
                 continue
-            score = overlap * 100000 + rec.count
+            novelty = len([item for item in key if item not in seed])
+            score = (novelty * 100000) + (overlap * 1000) + rec.count
             out.append((key, score, rec.count))
         out.sort(key=lambda x: x[1], reverse=True)
         return out[:max_results]
@@ -410,22 +425,25 @@ def collate_synthetic(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
 
 
 class ResidualConvBlock(nn.Module):
-    def __init__(self, channels: int) -> None:
+    def __init__(self, channels: int, dropout_p: float = 0.0) -> None:
         super().__init__()
+        self.norm = nn.GroupNorm(min(8, channels), channels)
         self.block = nn.Sequential(
             nn.Conv2d(channels, channels, 3, padding=1),
             nn.GELU(),
             nn.Conv2d(channels, channels, 3, padding=1),
         )
+        self.drop = _dropout2d(dropout_p)
         self.act = nn.GELU()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.act(x + self.block(x))
+        return self.act(x + self.drop(self.block(self.norm(x))))
 
 
 class ImageEncoder(nn.Module):
-    def __init__(self, in_channels: int, hidden_dim: int) -> None:
+    def __init__(self, in_channels: int, hidden_dim: int, dropout_p: float = 0.0) -> None:
         super().__init__()
+        drop_p = _clamp_dropout_rate(dropout_p)
         quarter_channels = max(96, int(hidden_dim) // 2)
         self.output_channels: Dict[str, int] = {
             "full": 32,
@@ -440,7 +458,7 @@ class ImageEncoder(nn.Module):
             nn.Conv2d(self.output_channels["full"], self.output_channels["full"], 3, padding=1),
             nn.GELU(),
         )
-        self.full_refine = ResidualConvBlock(self.output_channels["full"])
+        self.full_refine = ResidualConvBlock(self.output_channels["full"], dropout_p=drop_p)
 
         self.down_half = nn.Sequential(
             nn.Conv2d(self.output_channels["full"], self.output_channels["half"], 3, stride=2, padding=1),
@@ -448,7 +466,7 @@ class ImageEncoder(nn.Module):
             nn.Conv2d(self.output_channels["half"], self.output_channels["half"], 3, padding=1),
             nn.GELU(),
         )
-        self.half_refine = ResidualConvBlock(self.output_channels["half"])
+        self.half_refine = ResidualConvBlock(self.output_channels["half"], dropout_p=drop_p)
 
         self.down_quarter = nn.Sequential(
             nn.Conv2d(self.output_channels["half"], self.output_channels["quarter"], 3, stride=2, padding=1),
@@ -456,7 +474,7 @@ class ImageEncoder(nn.Module):
             nn.Conv2d(self.output_channels["quarter"], self.output_channels["quarter"], 3, padding=1),
             nn.GELU(),
         )
-        self.quarter_refine = ResidualConvBlock(self.output_channels["quarter"])
+        self.quarter_refine = ResidualConvBlock(self.output_channels["quarter"], dropout_p=drop_p)
 
         self.down_eighth = nn.Sequential(
             nn.Conv2d(self.output_channels["quarter"], self.output_channels["eighth"], 3, stride=2, padding=1),
@@ -465,14 +483,19 @@ class ImageEncoder(nn.Module):
             nn.GELU(),
         )
         self.eighth_refine = nn.Sequential(
-            ResidualConvBlock(self.output_channels["eighth"]),
-            ResidualConvBlock(self.output_channels["eighth"]),
+            ResidualConvBlock(self.output_channels["eighth"], dropout_p=drop_p),
+            ResidualConvBlock(self.output_channels["eighth"], dropout_p=drop_p),
         )
 
         self.alpha_proj_full = nn.Conv2d(1, self.output_channels["full"], 1)
         self.alpha_proj_half = nn.Conv2d(1, self.output_channels["half"], 1)
         self.alpha_proj_quarter = nn.Conv2d(1, self.output_channels["quarter"], 1)
         self.alpha_proj_eighth = nn.Conv2d(1, self.output_channels["eighth"], 1)
+
+        self.norm_full = nn.GroupNorm(min(8, self.output_channels["full"]), self.output_channels["full"])
+        self.norm_half = nn.GroupNorm(min(8, self.output_channels["half"]), self.output_channels["half"])
+        self.norm_quarter = nn.GroupNorm(min(8, self.output_channels["quarter"]), self.output_channels["quarter"])
+        self.norm_eighth = nn.GroupNorm(min(8, self.output_channels["eighth"]), self.output_channels["eighth"])
 
     def forward(self, rgba: torch.Tensor) -> Dict[str, torch.Tensor]:
         # Support both RGB and RGBA by synthesizing an opaque alpha plane when missing.
@@ -489,22 +512,22 @@ class ImageEncoder(nn.Module):
             )
 
         full = self.stem(rgba)
-        full = full + self.alpha_proj_full(alpha)
+        full = self.norm_full(full + self.alpha_proj_full(alpha))
         full = self.full_refine(full)
 
         half = self.down_half(full)
         alpha_half = F.interpolate(alpha, size=half.shape[-2:], mode="bilinear", align_corners=False)
-        half = half + self.alpha_proj_half(alpha_half)
+        half = self.norm_half(half + self.alpha_proj_half(alpha_half))
         half = self.half_refine(half)
 
         quarter = self.down_quarter(half)
         alpha_quarter = F.interpolate(alpha, size=quarter.shape[-2:], mode="bilinear", align_corners=False)
-        quarter = quarter + self.alpha_proj_quarter(alpha_quarter)
+        quarter = self.norm_quarter(quarter + self.alpha_proj_quarter(alpha_quarter))
         quarter = self.quarter_refine(quarter)
 
         eighth = self.down_eighth(quarter)
         alpha_eighth = F.interpolate(alpha, size=eighth.shape[-2:], mode="bilinear", align_corners=False)
-        eighth = eighth + self.alpha_proj_eighth(alpha_eighth)
+        eighth = self.norm_eighth(eighth + self.alpha_proj_eighth(alpha_eighth))
         eighth = self.eighth_refine(eighth)
 
         return {
@@ -516,8 +539,9 @@ class ImageEncoder(nn.Module):
 
 
 class DynamicLayerAssembler(nn.Module):
-    def __init__(self, row_dim: int, hidden_dim: int) -> None:
+    def __init__(self, row_dim: int, hidden_dim: int, dropout_p: float = 0.0) -> None:
         super().__init__()
+        self.row_norm = nn.LayerNorm(row_dim)
         self.row_proj = nn.Sequential(
             nn.Linear(row_dim, hidden_dim),
             nn.GELU(),
@@ -533,13 +557,17 @@ class DynamicLayerAssembler(nn.Module):
             nn.GELU(),
             nn.Linear(hidden_dim, hidden_dim),
         )
+        self.out_norm = nn.LayerNorm(hidden_dim)
+        self.row_dropout = _dropout1d(dropout_p)
+        self.global_dropout = _dropout1d(dropout_p)
+        self.mix_dropout = _dropout1d(dropout_p)
 
     def forward(self, image_features: torch.Tensor, active_rows: torch.Tensor, active_valid: torch.Tensor) -> torch.Tensor:
         pooled = image_features.mean(dim=(2, 3))
-        pooled = self.global_proj(pooled)
-        row_hidden = self.row_proj(active_rows)
+        pooled = self.global_dropout(self.global_proj(pooled))
+        row_hidden = self.row_dropout(self.row_proj(self.row_norm(active_rows)))
         pooled_expand = pooled.unsqueeze(1).expand_as(row_hidden)
-        mixed = self.mix(torch.cat([row_hidden, pooled_expand], dim=-1))
+        mixed = self.out_norm(self.mix_dropout(self.mix(torch.cat([row_hidden, pooled_expand], dim=-1))))
         mixed = mixed * active_valid.unsqueeze(-1)
         return mixed
 
@@ -552,6 +580,7 @@ class SequentialMaskHead(nn.Module):
         hidden_dim: int,
         image_size: int,
         encoder_channels: Dict[str, int],
+        dropout_p: float = 0.0,
         spatial_memory_hw: Tuple[int, int] = (8, 8),
     ) -> None:
         super().__init__()
@@ -689,6 +718,9 @@ class SequentialMaskHead(nn.Module):
             nn.GELU(),
             nn.AdaptiveAvgPool2d((1, 1)),
         )
+        self.memory_dropout = _dropout1d(dropout_p)
+        self.token_dropout = _dropout1d(dropout_p)
+        self.context_dropout = _dropout1d(dropout_p)
 
     def prepare_features(self, encoder_features: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         full = self.full_proj(encoder_features["full"])
@@ -715,6 +747,7 @@ class SequentialMaskHead(nn.Module):
             output_size=self.spatial_memory_hw,
         )
         spatial_memory = spatial_memory_map.flatten(2).transpose(1, 2).contiguous()
+        spatial_memory = self.memory_dropout(spatial_memory)
         return {
             "full": full,
             "half": half,
@@ -736,7 +769,7 @@ class SequentialMaskHead(nn.Module):
         canvas: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         base_token = self.token_proj(torch.cat([slot_hidden, pred_vector], dim=-1))
-        base_token = F.layer_norm(base_token, (int(base_token.shape[-1]),))
+        base_token = self.token_dropout(F.layer_norm(base_token, (int(base_token.shape[-1]),)))
 
         coarse = base_features["coarse"]
         half = base_features["half"]
@@ -758,7 +791,7 @@ class SequentialMaskHead(nn.Module):
 
         occ_hidden = self.occupancy_encoder(coarse_feat * coarse_prob).flatten(1)
         mask_context = self.context_proj(torch.cat([base_token, occ_hidden], dim=-1))
-        mask_context = F.layer_norm(mask_context, (int(mask_context.shape[-1]),))
+        mask_context = self.context_dropout(F.layer_norm(mask_context, (int(mask_context.shape[-1]),)))
 
         half_canvas = F.interpolate(canvas, size=half.shape[-2:], mode="bilinear", align_corners=False)
         half_seed = F.interpolate(coarse_prob, size=half.shape[-2:], mode="bilinear", align_corners=False)
@@ -825,6 +858,7 @@ class ParameterizedHypergraphPrior(nn.Module):
         *,
         vocab_size: int,
         hidden_dim: int,
+        dropout_p: float = 0.0,
         predictive_memory_momentum: float = 0.96,
     ) -> None:
         super().__init__()
@@ -848,6 +882,16 @@ class ParameterizedHypergraphPrior(nn.Module):
         )
         self.register_buffer("predictive_node_state", torch.zeros(self.vocab_size, dtype=torch.float32))
         self.register_buffer("predictive_pair_state", torch.zeros(self.vocab_size, self.vocab_size, dtype=torch.float32))
+        self.feature_dropout = _dropout1d(dropout_p)
+        self.context_dropout = _dropout1d(dropout_p)
+        # Fixed sign convention: reward rarity/freshness, penalize co-occurrence
+        # and semantic redundancy so the hypergraph pushes slots apart.
+        self.rarity_bonus_weight = 0.35
+        self.freshness_bonus_weight = 0.20
+        self.cooccurrence_penalty_weight = 0.75
+        self.predictive_pair_penalty_weight = 0.50
+        self.semantic_similarity_penalty_weight = 1.10
+        self.learned_residual_weight = 0.20
 
     def forward(
         self,
@@ -856,6 +900,7 @@ class ParameterizedHypergraphPrior(nn.Module):
         pair_log_prior: torch.Tensor,
         selected_mass: torch.Tensor,
         selected_context: torch.Tensor,
+        semantic_similarity: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         bsz = int(selected_mass.shape[0])
         total = selected_mass.sum(dim=1, keepdim=True).clamp_min(1.0)
@@ -869,21 +914,52 @@ class ParameterizedHypergraphPrior(nn.Module):
             device=selected_mass.device,
             dtype=selected_mass.dtype,
         )
-        observed_pair_signal = selected_dist @ pair_log_prior
-        predictive_pair_signal = selected_dist @ predictive_pair
-        base_prior = base_log_prior.unsqueeze(0).expand(bsz, -1)
+        observed_pair_prob = pair_log_prior.exp().clamp(0.0, 1.0)
+        predictive_pair = predictive_pair.clamp(0.0, 1.0)
+        predictive_node = predictive_node.clamp(0.0, 1.0)
+        base_prob = base_log_prior.exp().clamp(0.0, 1.0).unsqueeze(0).expand(bsz, -1)
+
+        observed_pair_penalty = selected_dist @ observed_pair_prob
+        predictive_pair_penalty = selected_dist @ predictive_pair
+
+        if semantic_similarity is None:
+            term_basis = F.normalize(
+                self.term_embeddings.to(
+                    device=selected_mass.device,
+                    dtype=selected_mass.dtype,
+                ),
+                dim=-1,
+            )
+            semantic_similarity = term_basis @ term_basis.transpose(0, 1)
+        else:
+            semantic_similarity = semantic_similarity.to(
+                device=selected_mass.device,
+                dtype=selected_mass.dtype,
+            )
+        semantic_similarity = semantic_similarity.clamp(min=0.0, max=1.0)
+        semantic_redundancy = selected_dist @ semantic_similarity
+
+        rarity_bonus = 1.0 - base_prob
+        freshness_bonus = 1.0 - predictive_node
+        diversity_bias = (
+            (float(self.rarity_bonus_weight) * rarity_bonus)
+            + (float(self.freshness_bonus_weight) * freshness_bonus)
+            - (float(self.cooccurrence_penalty_weight) * observed_pair_penalty)
+            - (float(self.predictive_pair_penalty_weight) * predictive_pair_penalty)
+            - (float(self.semantic_similarity_penalty_weight) * semantic_redundancy)
+        )
 
         feature_stack = torch.stack(
             [
-                base_prior,
-                predictive_node,
-                observed_pair_signal,
-                predictive_pair_signal,
+                rarity_bonus,
+                freshness_bonus,
+                1.0 - observed_pair_penalty,
+                1.0 - predictive_pair_penalty,
                 selected_mass,
             ],
             dim=-1,
         )
-        feature_hidden = self.feature_mlp(feature_stack)
+        feature_hidden = self.feature_dropout(self.feature_mlp(feature_stack))
 
         term_basis = self.term_embeddings.to(
             device=selected_mass.device,
@@ -891,14 +967,14 @@ class ParameterizedHypergraphPrior(nn.Module):
         )
         term_embed = term_basis.unsqueeze(0).expand(bsz, -1, -1)
         predictive_context = selected_dist @ term_basis
-        state_context = self.context_fuse(
-            torch.cat([selected_context, predictive_context], dim=-1)
+        state_context = self.context_dropout(
+            self.context_fuse(torch.cat([selected_context, predictive_context], dim=-1))
         ).unsqueeze(1).expand(-1, self.vocab_size, -1)
 
-        bias = self.bias_head(
+        learned_bias = self.bias_head(
             torch.cat([term_embed, feature_hidden, state_context], dim=-1)
         ).squeeze(-1)
-        return bias
+        return diversity_bias + (float(self.learned_residual_weight) * learned_bias)
 
     @torch.no_grad()
     def observe_predictions(
@@ -942,6 +1018,7 @@ class SequentialSlotDecoder(nn.Module):
         st_dim: int,
         n_slots: int,
         vocab_size: int,
+        dropout_p: float = 0.0,
         hypergraph_prior_weight: float = 0.35,
         duplicate_penalty: float = 1.25,
         state_selection_temp: float = 6.0,
@@ -955,6 +1032,7 @@ class SequentialSlotDecoder(nn.Module):
         self.hypergraph_prior = ParameterizedHypergraphPrior(
             vocab_size=int(vocab_size),
             hidden_dim=hidden_dim,
+            dropout_p=dropout_p,
             predictive_memory_momentum=predictive_memory_momentum,
         )
 
@@ -996,6 +1074,10 @@ class SequentialSlotDecoder(nn.Module):
             nn.GELU(),
             nn.Linear(hidden_dim, 1),
         )
+        self.query_dropout = _dropout1d(dropout_p)
+        self.context_dropout = _dropout1d(dropout_p)
+        self.slot_dropout = _dropout1d(dropout_p)
+        self.recurrent_dropout = _dropout1d(dropout_p)
 
     def forward(
         self,
@@ -1013,6 +1095,7 @@ class SequentialSlotDecoder(nn.Module):
     ) -> Dict[str, torch.Tensor]:
         bsz = int(image_features.shape[0])
         vocab_matrix = F.normalize(vocab_matrix, dim=-1)
+        semantic_similarity = torch.matmul(vocab_matrix, vocab_matrix.transpose(0, 1)).clamp(0.0, 1.0)
         pooled = image_features.mean(dim=(2, 3))
         recurrent = self.state_init(pooled)
         selected_context = torch.zeros_like(recurrent)
@@ -1050,7 +1133,7 @@ class SequentialSlotDecoder(nn.Module):
                     dim=-1,
                 )
             )
-            query = self.query_norm(query)
+            query = self.query_dropout(self.query_norm(query))
             attn_out, _ = self.context_attn(
                 query=query.unsqueeze(1),
                 key=memory_tokens,
@@ -1058,13 +1141,13 @@ class SequentialSlotDecoder(nn.Module):
                 key_padding_mask=~memory_valid,
                 need_weights=False,
             )
-            attn_vec = attn_out.squeeze(1)
+            attn_vec = self.context_dropout(attn_out.squeeze(1))
             slot_hidden = self.slot_fuse(
                 torch.cat([query, attn_vec, selected_context, mask_context], dim=-1)
             )
-            slot_hidden = self.slot_hidden_norm(slot_hidden)
+            slot_hidden = self.slot_dropout(self.slot_hidden_norm(slot_hidden))
             recurrent = self.state_cell(slot_hidden, recurrent)
-            recurrent = self.recurrent_norm(recurrent)
+            recurrent = self.recurrent_dropout(self.recurrent_norm(recurrent))
 
             pred_vector = self.vector_head(slot_hidden)
             pred_vector_norm = F.normalize(pred_vector, dim=-1)
@@ -1075,6 +1158,7 @@ class SequentialSlotDecoder(nn.Module):
                 pair_log_prior=pair_prior,
                 selected_mass=selected_mass,
                 selected_context=selected_context,
+                semantic_similarity=semantic_similarity,
             )
             if float(self.duplicate_penalty) > 0.0:
                 prior_bias = prior_bias - (float(self.duplicate_penalty) * selected_mass)
@@ -1088,7 +1172,7 @@ class SequentialSlotDecoder(nn.Module):
             selected_mass = selected_mass + selection_probs
             selected_embed = selection_probs @ vocab_matrix
             selected_context = self.term_context_proj(selected_embed)
-            selected_context = self.selected_context_norm(selected_context)
+            selected_context = self.context_dropout(self.selected_context_norm(selected_context))
 
             mask_logits, canvas, mask_context = mask_head.step(
                 base_features=base_mask_features,
@@ -1153,6 +1237,7 @@ class PrototypeAutoClassifier(nn.Module):
         hypergraph_prior_weight: float = 0.35,
         duplicate_penalty: float = 1.25,
         hypergraph_alpha: float = 0.5,
+        network_dropout: float = 0.0,
         predictive_hypergraph_momentum: float = 0.96,
     ) -> None:
         super().__init__()
@@ -1164,20 +1249,31 @@ class PrototypeAutoClassifier(nn.Module):
         self.in_channels = in_channels
         self.selection_temp = float(max(1e-4, selection_temp))
         self.hypergraph_alpha = float(max(1e-6, hypergraph_alpha))
+        self.network_dropout = _clamp_dropout_rate(network_dropout)
 
-        self.image_encoder = ImageEncoder(in_channels=in_channels, hidden_dim=hidden_dim)
-        self.dynamic_layer = DynamicLayerAssembler(row_dim=row_bank.row_dim, hidden_dim=hidden_dim)
+        self.image_encoder = ImageEncoder(
+            in_channels=in_channels,
+            hidden_dim=hidden_dim,
+            dropout_p=self.network_dropout,
+        )
+        self.dynamic_layer = DynamicLayerAssembler(
+            row_dim=row_bank.row_dim,
+            hidden_dim=hidden_dim,
+            dropout_p=self.network_dropout,
+        )
         self.mask_head = SequentialMaskHead(
             encoder_channels=dict(self.image_encoder.output_channels),
             st_dim=vocab_bank.dim,
             hidden_dim=hidden_dim,
             image_size=image_size,
+            dropout_p=self.network_dropout,
         )
         self.slot_decoder = SequentialSlotDecoder(
             hidden_dim=hidden_dim,
             st_dim=vocab_bank.dim,
             n_slots=n_slots,
             vocab_size=len(vocab_bank.phrases),
+            dropout_p=self.network_dropout,
             hypergraph_prior_weight=hypergraph_prior_weight,
             duplicate_penalty=duplicate_penalty,
             state_selection_temp=self.selection_temp,
@@ -1573,11 +1669,19 @@ class OneToOneMatcher(nn.Module):
 
         assignments: List[Dict[str, Any]] = []
         assign_matrix = torch.zeros(bsz, n_slots, max_m, device=device, dtype=pair_cost.dtype)
+        # pre_threshold_assign_matrix: raw Hungarian result before dustbin_cost rejection.
+        # Used to apply losses to rejected slots — they should still be pushed toward
+        # the target they bailed on.
+        pre_threshold_assign_matrix = torch.zeros(bsz, n_slots, max_m, device=device, dtype=pair_cost.dtype)
         dustbin_mask = torch.zeros(bsz, n_slots, device=device, dtype=torch.bool)
+        # True only for slots that went to dustbin while unmatched items still existed —
+        # i.e. the slot's best match cost exceeded dustbin_cost so it bailed.
+        rejected_dustbin_mask = torch.zeros(bsz, n_slots, device=device, dtype=torch.bool)
 
         for b in range(bsz):
             valid_m = int(target_valid[b].sum().item())
             slot_to_target: List[Optional[int]] = [None] * n_slots
+            sample_cost: Optional[Any] = None
             if valid_m > 0:
                 sample_cost = (
                     pair_cost[b, :, :valid_m]
@@ -1587,10 +1691,28 @@ class OneToOneMatcher(nn.Module):
                     .numpy()
                 )  # [N, valid_m]
                 slot_to_target = self._solve_rectangular_assignment(sample_cost)
+                # Capture pre-threshold assignment.
+                for slot_idx, target_idx in enumerate(slot_to_target):
+                    if target_idx is not None:
+                        pre_threshold_assign_matrix[b, slot_idx, int(target_idx)] = 1.0
+                # Apply dustbin_cost threshold: a slot whose best match costs more
+                # than dustbin_cost rejects that match and goes to dustbin.
+                for slot_idx, target_idx in enumerate(slot_to_target):
+                    if target_idx is not None:
+                        if float(sample_cost[slot_idx, int(target_idx)]) > float(self.dustbin_cost):
+                            slot_to_target[slot_idx] = None
+
+            # Any target not claimed by a slot is an unmatched item.  Dustbin
+            # slots that exist while unmatched items remain are "rejected" —
+            # they should have matched something.
+            matched_targets: set = {t for t in slot_to_target if t is not None}
+            unmatched_targets: set = set(range(valid_m)) - matched_targets
 
             for slot_idx, target_idx in enumerate(slot_to_target):
                 if target_idx is None:
                     dustbin_mask[b, slot_idx] = True
+                    if unmatched_targets:
+                        rejected_dustbin_mask[b, slot_idx] = True
                     continue
                 assign_matrix[b, slot_idx, int(target_idx)] = 1.0
 
@@ -1604,7 +1726,9 @@ class OneToOneMatcher(nn.Module):
         return {
             "pair_cost": pair_cost,
             "assign_matrix": assign_matrix,
+            "pre_threshold_assign_matrix": pre_threshold_assign_matrix,
             "dustbin_mask": dustbin_mask,
+            "rejected_dustbin_mask": rejected_dustbin_mask,
             "assignments": assignments,
         }
 
@@ -1638,8 +1762,12 @@ class PrototypeLoss(nn.Module):
         enable_residual_mask_loss: bool = True,
         residual_mask_weight: float = 0.20,
         residual_mask_detach_canvas: bool = True,
+        # Weight applied to false-negative pixels in mask BCE (target=1, pred≈0).
+        # >1.0 penalises missing mask content harder than spurious activation.
+        mask_fn_weight: float = 2.0,
     ) -> None:
         super().__init__()
+        self.mask_fn_weight = float(max(1.0, mask_fn_weight))
         self.matcher = matcher
         # [V, D] normalised ST vectors for the full vocabulary — kept on CPU,
         # moved to the right device lazily at forward time.
@@ -1774,79 +1902,118 @@ class PrototypeLoss(nn.Module):
         _, _, H, W = target_masks.shape
         D = target_vectors.shape[-1]
 
-        p_vecs  = torch.zeros(B, max_m, D,    device=device, dtype=target_vectors.dtype)
-        p_masks = torch.zeros(B, max_m, H, W, device=device, dtype=target_masks.dtype)
-        p_valid = torch.zeros(B, max_m,        device=device, dtype=torch.bool)
+        p_vecs    = torch.zeros(B, max_m, D,    device=device, dtype=target_vectors.dtype)
+        p_masks   = torch.zeros(B, max_m, H, W, device=device, dtype=target_masks.dtype)
+        p_valid   = torch.zeros(B, max_m,        device=device, dtype=torch.bool)
+        p_indices = torch.zeros(B, max_m,        device=device, dtype=torch.long)
         for b in range(B):
             idx = present_mask[b].nonzero(as_tuple=True)[0]
             m = idx.shape[0]
-            p_vecs[b,  :m] = target_vectors[b, idx]
-            p_masks[b, :m] = target_masks[b,   idx]
-            p_valid[b, :m] = True
+            p_vecs[b,    :m] = target_vectors[b, idx]
+            p_masks[b,   :m] = target_masks[b,   idx]
+            p_valid[b,   :m] = True
+            p_indices[b, :m] = idx
 
         # Present-only match: slots compete only among real targets → clean reconstruction loss.
         pmatch       = self.matcher(pred_vectors, p_vecs, p_valid)
-        p_pair_cost  = pmatch["pair_cost"]      # [B, N, max_m]
-        p_assign_mat = pmatch["assign_matrix"]  # [B, N, max_m]
+        p_pair_cost  = pmatch["pair_cost"]                      # [B, N, max_m]
+        p_assign_mat = pmatch["assign_matrix"]                  # [B, N, max_m] — post-threshold
+        p_pre_assign = pmatch["pre_threshold_assign_matrix"]    # [B, N, max_m] — raw Hungarian
         sample_match_count = p_assign_mat.sum(dim=(1, 2)).clamp_min(1.0)
         match_count = sample_match_count.sum()
         active_slot_mask = (~pmatch["dustbin_mask"]).to(dtype=pred_vectors.dtype)
+        rejected_float = pmatch["rejected_dustbin_mask"].to(dtype=pred_vectors.dtype)  # [B, N]
 
+        # vector_loss: matched slots only (post-threshold).
+        # Rejected slots get their own vector penalty below.
         vector_loss = ((p_assign_mat * p_pair_cost).sum(dim=(1, 2)) / sample_match_count).mean()
 
-        # Full-vocab match: slots pick freely across all vocab → drives selection pressure
-        # and is what the viewer shows as "committed" assignments.
+        # Full-vocab match: for display/viewer assignments only.
         fmatch      = self.matcher(pred_vectors, target_vectors, target_valid)
-        assignments = fmatch["assignments"]     # indices into full vocab (for display)
-        assigned_target_masks = (
-            torch.einsum("bnm,bmhw->bnhw", p_assign_mat, p_masks)
-            if max_m > 0
-            else pred_masks.new_zeros(B, int(pred_masks.shape[1]), H, W)
-        )
+        assignments = fmatch["assignments"]
 
         if max_m > 0:
+            # Target masks for matched slots (post-threshold assignment).
+            assigned_target_masks = torch.einsum("bnm,bmhw->bnhw", p_assign_mat, p_masks)
+            # Target masks for rejected slots (pre-threshold Hungarian assignment).
+            rejected_target_masks = torch.einsum("bnm,bmhw->bnhw", p_pre_assign, p_masks)
+
+            pos_weight_t = pred_masks.new_tensor(float(self.mask_fn_weight))
+
+            # Mask loss for properly matched slots.
             slot_mask_cost = F.binary_cross_entropy_with_logits(
                 pred_masks,
                 assigned_target_masks,
                 reduction="none",
+                pos_weight=pos_weight_t,
             ).mean(dim=(-1, -2))
             mask_pair_cost = slot_mask_cost
             mask_loss = ((slot_mask_cost * active_slot_mask).sum(dim=1) / sample_match_count).mean()
+
+            # Rejected slots: apply full vector + mask loss against the target they
+            # should have matched.  This removes the 0-loss dustbin escape hatch.
+            n_rejected = float(rejected_float.sum().item())
+            if n_rejected > 0.0:
+                # Vector loss against the target the rejected slot was assigned pre-threshold.
+                rejected_vec_cost = (p_pre_assign * p_pair_cost).sum(dim=2)  # [B, N]
+                vector_loss = vector_loss + (rejected_vec_cost * rejected_float).sum() / n_rejected
+                # Mask loss against the same target.
+                rejected_mask_cost = F.binary_cross_entropy_with_logits(
+                    pred_masks,
+                    rejected_target_masks,
+                    reduction="none",
+                    pos_weight=pos_weight_t,
+                ).mean(dim=(-1, -2))
+                mask_loss = mask_loss + (rejected_mask_cost * rejected_float).sum() / n_rejected
         else:
+            assigned_target_masks = pred_masks.new_zeros(B, int(pred_masks.shape[1]), H, W)
             mask_pair_cost = pred_vectors.new_zeros(B, int(pred_vectors.shape[1]))
             mask_loss = pred_vectors.new_tensor(0.0)
 
         pred_probs = pred_masks.sigmoid()
 
-        # Selection loss: for each vocab term, aggregate cosine similarity across
-        # all slots via logsumexp so that every slot receives a gradient
-        # (not just the argmax winner).  logsumexp acts as a smooth-max; its
-        # gradient w.r.t. each slot score is proportional to that slot's current
-        # score, so well-aligned slots are pushed harder but no slot is frozen out.
-        if slot_selection_logits is None:
-            vocab_mat = _sanitize_finite_tensor(self.vocab_matrix.to(pred_vectors.device))  # [V, D]
-            pred_norm = l2_normalize(pred_vectors, dim=-1)                 # [B, N, D]
-            scores = torch.einsum("bnd,vd->bnv", pred_norm, vocab_mat)     # [B, N, V]
-        else:
-            scores = slot_selection_logits
-        n_slots = max(1, int(scores.shape[1]))
-        temp = float(max(1e-4, self.selection_temp))
-        agg_scores = (
-            torch.logsumexp(scores * temp, dim=1) - math.log(float(n_slots))
-        ) / temp
-        selection_loss = F.binary_cross_entropy_with_logits(
-            agg_scores,
-            present_mask.float(),
-            reduction="mean",
-        )
+        # Selection loss: per-slot cross-entropy over present items only.
+        # Each matched (non-dustbin) slot must identify which present item it is
+        # assigned to.
+        pred_norm = l2_normalize(pred_vectors, dim=-1)    # [B, N, D]
+        n_slots = max(1, int(pred_norm.shape[1]))
 
-        # Confidence loss: slots assigned to real present items should be high
-        # confidence (target=1); dustbin slots should be low (target=0).
-        # pmatch["dustbin_mask"] is True for every slot that went to the dustbin
-        # in the present-only match, so (~dustbin_mask).float() gives 1.0/0.0 targets.
+        if max_m > 0:
+            if slot_selection_logits is None:
+                p_vecs_norm = l2_normalize(p_vecs, dim=-1)                               # [B, max_m, D]
+                slot_item_scores = torch.einsum("bnd,bmd->bnm", pred_norm, p_vecs_norm)  # [B, N, max_m]
+            else:
+                slot_item_scores = torch.gather(
+                    slot_selection_logits,
+                    dim=2,
+                    index=p_indices.unsqueeze(1).expand(B, n_slots, max_m),
+                )
+            # Matched slots: use post-threshold assignment.
+            # Rejected slots: use pre-threshold assignment (penalise the identity
+            # they bailed on so they can't escape via dustbin).
+            slot_targets = (p_assign_mat + p_pre_assign * rejected_float.unsqueeze(2)).argmax(dim=2)  # [B, N]
+            flat_scores  = slot_item_scores.view(B * n_slots, max_m)
+            flat_targets = slot_targets.view(B * n_slots)
+            flat_valid   = (active_slot_mask.bool() | pmatch["rejected_dustbin_mask"]).view(B * n_slots)
+            if flat_valid.any():
+                selection_loss = F.cross_entropy(
+                    flat_scores[flat_valid], flat_targets[flat_valid], reduction="mean"
+                )
+            else:
+                selection_loss = pred_vectors.new_tensor(0.0)
+        else:
+            selection_loss = pred_vectors.new_tensor(0.0)
+
+        # Confidence loss: slots assigned to real present items AND producing a
+        # non-blank predicted mask should be high confidence (target=1).
+        # Dustbin slots are target=0.  A matched slot whose predicted mask is
+        # effectively blank (mean sigmoid < 0.05) associated a word but produced
+        # no spatial evidence — it is treated as dustbin for confidence.
         confidence_loss = pred_vectors.new_tensor(0.0)
         if confidence_logits is not None and float(self.confidence_weight) > 0.0:
-            confidence_target = (~pmatch["dustbin_mask"]).float()   # [B, N]
+            pred_mask_activation = pred_masks.detach().sigmoid().mean(dim=(-1, -2))  # [B, N]
+            pred_is_blank = pred_mask_activation < 0.05
+            confidence_target = (~pmatch["dustbin_mask"] & ~pred_is_blank).float()  # [B, N]
             confidence_loss = F.binary_cross_entropy_with_logits(
                 confidence_logits, confidence_target, reduction="mean"
             )
@@ -1873,10 +2040,15 @@ class PrototypeLoss(nn.Module):
             pred_j = pred_priority.unsqueeze(1)
             active_i = active_slot_mask.unsqueeze(2)
             active_j = active_slot_mask.unsqueeze(1)
+            n_s = int(pred_priority.shape[1])
+            slot_range = torch.arange(n_s, device=device)
+            slot_i_idx = slot_range.view(1, n_s, 1).expand(B, n_s, n_s)
+            slot_j_idx = slot_range.view(1, 1, n_s).expand(B, n_s, n_s)
             pair_mask = (
                 (active_i > 0.0)
                 & (active_j > 0.0)
                 & ((target_i + 1e-6) < target_j)
+                & (slot_i_idx < slot_j_idx)
             ).to(dtype=pred_vectors.dtype)
             if confidence_logits is not None:
                 conf_prob = confidence_logits.detach().sigmoid().to(dtype=pred_vectors.dtype)
@@ -1899,7 +2071,8 @@ class PrototypeLoss(nn.Module):
                 novel_pred = torch.relu(pred_slot - ref_canvas).clamp(0.0, 1.0)
                 slot_mse = F.mse_loss(novel_pred, residual_target, reduction="none").mean(dim=(1, 2, 3))
                 residual_parts.append(slot_mse * active_slot_mask[:, slot_idx])
-                prev_canvas = torch.maximum(prev_canvas, pred_slot)
+                slot_active_4d = active_slot_mask[:, slot_idx].view(B, 1, 1, 1)
+                prev_canvas = torch.maximum(prev_canvas, pred_slot * slot_active_4d)
             if residual_parts:
                 residual_stack = torch.stack(residual_parts, dim=1)
                 residual_mask_loss = residual_stack.sum() / active_slot_mask.sum().clamp_min(1.0)
@@ -1941,7 +2114,7 @@ class PrototypeLoss(nn.Module):
             "confidence_loss": confidence_loss.detach(),
             "mask_order_loss": mask_order_loss.detach(),
             "residual_mask_loss": residual_mask_loss.detach(),
-            "selection_logits": agg_scores.detach(),
+
             "match_count": match_count.detach(),
             "target_priority": target_priority.detach(),
             "pred_priority": pred_priority.detach(),
@@ -2098,6 +2271,8 @@ class TrainConfig:
     batch_size: int = 64
     train_samples: int = 20000
     learning_rate: float = 5e-4
+    grad_clip: float = 1.0
+    network_dropout: float = 0.0
     steps: int = 2000
     min_items: int = 1
     max_items: int = 8
@@ -2142,6 +2317,7 @@ class PrototypeTrainer:
             hidden_dim=config.hidden_dim,
             n_slots=config.n_slots,
             image_size=config.image_size,
+            network_dropout=config.network_dropout,
         ).to(self.device)
         # Normalised ST vectors for all vocabulary phrases — used by the selection loss.
         vocab_matrix = F.normalize(
@@ -2276,6 +2452,8 @@ class PrototypeTrainer:
 
             self.optimizer.zero_grad(set_to_none=True)
             losses["loss"].backward()
+            grad_norm = nn.utils.clip_grad_norm_(self.model.parameters(), float(self.config.grad_clip))
+            grad_norm_value = float(grad_norm.detach().item()) if isinstance(grad_norm, torch.Tensor) else float(grad_norm)
             self.optimizer.step()
             self.model.observe_predictions(
                 aux.get("slot_selection_probs"),
@@ -2306,6 +2484,7 @@ class PrototypeTrainer:
                     f"step={step:05d} "
                     f"loss={float(losses['loss']):.5f} "
                     f"{' | '.join(loss_rows)} "
+                    f"grad={grad_norm_value:.3g}/{float(self.config.grad_clip):.3g} "
                     f"hyperedges={int(hypergraph_len)}"
                     f"{diag_suffix}"
                 )

@@ -138,7 +138,15 @@ class ClassifierConfig:
     lr: float = 1e-4
     weight_decay: float = 1e-5
     grad_clip: float = 1.0
+    # Per-stage gradient accumulation
+    stage0_grad_accum_steps: int = -1
+    stage1_grad_accum_steps: int = -1
+    stage2_grad_accum_steps: int = 100
+    # Deprecated/compatibility
     grad_accum_steps: int = 1
+    speculative_grad_accum_steps: int = -1
+    # Save active_network.pt after every speculative optimizer step.
+    speculative_save_on_grad_step: bool = False
 
     # Sinusoidal LR schedule
     lr_cycles: float = 1.0
@@ -438,7 +446,7 @@ class PregestationTrainNode(IRTrainingNode):
                 amp_enabled=ctx.amp_enabled,
                 amp_dtype=ctx.amp_dtype,
                 grad_clip=self.cfg.grad_clip,
-                grad_accum_steps=self.cfg.grad_accum_steps,
+                grad_accum_steps=self.cfg.stage0_grad_accum_steps,
                 semantic_cosine_weight=self.cfg.semantic_cosine_weight,
                 grad_scaler=ctx.classifier_grad_scaler,
                 channels_last=self.cfg.channels_last,
@@ -570,7 +578,7 @@ class GestationTrainNode(IRTrainingNode):
                 amp_enabled=ctx.amp_enabled,
                 amp_dtype=ctx.amp_dtype,
                 grad_clip=self.cfg.grad_clip,
-                grad_accum_steps=self.cfg.grad_accum_steps,
+                grad_accum_steps=self.cfg.stage1_grad_accum_steps,
                 semantic_cosine_weight=self.cfg.semantic_cosine_weight,
                 grad_scaler=ctx.classifier_grad_scaler,
                 channels_last=self.cfg.channels_last,
@@ -701,7 +709,7 @@ class BerkeleyRefreshTrainNode(IRTrainingNode):
                 amp_enabled=ctx.amp_enabled,
                 amp_dtype=ctx.amp_dtype,
                 grad_clip=self.cfg.grad_clip,
-                grad_accum_steps=self.cfg.grad_accum_steps,
+                grad_accum_steps=self.cfg.stage2_grad_accum_steps,
                 semantic_cosine_weight=self.cfg.semantic_cosine_weight,
                 grad_scaler=ctx.classifier_grad_scaler,
                 channels_last=self.cfg.channels_last,
