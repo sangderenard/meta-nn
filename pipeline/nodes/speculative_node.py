@@ -337,6 +337,10 @@ class SpeculativeNetConfig:
     # 0 = disable accumulation; -1 = one optimiser step per full loader pass.
     # Positive values step once per N loader batches.
     grad_accum_steps: int = -1
+    # Per-stage overrides; -1 falls back to grad_accum_steps.
+    stage0_grad_accum_steps: int = -1
+    stage1_grad_accum_steps: int = -1
+    stage2_grad_accum_steps: int = 100
     network_dropout: float = 0.0
 
     # ---- Runtime / memory -----------------------------------------------
@@ -1616,6 +1620,7 @@ class _SpeculativeBaseTrainNode(IRTrainingNode):
         epochs: int,
         stage_label: str,
         metric_stage: str,
+        grad_accum_steps: int = -1,
     ) -> None:
         loader_info = ensure_runtime_loader_contract(ctx, consumer_id=self.node_id)
         preview_cb = make_speculative_step_preview_callback(ctx, self.node_id)
@@ -1674,7 +1679,7 @@ class _SpeculativeBaseTrainNode(IRTrainingNode):
             vocab_phrases=list(ctx.class_names),
             active_term_to_idx=dict(ctx.semantic_term_to_idx),
             grad_clip=self.cfg.grad_clip,
-            grad_accum_steps=self.cfg.grad_accum_steps,
+            grad_accum_steps=grad_accum_steps,
             network_dropout=self.cfg.network_dropout,
             log_every=self.cfg.log_every,
             stage_label=stage_label,
@@ -1735,7 +1740,8 @@ class SpeculativePregestationNode(_SpeculativeBaseTrainNode):
         return []
 
     def execute(self, ctx: PipelineContext) -> None:
-        self._run(ctx, self.cfg.stage0_epochs, "stage0_speculative", "stage0")
+        self._run(ctx, self.cfg.stage0_epochs, "stage0_speculative", "stage0",
+                  grad_accum_steps=self.cfg.stage0_grad_accum_steps)
 
 
 class SpeculativeGestationNode(_SpeculativeBaseTrainNode):
@@ -1775,7 +1781,8 @@ class SpeculativeGestationNode(_SpeculativeBaseTrainNode):
         return []
 
     def execute(self, ctx: PipelineContext) -> None:
-        self._run(ctx, self.cfg.stage1_epochs, "stage1_speculative", "stage1")
+        self._run(ctx, self.cfg.stage1_epochs, "stage1_speculative", "stage1",
+                  grad_accum_steps=self.cfg.stage1_grad_accum_steps)
 
 
 class SpeculativeBerkeleyNode(_SpeculativeBaseTrainNode):
@@ -1815,4 +1822,5 @@ class SpeculativeBerkeleyNode(_SpeculativeBaseTrainNode):
         return []
 
     def execute(self, ctx: PipelineContext) -> None:
-        self._run(ctx, self.cfg.stage2_epochs, "stage2_speculative", "stage2")
+        self._run(ctx, self.cfg.stage2_epochs, "stage2_speculative", "stage2",
+                  grad_accum_steps=self.cfg.stage2_grad_accum_steps)
